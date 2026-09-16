@@ -535,3 +535,22 @@ textarea:focus { border-color: var(--accent); }
 .settings-state { min-height: 18px; margin-top: 10px; }
 /* 导入导出面板：说明紧贴面板头，不留 .hint 默认的上外边距 */
 .settings-hint { margin-top: 0; }
+
+/* ─── 自动签到 / 软件更新 ─── */
+/* 带时间输入的 .switch：它内部不是「开关」而是原生 time 控件，
+   必须覆盖上面对 .switch input 做的隐藏处理（那条规则是给自定义开关用的） */
+.switch-time { gap: 10px; cursor: default; }
+.switch-time input[type="time"] {
+  position: static; width: auto; height: auto; opacity: 1; pointer-events: auto;
+  font: inherit; color: var(--text); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 7px; padding: 4px 8px;
+}
+.switch-time input[type="time"]:disabled { opacity: .5; }
+.switch-time input[type="time"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* 更新日志：等宽换行展示 Release notes，限高避免长文把设置页撑得难翻 */
+.update-notes {
+  margin-top: 10px; padding: 10px 14px; max-height: 180px; overflow: auto;
+  background: var(--panel-muted); border: 1px solid var(--border); border-radius: 9px;
+  color: var(--muted); font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
+}

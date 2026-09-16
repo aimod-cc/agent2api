@@ -64,11 +64,6 @@ const BUILTIN_MODELS = [
 
   { id: 'default-1.1', name: 'Claude-3.7-Sonnet', vendor: 'e', credits: '', maxOutputTokens: 8192, maxInputTokens: 200000, supportsToolCall: true, supportsImages: true, supportsReasoning: true, onlyReasoning: true },
   { id: 'default-1.2', name: 'Claude-4.0-Sonnet', vendor: 'e', credits: '', maxOutputTokens: 24000, maxInputTokens: 200000, supportsToolCall: true, supportsImages: true, supportsReasoning: true, onlyReasoning: true },
-
-  // 图像 / 视频生成（非对话模型，/v1/models 里也列出便于选择）
-  { id: 'hunyuan-image-v3.0', name: 'Hunyuan-Image-V3', vendor: 'j', credits: '', kind: 'image' },
-  { id: 'kling-v3-t2v', name: 'Kling-V3-T2V', vendor: 'k', credits: '', kind: 'video' },
-  { id: 'kling-v3-i2v', name: 'Kling-V3-I2V', vendor: 'k', credits: '', kind: 'video' },
 ];
 
 export class ModelRouteError extends Error {

@@ -228,6 +228,109 @@ pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
     .await
 }
 
+/// 检查新版本：把本应用版本作为 query 参数交给后端比较。
+///
+/// 版本号必须由壳提供 —— 后端以独立进程运行，不知道自己被哪个壳打包，
+/// 缺了它后端只能回报「最新版本是多少」，无法判断「是否有更新」。
+/// 取值用运行时的 package_info（打包配置里的版本），而不是编译期常量：
+/// 版本号在 Cargo.toml 与 tauri.conf.json 各有一份，前者可能与实际安装包不一致。
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> Result<Value, String> {
+    let current = app.package_info().version.to_string();
+    let path = format!("/api/update/check?current={}", urlencoding(&current));
+    gateway::call("GET", &path, None).await
+}
+
+/// 下载安装包（后端负责联网与落盘，这里只转发参数）
+#[tauri::command]
+pub async fn download_update(url: String, name: Option<String>) -> Result<Value, String> {
+    let payload = json!({ "url": url, "name": name.unwrap_or_default() });
+    gateway::call("POST", "/api/update/download", Some(&payload)).await
+}
+
+/// 下载进度（前端轮询）
+#[tauri::command]
+pub async fn update_progress() -> Result<Value, String> {
+    gateway::call("GET", "/api/update/progress", None).await
+}
+
+/// 取消下载
+#[tauri::command]
+pub async fn cancel_update() -> Result<Value, String> {
+    gateway::call("POST", "/api/update/cancel", Some(&json!({}))).await
+}
+
+/// 运行已下载的安装包。
+///
+/// 路径必须通过 `update::verify_installer` 的校验（存在、.exe、位于下载目录内），
+/// 否则这个命令就成了「执行任意程序」的入口。
+///
+/// `restart` 为 true 时：先把退出标志置位再退出，让出安装包要覆盖的文件占用
+/// （不置位的话关窗逻辑会把退出拦成「最小化到托盘」，安装程序会卡在文件占用上）。
+#[tauri::command]
+pub fn run_installer(app: AppHandle, path: String, restart: Option<bool>) -> Result<Value, String> {
+    let target = crate::update::verify_installer(&path)?;
+    crate::update::launch_installer(&target, true)?;
+
+    if restart.unwrap_or(true) {
+        let state = app.state::<AppState>();
+        state.begin_exit();
+        // 稍留一点时间让命令的返回值先回到前端，再退出
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            handle.exit(0);
+        });
+    }
+    Ok(json!({ "launched": true, "path": target.to_string_lossy(), "restart": restart.unwrap_or(true) }))
+}
+
+/// 用系统默认浏览器打开 Release 页面。
+///
+/// 只允许 http(s)：直接交给系统打开器时，file:// 会变成「用默认程序打开本地文件」，
+/// 等于给渲染层留了一个执行本机文件的口子。
+#[tauri::command]
+pub fn open_release_page(url: String) -> Result<Value, String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("只允许打开 http(s) 链接".to_string());
+    }
+    open_in_browser(trimmed)?;
+    Ok(json!({ "url": trimmed }))
+}
+
+/// 交给系统默认浏览器处理。
+/// Windows 用 `cmd /C start`，注意 start 会把第一个带引号的参数当窗口标题，
+/// 因此必须补一个空标题占位。
+#[cfg(windows)]
+fn open_in_browser(url: &str) -> Result<(), String> {
+    std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("打开浏览器失败: {error}"))
+}
+
+#[cfg(not(windows))]
+fn open_in_browser(url: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(opener)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("打开浏览器失败: {error}"))
+}
+
+/// 最小化的 query 转义：版本号只含数字与点，做一层保险即可
+fn urlencoding(text: &str) -> String {
+    text.chars()
+        .map(|ch| match ch {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => ch.to_string(),
+            other => format!("%{:02X}", other as u32 & 0xFF),
+        })
+        .collect()
+}
+
 /// 本地时间戳（yyyy-MM-dd-HH-mm-ss），避免引入时间格式化依赖
 fn timestamp_for_filename() -> String {
     let now = std::time::SystemTime::now()

@@ -132,6 +132,25 @@ pub const BRIDGE_JS: &str = r#"
     getAllBalances: () => call('GET', '/api/accounts/usage'),
     checkinAllAccounts: id => call('POST', '/api/accounts/checkin', id ? { id } : {}),
 
+    // ── 定时签到 ──
+    getAutoCheckin: () => call('GET', '/api/auto-checkin'),
+    saveAutoCheckin: patch => call('POST', '/api/auto-checkin', patch),
+    runAutoCheckinNow: () => call('POST', '/api/auto-checkin/run', {}),
+
+    // ── 软件更新 ──
+    // checkUpdate 走壳命令：当前版本号只有壳知道（后端是独立进程），
+    // 由壳把版本带上去交给后端比较
+    checkUpdate: () => invoke('check_update'),
+    downloadUpdate: payload => invoke('download_update', {
+      url: String((payload && payload.url) || ''),
+      name: (payload && payload.name) ? String(payload.name) : null,
+    }),
+    updateProgress: () => invoke('update_progress'),
+    cancelUpdate: () => invoke('cancel_update'),
+    runInstaller: (path, restart) =>
+      invoke('run_installer', { path: String(path || ''), restart: restart !== false }),
+    openReleasePage: url => invoke('open_release_page', { url: String(url || '') }),
+
     // ── 敏感词脱敏 ──
     getDesensitize: () => call('GET', '/api/desensitize'),
     setDesensitizeEnabled: enabled =>

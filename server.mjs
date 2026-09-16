@@ -59,6 +59,8 @@ import { createDesensitizer, DEFAULT_ROLES } from './src/workbuddy-desensitize.m
 import { setupDesensitizeRoutes } from './src/workbuddy-desensitize-routes.mjs';
 import { createLogStore } from './src/workbuddy-logs.mjs';
 import { setupLogRoutes } from './src/workbuddy-log-routes.mjs';
+import { createAutoCheckin, AutoCheckinConfigError } from './src/workbuddy-auto-checkin.mjs';
+import { createUpdateManager, UpdateError } from './src/workbuddy-update.mjs';
 import {
   DEFAULT_PREFIX_PATH,
   DEFAULT_EDITION,
@@ -422,6 +424,18 @@ const logRoutes = setupLogRoutes({
   log,
 });
 
+// 定时签到：与 /api/accounts/checkin 复用 runCheckin，规则完全一致
+const autoCheckin = createAutoCheckin({
+  loadConfig,
+  saveConfig,
+  runCheckin: (id) => accountRoutes.runCheckin(id),
+  log,
+  verbose,
+});
+
+// 软件更新：GitHub Release 检测与安装包下载
+const updateManager = createUpdateManager({ directory: CONFIG_DIR, log, verbose });
+
 /** 模型目录动态刷新：GET /v3/config → data.models（端点/UA/出口按当前账号走） */
 async function refreshModelCatalog() {
   try {
@@ -449,7 +463,7 @@ async function refreshModelCatalog() {
 
 // ─── 路由处理 ──────────────────────────────────────────────
 
-async function handleModelRequest(req, res, rawBody, kind, path) {
+async function handleModelRequest(req, res, rawBody, path) {
   let body;
   try {
     body = rawBody.length ? JSON.parse(rawBody.toString('utf8')) : null;
@@ -458,7 +472,7 @@ async function handleModelRequest(req, res, rawBody, kind, path) {
     sendJson(res, 400, { error: { message: '请求体必须是 JSON 对象', type: 'invalid_request_error' } });
     return;
   }
-  if (kind === 'chat' && !Array.isArray(body.messages)) {
+  if (!Array.isArray(body.messages)) {
     sendJson(res, 400, { error: { message: '缺少 messages 数组', type: 'invalid_request_error' } });
     return;
   }
@@ -481,7 +495,7 @@ async function handleModelRequest(req, res, rawBody, kind, path) {
   // 模型路由：点名的模型必须是上游目录里真实存在的 id。
   // 不做任何静默改写/回退 —— 请求 4.1 就必须路由到 4.1，
   // 不存在就 400 报错（附近似名提示），让下游自己改配置。
-  if (kind === 'chat' && !body.model) {
+  if (!body.model) {
     // 客户端没点名 → 网关默认；默认值被白名单收窄掉时，落到目录里 isDefault 的模型
     body.model = modelCatalog.has(opts.defaultModel)
       ? opts.defaultModel
@@ -505,7 +519,7 @@ async function handleModelRequest(req, res, rawBody, kind, path) {
 
   // 内容脱敏：默认开启，命中词插零宽空格后再送上游（缓解后端审核对合规声明的误拦）。
   // 只处理 messages 的文本内容，不影响 model / stream 等其他字段。
-  if (kind === 'chat' || kind === 'completions') {
+  {
     const result = desensitizer.processBody(body);
     if (result.changed) {
       body = result.body;
@@ -522,19 +536,9 @@ async function handleModelRequest(req, res, rawBody, kind, path) {
   req.on('aborted', abortRequest);
   res.on('close', onResponseClose);
   try {
-    if (kind === 'chat') {
-      // 请求体哈希作为去重键：相同 body 的快速重试在代理内排队（防风控）
-      const dedupeKey = createHash('sha256').update(rawBody).digest('hex');
-      await upstreamClient.forwardChatCompletions({ req, res, body, controller, dedupeKey });
-    } else if (kind === 'completions') {
-      await upstreamClient.forwardCompletions({ req, res, body, controller });
-    } else if (kind === 'images') {
-      await upstreamClient.forwardImageGenerations({ req, res, body, controller });
-    } else if (kind === 'videos') {
-      await upstreamClient.forwardVideoGenerations({ req, res, body, controller });
-    } else {
-      await upstreamClient.forwardEmbeddings({ req, res, body, controller });
-    }
+    // 请求体哈希作为去重键：相同 body 的快速重试在代理内排队（防风控）
+    const dedupeKey = createHash('sha256').update(rawBody).digest('hex');
+    await upstreamClient.forwardChatCompletions({ req, res, body, controller, dedupeKey });
     responseCompleted = true;
   } catch (error) {
     if (controller.signal.aborted) return;
@@ -715,6 +719,56 @@ export function createRequestHandler() {
 
       // ── 运行日志（查询 / 统计 / 导出 / 清空）──
       if (await logRoutes.tryHandle(req, res, path, url)) return;
+
+      // ── 定时签到 ──
+      //   GET  /api/auto-checkin          读取开关、触发时刻、上次结果
+      //   POST /api/auto-checkin          修改设置 { enabled?, time? }
+      //   POST /api/auto-checkin/run      立即执行一次
+      if (path === '/api/auto-checkin' || path === '/api/auto-checkin/run') {
+        if (!checkApiKey(req)) return unauthorized(res);
+        if (req.method === 'GET' && path === '/api/auto-checkin') {
+          sendJson(res, 200, { success: true, data: autoCheckin.getState() });
+          return;
+        }
+        if (req.method === 'POST' && path === '/api/auto-checkin') {
+          const body = JSON.parse((await readRawBody(req)).toString('utf8') || '{}');
+          sendJson(res, 200, { success: true, data: autoCheckin.configure(body) });
+          return;
+        }
+        if (req.method === 'POST' && path === '/api/auto-checkin/run') {
+          const summary = await autoCheckin.runNow();
+          if (!summary) throw new AutoCheckinConfigError('签到正在执行中，请稍候');
+          sendJson(res, 200, { success: true, data: { ...summary, state: autoCheckin.getState() } });
+          return;
+        }
+      }
+
+      // ── 软件更新（GitHub Release 检测 / 下载安装包）──
+      //   GET  /api/update/check?current=1.0.0   检查新版本
+      //   POST /api/update/download              开始下载 { url, name }
+      //   GET  /api/update/progress              下载进度
+      //   POST /api/update/cancel                取消下载
+      if (path.startsWith('/api/update/')) {
+        if (!checkApiKey(req)) return unauthorized(res);
+        if (req.method === 'GET' && path === '/api/update/check') {
+          const current = url.searchParams.get('current') || '';
+          sendJson(res, 200, { success: true, data: await updateManager.check({ currentVersion: current }) });
+          return;
+        }
+        if (req.method === 'POST' && path === '/api/update/download') {
+          const body = JSON.parse((await readRawBody(req)).toString('utf8') || '{}');
+          sendJson(res, 200, { success: true, data: await updateManager.startDownload(body) });
+          return;
+        }
+        if (req.method === 'GET' && path === '/api/update/progress') {
+          sendJson(res, 200, { success: true, data: updateManager.getProgress() });
+          return;
+        }
+        if (req.method === 'POST' && path === '/api/update/cancel') {
+          sendJson(res, 200, { success: true, data: updateManager.cancelDownload() });
+          return;
+        }
+      }
 
       // ── 会话管理 API ──
       if (req.method === 'GET' && path === '/api/session') {
@@ -917,18 +971,11 @@ export function createRequestHandler() {
         return;
       }
 
-      // 模型请求
-      const modelRoutes = {
-        '/v1/chat/completions': 'chat',
-        '/v1/completions': 'completions',
-        '/v1/embeddings': 'embeddings',
-        '/v1/images/generations': 'images',
-        '/v1/videos/generations': 'videos',
-      };
-      if (req.method === 'POST' && modelRoutes[path]) {
+      // 模型请求：仅对话链路（其余 OpenAI 兼容端点未经实测，不对外暴露）
+      if (req.method === 'POST' && path === '/v1/chat/completions') {
         if (!checkApiKey(req)) return unauthorized(res);
         const rawBody = await readRawBody(req);
-        return await handleModelRequest(req, res, rawBody, modelRoutes[path], path);
+        return await handleModelRequest(req, res, rawBody, path);
       }
 
       sendJson(res, 404, { error: { message: `Not found: ${req.method} ${path}` } });
@@ -995,9 +1042,20 @@ async function main() {
 
   const server = createServer();
   // 退出时关掉缓存的代理连接，避免 shutdown 被挂起的 socket 拖住
-  const closeAll = () => { try { closeDispatchers(); } catch { /* 已退出 */ } };
+  const closeAll = () => {
+    try { autoCheckin.stop(); } catch { /* 已退出 */ }
+    try { closeDispatchers(); } catch { /* 已退出 */ }
+  };
   process.once('SIGINT', closeAll);
   process.once('SIGTERM', closeAll);
+
+  // 定时签到：开启时起调度，今天还没签且时间点已过则补签一次
+  const checkinState = autoCheckin.getState();
+  if (checkinState.enabled) {
+    log('[Checkin]', `定时签到已启用：每天 ${checkinState.time} 执行`);
+    autoCheckin.start();
+  }
+
   server.listen(opts.port, opts.host, () => {
     console.log('');
     log('[Server]', `✅ API 服务已启动: http://${opts.host}:${opts.port}`);
@@ -1017,6 +1075,8 @@ if (isDirectRun || process.env.WORKBUDDY_PROXY_STANDALONE === '1') {
       || error instanceof WorkBuddyUpstreamError
       || error instanceof WorkBuddyBillingError
       || error instanceof ModelRouteError
+      || error instanceof UpdateError
+      || error instanceof AutoCheckinConfigError
       || error instanceof AccountStoreError) {
       console.error('[Fatal]', error.message);
     } else {

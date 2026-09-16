@@ -3,10 +3,10 @@
  *
  * 端点（不带 prefixPath，直接挂 {endpoint}/v2/...）：
  *   POST {endpoint}/v2/chat/completions   对话（OpenAI 兼容 body，SSE）
- *   POST {endpoint}/v2/completions        代码补全
- *   POST {endpoint}/v2/embeddings         向量
- *   POST {endpoint}/v2/images/generations 文生图
- *   POST {endpoint}/v2/videos/generations 视频生成
+ *
+ * 只实现对话这一条链路：其他 OpenAI 兼容路径（completions / embeddings /
+ * images / videos）虽然出现在逆向出的接口清单里，但没有实测验证过上游是否
+ * 真的开放、body 结构是否一致，因此不对外暴露，也不在这里实现转发。
  *
  * 鉴权头（对齐桌面端 AuthService.buildHeaders + CLI ModelProviderImpl）：
  *   Authorization: Bearer <accessToken>
@@ -681,32 +681,6 @@ export function createWorkBuddyUpstreamClient({
     });
   }
 
-  /** 代码补全 / embeddings / 图像 / 视频 复用同一转发逻辑（同样按优先级选账号与出口） */
-  async function forwardJsonEndpoint({ path, req, res, body, controller }) {
-    const model = body?.model || '';
-    const target = selectTargetAccount(model, []);
-    const { session, init } = await buildRequestInit({
-      body,
-      signal: controller.signal,
-      accountId: target.accountId,
-      proxy: target.proxy,
-    });
-    const url = `${session?.endpoint || auth.baseUrl}${path}`;
-    verbose('[Upstream]',
-      `POST ${url} 出口=${target.proxy ? target.proxy.label : '直连'}`);
-    let response;
-    try {
-      response = await requestWithWafRetry(url, init, controller, target.proxy);
-    } catch (error) {
-      if (controller.signal.aborted) return;
-      if (error instanceof WorkBuddyUpstreamError) throw error;
-      throw new WorkBuddyUpstreamError(`上游请求失败: ${error.message}`, { statusCode: 502 });
-    }
-    const payload = await response.text();
-    res.writeHead(response.status, { 'Content-Type': 'application/json; charset=utf-8' });
-    res.end(payload);
-  }
-
   async function getConfigSummary() {
     // 有账号列表时以「优先级最高的可用账号」为准展示转发目标
     let accountId = null;
@@ -745,10 +719,6 @@ export function createWorkBuddyUpstreamClient({
   return {
     chatCompletionsUrl,
     forwardChatCompletions,
-    forwardCompletions: opts => forwardJsonEndpoint({ ...opts, path: '/v2/completions' }),
-    forwardEmbeddings: opts => forwardJsonEndpoint({ ...opts, path: '/v2/embeddings' }),
-    forwardImageGenerations: opts => forwardJsonEndpoint({ ...opts, path: '/v2/images/generations' }),
-    forwardVideoGenerations: opts => forwardJsonEndpoint({ ...opts, path: '/v2/videos/generations' }),
     getConfigSummary,
     NON_STREAM_NOT_SUPPORTED_CODE,
   };

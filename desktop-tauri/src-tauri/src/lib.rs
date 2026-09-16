@@ -26,6 +26,7 @@ mod login;
 mod settings;
 mod state;
 mod tray;
+mod update;
 
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::MacosLauncher;
@@ -83,6 +84,12 @@ pub fn run() {
             commands::save_app_settings,
             commands::export_accounts,
             commands::import_accounts,
+            commands::check_update,
+            commands::download_update,
+            commands::update_progress,
+            commands::cancel_update,
+            commands::run_installer,
+            commands::open_release_page,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

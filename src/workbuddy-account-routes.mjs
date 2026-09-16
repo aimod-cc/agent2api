@@ -174,6 +174,23 @@ export function setupAccountRoutes({
     }
   }
 
+  /**
+   * 执行签到并汇总结果。抽成独立函数是为了让定时签到复用同一条路径：
+   * 限额跳过、国际版排除、串行防风的规则只在这里维护一份。
+   * id 为空时签全部符合条件的账号，给了 id 则只签该账号。
+   */
+  async function runCheckin(id = null) {
+    if (!billing) throw new AccountStoreError('积分模块未启用', 503);
+    const { targets, skipped } = resolveCheckinTargets(id);
+    // 串行签到：避免多账号同时打上游触发 11128 风控
+    const results = [];
+    for (const account of targets) results.push(await checkinFor(account));
+    const succeeded = results.filter(r => r.claim?.success).length;
+    if (skipped) log('[Accounts]', `已跳过 ${skipped} 个账号（已禁用或国际版无签到活动）`);
+    log('[Accounts]', `签到完成: ${succeeded}/${results.length} 个账号成功领取`);
+    return { results, succeeded, total: results.length, skipped };
+  }
+
   async function tryHandle(req, res, path) {
     if (path !== '/api/accounts' && !path.startsWith('/api/accounts/')) return false;
     if (!checkApiKey(req)) { unauthorized(res); return true; }
@@ -299,18 +316,10 @@ export function setupAccountRoutes({
 
       // 批量/单个签到（国际版账号无签到活动，不参与；批量时跳过已禁用账号）
       if (req.method === 'POST' && path === '/api/accounts/checkin') {
-        if (!billing) throw new AccountStoreError('积分模块未启用', 503);
         const raw = (await readRawBody(req)).toString('utf8') || '{}';
         const parsed = JSON.parse(raw || '{}');
         const id = typeof parsed?.id === 'string' ? parsed.id : null;
-        const { targets, skipped } = resolveCheckinTargets(id);
-        // 串行签到：避免多账号同时打上游触发 11128 风控
-        const results = [];
-        for (const account of targets) results.push(await checkinFor(account));
-        const succeeded = results.filter(r => r.claim?.success).length;
-        if (skipped) log('[Accounts]', `已跳过 ${skipped} 个账号（已禁用或国际版无签到活动）`);
-        log('[Accounts]', `签到完成: ${succeeded}/${results.length} 个账号成功领取`);
-        sendJson(res, 200, { success: true, data: { results, succeeded, total: results.length, skipped } });
+        sendJson(res, 200, { success: true, data: await runCheckin(id) });
         return true;
       }
 
@@ -438,5 +447,5 @@ export function setupAccountRoutes({
     }
   }
 
-  return { tryHandle, tryHandleProxies };
+  return { tryHandle, tryHandleProxies, runCheckin };
 }

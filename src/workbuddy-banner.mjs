@@ -49,9 +49,6 @@ export function printStartupBanner(host, port, { apiKey } = {}) {
   console.log(row('模型端点:'));
   for (const line of [
     'POST   /v1/chat/completions    (OpenAI 兼容，SSE 透传)',
-    'POST   /v1/completions         (代码补全)',
-    'POST   /v1/embeddings          (向量)',
-    'POST   /v1/images/generations  (文生图)',
     'GET    /v1/models              (模型列表)',
   ]) console.log(row(line));
   console.log(GAP);
@@ -61,8 +58,17 @@ export function printStartupBanner(host, port, { apiKey } = {}) {
     'GET    /api/checkin/status     (签到活动状态)',
     'POST   /api/checkin            (领取每日签到积分)',
     'POST   /api/checkin/claim-and-report (签到+回报积分)',
+    'GET    /api/auto-checkin       (自动签到状态/下次执行)',
+    'POST   /api/auto-checkin/run   (立即签到全部账号)',
     'GET    /api/activity/banner    (运营横幅)',
     'GET    /api/activity/ambassador(大使状态)',
+  ]) console.log(row(line));
+  console.log(GAP);
+  console.log(row('软件更新:'));
+  for (const line of [
+    'GET    /api/update/check       (检查 GitHub 新版本)',
+    'POST   /api/update/download    (下载安装包)',
+    'GET    /api/update/progress    (下载进度)',
   ]) console.log(row(line));
   console.log(GAP);
   console.log(row('账号 / 路由:'));

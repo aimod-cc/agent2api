@@ -359,6 +359,57 @@
               网关只监听 <code>127.0.0.1</code>，仅本机可用。
             </p>
           </section>
+
+          <!-- 自动签到 -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>自动签到</h2>
+              <span id="checkin-badge" class="badge">检测中…</span>
+              <div class="head-actions">
+                <button id="btn-checkin-now">立即签到</button>
+              </div>
+            </div>
+            <div class="settings-switches">
+              <label class="switch">
+                <input type="checkbox" id="settings-auto-checkin">
+                <span class="track"></span>
+                <span>每天定时执行全部账号签到</span>
+              </label>
+              <label class="switch switch-time">
+                <span>触发时刻</span>
+                <input type="time" id="settings-auto-checkin-time" value="00:01">
+              </label>
+            </div>
+            <div class="detail settings-state" id="settings-checkin-state">—</div>
+            <p class="hint">
+              到点后会自动签到<strong>全部已启用的国内版账号</strong>（国际版没有签到活动，会被跳过）；
+              多个账号串行执行，避免同时请求触发上游风控。
+              若启动时当天的时间点已过且当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。
+              上游签到接口是幂等的，重复执行只会返回「已领取」，不会重复扣减。
+            </p>
+          </section>
+
+          <!-- 软件更新 -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>软件更新</h2>
+              <span id="update-badge" class="badge">未检查</span>
+              <div class="head-actions">
+                <button id="btn-update-check">检查更新</button>
+                <button id="btn-update-download" class="primary" style="display:none">下载并安装</button>
+              </div>
+            </div>
+            <div class="field-grid">
+              <div class="field"><div class="label">当前版本</div><div class="value" id="update-current">—</div></div>
+              <div class="field"><div class="label">最新版本</div><div class="value" id="update-latest">—</div></div>
+            </div>
+            <div class="detail settings-state" id="update-state">点击「检查更新」查询 GitHub 上的最新发布版本。</div>
+            <div class="update-notes" id="update-notes" style="display:none"></div>
+            <p class="hint">
+              更新包从项目的 GitHub Release 下载，下载完成后可直接启动安装程序并自动重启本程序。
+              安装包会先校验来源域名与文件完整性。若网络访问 GitHub 较慢，会自动尝试通过 Clash Verge 的混合端口重试一次。
+            </p>
+          </section>
         </section>
 
       </div>
@@ -515,6 +566,8 @@
   <script src="logs-panel.js"></script>
   <script src="proxy-form.js"></script>
   <script src="account-panel.js"></script>
+  <!-- update-panel 必须在 settings-panel 之前：后者在设置页首屏自持加载时会调它 -->
+  <script src="update-panel.js"></script>
   <script src="settings-panel.js"></script>
 </body>
 </html>

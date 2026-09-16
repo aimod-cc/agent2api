@@ -43,7 +43,7 @@ OpenAI 客户端 / 任意 SDK
 
 **OpenAI 兼容转发**
 
-- 支持 `/v1/chat/completions`、`/v1/completions`、`/v1/embeddings`、`/v1/images/generations`、`/v1/videos/generations`，与 `/v1/models` 模型列表。
+- 对话链路：`POST /v1/chat/completions` 与 `GET /v1/models`。多账号选路、429 降级、请求去重、内容脱敏、SSE 透传/聚合都实现在这条链路上。
 - 上游只支持流式（`stream:false` 会被上游拒绝），网关对声明 `stream:false` 的客户端在内部以流式请求、把 SSE 聚合成完整 JSON 返回，客户端无需关心。
 - 复刻桌面端的请求头（`Authorization` / `X-User-Id` / `X-Enterprise-Id` / `X-IDE-*` / `X-Product` / 链路追踪头），并按账号版本区分 UA（国内版 `WorkBuddy`、国际版 `WorkBuddy AI`）。UA 里的 `CLI/<版本>` 段必须带，否则上游只下发精简版模型清单。
 - 思考内容（`reasoning_content`）小分片会合并到 60 字符以上再下发，避免客户端把思考渲染成一堆碎块。
@@ -59,7 +59,14 @@ OpenAI 客户端 / 任意 SDK
 
 - 积分/额度查询（个人账号走资源包接口，企业账号走企业额度接口，不限量用哨兵值表示）。
 - 每日签到与一键签到全部账号（串行执行，避免触发上游风控；国际版无签到活动，会被明确跳过或报错）。
+- **自动签到**：在设置页指定每天的执行时刻（默认 `00:01`），到点自动签到全部已启用的国内版账号。若启动时当天时间点已过且尚未签到，会立即补签一次，不会因为当时没开机而漏掉；同一天只执行一次，上游接口幂等，重复调用只返回「已领取」。
 - 运营 banner 与大使状态查询。
+
+**软件更新**
+
+- 设置页可直接检查 GitHub Release 是否有新版本，展示版本号与发布说明，一键下载安装包并启动安装程序（自动退出本程序以让出文件占用，安装完成后重启）。
+- 检测与下载由本地网关发起（桌面壳的 HTTP 客户端不启用 TLS，发不出 GitHub 请求）。直连失败时自动尝试经 Clash Verge 混合端口重试一次。
+- 下载地址限定在 GitHub 域名内，安装包运行前会校验「存在、`.exe`、且位于受控下载目录」三项，避免该功能被当成任意程序执行入口。
 
 **网络与安全**
 
@@ -135,6 +142,8 @@ print(resp.choices[0].message.content)
 
 `GET /v1/models` 返回的清单有两个来源：内置兜底清单，以及运行时从上游 `GET /v3/config` 拉回的真实清单（后者在启动和每次访问 `/v1/models` 时异步刷新）。默认模型是 `auto`。
 
+清单**只收录对话模型**：判定规则见 `src/workbuddy-models.mjs` 的 `isChatModel`，非对话项（内部补全/工具模型、图像/视频模型）不会出现在对外目录里。
+
 **网关不会静默改写模型名**：请求里点名的模型必须在目录中真实存在，否则直接返回 400 并附上近似名提示（`model_not_found`）。这是有意为之——把 `deepseek-v4.1-flash` 悄悄换成别的模型会造成「请求 4.1 实跑 V4」这类难以察觉的事故。需要收窄可选模型时，在 `src/workbuddy-models.mjs` 的 `MODEL_ALLOWLIST` 填入白名单（默认空数组即全量放行）。
 
 ---
@@ -148,11 +157,9 @@ print(resp.choices[0].message.content)
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/v1/chat/completions` | 对话，SSE 流式透传；`stream:false` 由网关内部聚合 |
-| POST | `/v1/completions` | 代码补全 |
-| POST | `/v1/embeddings` | 向量 |
-| POST | `/v1/images/generations` | 文生图 |
-| POST | `/v1/videos/generations` | 视频生成 |
 | GET | `/v1/models` | 模型列表（OpenAI `list` 格式，附带 `credits`、上下文长度、能力标记） |
+
+> 只暴露对话这一个模型端点。逆向出的接口清单里还有 `/v2/completions`、`/v2/embeddings`、`/v2/images/generations`、`/v2/videos/generations` 等路径，但都未经实测（上游是否开放、body 结构是否一致均未知），因此没有实现转发，请求它们会得到 404。
 
 限额错误的返回体带 `type: "rate_limit_exceeded"`，并附加 `reset_at`（时间戳）与 `reset_at_text`（本地时间文本）。
 
@@ -201,6 +208,13 @@ print(resp.choices[0].message.content)
 | GET | `/api/checkin/status` | 签到活动状态 |
 | POST | `/api/checkin` | 领取每日签到积分 |
 | POST | `/api/checkin/claim-and-report` | 签到并回报最新积分 |
+| GET | `/api/auto-checkin` | 自动签到状态（开关、触发时刻、下次执行、上次结果） |
+| POST | `/api/auto-checkin` | 修改自动签到设置（`{ enabled?, time? }`，`time` 为 `HH:MM`） |
+| POST | `/api/auto-checkin/run` | 立即执行一次全部账号签到 |
+| GET | `/api/update/check?current=1.0.0` | 检查 GitHub Release 是否有新版本 |
+| POST | `/api/update/download` | 下载安装包（`{ url, name }`，仅接受 GitHub 域名） |
+| GET | `/api/update/progress` | 下载进度 |
+| POST | `/api/update/cancel` | 取消下载（清理半截文件） |
 | GET | `/api/desensitize` | 脱敏状态（开关、词表、角色、命中统计） |
 | POST | `/api/desensitize/enabled` | 开关脱敏 |
 | POST | `/api/desensitize/roles` | 设置作用角色 |
@@ -322,18 +336,21 @@ node server.mjs [options]
 | `WORKBUDDY_PROXY_STANDALONE` | `1` 时不做入口判定直接启动服务（被外部进程管理器拉起时用） |
 | `WORKBUDDY_PROXY_PORT` | 桌面端使用的网关端口（默认 3065） |
 | `WORKBUDDY_SKIP_OPEN_BROWSER` | `1` 时不自动打开系统浏览器（桌面端调试用） |
+| `WORKBUDDY_UPDATE_REPO` | 软件更新检测的 GitHub 仓库（默认 `aimod-cc/workbuddy-proxy`） |
+| `WORKBUDDY_GITHUB_TOKEN` | 可选。检查更新用的 GitHub token，仅用于提高 API 频率限额（不填也能用） |
 
 ### 配置文件
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | 网关 API Key、计费语言、最近一次请求所用模型 |
+| `config.json` | 网关 API Key、计费语言、最近一次请求所用模型、自动签到设置（`autoCheckin`） |
 | `accounts.json` | 账号列表（凭证、优先级、启用状态、代理、限额记录） |
 | `auth.json` | 旧版单账号登录态（仅在账号列表为空时迁移一次） |
 | `desensitize.json` | 脱敏开关、词表、作用角色 |
 | `logs.jsonl` | 运行日志（JSONL，一行一条） |
 | `desktop-settings.json` | 桌面端设置：关闭到托盘、开机自启 |
 | `debug/last-request.json` | 最近一次入站请求体（覆盖写，便于重放） |
+| `updates/` | 软件更新下载的安装包（覆盖写，同版本只保留一份） |
 
 账号文件的读取每次实时走磁盘，手工编辑后下一次请求即生效；`priority` / `enabled` / `proxy` 等字段都可以直接改（优先级仍需保持唯一）。
 
@@ -382,6 +399,8 @@ workbuddy/
 │  ├─ workbuddy-proxy.mjs        出网代理（Clash Verge 同步、dispatcher 缓存、出口测试）
 │  ├─ workbuddy-desensitize.mjs  脱敏纯函数与词表管理
 │  ├─ workbuddy-desensitize-routes.mjs
+│  ├─ workbuddy-auto-checkin.mjs 定时签到调度（轮询 + 当天去重 + 启动补签）
+│  ├─ workbuddy-update.mjs       GitHub Release 检测与安装包下载
 │  ├─ workbuddy-logs.mjs / workbuddy-log-routes.mjs 运行日志
 │  ├─ workbuddy-cli.mjs          CLI 子命令与启动自检输出
 │  └─ workbuddy-banner.mjs       启动横幅
@@ -393,6 +412,7 @@ workbuddy/
 │  │  ├─ login.rs                登录窗口与轮询
 │  │  ├─ commands.rs             暴露给前端的 invoke 命令
 │  │  ├─ bridge.rs               注入 window.workbuddyDesktop 的桥接脚本
+│  │  ├─ update.rs               安装包路径校验与启动（更新功能中壳侧的部分）
 │  │  ├─ settings.rs / state.rs / tray.rs
 │  ├─ ui/                        前端（原生 HTML/CSS/JS，无框架）
 │  └─ src-tauri/tauri.conf.json  打包配置（NSIS、资源清单）
@@ -458,10 +478,12 @@ node tests/desensitize-e2e.mjs        # 端到端：假上游 + 真实网关，�
 ## 设计取舍与已知限制
 
 - **模型不做静默回退**：点名不存在的模型直接 400，附带近似名提示。宁可让下游配置报错，也不接受「请求 A 实跑 B」。
+- **只实现对话端点**：逆向出的接口清单里还有补全、向量、图像、视频等路径，但都未经实测，本项目没有实现转发（请求会得到 404），模型目录也不收录对应的非对话模型。
 - **优先级强制唯一**：这是「主备序号」语义的前提。历史数据里的并列会做一次性去重迁移，相对顺序保持不变。
 - **上游只支持流式**：`stream:false` 由网关在内部聚合，代价是拿不到「非流式」的原生行为（例如服务端的 chunk 边界）。聚合时会拼接 `content` / `reasoning_content`、按 `index` 合并 `tool_calls`、取最后一次出现的 `usage`。
 - **首条消息必须是 system**：上游要求如此，客户端没带时网关会注入一条兜底系统消息「你是一个得力助手」。
 - **签到串行执行**：批量签到一个一个来，避免多账号同时打上游触发风控；代价是账号多时耗时线性增长。
+- **自动签到用轮询而非单定时器**：`setTimeout` 在系统休眠、锁屏、时钟被改之后会漂移甚至整段错过，因此改为每 30 秒比对一次「是否已过今天的触发点」，并在启动时补签当天遗漏的一次。判定用「当天日期去重」，与本地时区绑定。
 - **国际版无签到活动**：相关操作会被明确跳过（批量）或报错（单个），不会伪装成「签到失败」。
 - **代理配置不是「严格镜像」Clash**：账号里只存监听器 uid，端口每次实时读取。Clash 里删了监听器，对应账号回退直连并记日志提醒，不会静默换出口。
 - **无鉴权时假设仅本机可访问**：默认监听 `127.0.0.1`；若改为监听非回环地址，启动时会打印安全提醒，此时应当设置 API Key。

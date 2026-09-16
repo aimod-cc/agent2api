@@ -182,30 +182,9 @@ console.log('\n━━━ 2. 首条 system 消息注入 ━━━');
   check('出站消息数 +1', sent.messages.length, 2);
 }
 
-// ─── 3. 各转发端点 URL ─────────────────────────────────────
-
-console.log('\n━━━ 3. 各模型端点 URL（均不带 /plugin）━━━');
-{
-  const urls = [];
-  const client = createWorkBuddyUpstreamClient({
-    auth: makeAuth([]),
-    fetchImpl: async (url) => { urls.push(url); return new Response('{}', { status: 200 }); },
-  });
-  const res = makeRes();
-  const controller = new AbortController();
-  await client.forwardCompletions({ req: {}, res, body: {}, controller });
-  await client.forwardEmbeddings({ req: {}, res, body: {}, controller });
-  await client.forwardImageGenerations({ req: {}, res, body: {}, controller });
-  await client.forwardVideoGenerations({ req: {}, res, body: {}, controller });
-  check('completions', urls[0], 'https://copilot.tencent.com/v2/completions');
-  check('embeddings', urls[1], 'https://copilot.tencent.com/v2/embeddings');
-  check('images/generations', urls[2], 'https://copilot.tencent.com/v2/images/generations');
-  check('videos/generations', urls[3], 'https://copilot.tencent.com/v2/videos/generations');
-}
-
 // ─── 3. 计费 / 签到：URL + 头 + 归一化 ─────────────────────
 
-console.log('\n━━━ 4. 计费 / 签到（不带 /plugin）━━━');
+console.log('\n━━━ 3. 计费 / 签到（不带 /plugin）━━━');
 {
   const calls = [];
   const billingBodies = {
@@ -313,7 +292,7 @@ console.log('\n━━━ 4. 计费 / 签到（不带 /plugin）━━━');
 
 // ─── 4. 企业不限量哨兵 ─────────────────────────────────────
 
-console.log('\n━━━ 5. 企业不限量（limitNum = -1）━━━');
+console.log('\n━━━ 4. 企业不限量（limitNum = -1）━━━');
 {
   // 企业账号：fetchAvailableCredits 内部复用 queryUsage，需要 enterpriseId 才走企业链路
   const entSession = {
@@ -335,7 +314,7 @@ console.log('\n━━━ 5. 企业不限量（limitNum = -1）━━━');
 
 // ─── 5. 匿名登录 URL（不触网，仅校验拼装）──────────────────
 
-console.log('\n━━━ 6. 鉴权 URL 拼装 ━━━');
+console.log('\n━━━ 5. 鉴权 URL 拼装 ━━━');
 {
   const captured = [];
   const auth = createWorkBuddyAuth({
@@ -416,7 +395,7 @@ console.log('\n━━━ 6. 鉴权 URL 拼装 ━━━');
 
 // ─── 6. 错误码处理 ─────────────────────────────────────────
 
-console.log('\n━━━ 7. 上游错误码 ━━━');
+console.log('\n━━━ 6. 上游错误码 ━━━');
 {
   // 11217：登录轮询中，应继续等待而不是抛错
   let pollCount = 0;
@@ -446,7 +425,7 @@ console.log('\n━━━ 7. 上游错误码 ━━━');
 
 // ─── 7. 签到幂等（非 0 code）──────────────────────────────
 
-console.log('\n━━━ 8. 签到幂等（已领取时非 0 code）━━━');
+console.log('\n━━━ 7. 签到幂等（已领取时非 0 code）━━━');
 {
   const billing = createWorkBuddyBilling({
     auth: makeAuth([]),
@@ -465,7 +444,7 @@ console.log('\n━━━ 8. 签到幂等（已领取时非 0 code）━━━');
 
 // ─── 8. 模型目录 ───────────────────────────────────────────
 
-console.log('\n━━━ 9. 模型目录 ━━━');
+console.log('\n━━━ 8. 模型目录 ━━━');
 {
   const cat = createModelCatalog({});
   check('内置模型数 > 20', cat.list().length > 20, true);
@@ -492,7 +471,7 @@ console.log('\n━━━ 9. 模型目录 ━━━');
 
 // ─── 9. 账号存储 ───────────────────────────────────────────
 
-console.log('\n━━━ 10. 账号存储（临时目录）━━━');
+console.log('\n━━━ 9. 账号存储（临时目录）━━━');
 {
   const dir = mkdtempSync(join(tmpdir(), 'wb-store-test-'));
   try {
@@ -552,7 +531,7 @@ console.log('\n━━━ 10. 账号存储（临时目录）━━━');
 
 // ─── 10. 敏感词脱敏 ─────────────────────────────────────────
 
-console.log('\n━━━ 11. 敏感词脱敏 ━━━');
+console.log('\n━━━ 10. 敏感词脱敏 ━━━');
 {
   // 短词不多吃长词："C2 frameworks" 必须整体命中，而不是被 "C2 framework" 的短前缀切碎
   const pattern = compileTerms(['C2 framework', 'C2 frameworks', 'DoS']);
@@ -607,12 +586,12 @@ console.log('\n━━━ 11. 敏感词脱敏 ━━━');
   check('多模态文本块命中', multi.messages[0].content[0].text.includes(ZWSP), true);
   check('多模态图片块原样', multi.messages[0].content[1].type, 'image_url');
 
-  // 无 messages 的请求体（embeddings / images）不受影响
+  // 没有 messages 字段的请求体原样返回（脱敏只处理 messages）
   const noMessages = { input: 'DoS attack' };
   check('无 messages 原样返回', desensitizeBody(noMessages, { pattern }), noMessages);
 }
 
-console.log('\n━━━ 12. 脱敏器：开关 / 持久化 / 统计 ━━━');
+console.log('\n━━━ 11. 脱敏器：开关 / 持久化 / 统计 ━━━');
 {
   const dir = mkdtempSync(join(tmpdir(), 'wb-desens-test-'));
   try {
@@ -685,7 +664,7 @@ console.log('\n━━━ 12. 脱敏器：开关 / 持久化 / 统计 ━━━')
   }
 }
 
-console.log('\n━━━ 13. 脱敏 HTTP 路由 ━━━');
+console.log('\n━━━ 12. 脱敏 HTTP 路由 ━━━');
 {
   const dir = mkdtempSync(join(tmpdir(), 'wb-desens-route-'));
   try {
@@ -759,7 +738,7 @@ console.log('\n━━━ 13. 脱敏 HTTP 路由 ━━━');
 
 // ─── 13. 账号限额轮换（429 / code 6004）───────────────────
 
-console.log('\n━━━ 14. 账号限额轮换 ━━━');
+console.log('\n━━━ 13. 账号限额轮换 ━━━');
 {
   // 恢复时间解析（msg 里的 UTC+8 文本）
   const QUOTA_MSG = '您的使用量已超出频率限制，将在 2026-09-11 19:43:46 UTC+8 重置，您也可以切换其他模型继续使用。';
@@ -867,7 +846,7 @@ console.log('\n━━━ 14. 账号限额轮换 ━━━');
 
 // ─── 14. 运行日志 ──────────────────────────────────────────
 
-console.log('\n━━━ 15. 运行日志 ━━━');
+console.log('\n━━━ 14. 运行日志 ━━━');
 {
   const dir = mkdtempSync(join(tmpdir(), 'wb-logs-test-'));
   try {
@@ -943,7 +922,7 @@ console.log('\n━━━ 15. 运行日志 ━━━');
 
 // ─── 15. 429 切换写入运行日志 ──────────────────────────────
 
-console.log('\n━━━ 16. 429 切换日志 ━━━');
+console.log('\n━━━ 15. 429 切换日志 ━━━');
 {
   const dir = mkdtempSync(join(tmpdir(), 'wb-logs-429-'));
   try {

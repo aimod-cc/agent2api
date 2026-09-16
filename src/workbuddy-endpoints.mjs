@@ -193,8 +193,13 @@ export const AUTH = {
   },
 };
 
-// ─── 2. LLM：对话 / 补全 / 多模态 ───────────────────────────
+// ─── 2. LLM：对话 ──────────────────────────────────────────
 // 不带 prefixPath，直接挂 {endpoint}/v2/...
+//
+// 这里只保留对话链路。逆向时在客户端里还见到过 /v2/completions、
+// /v2/embeddings、/v2/images/generations、/v2/images/edits、/v2/videos/generations
+// 等路径，但都没有实测确认（上游是否开放、body 结构是否一致均未知），
+// 因此不登记、不转发 —— 记在这里只是留个线索给后续排查。
 
 export const LLM = {
   /** 对话（OpenAI 兼容，SSE 流式）；WorkBuddy 主链路 */
@@ -204,14 +209,6 @@ export const LLM = {
     accept: 'text/event-stream',
     note: 'body 为 OpenAI 兼容结构；上游仅支持 stream:true（stream:false 会返回 code=11101）',
   },
-  /** 代码补全（旧版 VS Code 扩展链路，WorkBuddy 桌面端默认不走） */
-  completions: { method: 'POST', path: '/v2/completions' },
-  embeddings: { method: 'POST', path: '/v2/embeddings' },
-  /** 文生图（插件 ImageGen 用，endpoint 同源） */
-  imageGenerations: { method: 'POST', path: '/v2/images/generations' },
-  imageEdits: { method: 'POST', path: '/v2/images/edits' },
-  /** 视频生成：提交任务 + 轮询 */
-  videoGenerations: { method: 'POST', path: '/v2/videos/generations' },
 };
 
 // ─── 3. 计费 / 积分 / 签到 ─────────────────────────────────

@@ -104,7 +104,12 @@
 
   /** 设置页数据入口（app.js 切入该页时调用） */
   async function load() {
-    await Promise.all([loadSettings(), loadGateway()]);
+    await Promise.all([
+      loadSettings(),
+      loadGateway(),
+      loadAutoCheckin(),
+      window.wbUpdatePanel?.load?.(),
+    ]);
   }
 
   // ─── 操作：开关 ─────────────────────────────
@@ -223,6 +228,106 @@
     });
   }
 
+  // ─── 渲染：自动签到 ─────────────────────────
+
+  /** 把「下次执行」化成一句人话；后端没给时间时退回只描述开关状态 */
+  function describeNextRun(state) {
+    if (!state?.enabled) return '定时签到未开启，账号需要手动签到。';
+    const nextAt = Number(state.nextRunAt) || 0;
+    if (!nextAt) return `每天 ${state.time} 自动签到。`;
+    const next = new Date(nextAt);
+    const today = new Date();
+    const sameDay = next.toDateString() === today.toDateString();
+    const stamp = `${String(next.getHours()).padStart(2, '0')}:${String(next.getMinutes()).padStart(2, '0')}`;
+    return `每天 ${state.time} 自动签到，下次执行：${sameDay ? '今天' : '明天'} ${stamp}`
+      + `${state.lastFiredToday ? '（今天已执行）' : ''}`;
+  }
+
+  /** 上次执行结果写成一行摘要；失败明细只列前两条，与账号页的密度一致 */
+  function describeLastResult(result) {
+    if (!result) return '';
+    const when = result.at ? new Date(Number(result.at)).toLocaleString('zh-CN', { hour12: false }) : '';
+    const head = `${when ? `${when} ` : ''}上次执行（${result.reason || '定时'}）：`
+      + `${Number(result.succeeded) || 0}/${Number(result.total) || 0} 个账号成功领取`;
+    const extras = [];
+    if (Number(result.skipped)) extras.push(`跳过 ${result.skipped} 个`);
+    if (Number(result.failedCount)) extras.push(`失败 ${result.failedCount} 个`);
+    const suffix = extras.length ? `，${extras.join('、')}` : '';
+    const failed = Array.isArray(result.failed) && result.failed.length
+      ? `（${result.failed.slice(0, 2).join('；')}${result.failed.length > 2 ? ' 等' : ''}）`
+      : '';
+    return `${head}${suffix}${failed}`;
+  }
+
+  function renderAutoCheckin(state) {
+    const toggle = $('settings-auto-checkin');
+    const time = $('settings-auto-checkin-time');
+    const badge = $('checkin-badge');
+    if (!toggle || !time || !badge) return;
+
+    if (!state || typeof state !== 'object') {
+      badge.className = 'badge bad';
+      badge.textContent = '不可用';
+      $('settings-checkin-state').textContent = '后端未返回自动签到设置';
+      return;
+    }
+
+    toggle.checked = state.enabled === true;
+    // 只在用户没在编辑时回填时间：否则轮询/重载会把正在输入的值冲掉
+    if (document.activeElement !== time && typeof state.time === 'string') time.value = state.time;
+
+    badge.className = `badge ${state.enabled ? 'ok' : ''}`.trim();
+    badge.textContent = state.enabled ? (state.lastFiredToday ? '今日已执行' : '已开启') : '未开启';
+
+    const lines = [describeNextRun(state), describeLastResult(state.lastResult)].filter(Boolean);
+    $('settings-checkin-state').textContent = lines.join('　·　');
+  }
+
+  async function loadAutoCheckin() {
+    try {
+      renderAutoCheckin(await api.getAutoCheckin());
+    } catch (error) {
+      console.warn('读取自动签到设置失败:', error.message);
+      renderAutoCheckin(null);
+    }
+  }
+
+  /** 保存自动签到设置（开关与时刻一起提交，契约要求显式给出改动的字段） */
+  async function saveAutoCheckin(patch, label) {
+    const toggle = $('settings-auto-checkin');
+    const time = $('settings-auto-checkin-time');
+    if (toggle) toggle.disabled = true;
+    if (time) time.disabled = true;
+    try {
+      const saved = await api.saveAutoCheckin(patch);
+      renderAutoCheckin(saved);
+      toast(`✅ 已更新「${label}」`);
+    } catch (error) {
+      toast(`保存失败：${error.message}`, 'err');
+      await loadAutoCheckin(); // 回滚到后端的真实状态
+    } finally {
+      if (toggle) toggle.disabled = false;
+      if (time) time.disabled = false;
+    }
+  }
+
+  async function runCheckinNow() {
+    await guard($('btn-checkin-now'), '签到中…', async () => {
+      const result = await api.runAutoCheckinNow();
+      const succeeded = Number(result?.succeeded) || 0;
+      const total = Number(result?.total) || 0;
+      const failed = Number(result?.failedCount) || 0;
+      if (failed) {
+        toast(`签到完成：${succeeded}/${total} 成功，${failed} 个失败`, 'err');
+      } else {
+        toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取`);
+      }
+      if (result?.state) renderAutoCheckin(result.state);
+      // 积分可能已变化，顺带刷新账号页的余额展示
+      await wbApp.refresh?.();
+    });
+  }
+
   // ─── 事件绑定 ──────────────────────────────
 
   $('settings-close-to-tray').addEventListener('change', event => saveToggles(event.target));
@@ -231,7 +336,16 @@
   $('btn-settings-import').addEventListener('click', importAccounts);
   $('btn-settings-refresh').addEventListener('click', () => loadGateway().then(() => toast('网关地址已刷新')));
 
-  window.wbSettingsPanel = { load, render: renderSettings, loadGateway };
+  $('settings-auto-checkin')?.addEventListener('change', event =>
+    saveAutoCheckin({ enabled: event.target.checked, time: $('settings-auto-checkin-time').value },
+      '自动签到开关'));
+  // 时间用 change 而不是 input：拖动时间选择器时不该每动一下就发一次请求
+  $('settings-auto-checkin-time')?.addEventListener('change', event =>
+    saveAutoCheckin({ enabled: $('settings-auto-checkin').checked, time: event.target.value },
+      '签到触发时刻'));
+  $('btn-checkin-now')?.addEventListener('click', runCheckinNow);
+
+  window.wbSettingsPanel = { load, render: renderSettings, loadGateway, renderAutoCheckin };
 
   // 首屏自持加载：app.js 的 showPage 在脚本加载前已执行过，
   // 若上次停留在设置页，这里补一次加载，避免徽标一直停在「检测中…」
