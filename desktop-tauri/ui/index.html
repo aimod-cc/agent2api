@@ -1,0 +1,520 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="system">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WorkBuddy 本地代理 · 会话与账号管理</title>
+  <script>
+    // 与主题持久化配合：在 CSS 解析前先贴上 data-theme，避免深色模式首屏闪烁
+    (() => {
+      const mode = localStorage.getItem('workbuddy-desktop-theme') || 'system';
+      document.documentElement.dataset.theme = mode;
+      const dark = mode === 'dark'
+        || (mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+    })();
+  </script>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="shell">
+    <!-- ─── 左侧导航 ─── -->
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>WorkBuddy 本地代理</h1>
+        <div class="sub">OpenAI 兼容网关</div>
+      </div>
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-page="overview"><span class="ico">◈</span><span class="label">概览</span></button>
+        <button class="nav-item" data-page="accounts"><span class="ico">☰</span><span class="label">账号</span><span class="count muted" id="nav-count-accounts">0</span></button>
+        <button class="nav-item" data-page="gateway"><span class="ico">⇄</span><span class="label">网关</span></button>
+        <button class="nav-item" data-page="desensitize"><span class="ico">✳</span><span class="label">脱敏</span></button>
+        <button class="nav-item" data-page="logs"><span class="ico">≡</span><span class="label">日志</span><span class="count" id="nav-count-logs" style="display:none">0</span></button>
+        <button class="nav-item" data-page="settings"><span class="ico">⚙</span><span class="label">设置</span></button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="theme-switch" id="theme-switch">
+          <button data-mode="system">跟随系统</button>
+          <button data-mode="light">浅色</button>
+          <button data-mode="dark">深色</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="content">
+      <div class="content-inner">
+
+        <!-- ─── 概览 ─── -->
+        <section class="page active" data-page="overview">
+          <div class="page-head">
+            <h2>概览</h2>
+            <p class="intro">登录会打开 WorkBuddy 官方登录页；登录成功后自动加入账号列表，并排在转发顺序最后（不会抢占正在使用的账号）。</p>
+          </div>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>会话状态</h2>
+              <span id="session-badge" class="badge">检测中…</span>
+              <div class="head-actions">
+                <button id="btn-refresh-state">刷新状态</button>
+                <button id="btn-refresh-token">刷新 Token</button>
+                <button id="btn-logout" class="danger">退出登录</button>
+                <button id="btn-add-account" class="primary">登录 / 添加账号</button>
+              </div>
+            </div>
+            <div class="field-grid">
+              <div class="field"><div class="label">首选账号昵称</div><div class="value" id="session-nickname">—</div></div>
+              <div class="field"><div class="label">账号 UID</div><div class="value" id="session-uid">—</div></div>
+              <div class="field"><div class="label">上游端点</div><div class="value" id="session-endpoint">—</div></div>
+              <div class="field"><div class="label">Token 过期时间</div><div class="value" id="session-expires">—</div></div>
+            </div>
+            <p class="hint">「首选」= 转发顺序第一位（账号页 P 值最小的那个启用账号），默认优先用它。限额按<strong>模型</strong>记录，所以换个模型走哪个账号可能不同——账号页顶部的「模型」筛选用来看某个模型的实际队列。此处展示与刷新 Token / 退出登录针对的都是首选账号。</p>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head"><h2>本地代理状态</h2></div>
+            <div id="proxy-status" class="detail">正在检查本地代理…</div>
+            <p class="hint">账号数据保存在 <code>~/.workbuddy-proxy/accounts.json</code>。关闭此窗口不会删除账号或登录态。</p>
+          </section>
+        </section>
+
+        <!-- ─── 账号 ─── -->
+        <section class="page" data-page="accounts">
+          <div class="page-head">
+            <h2>账号</h2>
+            <p class="intro">先选模型（默认是你最近在用的那个），列表即按该模型的账号队列呈现：限额、首选都按这个模型判定。</p>
+          </div>
+
+          <section class="panel">
+            <!-- 工具条：模型 + 三段筛选 + 主操作，收在一行 -->
+            <div class="account-filters">
+              <div class="filter-group">
+                <span class="filter-label">模型</span>
+                <select id="account-model-filter" class="model-select" aria-label="按模型筛选账号队列"></select>
+              </div>
+              <div class="filter-group">
+                <span class="filter-label">版本</span>
+                <div class="seg" id="account-edition-filter" role="tablist" aria-label="账号版本">
+                  <button class="seg-item active" data-edition="all">全部 <span class="seg-count" data-count="editionAll">0</span></button>
+                  <button class="seg-item" data-edition="cn">国内 <span class="seg-count" data-count="cn">0</span></button>
+                  <button class="seg-item" data-edition="intl">国际 <span class="seg-count" data-count="intl">0</span></button>
+                </div>
+              </div>
+              <div class="filter-group">
+                <span class="filter-label">状态</span>
+                <div class="seg" id="account-enabled-filter" role="tablist" aria-label="启用状态">
+                  <button class="seg-item active" data-enabled="all">全部 <span class="seg-count" data-count="enabledAll">0</span></button>
+                  <button class="seg-item" data-enabled="enabled">启用 <span class="seg-count" data-count="enabled">0</span></button>
+                  <button class="seg-item" data-enabled="disabled">禁用 <span class="seg-count" data-count="disabled">0</span></button>
+                </div>
+              </div>
+              <div class="filter-group">
+                <span class="filter-label">限额</span>
+                <div class="seg" id="account-limit-filter" role="tablist" aria-label="限额状态">
+                  <button class="seg-item active" data-limit="all">全部 <span class="seg-count" data-count="limitAll">0</span></button>
+                  <button class="seg-item" data-limit="normal">正常 <span class="seg-count" data-count="normal">0</span></button>
+                  <button class="seg-item" data-limit="limited">已限流 <span class="seg-count" data-count="limited">0</span></button>
+                </div>
+              </div>
+              <div class="head-actions">
+                <button id="btn-query-usage">查询积分</button>
+                <button id="btn-checkin-all">全部签到</button>
+                <button id="btn-add-account-2" class="primary">登录 / 添加账号</button>
+              </div>
+            </div>
+
+            <!-- 列表头：全选 + 计数 + 批量操作（原独立批量栏并入此处，不额外占高） -->
+            <div class="batch-bar" id="batch-bar">
+              <label class="batch-select-all">
+                <input type="checkbox" id="batch-select-all">
+                <span id="batch-select-label">全选当前筛选结果</span>
+              </label>
+              <span class="batch-count">已选 <b id="batch-count">0</b> 个 · 共 <b id="accounts-count">0</b> 个</span>
+              <span class="batch-hidden" id="batch-hidden-hint" style="display:none"></span>
+              <div class="batch-actions">
+                <button id="btn-batch-enable" disabled>启用</button>
+                <button id="btn-batch-disable" disabled>禁用</button>
+                <button id="btn-batch-proxy" disabled>改代理</button>
+                <button id="btn-batch-remove" class="danger" disabled>删除</button>
+                <button id="btn-batch-clear" disabled>取消选择</button>
+              </div>
+            </div>
+
+            <div id="account-list"><div class="empty"><span class="spinner"></span>正在加载…</div></div>
+            <details class="hint">
+              <summary>操作说明（勾选可批量启用 / 禁用 / 改代理 / 删除）</summary>
+              <p>
+                勾选账号左侧复选框，或用上方的「全选当前筛选结果」，即可批量启用 / 禁用 / 改代理 / 删除；批量操作只作用于勾选的账号，被筛掉的账号不受影响。
+                行内的「积分」「签到」按钮只对单个账号生效；
+                「全部签到」只对国内版账号生效并按顺序串行执行（避免触发上游 code 11128 风控），单个账号失败不影响其他账号；
+                国际版暂无签到活动，其签到入口不显示。账号因限额（429）被自动切换时，可在「日志」页看到完整记录。
+              </p>
+            </details>
+          </section>
+        </section>
+
+        <!-- ─── 网关 ─── -->
+        <section class="page" data-page="gateway">
+          <div class="page-head">
+            <h2>网关</h2>
+            <p class="intro">OpenAI 客户端把 base URL 指到下面的地址即可；SSE 流式透传。</p>
+          </div>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>网关接口</h2>
+              <span id="default-model-badge" class="badge" style="display:none;"></span>
+            </div>
+            <div class="field-grid">
+              <div class="field"><div class="label">对话端点</div><div class="value"><code id="api-chat">—</code></div></div>
+              <div class="field"><div class="label">模型列表</div><div class="value"><code id="api-models">—</code></div></div>
+              <div class="field"><div class="label">默认模型</div><div class="value" id="default-model">—</div></div>
+            </div>
+            <p class="hint">base URL：<code id="api-base">—</code></p>
+
+            <div class="panel-head" style="margin-top:14px"><h2 style="font-size:13.5px">可用模型</h2></div>
+            <div class="models" id="models"><div class="empty" style="padding:14px 0">暂无模型</div></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head"><h2>网关 API Key（可选）</h2></div>
+            <div class="apikey-row">
+              <input type="password" id="api-key-input" placeholder="留空表示不启用鉴权；至少 8 个字符" autocomplete="off">
+              <button id="btn-save-key" class="primary">保存</button>
+              <button id="btn-clear-key">清除</button>
+            </div>
+            <p class="hint" id="api-key-status">未启用（仅监听 127.0.0.1，建议本机使用）</p>
+          </section>
+        </section>
+
+        <!-- ─── 脱敏 ─── -->
+        <section class="page" data-page="desensitize">
+          <div class="page-head">
+            <h2>敏感词脱敏</h2>
+            <p class="intro">命中词会在词内插入零宽空格，人眼与模型读到的不变，但上游后端的关键词匹配会失效。</p>
+          </div>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>脱敏设置</h2>
+              <span id="desensitize-badge" class="badge">检测中…</span>
+              <div class="head-actions">
+                <button id="btn-reset-terms">恢复默认词表</button>
+              </div>
+            </div>
+            <div class="panel-head" style="margin-bottom:0">
+              <label class="switch">
+                <input type="checkbox" id="desensitize-enabled">
+                <span class="track"></span>
+                <span>启用脱敏</span>
+              </label>
+              <span class="detail" id="desensitize-state">—</span>
+            </div>
+
+            <div class="role-picks" id="desensitize-roles">
+              <span class="detail" style="font-size:12.5px">作用角色：</span>
+              <label><input type="checkbox" value="system"> system（客户端合规模板）</label>
+              <label><input type="checkbox" value="user"> user（用户输入）</label>
+              <label><input type="checkbox" value="assistant"> assistant</label>
+              <label><input type="checkbox" value="tool"> tool</label>
+            </div>
+
+            <div class="term-add">
+              <input type="text" id="term-input" placeholder="输入要添加的词，回车或点「添加」（支持逗号/换行批量粘贴）" autocomplete="off">
+              <button id="btn-add-term" class="primary">添加</button>
+            </div>
+
+            <div class="terms" id="term-list"><div class="empty" style="padding:14px 0">正在加载词表…</div></div>
+
+            <div class="stat-row">
+              <span>已处理请求 <b id="stat-requests">—</b></span>
+              <span>命中请求 <b id="stat-changed">—</b></span>
+              <span>命中次数 <b id="stat-hits">—</b></span>
+              <span style="margin-left:auto"><button id="btn-reset-stats">清空统计</button></span>
+            </div>
+            <div class="stat-terms" id="stat-terms"></div>
+
+            <p class="hint">
+              命中词会在词内插入零宽空格（如 <code>DoS</code> → <code>Do&#8203;S</code>），人眼和模型读到的不变，
+              但上游后端的关键词匹配会失效，从而避免合规模板被内容审核误拦。
+              词表保存在 <code id="desensitize-file">~/.workbuddy-proxy/desensitize.json</code>。
+            </p>
+          </section>
+        </section>
+
+        <!-- ─── 日志 ─── -->
+        <section class="page" data-page="logs">
+          <div class="page-head">
+            <h2>运行日志</h2>
+            <p class="intro">记录登录、token 刷新、账号切换、模型目录刷新、限额自动切换（429）等系统事件。</p>
+          </div>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>系统事件</h2>
+              <span id="logs-badge" class="badge">—</span>
+              <div class="head-actions">
+                <button id="btn-logs-refresh">刷新</button>
+                <button id="btn-logs-export">导出</button>
+                <button id="btn-logs-clear" class="danger">清空</button>
+              </div>
+            </div>
+
+            <div class="log-filters">
+              <select id="logs-level" title="按最低级别筛选">
+                <option value="">全部级别</option>
+                <option value="debug">debug 及以上</option>
+                <option value="info">info 及以上</option>
+                <option value="warn">warn 及以上</option>
+                <option value="error">仅 error</option>
+              </select>
+              <select id="logs-category" title="按分类筛选">
+                <option value="">全部分类</option>
+              </select>
+              <input type="search" id="logs-keyword" placeholder="搜索消息关键词…" autocomplete="off">
+              <label class="switch">
+                <input type="checkbox" id="logs-auto" checked>
+                <span class="track"></span>
+                <span>自动刷新</span>
+              </label>
+            </div>
+
+            <div class="log-list" id="log-list"><div class="log-empty">正在加载日志…</div></div>
+            <p class="hint">
+              日志保存在 <code id="logs-file">~/.workbuddy-proxy/logs.jsonl</code>，保留最近 500 条，重启后仍可查询。
+              429 自动切换记录会带上「原账号 → 目标账号」与限额恢复时间。
+            </p>
+          </section>
+        </section>
+
+        <!-- ─── 设置 ─── -->
+        <section class="page" data-page="settings">
+          <div class="page-head">
+            <h2>设置</h2>
+            <p class="intro">桌面端的启动行为与账号数据的导入 / 导出。这些设置保存在本机，重启后依然生效。</p>
+          </div>
+
+          <!-- 启动与托盘 -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>启动与托盘</h2>
+              <span id="settings-badge" class="badge">检测中…</span>
+            </div>
+            <div class="settings-switches">
+              <label class="switch">
+                <input type="checkbox" id="settings-close-to-tray">
+                <span class="track"></span>
+                <span>关闭窗口时最小化到托盘</span>
+              </label>
+              <label class="switch">
+                <input type="checkbox" id="settings-autostart">
+                <span class="track"></span>
+                <span>开机自动启动</span>
+              </label>
+            </div>
+            <div class="detail settings-state" id="settings-state">—</div>
+            <p class="hint">
+              默认<strong>关闭窗口不会退出程序</strong>，而是把窗口缩到系统托盘，转发继续在后台运行（OpenAI 客户端不受影响）；
+              要彻底退出程序，请在托盘图标上右键选「退出」。关掉这个开关后，点关闭按钮即退出程序、转发随之中断。
+              「开机自动启动」开启后，登录系统时会自动启动本程序（通常直接驻留托盘），不需要手动打开。
+            </p>
+          </section>
+
+          <!-- 账号导入 / 导出 -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>账号导入 / 导出</h2>
+              <div class="head-actions">
+                <button id="btn-settings-export">导出账号</button>
+                <button id="btn-settings-import" class="primary">导入账号</button>
+              </div>
+            </div>
+            <p class="hint settings-hint">
+              导出会把全部账号写入一个 JSON 文件，<strong>文件内含 accessToken / refreshToken 等凭证</strong>，
+              可以拷到另一台机器上导入后继续使用。
+              导入采用<strong>合并策略</strong>：按账号 UID 去重 —— 已存在的账号只更新凭证，<strong>保留本机原有的优先级顺序</strong>；
+              新账号追加到转发顺序末尾，不会抢占当前正在使用的账号。
+              导出文件里的凭证可直接使用，请妥善保管，不要外传或上传到公共位置。
+            </p>
+            <div class="detail settings-state" id="settings-io-result"></div>
+          </section>
+
+          <!-- 网关地址 -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>网关地址</h2>
+              <span id="settings-gateway-badge" class="badge">检测中…</span>
+              <div class="head-actions">
+                <button id="btn-settings-refresh">刷新</button>
+              </div>
+            </div>
+            <div class="field-grid">
+              <div class="field"><div class="label">Base URL</div><div class="value"><code id="settings-gateway-base">—</code></div></div>
+              <div class="field"><div class="label">对话端点</div><div class="value"><code id="settings-gateway-chat">—</code></div></div>
+              <div class="field"><div class="label">监听端口</div><div class="value" id="settings-gateway-port">—</div></div>
+            </div>
+            <p class="hint">
+              把 <code>Base URL</code> 填进 OpenAI 客户端的 <code>base_url</code> / <code>api_base</code> 即可接入。
+              端口由主程序在启动时确定；若显示的地址连不上，点右上角「刷新」重新读取。
+              网关只监听 <code>127.0.0.1</code>，仅本机可用。
+            </p>
+          </section>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+  <!-- ─── 添加账号弹窗：网页登录 / 手动粘贴 auth.json ─── -->
+  <div id="add-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="add-title">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="add-title">登录 / 添加 WorkBuddy 账号</h2>
+        <button id="close-modal">关闭</button>
+      </div>
+
+      <div class="modal-section">
+        <h3>账号版本</h3>
+        <p>国内版走 copilot.tencent.com，国际版走 www.workbuddy.ai，两版账号可同时保存、按账号自动路由。</p>
+        <div class="field-row">
+          <label class="edition-option">
+            <input type="radio" name="account-edition" value="cn" checked>
+            <span>国内版（WorkBuddy）</span>
+          </label>
+          <label class="edition-option">
+            <input type="radio" name="account-edition" value="intl">
+            <span>国际版（WorkBuddy AI）</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <h3>登录方式</h3>
+        <p>系统浏览器可复用你已有的登录态（国际版推荐）；内嵌窗口与你日常浏览器隔离，更干净。</p>
+        <div class="field-row">
+          <label class="edition-option">
+            <input type="radio" name="login-mode" value="embedded" checked>
+            <span>内嵌窗口</span>
+          </label>
+          <label class="edition-option">
+            <input type="radio" name="login-mode" value="external">
+            <span>系统默认浏览器</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <h3>推荐：网页登录</h3>
+        <p>打开官方 WorkBuddy 登录页，完成登录后自动加入账号列表（排在转发顺序最后，不会抢占首选账号）。账号昵称取自上游，无需手动填写。</p>
+        <div class="field-row">
+          <button id="web-login-button" class="primary">打开网页登录</button>
+          <button id="web-login-cancel" style="display:none">取消等待</button>
+          <span class="detail" id="web-login-hint">将打开内嵌窗口，登录完成后自动加入账号列表；关掉此窗口即取消等待</span>
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <h3>备用：粘贴登录态 JSON</h3>
+        <p>如果当前环境无法打开登录窗口，也可以把已有的 accessToken/refreshToken JSON 粘进来直接启用。</p>
+        <div class="field-row">
+          <label for="account-name">备注名</label>
+          <input id="account-name" type="text" maxlength="100" placeholder="可选，例如：工作账号">
+        </div>
+        <div class="field-row" style="margin-top:10px;">
+          <textarea id="auth-json-input" placeholder='{"accessToken":"...","refreshToken":"...","uid":"...","expiresAt":1730000000000}'></textarea>
+        </div>
+        <div class="field-row" style="margin-top:10px;">
+          <button id="upload-button" class="primary" disabled>导入并启用</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── 账号设置弹窗：优先级 / 启用状态 / 备用名 / 出网代理 ─── -->
+  <div id="account-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="account-modal-title">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="account-modal-title">账号设置</h2>
+        <button id="account-modal-close">关闭</button>
+      </div>
+
+      <div class="modal-section">
+        <h3>转发路由</h3>
+        <p>优先级是转发顺序，数值越小越先用。<strong>每个账号的优先级必须唯一</strong>——多个账号并列时「谁先用」会失去意义，因此保存时会拒绝已被占用的数值。调整顺序也可以直接在账号列表里用「↑ / ↓」与相邻账号交换。</p>
+        <div class="field-row">
+          <label for="account-priority-input">优先级</label>
+          <input id="account-priority-input" type="number" min="0" max="9999" step="1" style="max-width:120px">
+          <span class="detail" id="priority-usage"></span>
+          <label class="switch" style="margin-left:12px">
+            <input type="checkbox" id="account-enabled-input">
+            <span class="track"></span>
+            <span>启用该账号（关闭则不参与转发）</span>
+          </label>
+        </div>
+        <div class="field-row" style="margin-top:10px">
+          <label for="account-name-input">备注名</label>
+          <input id="account-name-input" type="text" maxlength="100" placeholder="账号显示名称">
+        </div>
+      </div>
+
+      <div class="modal-section">
+        <h3>出网代理</h3>
+        <p>默认无代理（直连上游）。需要经代理访问时可选择 Clash Verge 里的出口；端口由 Clash Verge 管理，这里每次实时读取。</p>
+        <!-- 表单由 proxy-form.js 渲染：与批量改代理弹窗共用同一份实现 -->
+        <div id="account-proxy-form"></div>
+      </div>
+
+      <div class="detail" id="account-modal-status" style="min-height:18px"></div>
+      <div class="modal-foot">
+        <button id="account-modal-cancel">取消</button>
+        <button id="account-modal-save" class="primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── 批量操作弹窗：启用 / 禁用 / 改代理 / 删除 ─── -->
+  <div id="batch-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="batch-modal-title">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="batch-modal-title">批量操作</h2>
+        <button id="batch-close">关闭</button>
+      </div>
+
+      <div class="modal-section">
+        <h3>将作用于以下账号</h3>
+        <p id="batch-summary" style="max-height:90px;overflow-y:auto"></p>
+      </div>
+
+      <div class="modal-section">
+        <h3>操作</h3>
+        <div class="field-row">
+          <label class="edition-option"><input type="radio" name="batch-action" value="enable" checked><span>启用</span></label>
+          <label class="edition-option"><input type="radio" name="batch-action" value="disable"><span>禁用</span></label>
+          <label class="edition-option"><input type="radio" name="batch-action" value="proxy"><span>修改代理</span></label>
+          <label class="edition-option"><input type="radio" name="batch-action" value="remove"><span>删除</span></label>
+        </div>
+
+        <div id="batch-proxy-block" style="display:none;margin-top:12px">
+          <!-- 与账号设置弹窗共用 proxy-form.js -->
+          <div id="batch-proxy-form"></div>
+        </div>
+      </div>
+
+      <div class="detail" id="batch-result" style="min-height:18px"></div>
+      <div class="modal-foot">
+        <button id="batch-cancel">取消</button>
+        <button id="batch-run" class="primary">执行</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+  <script src="accounts-view.js"></script>
+  <script src="desensitize-panel.js"></script>
+  <script src="logs-panel.js"></script>
+  <script src="proxy-form.js"></script>
+  <script src="account-panel.js"></script>
+  <script src="settings-panel.js"></script>
+</body>
+</html>

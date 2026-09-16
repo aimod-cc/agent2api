@@ -1,0 +1,17 @@
+# 服务端依赖（undici / yaml）
+node_modules/
+
+# Tauri 工程依赖与构建产物
+desktop-tauri/node_modules/
+desktop-tauri/src-tauri/target/
+desktop-tauri/src-tauri/gen/schemas/
+
+# 由 npm run build:backend 生成的运行时资源（node.exe 约 87MB + server.cjs）
+desktop-tauri/src-tauri/resources/
+
+# 本地开发过程产物
+.zcode/
+
+# 运行日志与截图产物
+logs/
+desktop-tauri/window-shot.png

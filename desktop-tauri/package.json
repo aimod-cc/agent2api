@@ -1,0 +1,14 @@
+{
+  "name": "workbuddy-proxy-desktop-tauri",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WorkBuddy 本地代理桌面端（Tauri）",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "icon": "tauri icon src-tauri/icons/source.png"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

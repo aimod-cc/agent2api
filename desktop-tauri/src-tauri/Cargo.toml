@@ -1,0 +1,38 @@
+[package]
+name = "workbuddy-proxy-desktop"
+version = "1.0.0"
+description = "WorkBuddy 本地代理桌面端 — 会话与多账号管理"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "workbuddy_proxy_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tray-icon 提供系统托盘，image-png 用于解析 bundle 图标（托盘图标直接复用它，不新增图片资源）
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["time"] }
+url = "2"
+# 只访问本机 127.0.0.1 上的网关（纯 HTTP），不需要 TLS，
+# 因此关掉默认特性以免引入 openssl/rustls 及其平台编译依赖
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
