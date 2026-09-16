@@ -1,6 +1,6 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "1.0.0"
+version = "1.0.1"
 description = "WorkBuddy 本地代理桌面端 — 会话与多账号管理"
 edition = "2021"
 rust-version = "1.77"

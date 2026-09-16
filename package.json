@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-local-proxy",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "WorkBuddy Local Proxy - OpenAI-compatible API via 腾讯 WorkBuddy 登录态，附带积分/签到与桌面端账号管理",
   "type": "module",
   "main": "server.mjs",
