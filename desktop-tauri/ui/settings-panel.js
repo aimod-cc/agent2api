@@ -179,7 +179,10 @@
 
   function setIoResult(html) {
     const box = $('settings-io-result');
-    if (box) box.innerHTML = html || '';
+    if (!box) return;
+    box.innerHTML = html || '';
+    // 空结果整块收起，避免页面上留一个空框
+    box.style.display = html ? '' : 'none';
   }
 
   async function exportAccounts() {

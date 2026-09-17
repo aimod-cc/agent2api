@@ -1,6 +1,6 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "1.0.1"
+version = "1.1.1"
 description = "WorkBuddy 本地代理桌面端 — 会话与多账号管理"
 edition = "2021"
 rust-version = "1.77"
@@ -20,11 +20,33 @@ tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["time"] }
+# 后端已改为「壳进程内 HTTP 服务器」，相应开启所需特性：
+# rt-multi-thread/macros 起运行时，net 监听端口，sync 传停机信号，
+# fs/io-util 读写配置与日志文件（后续切片的流式转发继续用 io-util/time）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs"] }
 url = "2"
-# 只访问本机 127.0.0.1 上的网关（纯 HTTP），不需要 TLS，
-# 因此关掉默认特性以免引入 openssl/rustls 及其平台编译依赖
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+# 进程内 HTTP 服务器：路由、body 限制、中间件都由它提供
+axum = "0.8"
+# 管理 API 走本机 127.0.0.1 明文 HTTP；后续切片要用它访问 https 上游
+# （copilot.tencent.com）与 GitHub Release，所以必须带一套 TLS 实现。
+# 用 rustls + ring：纯 Rust 实现，不依赖系统 openssl、也不需要 nasm，
+# 打包与交叉编译都没有额外平台负担。
+# socks：账号出网代理支持 socks5（切片 3）—— 没有它 `http://` 之外的代理
+# URI 会被 reqwest 拒绝（unknown proxy scheme），自定义 socks5 出口直接不可用。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+# 解析 Clash Verge 的 verge.yaml / profiles.yaml（切片 3：出网代理可选项）
+serde_yaml = "0.9"
+# 请求体去重键（后续切片：转发链路）
+sha2 = "0.10"
+# 签到调度时刻、token 过期时间的本地时间处理（后续切片）
+chrono = "0.4"
+# 上游 SSE 流式转发（切片 4）
+futures = "0.3"
+tokio-stream = "0.1"
+# SSE 帧的字节容器：axum 的 Body::from_stream 与 reqwest 的 bytes_stream
+# 都要用 bytes::Bytes（reqwest 只再导出 Response，不导出 Bytes 本身），
+# 转发链路要自己拼 SSE 帧，所以显式依赖（版本与 axum/reqwest 内部一致）
+bytes = "1"
 
 [features]
 default = ["custom-protocol"]

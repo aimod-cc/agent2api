@@ -39,10 +39,12 @@ import { proxyFetch, proxyErrorDetail } from './workbuddy-proxy.mjs';
 import { pickAccountByPriority, rateLimitResetAt } from './workbuddy-routing.mjs';
 
 /**
- * 上游风控码 11128 = Illegal API invocation from an unapproved channel。
- * 实测为频率风控的临时冷却窗口：客户端失败自动重试会形成重试风暴，
- * 且拉黑期间的每次重试都会给黑名单续期。因此退避间隔必须足够长，
- * 仅重试 2 次，让黑名单自然过期。
+ * 上游错误码 11128（历史文案：Illegal API invocation from an unapproved channel）。
+ * 实测语义：多为提示词命中上游敏感词审核而被拦截（并非单纯的频率风控）。
+ * 常量名 RATE_LIMIT_CODE 沿用历史命名，不要据此理解成「频率限制」。
+ * 拦截会持续一小段时间，期间客户端失败自动重试会形成重试风暴并给拦截续期。
+ * 因此命中 11128 时退避间隔必须足够长，仅重试 2 次（见 WAF_RETRY_DELAYS_MS），
+ * 让拦截窗口自然过期，并把「敏感词」提示透传给调用端与运行日志。
  */
 const RATE_LIMIT_CODE = 11128;
 const WAF_RETRY_DELAYS_MS = [10_000, 25_000];
@@ -391,8 +393,8 @@ export function createWorkBuddyUpstreamClient({
   }
 
   /**
-   * 带风控退避的上游请求：11128 拦截时按 10s/25s 退避重试（最多 2 次），
-   * 其余错误原样抛出。
+   * 带 11128 退避的上游请求：命中 11128（敏感词拦截）时按 10s/25s 退避重试
+   * （最多 2 次），其余错误原样抛出。
    * 按账号代理出网 —— proxy 为 null 时直连（仍走 undici，保证流式/超时行为一致）。
    */
   async function requestWithWafRetry(url, init, controller, proxy = null) {
@@ -402,13 +404,17 @@ export function createWorkBuddyUpstreamClient({
       const detail = await readUpstreamError(response);
       if (Number(detail.code) === RATE_LIMIT_CODE && attempt < WAF_RETRY_DELAYS_MS.length) {
         const delay = WAF_RETRY_DELAYS_MS[attempt];
-        log('[Upstream]', `⚠️ 上游风控拦截(11128)，${delay / 1000}s 后重试（第 ${attempt + 1}/${WAF_RETRY_DELAYS_MS.length} 次）`);
+        log('[Upstream]', `⚠️ 上游敏感词拦截（11128），请检查提示词中的敏感词（可在「脱敏」页维护词表）；${delay / 1000}s 后重试（第 ${attempt + 1}/${WAF_RETRY_DELAYS_MS.length} 次）`);
         await sleep(delay, controller);
         continue;
       }
       log('[Upstream]', `上游错误 HTTP ${response.status}: ${detail.message}`);
+      // 11128 透传给客户端时追加敏感词指引，避免被误当成普通频率限制
+      const hint = Number(detail.code) === RATE_LIMIT_CODE
+        ? '；提示词可能命中上游敏感词，请检查提示词'
+        : '';
       throw new WorkBuddyUpstreamError(
-        `上游返回 ${response.status}: ${detail.message}`,
+        `上游返回 ${response.status}: ${detail.message}${hint}`,
         { statusCode: response.status, upstreamCode: detail.code, body: detail.body },
       );
     }
@@ -432,8 +438,9 @@ export function createWorkBuddyUpstreamClient({
   }
 
   // ─── 请求合并（single-flight）──────────────────────────
-  // 客户端失败后常对同一 body 快速重试，高频重复请求会触发上游 11128
-  // 频率风控并互相续期。相同请求体在代理内排队串行，把重试风暴压成逐个执行。
+  // 客户端失败后常对同一 body 快速重试，高频重复请求会加重上游 11128 拦截
+  // （实测多为提示词命中敏感词，重试不会改变结果却会互相续期）。
+  // 相同请求体在代理内排队串行，把重试风暴压成逐个执行。
   const inFlight = new Map();
   const INFLIGHT_WAIT_MS = 45_000;
 

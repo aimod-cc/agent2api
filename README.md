@@ -8,7 +8,7 @@
 OpenAI 客户端 / 任意 SDK
         │  POST /v1/chat/completions   （OpenAI 兼容，SSE）
         ▼
-  本网关 server.mjs                     ← 本机 127.0.0.1:3065
+  本网关（桌面端：Rust 进程内服务；CLI：server.mjs）  ← 本机 127.0.0.1:3065
   登录态复用 · 多账号选路 · 429 降级 · 出网代理 · 内容脱敏
         │  HTTPS
         ▼
@@ -77,12 +77,14 @@ OpenAI 客户端 / 任意 SDK
 **可观测性**
 
 - 运行日志落到 `logs.jsonl`（环形保留最近 500 条，重启后仍可查），分 `debug/info/warn/error` 四级与 7 个分类，429 自动切换带结构化的「原账号 → 目标账号 + 恢复时间」字段。
+- 日志页支持按级别/分类/关键词筛选、分页浏览（默认每页 50 条，只滚动列表本身）、一键开关「不看脱敏」（默认开启，隐藏脱敏命中日志，设置会被记住）。
 - `--verbose` 输出每个入站请求与上游交互的细节，并把最近一次请求体落盘到 `debug/last-request.json` 便于重放分析。
 
 **桌面端**
 
-- Tauri 2 打包，随包内置官方 `node.exe` 与后端 bundle，安装后开箱即用，**无需用户自行安装 Node**。
+- Tauri 2 打包，**后端网关以 Rust 重写并运行在应用进程内**，随包不携带任何外部运行时（`node.exe` 已移除），安装包约 **2.4 MB**，安装后开箱即用。
 - 六个页面：概览、账号、网关、脱敏、日志、设置；支持明暗主题、系统托盘、开机自启、关闭窗口最小化到托盘、单实例。
+- 覆盖升级时会自动收口旧版本残留：若检测到旧版网关进程仍占用 3065 端口（例如旧版被强杀后留下的孤儿 `node` 进程），确认是本产品进程且位于本应用安装目录内才会结束它，并清理安装目录里遗留的 `resources\node.exe`。用户自己 `npm start` 起的服务在安装目录之外，绝不会被误杀。
 
 ---
 
@@ -90,17 +92,19 @@ OpenAI 客户端 / 任意 SDK
 
 ### 方式一：桌面端（推荐）
 
-从 Releases 下载安装包（NSIS，简体中文，按当前用户安装），安装后启动即可：
+从 Releases 下载安装包（NSIS，简体中文，按当前用户安装），安装后启动即可，**无需安装 Node 或任何其它运行时**：
 
-1. 首次启动会自动拉起本机网关（端口 3065）并打开主窗口。
+1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口。
 2. 到「概览」页点「登录 / 添加账号」，选账号版本（国内版 / 国际版）与登录方式（内嵌窗口 / 系统默认浏览器），完成一次官方登录。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。
 
+从 1.0.x 覆盖升级时无需手工处理旧进程：新版启动会自动结束旧版遗留的网关进程并清理安装目录里的旧运行时文件（判定条件见[桌面端](#主要特性)一节）。
+
 ### 方式二：命令行
 
-需要 Node.js **>= 18.17**（推荐 20 或更高）。
+命令行方式跑的是仓库里的 Node 版实现（桌面端则使用等价的 Rust 实现，两者 HTTP 契约与数据文件格式一致）。需要 Node.js **>= 18.17**（推荐 20 或更高）。
 
 ```bash
 git clone https://github.com/aimod-cc/workbuddy-proxy.git
@@ -383,10 +387,12 @@ node server.mjs [options]
 
 ## 项目结构
 
+代码分两条线：**桌面端（Rust，推荐）** 与 **命令行（Node）**。两条线实现同一套 HTTP 契约、读写同一份数据文件，可以互换使用（但不要同时监听同一端口）。
+
 ```
 workbuddy/
-├─ server.mjs                    后端入口：HTTP 服务、路由分发、CLI 子命令
-├─ src/
+├─ server.mjs                    命令行后端入口：HTTP 服务、路由分发、CLI 子命令
+├─ src/                          Node 版后端模块（命令行使用；桌面端不打包这些文件）
 │  ├─ workbuddy-endpoints.mjs    上游接口清单（唯一事实来源）+ 版本/UA/商品码常量
 │  ├─ workbuddy-auth.mjs         登录态存储、无头登录、token 自动刷新
 │  ├─ workbuddy-account-store.mjs 多账号存储、优先级规则、限额记录
@@ -406,20 +412,35 @@ workbuddy/
 │  └─ workbuddy-banner.mjs       启动横幅
 ├─ desktop-tauri/
 │  ├─ src-tauri/src/
+│  │  ├─ server/                 桌面端的网关实现（Rust，进程内 HTTP 服务器）
+│  │  │  ├─ mod.rs               服务组装：ServerState、启动与优雅停机
+│  │  │  ├─ http.rs              路由表、CORS、API Key 中间件、body 限制
+│  │  │  ├─ config.rs / logging.rs / logs_store.rs / errors.rs
+│  │  │  ├─ core/                领域逻辑（按职责分子目录）
+│  │  │  │  ├─ endpoints.rs      上游接口清单（与 Node 版同源）
+│  │  │  │  ├─ account_store/    账号存储、优先级、限额记录、导入导出
+│  │  │  │  ├─ auth.rs / auth_http.rs / login.rs   会话、出网传输、无头登录
+│  │  │  │  ├─ upstream/         请求头复刻、SSE 透传与帧合并、429 轮换、聚合
+│  │  │  │  ├─ models.rs / routing.rs              模型目录、账号选路
+│  │  │  │  ├─ billing/          积分、额度、签到、运营活动
+│  │  │  │  ├─ proxies.rs / clash.rs / egress.rs   出网代理与按出口缓存 Client
+│  │  │  │  ├─ desensitize/      脱敏引擎与词表
+│  │  │  │  ├─ auto_checkin.rs / update/           定时签到、软件更新
+│  │  │  └─ api/                 各路由 handler（health/session/accounts/chat/…）
 │  │  ├─ lib.rs                  应用入口：窗口生命周期、插件与命令注册
-│  │  ├─ backend.rs              后端进程生命周期（拉起/复用/回收 node）
-│  │  ├─ gateway.rs              管理 API 的 HTTP 客户端
-│  │  ├─ login.rs                登录窗口与轮询
+│  │  ├─ backend.rs              进程内服务器生命周期 + 覆盖升级迁移
+│  │  ├─ gateway.rs              壳侧访问管理 API 的 HTTP 客户端
+│  │  ├─ login.rs                登录窗口与轮询（含系统浏览器打开）
 │  │  ├─ commands.rs             暴露给前端的 invoke 命令
 │  │  ├─ bridge.rs               注入 window.workbuddyDesktop 的桥接脚本
 │  │  ├─ update.rs               安装包路径校验与启动（更新功能中壳侧的部分）
 │  │  ├─ settings.rs / state.rs / tray.rs
 │  ├─ ui/                        前端（原生 HTML/CSS/JS，无框架）
-│  └─ src-tauri/tauri.conf.json  打包配置（NSIS、资源清单）
+│  └─ src-tauri/tauri.conf.json  打包配置（NSIS）
 ├─ build/
-│  ├─ build-backend.mjs          esbuild 打包后端 + 复制官方 node.exe
+│  ├─ build-backend.mjs          esbuild 打包 Node 版后端（仅命令行分发用）
 │  └─ make-icon.mjs              生成应用图标源图
-└─ tests/                        冒烟测试、HTTP 契约测试、脱敏端到端测试
+└─ tests/                        Node 版冒烟测试、HTTP 契约测试、脱敏端到端测试
 ```
 
 ---
@@ -428,40 +449,43 @@ workbuddy/
 
 ### 环境要求
 
-- Node.js >= 18.17（后端）
-- Rust >= 1.77 与 Tauri 2 工具链（仅桌面端需要；Windows 上还需 WebView2 运行时）
+- Rust >= 1.77 与 Tauri 2 工具链（桌面端；Windows 上还需 WebView2 运行时）
+- Node.js >= 18.17（仅命令行方式与 Node 版测试需要）
 
 ### 常用脚本
 
 ```bash
-npm install                # 安装后端依赖（undici / yaml / esbuild）
+npm install                # 安装 Node 版依赖（undici / yaml / esbuild）
 
-npm run serve              # 启动网关（3065 端口）
+npm run serve              # 启动命令行网关（3065 端口）
 npm run login              # 无头登录
 npm run endpoints          # 打印上游接口清单
 
-npm run build:backend      # 后端 bundle → desktop-tauri/src-tauri/resources/server.cjs + node.exe
+npm run build:backend      # 打包 Node 版后端 → desktop-tauri/src-tauri/resources/server.cjs
 npm run build:icon         # 生成图标源图（改图标设计后执行，再跑 tauri icon）
 
 npm run tauri:install      # 安装桌面端依赖
 npm run tauri:dev          # 开发模式调起桌面端（自动热重载）
-npm run tauri:build        # 构建安装包（会先执行 build:backend）
+npm run tauri:build        # 构建桌面端安装包
 ```
 
-打包产物为 `desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe`。
+打包产物为 `desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe`（约 2.4 MB）。
 
-### 关于后端打包方式
+### 关于后端实现
 
-桌面端不打成单文件可执行，而是「官方未改动的 `node.exe` + esbuild 打包的 `server.cjs`」一起分发，原因是：
+桌面端的网关是**壳进程内的 Rust HTTP 服务器**（`desktop-tauri/src-tauri/src/server/`），与 Node 版 `server.mjs` 保持逐字段一致的 HTTP 契约与磁盘格式。这样做的好处：
 
-- **Bun 编译**：Bun 会把 `import 'undici'` 解析成自带 shim，缺少 `Socks5ProxyAgent`，账号走 SOCKS5 出网会崩；真实 undici 在 Bun 下也加载不了（webidl 不兼容）。
-- **Node SEA**：需要把 blob 注入 `node.exe`，注入后二进制签名失效，杀毒软件会直接报「发现可疑程序」，分发给别人同样会被拦。
+- **安装包小**：不再随包分发外部运行时（旧版曾内置官方 `node.exe`，约 87 MB），安装包从约 24 MB 降到约 2.4 MB。
+- **没有子进程**：不存在「升级时杀不掉后端进程导致覆盖安装失败」的问题，退出只是关闭本进程内的监听器。
+- **前端零改动**：界面只依赖 `window.workbuddyDesktop` 与 HTTP 接口，两条后端线可以无缝替换。
 
-官方 `node.exe` 未做任何改动、签名完整，不会被误报，代价只是安装包大一些（`node.exe` 约 87 MB，已在 `.gitignore` 中排除）。
+Node 版仍完整保留，供命令行使用（`npm run serve`），也是迁移对照时的参考实现。两者的数据文件（`accounts.json` / `config.json` / `logs.jsonl` / `desensitize.json`）完全兼容，可以混用。
+
+> 历史说明：早期版本曾评估过用 Bun 编译或 Node SEA 打成单文件，都因 SOCKS5 支持缺失（Bun 的 undici shim 不含 `Socks5ProxyAgent`）或注入后二进制签名失效被安全软件误报（Node SEA）而放弃。Rust 重写后这些取舍不再适用。
 
 ### 前端桥接
 
-界面代码只依赖 `window.workbuddyDesktop` 这一个接口，由 `bridge.rs` 在页面脚本执行前注入，内部把每个方法映射到 Tauri 的 `invoke`。因此 UI 代码里不出现任何 Tauri 字样——这也是桌面端从 Electron 迁到 Tauri 时前端一行未改的原因。
+界面代码只依赖 `window.workbuddyDesktop` 这一个接口，由 `bridge.rs` 在页面脚本执行前注入，内部把每个方法映射到 Tauri 的 `invoke`。因此 UI 代码里不出现任何 Tauri 字样——这也是桌面端从 Electron 迁到 Tauri、后端从 Node 换成 Rust 时前端都没改过的原因。
 
 ### 测试
 
@@ -471,7 +495,7 @@ node tests/http-test.mjs              # HTTP 契约测试：起真实 server 进
 node tests/desensitize-e2e.mjs        # 端到端：假上游 + 真实网关，验证出站请求体确实被改写
 ```
 
-三个脚本都用临时配置目录（`WORKBUDDY_PROXY_HOME` 指向 mkdtemp），不会碰你本机的账号数据，也不会访问真实上游。
+三个脚本都用临时配置目录（`WORKBUDDY_PROXY_HOME` 指向 mkdtemp），不会碰你本机的账号数据，也不会访问真实上游。它们针对的是 Node 版实现。
 
 ---
 
@@ -489,6 +513,8 @@ node tests/desensitize-e2e.mjs        # 端到端：假上游 + 真实网关，�
 - **无鉴权时假设仅本机可访问**：默认监听 `127.0.0.1`；若改为监听非回环地址，启动时会打印安全提醒，此时应当设置 API Key。
 - **账号数上限 20 个**，token 长度上限 8192 字符，脱敏词表上限 2000 词。
 - **接口形态来自逆向观察**：上游可能随时调整路径、鉴权头或风控策略，届时需要更新 `src/workbuddy-endpoints.mjs`（该项目里所有上游接口的唯一事实来源，改这一处即可）。
+- **端口被占用时不再「复用已运行的服务」**：旧版桌面端探测到 3065 已有网关就直接复用，这会让管理 API 落到一个版本可能不匹配的外部进程上。现在进程内服务器必须自己绑定成功；若占用者是本产品的旧版进程且位于本应用安装目录内，会自动结束它以完成升级迁移，其余情况给出可操作的错误提示（也可用 `WORKBUDDY_PROXY_PORT` 换端口）。
+- **日志的过滤与分页在前端做**：接口一次返回整个保留窗口（最多 500 条），「不看脱敏」与翻页都不再请求后端——交互即时，也不会和 10 秒自动刷新抢状态。副作用是隐藏了多少条只在界面层可见，接口本身不认识这个开关。
 
 ---
 

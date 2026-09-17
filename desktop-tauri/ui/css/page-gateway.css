@@ -1,0 +1,217 @@
+/* ─────────────────────────────────────────────
+   网关页：端点卡片 + 模型清单
+   ───────────────────────────────────────────── */
+
+/* ─── 模型清单 ─── */
+.models-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.models-count { color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+
+.models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 244px;
+  overflow-y: auto;
+  padding: 2px;
+}
+
+/* 模型芯片：点一下复制模型 ID */
+.model-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 27px;
+  max-width: 100%;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  box-shadow: none;
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 500;
+  transition: border-color .15s ease, background .15s ease, transform .1s ease;
+}
+
+.model-chip:hover:not(:disabled) {
+  border-color: var(--primary-bd);
+  background: var(--primary-soft);
+  color: var(--text);
+  transform: translateY(-1px);
+}
+
+.model-chip .id {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 172px;
+}
+
+.model-chip .name {
+  color: var(--text-3);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 168px;
+}
+
+/* 倍率：与名称之间用一道竖线分隔 */
+.model-chip .credits {
+  padding-left: 6px;
+  border-left: 1px solid var(--border);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.model-chip.default {
+  border-color: var(--primary-bd);
+  background: var(--primary-soft);
+}
+
+.model-chip.default .id { color: var(--primary-fg); font-weight: 650; }
+.model-chip.default .credits { border-color: var(--primary-bd); color: var(--primary-fg); }
+.model-chip.default::before { content: "★"; color: var(--primary); font-size: 10px; }
+
+/* 隐藏被搜索过滤掉的芯片 */
+.model-chip.filtered { display: none; }
+
+/* ─── API Key ─── */
+.apikey-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.apikey-row input { flex: 1 1 240px; }
+
+/* ─────────────────────────────────────────────
+   脱敏页
+   ───────────────────────────────────────────── */
+
+/* 作用角色选择 */
+.role-picks {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.role-picks .lead { color: var(--text-3); font-size: 11.5px; }
+
+/* 添加词 */
+.term-add { display: flex; gap: 8px; }
+.term-add input { flex: 1 1 auto; }
+
+/* 词表 */
+.terms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 2px;
+}
+
+.term-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 4px 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.term-chip button {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.term-chip button:hover:not(:disabled) { background: var(--danger); border-color: transparent; color: #fff; }
+
+/* 命中统计：数据条 */
+.stat-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 9px;
+}
+
+.stat-cell {
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.stat-cell .n {
+  display: block;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.4px;
+  line-height: 1.2;
+}
+
+.stat-cell .l { color: var(--text-3); font-size: 11.5px; }
+
+.stat-cell.accent { background: var(--primary-soft); border-color: var(--primary-bd); }
+.stat-cell.accent .n { color: var(--primary-fg); }
+.stat-cell.warn { background: var(--warn-soft); border-color: var(--warn-bd); }
+.stat-cell.warn .n { color: var(--warn); }
+
+/* 命中排行：词 + 次数药丸 */
+.stat-terms { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+
+.stat-term {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 23px;
+  padding: 0 4px 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 命中次数用暖色药丸强调 */
+.stat-term.hit {
+  border-color: var(--warn-bd);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-weight: 600;
+}

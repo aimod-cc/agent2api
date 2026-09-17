@@ -267,9 +267,16 @@ pub async fn cancel_update() -> Result<Value, String> {
 ///
 /// `restart` 为 true 时：先把退出标志置位再退出，让出安装包要覆盖的文件占用
 /// （不置位的话关窗逻辑会把退出拦成「最小化到托盘」，安装程序会卡在文件占用上）。
+///
+/// 顺序很关键：必须在启动安装包之前显式回收后端进程。
+/// 壳自己退出并不会带走 node 子进程（`exit(0)` 不保证触发 `RunEvent::Exit`），
+/// NSIS 覆盖安装时 node.exe 仍占着可执行文件与 3065 端口，复制文件必然失败；
+/// `backend::shutdown` 内部是同步的 kill + wait，返回时占用已经释放。
 #[tauri::command]
 pub fn run_installer(app: AppHandle, path: String, restart: Option<bool>) -> Result<Value, String> {
     let target = crate::update::verify_installer(&path)?;
+    // 先让出 node.exe 的文件占用与 3065 端口，再让安装包去覆盖文件
+    crate::backend::shutdown(&app.state::<AppState>());
     crate::update::launch_installer(&target, true)?;
 
     if restart.unwrap_or(true) {
@@ -289,36 +296,36 @@ pub fn run_installer(app: AppHandle, path: String, restart: Option<bool>) -> Res
 ///
 /// 只允许 http(s)：直接交给系统打开器时，file:// 会变成「用默认程序打开本地文件」，
 /// 等于给渲染层留了一个执行本机文件的口子。
+///
+/// 打开动作复用 login.rs 的实现（Windows 走 ShellExecuteW）：本地原来的
+/// `cmd /C start` 会把 URL 里的 `&` 当命令分隔符，带查询串的链接会被截断，
+/// 而且控制台窗口会闪一下。
 #[tauri::command]
 pub fn open_release_page(url: String) -> Result<Value, String> {
     let trimmed = url.trim();
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
         return Err("只允许打开 http(s) 链接".to_string());
     }
-    open_in_browser(trimmed)?;
+    crate::login::open_in_browser(trimmed)?;
     Ok(json!({ "url": trimmed }))
 }
 
-/// 交给系统默认浏览器处理。
-/// Windows 用 `cmd /C start`，注意 start 会把第一个带引号的参数当窗口标题，
-/// 因此必须补一个空标题占位。
-#[cfg(windows)]
-fn open_in_browser(url: &str) -> Result<(), String> {
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("打开浏览器失败: {error}"))
-}
-
-#[cfg(not(windows))]
-fn open_in_browser(url: &str) -> Result<(), String> {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    std::process::Command::new(opener)
-        .arg(url)
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("打开浏览器失败: {error}"))
+/// 设置主窗口主题（跟随界面深浅色切换）。
+///
+/// Windows 上这决定系统标题栏的深浅色（tao 内部走 DWMWA_USE_IMMERSIVE_DARK_MODE）：
+/// 不设置时标题栏由操作系统按「系统主题」绘制，于是界面切到深色时标题栏仍是浅色，
+/// 顶部就会出现一条刺眼的白带。传入 None 表示交回系统跟随，语义与 Tauri 一致。
+#[tauri::command]
+pub fn set_window_theme(app: AppHandle, theme: Option<String>) -> Result<(), String> {
+    let theme = match theme.as_deref() {
+        Some("dark") => Some(tauri::Theme::Dark),
+        Some("light") => Some(tauri::Theme::Light),
+        _ => None,
+    };
+    let window = app
+        .get_webview_window(crate::MAIN_WINDOW_LABEL)
+        .ok_or_else(|| "主窗口不存在".to_string())?;
+    window.set_theme(theme).map_err(|error| format!("设置窗口主题失败: {error}"))
 }
 
 /// 最小化的 query 转义：版本号只含数字与点，做一层保险即可

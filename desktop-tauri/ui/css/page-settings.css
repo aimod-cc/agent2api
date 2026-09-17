@@ -1,0 +1,117 @@
+/* ─────────────────────────────────────────────
+   设置页：分组卡片 / 自动签到 / 软件更新
+   ───────────────────────────────────────────── */
+
+/* 设置项容器：开关纵向堆叠 */
+.settings-switches {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+/* 放进容器后开关文字提到正文色，比默认的次要色更醒目 */
+.settings-switches .switch { color: var(--text); font-weight: 500; }
+
+/* 状态说明行：启动与托盘 / 自动签到 / 软件更新共用 */
+.settings-state {
+  min-height: 16px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.settings-state code { padding: 1px 5px; border: 1px solid var(--border); border-radius: var(--r-xs); background: var(--surface-3); }
+
+/* 导入导出结果 */
+.io-result {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--ok-bd);
+  border-radius: var(--r-md);
+  background: var(--ok-soft);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.io-result .ico { flex: 0 0 auto; color: var(--ok); font-size: 13px; }
+.io-result b { color: var(--text); }
+
+/* 危险提示区（导出含凭证） */
+.danger-zone {
+  padding: 10px 12px;
+  border: 1px solid var(--danger-bd);
+  border-radius: var(--r-md);
+  background: var(--danger-soft);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.danger-zone strong { color: var(--danger); }
+
+/* ─── 出网代理表单（proxy-form.js 动态渲染）─── */
+.proxy-select { max-width: 240px; }
+
+/* 代理表单的自定义输入只按内容伸展，不要占满整行 */
+.field-row > .pf-host { flex: 0 1 180px; }
+.field-row > .pf-username,
+.field-row > .pf-password { flex: 0 1 150px; }
+
+.pf-test-result { word-break: break-word; }
+
+/* ─── 软件更新 ─── */
+.update-version {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+.version-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+.version-pill .k { color: var(--text-3); font-size: 11.5px; }
+
+.version-pill .v {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.version-pill.new { border-color: var(--ok-bd); background: var(--ok-soft); }
+.version-pill.new .v { color: var(--ok); }
+
+.version-arrow { color: var(--text-3); font-size: 13px; }
+
+/* 更新说明：等宽换行展示 Release notes */
+.update-notes {
+  padding: 11px 12px;
+  max-height: 176px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

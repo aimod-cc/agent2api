@@ -1,0 +1,473 @@
+/* ─────────────────────────────────────────────
+   布局：应用外框 / 侧边栏 / 顶栏 / 内容区
+   ───────────────────────────────────────────── */
+
+/* ─── 应用外框 ─── */
+.shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* 窄窗口（最小 820px）收起侧栏文字，只留图标 */
+@media (max-width: 900px) {
+  :root { --sidebar-w: 68px; }
+}
+
+/* ─────────────────────────────
+   侧边栏
+   ───────────────────────────── */
+.sidebar {
+  position: relative;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 12px 10px;
+  background: var(--surface-2);
+  border-right: 1px solid var(--border);
+}
+
+/* 品牌 */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 4px 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.brand-logo {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: linear-gradient(150deg, var(--primary-top) 0%, #7b5cff 100%);
+  box-shadow: var(--glow);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.brand-text { min-width: 0; }
+
+.brand h1 {
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.brand .sub {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+@media (max-width: 900px) {
+  .brand-text { display: none; }
+  .brand { justify-content: center; }
+}
+
+/* 导航 */
+.nav {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 4px;
+}
+
+.nav-group-label {
+  padding: 8px 8px 5px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+}
+
+.nav-group-label:first-child { padding-top: 0; }
+
+@media (max-width: 900px) { .nav-group-label { display: none; } }
+
+.nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  transition: background .15s ease, color .15s ease;
+}
+
+.nav-item .ico {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+  color: currentColor;
+  opacity: .85;
+}
+
+/* SVG 图标：尺寸由 .ico 决定，颜色跟随 currentColor（选中态自动变主题色）。
+   原来是 ◈ ☰ 这类文字符号 —— 字体字形在不同机器上粗细与基线不一致，
+   且部分会被系统当成 emoji 渲染成彩色，无法控制。 */
+.nav-item .ico svg { display: block; }
+
+.nav-item:hover { background: var(--surface-3); color: var(--text); border-color: transparent; }
+
+.nav-item.active {
+  color: var(--primary-fg);
+  background: var(--primary-soft);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.nav-item.active .ico { opacity: 1; }
+
+/* 选中项左侧的指示条 */
+.nav-item.active::before {
+  content: "";
+  position: absolute;
+  left: -12px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 17px;
+  border-radius: 0 3px 3px 0;
+  background: var(--primary);
+}
+
+.nav-item .label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.nav-item .count {
+  flex: 0 0 auto;
+  min-width: 20px;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.nav-item.active .count { background: var(--surface); border-color: var(--primary-bd); color: var(--primary-fg); }
+
+.nav-item .count:not(.muted) { border-color: var(--danger-bd); background: var(--danger-soft); color: var(--danger); }
+.nav-item.active .count:not(.muted) { background: var(--surface); }
+
+@media (max-width: 900px) {
+  .nav-item { justify-content: center; padding: 9px 0; }
+  .nav-item .label, .nav-item .count { display: none; }
+}
+
+/* 侧栏底部 */
+.sidebar-foot {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+/* ─── 网关运行状态 ───
+   常驻在侧栏底部：网关是否在监听是本工具最基础的状态，
+   不该只有切到「网关」页才能看到。 */
+.sidebar-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.4;
+}
+
+.sidebar-status .txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 状态灯：绿=在监听 / 红=未就绪 / 灰=未知或已停止 */
+.live {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent);
+}
+
+.live.pulse { animation: live-pulse 2.4s ease-in-out infinite; }
+.live.bad { background: var(--danger); box-shadow: 0 0 0 3px color-mix(in srgb, var(--danger) 20%, transparent); }
+.live.off { background: var(--text-3); box-shadow: none; animation: none; }
+
+@keyframes live-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+  50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--ok) 6%, transparent); }
+}
+
+/* 窄侧栏只留状态灯 */
+@media (max-width: 900px) {
+  .sidebar-status { justify-content: center; padding: 8px 0; }
+  .sidebar-status .txt { display: none; }
+}
+
+.theme-switch {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--surface-3);
+}
+
+.theme-switch button {
+  flex: 1 1 0;
+  padding: 4px 4px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 11px;
+  white-space: nowrap;
+  transition: background .15s ease, color .15s ease;
+}
+
+.theme-switch button:hover { color: var(--text); }
+
+.theme-switch button.active {
+  background: var(--surface);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+}
+
+@media (max-width: 900px) {
+  .theme-switch { flex-direction: column; }
+  .theme-switch button { font-size: 0; padding: 6px 0; }
+  .theme-switch button::after { font-size: 11px; }
+  .theme-switch button[data-mode="system"]::after { content: "自动"; }
+  .theme-switch button[data-mode="light"]::after { content: "浅"; }
+  .theme-switch button[data-mode="dark"]::after { content: "深"; }
+}
+
+/* ─────────────────────────────
+   主区域
+   ───────────────────────────── */
+.main {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* 顶栏 */
+.topbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--topbar-h);
+  /* 与 .content-inner 用同一套「居中后左右留白」算法，让面包屑和内容左边缘对齐：
+     内容区超过上限时内层会居中，顶栏必须跟着让出同样的留白，否则两者错开。 */
+  padding: 0 max(var(--pad), calc((100% - var(--content-max)) / 2));
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.crumb {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.crumb .sep { opacity: .5; }
+
+.crumb .cur {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.topbar-actions { display: flex; align-items: center; gap: 7px; }
+
+@media (max-width: 900px) {
+  .topbar-actions .badge.optional { display: none; }
+}
+
+/* 内容滚动区 */
+.content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  padding: var(--pad) var(--pad) 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 内容区居中容器：达到 --content-max 后停止变宽并水平居中 */
+.content-inner {
+  width: 100%;
+  max-width: var(--content-max);
+  margin: 0 auto;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.page { display: none; }
+
+/* 普通页面：页面内滚动 */
+.page.active {
+  display: block;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 20px;
+}
+
+/* 页头：标题 + 一句话说明 */
+.page-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.page-head h2 {
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -.2px;
+}
+
+.page-head .intro {
+  flex: 1 1 300px;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* ─── 面板 ─── */
+.panel {
+  position: relative;
+  margin-bottom: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hairline);
+  flex-wrap: wrap;
+}
+
+.panel-head h2 { font-size: 13.5px; font-weight: 650; }
+.panel-head .panel-sub { color: var(--text-3); font-size: 11.5px; }
+.head-actions { margin-left: auto; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+
+.panel-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+.panel-body.flush { padding: 0; }
+
+/* 面板底注：说明文字收在底部灰条里，不抢主内容 */
+.panel-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 16px;
+  border-top: 1px solid var(--hairline);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.6;
+  flex-wrap: wrap;
+}
+
+.panel-foot .spacer { flex: 1 1 auto; }
+
+/* 账号页：占满剩余高度，滚动只发生在列表内部 */
+.page.active[data-page="accounts"] {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: 0;
+}
+
+.page[data-page="accounts"] .page-head { flex: none; }
+
+.page[data-page="accounts"] .panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+.page[data-page="accounts"] .account-table { flex: 1; min-height: 120px; }
+
+/* 日志页：与账号页同一套范式 —— 页面占满剩余高度，滚动只发生在日志列表内部。
+   720 行日志整页滚动时，筛选行和分页栏会跟着滚出视野，翻页要来回滚，
+   「第几页」也看不见，所以这里必须锁死外框、只让列表滚。 */
+.page.active[data-page="logs"] {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: 0;
+}
+
+.page[data-page="logs"] .page-head { flex: none; }
+
+.page[data-page="logs"] .panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+/* 页头 / 筛选行 / 分页栏都不参与伸缩，只有列表吃掉剩余高度 */
+.page[data-page="logs"] .panel-head,
+.page[data-page="logs"] .panel-foot { flex: none; }
+
+.page[data-page="logs"] .panel-body { flex: 1; min-height: 0; }

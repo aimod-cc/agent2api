@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-local-proxy",
-  "version": "1.0.1",
+  "version": "1.1.1",
   "description": "WorkBuddy Local Proxy - OpenAI-compatible API via 腾讯 WorkBuddy 登录态，附带积分/签到与桌面端账号管理",
   "type": "module",
   "main": "server.mjs",
@@ -18,7 +18,7 @@
     "build:icon": "node build/make-icon.mjs",
     "tauri:install": "npm --prefix desktop-tauri install",
     "tauri:dev": "npm --prefix desktop-tauri run dev",
-    "tauri:build": "npm run build:backend && npm --prefix desktop-tauri run build"
+    "tauri:build": "npm --prefix desktop-tauri run build"
   },
   "keywords": [
     "workbuddy",

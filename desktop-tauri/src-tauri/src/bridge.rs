@@ -178,6 +178,11 @@ pub const BRIDGE_JS: &str = r#"
     // ── 本壳特有：后端就绪状态（界面可选使用） ──
     getBackendStatus: () => invoke('backend_status'),
 
+    // ── 本壳特有：窗口主题 ──
+    // 渲染层只知道 light/dark，这里统一整形：非 'dark' 一律按浅色下发，
+    // 免得 undefined 之类的值被当成「跟随系统」而漏掉标题栏同步。
+    setWindowTheme: theme => invoke('set_window_theme', { theme: theme === 'dark' ? 'dark' : 'light' }),
+
     // ── 本壳特有：应用设置与账号导入导出 ──
     // 这四项不走 api_request：设置存在桌面端本地（与后端无关），
     // 导入导出需要调用系统文件对话框，只有壳进程能做。

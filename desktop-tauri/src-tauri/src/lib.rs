@@ -4,7 +4,8 @@
  * 前端源码在 desktop-tauri/ui/，通过 tauri.conf.json 的 frontendDist 引入。
  * 界面代码只依赖 window.workbuddyDesktop 这个接口，不感知具体壳，
  * 因此从 Electron 迁到 Tauri 时前端一行未改。职责拆成几块：
- *   backend.rs   后端进程生命周期（拉起 node + server.cjs、健康检查、退出回收）
+ *   server/      进程内 HTTP 服务器（网关本体；原为外部 node 后端进程）
+ *   backend.rs   服务生命周期（启动/健康检查/退出停机信号）
  *   gateway.rs   管理 API 的 HTTP 客户端（含 API Key 读取与统一解包）
  *   login.rs     登录窗口与轮询
  *   commands.rs  暴露给前端的 invoke 命令（对齐原 preload 的 API 面）
@@ -23,6 +24,7 @@ mod bridge;
 mod commands;
 mod gateway;
 mod login;
+mod server;
 mod settings;
 mod state;
 mod tray;
@@ -89,6 +91,7 @@ pub fn run() {
             commands::update_progress,
             commands::cancel_update,
             commands::run_installer,
+            commands::set_window_theme,
             commands::open_release_page,
         ])
         .setup(|app| {
@@ -156,14 +159,22 @@ pub fn run() {
                 }
             }
             // 最后一个窗口关闭后 Tauri 会请求退出，这里再兜一次：
-            // 只拦「用户关窗」这一种，托盘退出与主动 exit 都要放行
+            // 只拦「用户关窗」这一种，托盘退出与主动 exit 都要放行。
+            // 放行时顺手回收后端 —— 例如用户关掉了「关闭到托盘」后直接关窗真退出，
+            // 这条路径不会走到下面的 Exit 分支，不在这里回收就会漏下 node 进程
+            // （shutdown 幂等，与其它调用点重复也不会有副作用）。
             tauri::RunEvent::ExitRequested { api, .. } => {
                 let state = app.state::<AppState>();
                 if state.window.close_to_tray() && !state.window.is_exiting() {
                     api.prevent_exit();
+                } else {
+                    backend::shutdown(&state);
                 }
             }
-            // 退出时回收我们自己拉起的后端进程（复用外部服务的不会被动）
+            // 最后兜底回收后端进程（复用外部服务的不会被动）。
+            // 注意：程序化退出（托盘退出、安装前退出走的都是 `AppHandle::exit(0)`）
+            // 不保证触发本事件，这是 Tauri 的已知行为，所以那几条主动退出路径
+            // 已各自显式调用了 shutdown，这里只覆盖其余自然退出。
             tauri::RunEvent::Exit => {
                 let state = app.state::<AppState>();
                 backend::shutdown(&state);

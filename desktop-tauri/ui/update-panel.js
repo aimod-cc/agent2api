@@ -74,6 +74,15 @@
     if (polling) { clearInterval(polling); polling = null; }
   }
 
+  /** 下载进度条：只在下载中显示，百分比直接驱动宽度 */
+  function setProgress(percent) {
+    const box = $('update-progress');
+    if (!box) return;
+    const value = Math.max(0, Math.min(100, Number(percent) || 0));
+    box.querySelector('.bar').style.width = `${value}%`;
+    box.hidden = value <= 0 || value >= 100;
+  }
+
   /** 下载任务状态 → 界面文案 */
   function renderTask(task) {
     if (!task) return false;
@@ -84,6 +93,7 @@
       const totalMb = (Number(task.total) || 0) / 1024 / 1024;
       setBadge('下载中', 'warn');
       setState(`正在下载 ${task.filename || '安装包'}：${percent}%（${mb.toFixed(1)} / ${totalMb.toFixed(1)} MB）`);
+      setProgress(percent);
       const button = $('btn-update-download');
       if (button) { button.textContent = '取消下载'; button.disabled = false; }
       return true;
@@ -91,6 +101,7 @@
 
     stopPolling();
     downloading = false;
+    setProgress(0);
     const button = $('btn-update-download');
     if (task.error) {
       setBadge('下载失败', 'bad');

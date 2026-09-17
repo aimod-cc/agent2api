@@ -287,33 +287,76 @@ async fn run_embedded(
     outcome
 }
 
-/// 用系统默认浏览器打开链接
-fn open_in_browser(url: &str) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        // cmd /c start：空字符串是窗口标题占位，否则 start 会把带引号的 URL 当标题
-        std::process::Command::new("cmd")
-            .args(["/c", "start", "", url])
-            .spawn()
-            .map_err(|error| format!("打开系统浏览器失败: {error}"))?;
-        return Ok(());
+/// 用系统默认浏览器打开链接。
+///
+/// 公开给 commands.rs 复用（打开 Release 页面）：它原来的实现是同一份
+/// `cmd /C start`，有下面这个同样的 `&` 截断缺陷 —— 更新说明链接虽然大多
+/// 不含查询串，但没有理由留着两份行为不一致的实现。
+///
+/// ── 为什么不用 `cmd /C start`（曾经的实现，两个真实故障的来源）──
+/// 登录 URL 形如 `https://.../login?platform=workbuddy&state=<uuid>`，
+/// 而 `cmd` 把 `&` 当**命令分隔符**：实际执行变成
+///   ① `start "" https://.../login?platform=workbuddy`
+///   ② `state=<uuid>`（一条不存在的命令）
+/// 后果有两个，且都很难从现象反推：
+///   1. 浏览器打开的登录页**没有 state** —— 用户能正常登录，但上游无法把
+///      这次登录与本地发起的任务绑定，后端轮询 `auth/token` 永远返回
+///      11217（登录中），前端一直卡在「等待登录完成」直到 5 分钟超时；
+///   2. ② 那条命令让 cmd 报错，黑窗口一闪而过。
+///
+/// 因此改用 `ShellExecuteW`：直接交给 shell 打开 URL，不经过命令解释器，
+/// 既不解析 `&`，也不创建控制台窗口。`SW_SHOWNORMAL` 让浏览器正常前台打开。
+#[cfg(windows)]
+pub fn open_in_browser(url: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const SW_SHOWNORMAL: i32 = 1;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut std::ffi::c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show_cmd: i32,
+        ) -> *mut std::ffi::c_void;
     }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-            .arg(url)
-            .spawn()
-            .map_err(|error| format!("打开系统浏览器失败: {error}"))?;
-        return Ok(());
+
+    let to_wide = |text: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(text).encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let operation = to_wide("open");
+    let file = to_wide(url);
+
+    // ShellExecuteW 的返回值 <= 32 表示失败（这是 Win32 的历史约定）
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            operation.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as isize <= 32 {
+        return Err(format!("打开系统浏览器失败（ShellExecute 返回 {result:?}）"));
     }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(url)
-            .spawn()
-            .map_err(|error| format!("打开系统浏览器失败: {error}"))?;
-        return Ok(());
-    }
-    #[allow(unreachable_code)]
-    Err("当前平台不支持打开系统浏览器".to_string())
+    Ok(())
+}
+
+/// 非 Windows 平台的等价实现（本项目的打包目标只有 Windows，
+/// 保留分支是为了 `cargo check` 在其它平台也能过）
+#[cfg(not(windows))]
+pub fn open_in_browser(url: &str) -> Result<(), String> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    // URL 作为独立 argv 传入，不经过 shell，`&` 不会被解释
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("打开系统浏览器失败: {error}"))
 }

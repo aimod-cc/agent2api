@@ -18,19 +18,22 @@
 (() => {
   const api = workbuddyDesktop;
   const $ = id => document.getElementById(id);
-  const { esc, toast, formatTime, formatShortTime } = wbApp;
-
-  /**
-   * 转发顺序排序键：优先级升序，并列时按加入时间。
-   * 与后端 src/workbuddy-account-store.mjs 的 byPriorityOrder 保持一致
-   * （渲染层无法 import 后端 ESM，只能同构实现；改一处必须同步另一处）。
-   * 优先级在写入侧强制唯一，并列只会出现在手工编辑的账号文件里。
-   */
-  function byPriorityOrder(a, b) {
-    const diff = Number(a?.priority ?? 100) - Number(b?.priority ?? 100);
-    if (diff !== 0) return diff;
-    return (Number(a?.addedAt) || 0) - (Number(b?.addedAt) || 0);
-  }
+  const { esc, toast, formatTime } = wbApp;
+  // 领域判定与标签渲染抽到 accounts-model.js（纯逻辑，无状态），这里直接引用
+  const {
+    byPriorityOrder,
+    isEnabled,
+    isRateLimited,
+    usableForModel,
+    accountEdition,
+    supportsCheckin,
+    checkinableAccounts,
+    accountTags,
+    metaLine,
+    editionCell,
+    usagePanelHtml: usagePanelHtmlOf,
+    checkinPanelHtml: checkinPanelHtmlOf,
+  } = wbAccountsModel;
 
   const usageMap = new Map();   // accountId -> usage | error string | null(loading)
   const checkinMap = new Map(); // accountId -> claimResult | error string | null(loading)
@@ -55,152 +58,11 @@
   const accounts = () => wbApp.getState()?.accounts?.accounts || [];
   const snapshot = () => wbApp.getState()?.accounts;
 
-  // ─── 基础判定 ──────────────────────────────
-
-  function typeLabel(type) {
-    if (type === 'enterprise') return '企业';
-    if (type === 'ultimate') return '旗舰';
-    return '个人';
-  }
-
-  /** 账号是否启用（禁用账号不参与转发） */
-  function isEnabled(account) {
-    return account?.enabled !== false;
-  }
-
-  /**
-   * 账号是否处于限流状态（存在未到恢复时间的限额记录）。
-   * 传入 model 时只判定该模型 —— 限额是按模型记的，这是「模型筛选」的核心：
-   * 一个账号可能对 A 模型限额、对 B 模型完全正常。
-   */
-  function isRateLimited(account, model = '') {
-    const limits = account?.rateLimits || {};
-    const now = Date.now();
-    if (model) return Number(limits[model]?.resetAt) > now;
-    return Object.values(limits).some(info => Number(info?.resetAt) > now);
-  }
-
-  /** 该账号此刻能否承接指定模型的请求（与后端 accountUsability 同构） */
-  function usableForModel(account, model) {
-    if (!isEnabled(account)) return false;
-    return !isRateLimited(account, model);
-  }
-
-  /** 账号所属版本：cn=国内 / intl=国际（缺省视为国内，兼容旧账号记录） */
-  function accountEdition(account) {
-    return account?.edition === 'intl' ? 'intl' : 'cn';
-  }
-
-  /** 国际版没有签到活动，签到相关入口对其隐藏 */
-  function supportsCheckin(account) {
-    return accountEdition(account) !== 'intl';
-  }
-
-  /** 可参与签到的账号（一键签到只用这批：启用 + 国内版） */
-  function checkinableAccounts(list) {
-    return (list || []).filter(account => isEnabled(account) && supportsCheckin(account));
-  }
-
-  // ─── 徽章与状态标签 ─────────────────────────
-
-  /**
-   * 状态标签：只放「会变化的状态」，恒定信息（版本/类型/优先级/有效期）下沉到
-   * 第二行小字。标签少而稳定，扫一眼就能看出哪些账号需要关注。
-   */
-  function statusTag(text, kind, title) {
-    const cls = ['badge', 'tag', kind].filter(Boolean).join(' ');
-    return `<span class="${cls}"${title ? ` title="${esc(title)}"` : ''}>${esc(text)}</span>`;
-  }
-
-  /**
-   * 首选标签：转发顺序第一位。
-   * 选了模型时含义更精确 —— 它就是该模型请求实际会用的账号
-   * （列表按该模型的可用性判定，队首即该模型的选路结果）。
-   */
-  function currentTag(account, currentAccountId, model = '') {
-    if (!isEnabled(account) || account.id !== currentAccountId) return '';
-    const title = model
-      ? '当前筛选模型的首选账号：它的请求会优先走这里'
-      : '转发顺序第一位。限额按模型记：某模型被限额时该模型的请求会降级到后面账号';
-    return statusTag('首选', 'cur', title);
-  }
-
-  /**
-   * 限额标签：状态码 + 恢复时间。
-   *
-   * 选了模型时只看该模型的限额（列表已是该模型的队列，别的模型的限额与本视图无关，
-   * 显示出来只会造成「标着 429 却还能用」的困惑）；未选模型时汇总展示。
-   */
-  function rateLimitTag(account, model = '') {
-    const limits = account.rateLimits || {};
-    const now = Date.now();
-    const active = Object.entries(limits)
-      .map(([id, info]) => ({ model: id, ...info }))
-      .filter(item => Number(item.resetAt) > now)
-      .filter(item => !model || item.model === model)
-      .sort((a, b) => a.resetAt - b.resetAt);
-    if (!active.length) return '';
-    const first = active[0];
-    const extra = active.length > 1 ? ` +${active.length - 1}` : '';
-    const title = [
-      '已达上限的模型（其它模型不受影响）：',
-      ...active.map(item => `${item.model}: ${item.status}，${formatTime(item.resetAt)} 恢复`),
-    ].join('\n');
-    return statusTag(`${first.status} · ${formatShortTime(first.resetAt)} 恢复${extra}`, 'warn', title);
-  }
-
-  /** 第一行的状态标签集合 */
-  function accountTags(account, currentAccountId, model = '') {
-    const enabled = isEnabled(account);
-    return [
-      enabled ? '' : statusTag('已禁用', 'bad', '该账号已禁用，不参与转发'),
-      currentTag(account, currentAccountId, model),
-      // 代理配了解析不出来时明确标出：转发会回退直连，属于需要留意的情况
-      account.proxy?.error ? statusTag('代理异常', 'bad', `${account.proxy.error}（转发时会回退直连）`) : '',
-      account.available === false ? statusTag('不可用', 'bad', account.reason || '账号不可用') : '',
-      rateLimitTag(account, model),
-    ].filter(Boolean).join('');
-  }
-
-  /**
-   * 有效期文案（第二行小字用）。
-   * 返回纯文本而不是徽章 —— 有效期不是「需要盯」的状态，
-   * 做成徽章只会和真正重要的状态标签抢注意力。
-   */
-  function expiryText(expiresAt) {
-    if (!expiresAt) return '未提供过期时间';
-    const left = Number(expiresAt) - Date.now();
-    if (left <= 0) return '已过期';
-    if (left < 3600e3) return `${Math.max(1, Math.round(left / 60e3))} 分钟后过期`;
-    if (left < 48 * 3600e3) return `${(left / 3600e3).toFixed(1)} 小时后过期`;
-    return `${Math.floor(left / 24 / 3600e3)} 天后过期`;
-  }
-
-  /**
-   * 第二行小字：优先级 / 版本 / 类型 / 有效期 / 尾号 / 出口。
-   * 用「·」分隔而不是徽章堆叠，一行能放下且不喧宾夺主。
-   */
-  function metaLine(account, position) {
-    const edition = account.edition === 'intl' ? 'intl' : 'cn';
-    const parts = [
-      `<span class="pri" title="转发顺序：数值越小越先用${position ? `；当前第 ${position} 位` : ''}">P${Number(account.priority ?? 100)}</span>`,
-      // 版本既是有效信息也是既有探针的识别锚点（.badge[class*="edition-"]），保留徽章形态
-      `<span class="badge edition-${edition}">${esc(account.editionLabel || (edition === 'intl' ? '国际版' : '国内版'))}</span>`,
-      `<span>${esc(typeLabel(account.type))}</span>`,
-      `<span>${esc(expiryText(account.expiresAt))}</span>`,
-    ];
-    if (account.tokenTail) parts.push(`<span>尾号 ${esc(account.tokenTail)}</span>`);
-    if (account.proxy && !account.proxy.error) {
-      parts.push(`<span title="该账号经此出口访问上游">出口 ${esc(account.proxy.label || '已设置')}</span>`);
-    }
-    return parts.join('<span class="sep">·</span>');
-  }
-
-  // ─── 行内面板（积分 / 签到） ─────────────────
+  // ─── 行内面板：展开状态 ─────────────────────
   //
   // 面板按需展开：只有用户点过「积分」/「签到」（或批量操作带出结果）之后才渲染。
-  // 之前是每行常驻两块「尚未查询」的提示框，把行高撑到两倍且没有任何信息量；
-  // 现在收起状态下这两个函数返回空串，行高回到一行。
+  // 收起状态下面板 HTML 为空串，行高保持一行。
+  // 面板内容本身由 accounts-model.js 渲染（纯展示，入参是缓存里的 entry）。
 
   /** 已展开明细的账号：accountId -> Set<'usage' | 'checkin'> */
   const openPanels = new Map();
@@ -217,83 +79,34 @@
     else openPanels.delete(accountId);
   }
 
-  /** 明细条右上角的关闭按钮 */
-  const panelClose = kind =>
-    `<button class="panel-close" data-panel-close="${kind}" title="收起">✕</button>`;
-
   function usagePanelHtml(account) {
     if (!panelOpen(account.id, 'usage')) return '';
-    const entry = usageMap.get(account.id);
-    if (entry === undefined) {
-      return `<div class="row-panel">积分尚未查询，请点击该账号行上的「积分」按钮。${panelClose('usage')}</div>`;
-    }
-    if (entry === null) {
-      return `<div class="row-panel"><span class="badge warn">正在查询积分…</span>${panelClose('usage')}</div>`;
-    }
-    if (typeof entry === 'string') {
-      return `<div class="row-panel error"><span class="badge bad">查询失败</span> ${esc(entry)}${panelClose('usage')}</div>`;
-    }
-    // 三字段简报：总剩余 / 套餐基础 / 平台奖励（企业账号后两项为 null）
-    const totalLeft = entry.unlimited ? '∞' : (entry.totalLeft ?? '—');
-    const planLeft = entry.planLeft ?? '—';
-    const bonusLeft = entry.bonusLeft ?? '—';
-    const kindTag = entry.kind === 'enterprise' ? '<span>（企业账号）</span>' : '';
-    return `<div class="row-panel">`
-      + `<span>总剩余 <b class="big">${esc(totalLeft)}</b></span>`
-      + `<span>套餐 <b>${esc(planLeft)}</b></span>`
-      + `<span>奖励 <b>${esc(bonusLeft)}</b></span>`
-      + kindTag + panelClose('usage')
-      + `</div>`;
+    return usagePanelHtmlOf(account, usageMap.get(account.id));
   }
 
   function checkinPanelHtml(account) {
     if (!panelOpen(account.id, 'checkin')) return '';
-    const close = panelClose('checkin');
-    if (!supportsCheckin(account)) {
-      return `<div class="row-panel">国际版暂无签到活动，该账号不参与签到。${close}</div>`;
-    }
-    if (!isEnabled(account)) {
-      return `<div class="row-panel">账号已禁用，不参与批量签到；如需签到请先启用。${close}</div>`;
-    }
-    const entry = checkinMap.get(account.id);
-    if (entry === undefined) {
-      return `<div class="row-panel">签到状态未查询，请点击该账号行上的「签到」按钮。${close}</div>`;
-    }
-    if (entry === null) {
-      return `<div class="row-panel"><span class="badge warn">正在签到…</span>${close}</div>`;
-    }
-    if (typeof entry === 'string') {
-      return `<div class="row-panel error"><span class="badge bad">签到失败</span> ${esc(entry)}${close}</div>`;
-    }
-    if (!entry || entry.success === undefined) {
-      return `<div class="row-panel">未获取到签到结果${close}</div>`;
-    }
-    if (entry.success) {
-      const d = entry.data || {};
-      const parts = ['<span class="badge ok">✅ 签到成功</span>'];
-      if (Number.isFinite(d.points) && d.points) parts.push(`<span>本次 +${esc(d.points)} 积分</span>`);
-      if (Number.isFinite(d.continuousDays)) parts.push(`<span>连续 ${esc(d.continuousDays)} 天</span>`);
-      if (Number.isFinite(d.totalDays)) parts.push(`<span>累计 ${esc(d.totalDays)} 天</span>`);
-      return `<div class="row-panel">${parts.join('')}${close}</div>`;
-    }
-    return `<div class="row-panel"><span class="badge warn">${esc(entry.msg || '未领取')}</span>`
-      + `<span>code=${esc(entry.code ?? '?')}</span>${close}</div>`;
+    return checkinPanelHtmlOf(account, checkinMap.get(account.id));
   }
 
-  // ─── 行渲染 ────────────────────────────────
+  // ─── 卡片渲染 ──────────────────────────────
 
   /**
-   * 单行渲染（不含分组标题）。
-   * position / total 为该账号在全局转发顺序里的位置，用于显示「第 N 位」
-   * 与决定 ↑/↓ 按钮的可用性（队首不能上移、队尾不能下移）。
+   * 单张账号卡渲染（不含分组标题）。
+   * position / total 为该账号在全局转发顺序里的位置，用于显示 P 值与
+   * 决定 ↑/↓ 按钮的可用性（队首不能上移、队尾不能下移）。
    * routedId 为「当前视图下实际会被选中的账号 id」：选了模型时是该模型队列的
    * 第一个可用账号，未选模型时是全局首选。
    * model 为当前筛选的模型 id（空串 = 不限模型）。
    *
-   * 结构：第一层「账号名 + 状态标签」，第二层一行小字（优先级/版本/类型/有效期…）。
-   * 频繁用到的操作留在行内；刷新 Token 与删除收进「⋯」菜单（点击才生成菜单内容）。
+   * 卡片结构（自上而下，信息密度递减）：
+   *   ① 主体：勾选 / 账号名 + 版本徽章 / 状态徽章（贴账号名右侧）
+   *   ② 明细：额度类型 · 有效期 · 尾号 · 出口
+   *   ③ 提示：仅异常时出现的一行说明（429 恢复时间 / 代理异常）
+   *   ④ 底部：转发顺序在左，操作按钮在右
+   * 频繁用到的操作留在卡内；刷新 Token 与删除收进「⋯」菜单（点击才生成内容）。
    */
-  function accountRowHtml(account, routedId, position, total, model = '') {
+  function accountCardHtml(account, routedId, position, total, model = '') {
     const isCurrent = account.id === routedId;
     const enabled = isEnabled(account);
     const picked = selectedIds.has(account.id);
@@ -309,8 +122,8 @@
         + `</span>`,
       `<button data-action="settings" data-id="${esc(account.id)}">设置</button>`,
       isCurrent
-        ? '<button disabled title="已是转发顺序第一位，无需再置顶">已是首选</button>'
-        : `<button data-action="switch" data-id="${esc(account.id)}" title="把该账号移到转发顺序第一位，并启用它">设为首选</button>`,
+        ? '<button class="is-current" disabled title="已是转发顺序第一位，无需再置顶">已是首选</button>'
+        : `<button class="wide" data-action="switch" data-id="${esc(account.id)}" title="把该账号移到转发顺序第一位，并启用它">设为首选</button>`,
       `<button data-action="usage" data-id="${esc(account.id)}" title="查询该账号剩余积分">积分</button>`,
       // 签到按钮保持可见（国际版无签到活动，故仅国内版显示）
       enabled && supportsCheckin(account)
@@ -319,22 +132,56 @@
       `<button data-action="more" data-id="${esc(account.id)}" title="更多操作">⋯</button>`,
     ].filter(Boolean).join('');
 
-    return `<article class="account-item${enabled ? '' : ' disabled'}${picked ? ' selected' : ''}" data-id="${esc(account.id)}">
-    <div class="account-head">
-      <label class="account-pick" title="勾选后可批量操作">
-        <input type="checkbox" data-pick="${esc(account.id)}"${picked ? ' checked' : ''}>
-      </label>
-      <div class="account-main">
-        <div class="account-name">
-          <span class="name-text"${title ? ` title="${esc(title)}"` : ''}>${esc(account.nickname || account.name || account.uid || '未命名账号')}</span>
-          ${accountTags(account, routedId, model)}
+    const cardCls = [
+      'acct-card',
+      enabled ? '' : 'disabled',
+      picked ? 'selected' : '',
+      isCurrent ? 'is-first' : '',
+    ].filter(Boolean).join(' ');
+
+    return `<article class="${cardCls}" data-id="${esc(account.id)}">
+      <div class="card-head">
+        <span class="pick" title="勾选后可批量操作">
+          <input type="checkbox" data-pick="${esc(account.id)}"${picked ? ' checked' : ''}>
+        </span>
+        <div class="who">
+          <div class="who-name"${title ? ` title="${esc(title)}"` : ''}>
+            <span class="name">${esc(account.nickname || account.name || account.uid || '未命名账号')}</span>
+            ${editionCell(account)}
+          </div>
+          <div class="who-meta">${metaLine(account, position)}</div>
         </div>
-        <div class="account-meta">${metaLine(account, position)}</div>
+        <div class="card-state">${accountTags(account, routedId, model) || '<span class="badge tag plain">—</span>'}</div>
       </div>
-      <div class="account-actions">${actions}</div>
-    </div>
-    <div class="row-panels">${usagePanelHtml(account)}${checkinPanelHtml(account)}</div>
-  </article>`;
+      ${cardNoteHtml(account, model)}
+      <div class="card-foot">
+        <span class="rank${isCurrent ? ' is-first' : ''}" title="转发顺序：数值越小越先用${position ? `；当前第 ${position} 位` : ''}">${isCurrent ? '<span class="star">★</span>' : ''}<span class="p">P</span>${Number(account.priority ?? 100)}</span>
+        <div class="card-actions">${actions}</div>
+      </div>
+      <div class="row-panels">${usagePanelHtml(account)}${checkinPanelHtml(account)}</div>
+    </article>`;
+  }
+
+  /**
+   * 异常提示条：状态徽章只说「是什么」（429 / 代理异常），这一行补「怎么办」。
+   * 只在有异常时返回内容，正常卡片不占这行高度 —— 否则整片卡片都被拉高，
+   * 却只为了重复一遍「一切正常」。
+   */
+  function cardNoteHtml(account, model = '') {
+    const notes = [];
+    if (isEnabled(account) && isRateLimited(account, model)) {
+      notes.push('该模型已达上限，期间的请求会自动改用后面的账号');
+    }
+    if (account.proxy?.error) {
+      notes.push(`代理不可用（${esc(account.proxy.error)}），转发时会回退直连`);
+    }
+    if (account.available === false) {
+      notes.push(esc(account.reason || '账号当前不可用'));
+    }
+    if (!notes.length) return '';
+    // 代理/不可用属于必须处理的故障，用红；纯限额是会自动绕过的，用黄
+    const bad = Boolean(account.proxy?.error) || account.available === false;
+    return `<div class="card-note ${bad ? 'bad' : 'warn'}"><span class="ico">⚠</span><span>${notes.join('；')}</span></div>`;
   }
 
   /**
@@ -374,8 +221,9 @@
         + `${item.danger ? ' class="danger"' : ''}>${esc(item.label)}</button>`;
     }).join('');
 
-    // 贴在该行操作区的下方；行内绝对定位，随列表滚动一起移动
-    const host = button.closest('.account-item');
+    // 挂在卡片底部操作区里，菜单就贴着按钮组弹出（.card-foot 是定位祖先），
+    // 随列表滚动一起移动，不会浮到别的卡片上
+    const host = button.closest('.card-foot') || button.closest('.acct-card');
     host.appendChild(menu);
     openMenu = menu;
   }
@@ -472,20 +320,23 @@
       ].filter(group => group.items.length)
       : [{ key: accountFilter.edition, title: '', items: visible }];
 
-    // 组内按转发顺序排列，与「第 N 位」徽章和 ↑/↓ 的方向保持一致
+    // 组内按转发顺序排列，与 P 值和 ↑/↓ 的方向保持一致
     const { map: positions, total } = positionMap();
     // 选了模型时，该模型实际会用哪个账号 —— 这是「这个模型的账号队列」的答案：
     // 队列按优先级排，第一个「启用且对该模型未限流」的即为实际选中项。
     const routedId = model ? pickForModel(all, model)?.id ?? null : snap.currentAccountId;
-    list.innerHTML = groups.map(group => {
+    // 卡片网格：分组标题也是网格项，横跨整行
+    const body = groups.map(group => {
       const title = group.title
-        ? `<div class="account-group-title">${esc(group.title)} · ${group.items.length}</div>`
+        ? `<div class="acct-group-title">${esc(group.title)} · ${group.items.length}</div>`
         : '';
       const items = group.items.slice().sort(byPriorityOrder);
       return title + items
-        .map(a => accountRowHtml(a, routedId, positions.get(a.id) ?? 0, total, model))
+        .map(a => accountCardHtml(a, routedId, positions.get(a.id) ?? 0, total, model))
         .join('');
     }).join('');
+    list.className = 'acct-scroll';
+    list.innerHTML = `<div class="acct-grid">${body}</div>`;
   }
 
   /**
@@ -533,7 +384,7 @@
     const label = $('batch-select-label');
     if (label) label.textContent = visibleIds.length ? `全选当前筛选结果（${visibleIds.length} 个）` : '没有可全选的账号';
 
-    for (const id of ['btn-batch-enable', 'btn-batch-disable', 'btn-batch-proxy', 'btn-batch-remove', 'btn-batch-clear']) {
+    for (const id of ['btn-batch-open', 'btn-batch-clear']) {
       const button = $(id);
       if (button) button.disabled = !active;
     }
@@ -547,7 +398,7 @@
     document.querySelectorAll('#account-list input[data-pick]').forEach(box => {
       const picked = selectedIds.has(box.dataset.pick);
       box.checked = picked;
-      box.closest('.account-item')?.classList.toggle('selected', picked);
+      box.closest('.acct-card')?.classList.toggle('selected', picked);
     });
     renderBatchBar(accounts(), lastVisibleIds);
   }
@@ -756,7 +607,7 @@ function bindEvents() {
     // 明细条上的「收起」按钮
     const closer = event.target.closest('button[data-panel-close]');
     if (closer) {
-      const host = closer.closest('.account-item');
+      const host = closer.closest('.acct-card');
       setPanelOpen(host?.dataset.id, closer.dataset.panelClose, false);
       render();
       return;
@@ -894,13 +745,11 @@ function bindEvents() {
     selectedIds.clear();
     syncSelectionUi();
   });
-  $('btn-batch-enable').addEventListener('click', () => openBatch('enable'));
-  $('btn-batch-disable').addEventListener('click', () => openBatch('disable'));
-  $('btn-batch-proxy').addEventListener('click', () => openBatch('proxy'));
-  $('btn-batch-remove').addEventListener('click', () => openBatch('remove'));
+  // 单个「批量操作」按钮：打开弹窗，具体动作在弹窗里用单选切换（默认「启用」）
+  $('btn-batch-open').addEventListener('click', () => openBatch());
 
-  /** 把当前勾选与动作交给账号面板的批量弹窗 */
-  function openBatch(action) {
+  /** 把当前勾选与动作交给账号面板的批量弹窗；不传动作时默认选中「启用」 */
+  function openBatch(action = 'enable') {
     if (!selectedIds.size) { toast('请先勾选要操作的账号', 'err'); return; }
     window.wbAccountPanel?.openBatch([...selectedIds], action);
   }

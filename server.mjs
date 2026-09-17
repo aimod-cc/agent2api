@@ -523,7 +523,9 @@ async function handleModelRequest(req, res, rawBody, path) {
     const result = desensitizer.processBody(body);
     if (result.changed) {
       body = result.body;
-      verbose('[Desensitize]', `命中 ${result.hits} 处（${(result.matched || []).join('、')}）`);
+      // 命中即写运行日志（桌面端「日志」页可见）：总次数 + 每个词各自的次数
+      const perTerm = (result.termCounts || []).map(item => `${item.term}×${item.count}`).join('、');
+      log('[Desensitize]', `已脱敏命中 ${result.hits} 处：${perTerm}`);
     }
   }
 

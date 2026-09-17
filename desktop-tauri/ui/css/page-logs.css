@@ -1,0 +1,204 @@
+/* ─────────────────────────────────────────────
+   日志页：时间线
+   ───────────────────────────────────────────── */
+
+.log-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  /* 高度由内容决定：只剩列表该伸缩，筛选行不被压缩 */
+  flex: none;
+}
+
+.log-filters select { width: auto; min-width: 120px; }
+
+.log-filters input[type="search"] { flex: 1 1 180px; }
+
+/* 两个开关（不看脱敏 / 自动刷新）作为一组推向最右，彼此紧挨 */
+.log-filters .switch { margin-left: auto; }
+.log-filters .switch + .switch { margin-left: 0; }
+
+.log-list {
+  display: flex;
+  flex-direction: column;
+  /* 日志页整页不滚：列表吃掉筛选行与页脚之间的剩余高度，滚动只发生在这里 */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+/* 单条日志：左侧级别圆点 + 竖线，右侧时间 */
+.log-row {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--hairline);
+  transition: background .12s ease;
+  /* 列表是 flex 列容器：条目不许被压缩，超出的一律交给列表滚动 */
+  flex: none;
+}
+
+.log-row:last-child { border-bottom: none; }
+.log-row:hover { background: var(--surface-2); }
+
+/* 左侧导轨 */
+.log-rail {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  padding-top: 4px;
+}
+
+.log-rail::after {
+  content: "";
+  position: absolute;
+  top: 14px;
+  bottom: -11px;
+  width: 1px;
+  background: var(--hairline);
+}
+
+.log-row:last-child .log-rail::after { display: none; }
+
+.log-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--text-3);
+  box-shadow: 0 0 0 3px var(--surface-inset);
+}
+
+.log-row:hover .log-dot { box-shadow: 0 0 0 3px var(--surface-2); }
+.log-dot.info { background: var(--info); }
+.log-dot.warn { background: var(--warn); }
+.log-dot.error { background: var(--danger); }
+.log-dot.debug { background: var(--border-strong); }
+
+.log-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.log-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+/* 分类标签 */
+.log-cat {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.log-row.warn .log-cat { background: var(--warn-soft); border-color: var(--warn-bd); color: var(--warn); }
+.log-row.error .log-cat { background: var(--danger-soft); border-color: var(--danger-bd); color: var(--danger); }
+
+/* 级别（色块 + 文字） */
+.log-lvl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 6px;
+  height: 18px;
+  border-radius: var(--r-xs);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.log-lvl.info { color: var(--info); background: var(--info-soft); }
+.log-lvl.debug { color: var(--text-3); background: var(--surface-3); }
+.log-lvl.warn { color: var(--warn); background: var(--warn-soft); }
+.log-lvl.error { color: var(--danger); background: var(--danger-soft); }
+
+.log-row .msg {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+/* 附加数据：结构化后的关键信息，独立成行更易扫读 */
+.log-extra-wrap { display: flex; min-width: 0; }
+
+.log-row .extra {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.log-row .time {
+  padding-top: 2px;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 级别底色：轻微着色，不干扰阅读 */
+.log-row.warn { background: color-mix(in srgb, var(--warn-soft) 45%, transparent); }
+.log-row.error { background: color-mix(in srgb, var(--danger-soft) 45%, transparent); }
+.log-row.warn:hover { background: var(--warn-soft); }
+.log-row.error:hover { background: var(--danger-soft); }
+
+.log-empty {
+  padding: 30px 16px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* 列表现在撑满可用高度，空态若还贴着顶端会显得像渲染失败：居中成一条提示 */
+.log-list > .log-empty:only-child { margin: auto; }
+
+/* ─── 分页栏（面板底注内） ───
+   页码是「当前在哪」的状态读数，用等宽数字避免 9→10 时宽度跳动。 */
+.log-pager {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  /* 页脚允许换行：窄窗口下分页整组一起掉到下一行，不会被拆散 */
+  flex: 0 0 auto;
+}
+
+.log-pager-info {
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}

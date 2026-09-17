@@ -63,6 +63,9 @@ function applyTheme(mode) {
   const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
   const effective = mode === 'dark' || (mode === 'system' && systemDark) ? 'dark' : 'light';
   document.documentElement.style.colorScheme = effective;
+  // 同步操作系统标题栏的深浅色：界面切深色但标题栏仍是系统主题时，顶部会留一条白带。
+  // 浏览器直开时没有桥，用可选链 + try 吞掉，避免影响主题本身生效。
+  try { window.workbuddyDesktop?.setWindowTheme?.(effective); } catch { /* 非桌面环境忽略 */ }
   localStorage.setItem('workbuddy-desktop-theme', mode);
   document.querySelectorAll('#theme-switch button').forEach(item => {
     item.classList.toggle('active', item.dataset.mode === mode);
@@ -73,6 +76,15 @@ function applyTheme(mode) {
 
 const PAGE_KEY = 'workbuddy-desktop-page';
 const PAGES = ['overview', 'accounts', 'gateway', 'desensitize', 'logs', 'settings'];
+/** 页签中文名：顶栏面包屑用 */
+const PAGE_LABELS = {
+  overview: '概览',
+  accounts: '账号',
+  gateway: '网关',
+  desensitize: '脱敏',
+  logs: '日志',
+  settings: '设置',
+};
 
 /** 当前页（子模块据此判断是否需要重新加载） */
 let currentPage = 'overview';
@@ -86,6 +98,8 @@ function showPage(name, { persist = true } = {}) {
   document.querySelectorAll('.nav-item').forEach(item => {
     item.classList.toggle('active', item.dataset.page === page);
   });
+  const crumb = $('crumb-page');
+  if (crumb) crumb.textContent = PAGE_LABELS[page] || page;
   if (persist) localStorage.setItem(PAGE_KEY, page);
   // 切到日志页时清掉未读标记，并立即拉一次最新日志
   if (page === 'logs') {
@@ -96,6 +110,46 @@ function showPage(name, { persist = true } = {}) {
   if (page === 'settings') {
     window.wbSettingsPanel?.load?.();
   }
+  renderTopbarStatus();
+}
+
+// ─── 顶栏状态 ─────────────────────────────────
+
+/** 顶栏右侧状态区：随当前页给出该页最关心的两三个状态 */
+function renderTopbarStatus() {
+  const box = $('topbar-status');
+  if (!box) return;
+  const health = state?.health || {};
+  const session = state?.session || {};
+  const accounts = state?.accounts?.accounts || [];
+  const enabled = accounts.filter(a => a.enabled !== false).length;
+  // accounts-model.js 在 app.js 之后加载，首屏这次调用可能早于它就绪，故用可选链
+  const isRateLimited = window.wbAccountsModel?.isRateLimited;
+  const limited = isRateLimited ? accounts.filter(a => a.enabled !== false && isRateLimited(a)).length : 0;
+  const up = health.upstreamConfigured;
+  const chip = (text, kind = '', optional = false) =>
+    `<span class="badge ${kind}${optional ? ' optional' : ''}"><span class="dot"></span>${esc(text)}</span>`;
+  const port = gatewayBase.replace(/^https?:\/\//, '');
+  /** 直接复用某面板已渲染的徽标文案（词表 / 日志面板自持状态，这里不重复计算） */
+  const mirror = id => {
+    const badge = $(id);
+    if (!badge || !badge.textContent || badge.textContent === '—') return '';
+    return `<span class="badge ${badge.className.replace('badge', '').trim()}">${esc(badge.textContent)}</span>`;
+  };
+
+  const views = {
+    accounts: () => chip(`${enabled} 个启用`, enabled ? 'ok' : '')
+      + (limited ? chip(`${limited} 个已限流`, 'warn') : ''),
+    gateway: () => (up ? chip('监听 127.0.0.1', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
+    desensitize: () => mirror('desensitize-badge'),
+    logs: () => mirror('logs-badge'),
+    settings: () => (up ? chip('网关运行中', 'ok', true) : chip('未就绪', 'bad', true))
+      + (enabled ? chip(`${enabled} 个账号启用`) : ''),
+    overview: () => (up ? chip('网关运行中', 'ok') : chip('未就绪', 'bad'))
+      + (session.loggedIn ? chip('已登录', 'ok') : chip('未登录', 'warn')),
+  };
+
+  box.innerHTML = views[currentPage]?.() ?? views.overview();
 }
 
 // ─── 日志未读徽标 ─────────────────────────────
@@ -186,6 +240,37 @@ function paintGatewayAddress(base) {
   $('api-chat').textContent = `POST ${base}/v1/chat/completions`;
   $('api-models').textContent = `GET ${base}/v1/models`;
   $('api-base').textContent = `${base}/v1`;
+  renderSidebarStatus();
+}
+
+/**
+ * 侧边栏底部的网关状态：常驻显示，不必切到「网关」页也能确认服务是否在监听。
+ *
+ * 端口来自 gatewayBase（真实端口由 getBackendStatus 异步补上），
+ * 就绪与否看 state.health.upstreamConfigured —— 与顶栏徽标同一判定口径，
+ * 避免两处对「网关是否可用」给出不同答案。
+ * 首次渲染时 state 还没到，显示「正在检查…」而不是谎报未就绪。
+ */
+function renderSidebarStatus() {
+  const dot = $('sidebar-status-dot');
+  const text = $('sidebar-status-text');
+  if (!dot || !text) return;
+  const port = gatewayBase.replace(/^https?:\/\//, '');
+  const health = state?.health;
+  if (!health) {
+    dot.className = 'live off';
+    text.textContent = `正在检查… · ${port}`;
+    return;
+  }
+  const up = health.upstreamConfigured;
+  dot.className = up ? 'live pulse' : 'live bad';
+  text.textContent = up ? `网关运行中 · ${port}` : `网关未就绪 · ${port}`;
+  const box = $('sidebar-status');
+  if (box) {
+    box.title = up
+      ? `本地网关正在监听 ${gatewayBase}，可直接调用 OpenAI 兼容接口`
+      : `上游未就绪（${health.upstreamBaseUrl || '未配置'}），网关暂时无法转发请求`;
+  }
 }
 
 /**
@@ -223,6 +308,7 @@ function renderModels() {
   const models = Array.isArray(state?.models) ? state.models : [];
   if (!models.length) {
     box.innerHTML = '<div class="empty" style="padding:14px 0">暂无模型</div>';
+    setModelsCount(0, 0);
     return;
   }
   // 倍率统一展示为官方风格 "0.03x"：兼容远程 "x0.03" 与内置 "x0.03 credits" 两种写法
@@ -230,19 +316,56 @@ function renderModels() {
     const m = /x\s*([\d.]+)/i.exec(c || '');
     return m ? `${m[1]}x` : (c || '');
   };
+  // 芯片整块可点：点击即复制模型 ID（复制逻辑在 initCopyButtons 里统一处理）
   box.innerHTML = models.map(m => {
     const cls = m.isDefault ? 'model-chip default' : 'model-chip';
     const credits = m.credits ? `<span class="credits">${esc(formatCredits(m.credits))}</span>` : '';
-    const name = m.name && m.name !== m.id ? `<span class="credits">${esc(m.name)}</span>` : '';
-    return `<span class="${cls}">${esc(m.id)}${m.isDefault ? '（默认）' : ''}${name}${credits}</span>`;
+    const name = m.name && m.name !== m.id ? `<span class="name">${esc(m.name)}</span>` : '';
+    return `<button type="button" class="${cls}" data-copy="${esc(m.id)}" title="点击复制模型 ID：${esc(m.id)}">`
+      + `<span class="id">${esc(m.id)}</span>${m.isDefault ? '<span class="name">（默认）</span>' : ''}${name}${credits}</button>`;
   }).join('');
+
+  applyModelFilter();
+  setModelsCount(models.length, models.length);
 
   const def = models.find(m => m.isDefault) || models[0];
   if (def) {
     const badge = $('default-model-badge');
-    badge.textContent = `默认 ${def.id}`;
+    badge.textContent = `默认模型 ${def.id}`;
     badge.style.display = '';
     $('default-model').textContent = def.id;
+  }
+}
+
+/** 模型清单计数：搜索时显示「命中 / 全部」 */
+function setModelsCount(shown, total) {
+  const box = $('models-count');
+  if (!box) return;
+  box.textContent = shown === total ? `共 ${total} 个可用模型 · 点击芯片复制 ID` : `匹配 ${shown} / ${total} 个模型`;
+}
+
+/** 按搜索框内容过滤模型芯片（本地过滤，不再请求后端） */
+function applyModelFilter() {
+  const box = $('models');
+  const input = $('model-search');
+  if (!box || !input) return;
+  const keyword = input.value.trim().toLowerCase();
+  const chips = [...box.querySelectorAll('.model-chip')];
+  if (!chips.length) return;
+  let shown = 0;
+  chips.forEach(chip => {
+    const hit = !keyword || chip.textContent.toLowerCase().includes(keyword);
+    chip.classList.toggle('filtered', !hit);
+    if (hit) shown++;
+  });
+  setModelsCount(shown, chips.length);
+  const empty = box.querySelector('.models-empty');
+  if (shown === 0) {
+    if (!empty) {
+      box.insertAdjacentHTML('beforeend', `<div class="empty models-empty" style="padding:14px 0;width:100%">没有匹配「${esc(input.value.trim())}」的模型</div>`);
+    }
+  } else {
+    empty?.remove();
   }
 }
 
@@ -278,6 +401,8 @@ function render() {
   renderConfig();
   renderProxyStatus();
   renderNavCounts();
+  renderTopbarStatus();
+  renderSidebarStatus();
 }
 
 /** 账号列表由 accounts-view 模块负责（含优先级/禁用/代理徽章与行内面板） */
@@ -498,6 +623,66 @@ async function uploadAccount() {
   }
 }
 
+// ─── 复制 ─────────────────────────────────────
+
+/**
+ * 复制按钮统一入口。两种用法：
+ *   data-copy="文本"          直接复制给定文本（模型芯片）
+ *   data-copy-from="元素 id"  复制该元素的当前文本（地址 / UID 等会变的值）
+ * 地址类文本带 "POST " / "GET " 前缀，复制时去掉，保证粘出去能直接用。
+ */
+function copyTextOf(trigger) {
+  const fromId = trigger.dataset.copyFrom;
+  if (fromId) {
+    const source = $(fromId);
+    if (!source) return '';
+    return source.textContent.replace(/^(POST|GET)\s+/i, '').trim();
+  }
+  return trigger.dataset.copy || '';
+}
+
+async function copyToClipboard(text) {
+  if (!text) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // 剪贴板被拒（无权限 / 非安全上下文）时用兜底方案，避免功能静默失效
+    try {
+      const area = document.createElement('textarea');
+      area.value = text;
+      area.style.position = 'fixed';
+      area.style.opacity = '0';
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand('copy');
+      area.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+document.addEventListener('click', async event => {
+  const trigger = event.target.closest('[data-copy], [data-copy-from]');
+  if (!trigger) return;
+  const text = copyTextOf(trigger);
+  if (!(await copyToClipboard(text))) { toast('复制失败，请手动选择复制', 'err'); return; }
+  toast(`已复制：${text.length > 46 ? `${text.slice(0, 46)}…` : text}`);
+  // 复制按钮给个即时反馈（模型芯片本身是内容，不改它的外观）
+  if (trigger.classList.contains('copy-btn')) {
+    trigger.classList.add('done');
+    trigger.textContent = '✓';
+    setTimeout(() => {
+      trigger.classList.remove('done');
+      trigger.textContent = '⧉';
+    }, 1200);
+  }
+});
+
+$('model-search')?.addEventListener('input', applyModelFilter);
+
 // ─── 事件绑定 ─────────────────────────────────
 
 document.querySelectorAll('#theme-switch button').forEach(button => {
@@ -630,6 +815,22 @@ $('nav').addEventListener('click', event => {
   const item = event.target.closest('.nav-item[data-page]');
   if (item) showPage(item.dataset.page);
 });
+
+/**
+ * 导航图标注入：index.html 里的 .ico 只留空占位，图标从这里填。
+ * 放在 JS 而不是写死在 HTML 里，是为了让六个图标的定义集中在一处
+ * （icons.js），后续换图标只改一个文件，不必在 HTML 里翻找。
+ */
+function paintNavIcons() {
+  const icon = window.wbIcons?.icon;
+  if (!icon) return;
+  document.querySelectorAll('.nav-item[data-icon] .ico').forEach(slot => {
+    const name = slot.closest('.nav-item').dataset.icon;
+    slot.innerHTML = icon(name, 17);
+  });
+}
+paintNavIcons();
+
 showPage(localStorage.getItem(PAGE_KEY) || 'overview', { persist: false });
 
 refresh();

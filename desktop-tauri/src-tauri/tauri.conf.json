@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "WorkBuddy 本地代理",
-  "version": "1.0.1",
+  "version": "1.1.1",
   "identifier": "com.workbuddy.local-proxy",
   "build": {
     "frontendDist": "../ui"
@@ -22,10 +22,6 @@
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ],
-    "resources": {
-      "resources/server.cjs": "resources/server.cjs",
-      "resources/node.exe": "resources/node.exe"
-    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",
@@ -34,6 +30,6 @@
       }
     },
     "shortDescription": "WorkBuddy 本地代理 · 会话与多账号管理",
-    "longDescription": "把 WorkBuddy 登录态包装成本地 OpenAI 兼容接口，并集中管理多账号、出网代理与内容脱敏。安装后开箱即用，无需单独安装 Node。"
+    "longDescription": "把 WorkBuddy 登录态包装成本地 OpenAI 兼容接口，并集中管理多账号、出网代理与内容脱敏。网关已整体由 Rust 实现并运行在应用进程内，不再随包分发任何外部运行时，安装体积小、启动即用。"
   }
 }

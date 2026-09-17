@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-proxy-desktop-tauri",
-  "version": "1.0.1",
+  "version": "1.1.1",
   "private": true,
   "description": "WorkBuddy 本地代理桌面端（Tauri）",
   "scripts": {

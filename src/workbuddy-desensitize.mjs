@@ -33,6 +33,9 @@ export const MAX_TERM_LENGTH = 200;
  * 默认词表：客户端固定 system 模板里的合规声明高频词。
  * 这些词取自真实被上游审核拦下的模板（"拒绝协助 DoS 攻击 / 漏洞利用开发 /
  * 凭证测试 / C2 框架…"），属于「拒绝作恶」的声明而非有害输入，却会被误判。
+ *
+ * 末条 `Main branch (you will usually use this for PRs)` 是客户端 system 模板里被上游
+ * 审核整句误拦的真实文案（Git 工作流说明，本身无害）——整句作为一个词条，不要拆开。
  */
 export const DEFAULT_TERMS = Object.freeze([
   'DoS',
@@ -66,6 +69,28 @@ export const DEFAULT_TERMS = Object.freeze([
   'botnet',
   'zero-day',
   '0day',
+  'Main branch (you will usually use this for PRs)',
+]);
+
+/** 默认词表当前版本：每次往 DEFAULT_TERMS 追加新词条时 +1，并在下面迁移表登记 */
+export const DEFAULT_TERMS_VERSION = 2;
+
+/**
+ * 默认词表补词迁移表：版本号 → 该版本新增的默认词条。
+ *
+ * 老用户的词表持久化在 desensitize.json，默认词表更新后不会自动生效，
+ * 因此按版本做一次性合并：文件里记录已合并到哪个版本（defaultsVersion），
+ * 启动加载时把缺失的新词条按忽略大小写补进去，合并完落盘并更新版本标记。
+ *
+ * 用"只补登记词条"而不是"与 DEFAULT_TERMS 求并集"，是为了保护用户的删除权：
+ * 用户主动删掉的词条（无论新旧默认词）不会在下次启动时被加回来。
+ * 未来往 DEFAULT_TERMS 加新词条时：版本 +1、登记一条迁移即可，老用户自动生效。
+ *
+ * 注意：词条写法必须与 DEFAULT_TERMS 中的条目逐字符一致（零宽空格是运行时由
+ * zeroWidthSplit 插入的，词表本身是纯文本），否则忽略大小写比对会认成两个词。
+ */
+export const DEFAULT_TERM_MIGRATIONS = Object.freeze([
+  { version: 2, terms: ['Main branch (you will usually use this for PRs)'] },
 ]);
 
 // ─── 词表清洗与编译 ────────────────────────────────────────
@@ -204,6 +229,8 @@ export function createDesensitizer({ directory, log = () => {} } = {}) {
   let terms = [...DEFAULT_TERMS];
   let roles = [...DEFAULT_ROLES];
   let pattern = compileTerms(terms);
+  // 已合并到的默认词表版本：无配置文件（新用户）时直接视为最新，无需迁移
+  let defaultsVersion = DEFAULT_TERMS_VERSION;
 
   const stats = {
     requests: 0,
@@ -216,6 +243,38 @@ export function createDesensitizer({ directory, log = () => {} } = {}) {
     pattern = compileTerms(terms);
   }
 
+  /**
+   * 默认词表补词迁移（一次性）：把 defaultsVersion 之后各版本登记的新默认词条补进当前词表。
+   *
+   * 只在 load() 里、读盘之后调用。合并完无论是否真的补了词，都把版本标记推进到最新并落盘，
+   * 避免每次启动重复比对、重复写盘。
+   * 用户主动删掉的词条不会被补回：这里只处理"比用户已合并版本更新"的登记词条。
+   */
+  function migrateDefaults() {
+    const pending = DEFAULT_TERM_MIGRATIONS
+      .filter(item => item.version > defaultsVersion)
+      .sort((a, b) => a.version - b.version);
+    if (!pending.length) return;
+
+    const known = new Set(terms.map(term => term.toLowerCase()));
+    const added = [];
+    for (const item of pending) {
+      for (const term of item.terms) {
+        const key = term.toLowerCase();
+        if (known.has(key)) continue;
+        known.add(key);
+        added.push(term);
+      }
+    }
+
+    terms = normalizeTerms([...terms, ...added]);
+    defaultsVersion = DEFAULT_TERMS_VERSION;
+    save();
+    log('[Desensitize]', added.length
+      ? `默认词表已更新到 v${DEFAULT_TERMS_VERSION}，自动补充词条 ${added.length} 个：${added.join('、')}`
+      : `默认词表已是最新（v${DEFAULT_TERMS_VERSION}，无需补充词条）`);
+  }
+
   function load() {
     try {
       if (!existsSync(file)) return;
@@ -223,6 +282,9 @@ export function createDesensitizer({ directory, log = () => {} } = {}) {
       if (typeof json.enabled === 'boolean') enabled = json.enabled;
       if (Array.isArray(json.terms)) terms = normalizeTerms(json.terms);
       if (Array.isArray(json.roles)) roles = normalizeRoles(json.roles);
+      // 老版本写出的文件没有该字段，视为版本 1（只有初版默认词表）
+      defaultsVersion = Number(json.defaultsVersion) >= 1 ? Number(json.defaultsVersion) : 1;
+      migrateDefaults();
       rebuild();
       log('[Desensitize]', `已加载词表：${terms.length} 个词，${enabled ? '启用' : '停用'}`);
     } catch (error) {
@@ -233,7 +295,11 @@ export function createDesensitizer({ directory, log = () => {} } = {}) {
   function save() {
     try {
       mkdirSync(directory, { recursive: true });
-      writeFileSync(file, `${JSON.stringify({ enabled, terms, roles }, null, 2)}\n`, 'utf8');
+      writeFileSync(
+        file,
+        `${JSON.stringify({ enabled, terms, roles, defaultsVersion }, null, 2)}\n`,
+        'utf8',
+      );
       return true;
     } catch (error) {
       log('[Desensitize]', `词表保存失败: ${error.message}`);
@@ -243,7 +309,9 @@ export function createDesensitizer({ directory, log = () => {} } = {}) {
 
   /**
    * 主入口：处理一次入站请求体。
-   * 返回 { body, changed, hits }；未命中时 body 为原引用。
+   * 返回 { body, changed, hits, matched, termCounts }；未命中时 body 为原引用。
+   * matched 为命中的词列表（无计数，保持向后兼容），
+   * termCounts 为按命中次数降序的 [{ term, count }, ...]，供运行日志展示每词次数。
    */
   function processBody(body) {
     stats.requests += 1;
@@ -259,7 +327,15 @@ export function createDesensitizer({ directory, log = () => {} } = {}) {
     for (const [term, count] of counter.terms) {
       stats.termHits.set(term, (stats.termHits.get(term) || 0) + count);
     }
-    return { body: next, changed: true, hits: counter.total, matched: [...counter.terms.keys()] };
+    return {
+      body: next,
+      changed: true,
+      hits: counter.total,
+      matched: [...counter.terms.keys()],
+      termCounts: [...counter.terms.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([term, count]) => ({ term, count })),
+    };
   }
 
   function statsSnapshot({ top = 20 } = {}) {
@@ -288,7 +364,12 @@ export function createDesensitizer({ directory, log = () => {} } = {}) {
       terms: [...terms],
       roles: [...roles],
       termCount: terms.length,
-      defaults: { enabled: true, terms: [...DEFAULT_TERMS], roles: [...DEFAULT_ROLES] },
+      defaults: {
+        enabled: true,
+        terms: [...DEFAULT_TERMS],
+        roles: [...DEFAULT_ROLES],
+        version: DEFAULT_TERMS_VERSION,
+      },
       file,
       stats: statsSnapshot(),
     };

@@ -1,0 +1,245 @@
+/* ─────────────────────────────────────────────
+   WorkBuddy 本地代理 · 设计令牌
+   所有颜色都以变量下发，浅色 / 深色两套在这里统一定义。
+   组件与页面只引用变量，不再各自写死颜色。
+   ───────────────────────────────────────────── */
+
+:root {
+  color-scheme: light;
+
+  --font-sans: "Segoe UI", "Microsoft YaHei", "Microsoft YaHei UI", system-ui, sans-serif;
+  --font-mono: Consolas, "Cascadia Mono", "Courier New", monospace;
+
+  /* 画布与表面：三层高度，越靠上越亮 */
+  --bg: #eaeef7;
+  --bg-grad-a: rgba(255, 255, 255, .85);
+  --bg-grad-b: rgba(226, 234, 255, .7);
+  --surface: #ffffff;
+  --surface-2: #f6f8fd;
+  --surface-3: #eef2fa;
+  --surface-inset: #f3f6fc;
+  --border: #e3e8f2;
+  --border-strong: #ccd5e6;
+  --hairline: rgba(15, 23, 42, .07);
+
+  /* 文本三档 */
+  --text: #0f172a;
+  --text-2: #4a5668;
+  --text-3: #7d8798;
+
+  /* 品牌 */
+  --primary: #3d6ff5;
+  --primary-hover: #2f5fe6;
+  --primary-top: #5a86ff;
+  --primary-soft: #e9efff;
+  --primary-bd: #c6d6ff;
+  --primary-fg: #1e4fd0;
+
+  /* 语义色 */
+  --ok: #0f9d63;
+  --ok-soft: #e2f7ec;
+  --ok-bd: #b1e6cd;
+  --warn: #b0741a;
+  --warn-soft: #fdf3de;
+  --warn-bd: #f0d9a6;
+  --danger: #d5444f;
+  --danger-soft: #fdeced;
+  --danger-bd: #f5c5ca;
+  --info: #2f7dd1;
+  --info-soft: #eaf3fd;
+  --info-bd: #c3dcf6;
+
+  /* 版本标签 */
+  --cn: #d9544b;
+  --cn-soft: #fdecea;
+  --cn-bd: #f6cdc9;
+  --intl: #4a63d8;
+  --intl-soft: #ecf0ff;
+  --intl-bd: #ccd6fb;
+
+  /* 形状 */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 18px;
+  --r-pill: 999px;
+
+  /* 阴影 */
+  --shadow-1: 0 1px 2px rgba(15, 23, 42, .05);
+  --shadow-2: 0 1px 2px rgba(15, 23, 42, .05), 0 10px 26px -16px rgba(15, 23, 42, .34);
+  --shadow-3: 0 2px 8px rgba(15, 23, 42, .06), 0 22px 54px -22px rgba(15, 23, 42, .42);
+  --glow: 0 1px 2px rgba(20, 40, 90, .16), 0 10px 22px -12px rgba(61, 111, 245, .7);
+  --ring: 0 0 0 3px rgba(61, 111, 245, .2);
+
+  /* 尺寸 */
+  --sidebar-w: 216px;
+  --topbar-h: 50px;
+  --pad: 20px;
+  /* 内容区最大宽度（不含侧边栏）。用 vw 而不是 %：
+     % 相对的是「已排除侧边栏和内边距」的可用宽度，那样任何窗口下都会被限制成 80%，
+     内容永远占不满；vw 相对整个窗口，于是窗口 ≤1280px 时内容占满、
+     更宽时才收在 80vw 并居中（默认 1060px 窗口不受影响）。 */
+  --content-max: 80vw;
+  --sb-w: 11px;          /* 滚动条宽度：表头对齐要靠它补偿 */
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #090c13;
+  --bg-grad-a: rgba(24, 33, 53, .9);
+  --bg-grad-b: rgba(22, 32, 58, .75);
+  --surface: #12161f;
+  --surface-2: #171c27;
+  --surface-3: #1e2431;
+  --surface-inset: #0e1219;
+  --border: #232a39;
+  --border-strong: #333d51;
+  --hairline: rgba(255, 255, 255, .07);
+
+  --text: #e9edf6;
+  --text-2: #a4aec0;
+  --text-3: #6e7a8e;
+
+  --primary: #5b8cff;
+  --primary-hover: #7099ff;
+  --primary-top: #6d99ff;
+  --primary-soft: rgba(91, 140, 255, .15);
+  --primary-bd: rgba(91, 140, 255, .36);
+  --primary-fg: #a9c3ff;
+
+  --ok: #38c98c;
+  --ok-soft: rgba(56, 201, 140, .14);
+  --ok-bd: rgba(56, 201, 140, .32);
+  --warn: #e2a94f;
+  --warn-soft: rgba(226, 169, 79, .14);
+  --warn-bd: rgba(226, 169, 79, .32);
+  --danger: #f2707c;
+  --danger-soft: rgba(242, 112, 124, .14);
+  --danger-bd: rgba(242, 112, 124, .32);
+  --info: #62a6f0;
+  --info-soft: rgba(98, 166, 240, .14);
+  --info-bd: rgba(98, 166, 240, .3);
+
+  --cn: #f0837a;
+  --cn-soft: rgba(240, 131, 122, .14);
+  --cn-bd: rgba(240, 131, 122, .3);
+  --intl: #93a9ff;
+  --intl-soft: rgba(122, 148, 255, .14);
+  --intl-bd: rgba(122, 148, 255, .3);
+
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, .4);
+  --shadow-2: 0 1px 2px rgba(0, 0, 0, .4), 0 12px 28px -18px rgba(0, 0, 0, .8);
+  --shadow-3: 0 2px 10px rgba(0, 0, 0, .45), 0 26px 60px -24px rgba(0, 0, 0, .85);
+  --glow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 22px -14px rgba(91, 140, 255, .9);
+  --ring: 0 0 0 3px rgba(91, 140, 255, .28);
+}
+
+/* system 模式跟随系统深浅 */
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    color-scheme: dark;
+
+    --bg: #090c13;
+    --bg-grad-a: rgba(24, 33, 53, .9);
+    --bg-grad-b: rgba(22, 32, 58, .75);
+    --surface: #12161f;
+    --surface-2: #171c27;
+    --surface-3: #1e2431;
+    --surface-inset: #0e1219;
+    --border: #232a39;
+    --border-strong: #333d51;
+    --hairline: rgba(255, 255, 255, .07);
+
+    --text: #e9edf6;
+    --text-2: #a4aec0;
+    --text-3: #6e7a8e;
+
+    --primary: #5b8cff;
+    --primary-hover: #7099ff;
+    --primary-top: #6d99ff;
+    --primary-soft: rgba(91, 140, 255, .15);
+    --primary-bd: rgba(91, 140, 255, .36);
+    --primary-fg: #a9c3ff;
+
+    --ok: #38c98c;
+    --ok-soft: rgba(56, 201, 140, .14);
+    --ok-bd: rgba(56, 201, 140, .32);
+    --warn: #e2a94f;
+    --warn-soft: rgba(226, 169, 79, .14);
+    --warn-bd: rgba(226, 169, 79, .32);
+    --danger: #f2707c;
+    --danger-soft: rgba(242, 112, 124, .14);
+    --danger-bd: rgba(242, 112, 124, .32);
+    --info: #62a6f0;
+    --info-soft: rgba(98, 166, 240, .14);
+    --info-bd: rgba(98, 166, 240, .3);
+
+    --cn: #f0837a;
+    --cn-soft: rgba(240, 131, 122, .14);
+    --cn-bd: rgba(240, 131, 122, .3);
+    --intl: #93a9ff;
+    --intl-soft: rgba(122, 148, 255, .14);
+    --intl-bd: rgba(122, 148, 255, .3);
+
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, .4);
+    --shadow-2: 0 1px 2px rgba(0, 0, 0, .4), 0 12px 28px -18px rgba(0, 0, 0, .8);
+    --shadow-3: 0 2px 10px rgba(0, 0, 0, .45), 0 26px 60px -24px rgba(0, 0, 0, .85);
+    --glow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 22px -14px rgba(91, 140, 255, .9);
+    --ring: 0 0 0 3px rgba(91, 140, 255, .28);
+  }
+}
+
+/* ─── 基础重置 ─── */
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  min-width: 720px;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(1000px 460px at 6% -12%, var(--bg-grad-a) 0%, rgba(255, 255, 255, 0) 62%),
+    radial-gradient(820px 420px at 98% -6%, var(--bg-grad-b) 0%, rgba(255, 255, 255, 0) 58%);
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, p { margin: 0; }
+
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+code, kbd { font-family: var(--font-mono); font-size: .93em; }
+
+/* hidden 属性必须压过组件自身 display，否则弹窗 / 进度块会默认露出来 */
+[hidden] { display: none !important; }
+
+:focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--r-sm); }
+
+::selection { background: var(--primary-soft); color: var(--text); }
+
+/* ─── 滚动条 ─── */
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+
+::-webkit-scrollbar { width: var(--sb-w); height: var(--sb-w); }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: var(--r-pill);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--text-3); background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* ─── 工具类 ─── */
+.mono { font-family: var(--font-mono); }
+.muted { color: var(--text-3); }
+.spacer { flex: 1 1 auto; }

@@ -1,19 +1,25 @@
 //! 应用共享状态。
 //!
-//! 只放可变、跨命令共享的部分：后端进程句柄、登录会话，以及窗口生命周期
+//! 只放可变、跨命令共享的部分：进程内服务器句柄、登录会话，以及窗口生命周期
 //! 相关的两个开关（退出标志、关闭到托盘）。
 //! 窗口句柄不在这里 —— 由 Tauri 的 `AppHandle::get_webview_window` 按标签查找，
 //! 避免自己维护一份可能失同步的副本。
 
-use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-/// 后端进程由我们拉起时才会记录；复用外部已启动的服务时保持 None，
-/// 退出时据此决定要不要杀进程（不能误杀用户自己起的服务）。
+use tokio::sync::oneshot;
+
+/// 进程内 HTTP 服务器的停机句柄。
+///
+/// 旧版本这里放的是 `Option<Child>`（外部 node 子进程）；后端改成进程内服务器后
+/// 不再有子进程可杀，改为「发送一次停机信号 + 记下端口」。
+/// 语义上的关键差别：现在是**无条件**持有句柄 —— 不再有「复用外部已运行服务」
+/// 那种「没有 child 就什么都不做」的分支，因为服务器一定由本进程启动。
 #[derive(Default)]
 pub struct BackendHandle {
-    pub child: Option<Child>,
+    /// 停机信号发送端；take 走后不再持有（shutdown 幂等）
+    pub shutdown_tx: Option<oneshot::Sender<()>>,
     pub port: u16,
 }
 

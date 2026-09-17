@@ -35,8 +35,9 @@
     toggle.disabled = false;
     badge.className = data_.enabled ? 'badge ok' : 'badge';
     badge.textContent = data_.enabled ? `已启用 · ${data_.termCount} 个词` : '已关闭';
+    // 作用角色由下方勾选框直接呈现，这里不重复罗列，只说明当前是否生效
     $('desensitize-state').textContent = data_.enabled
-      ? `作用角色：${(data_.roles || []).join('、') || '—'}`
+      ? '按下方勾选的角色改写请求'
       : '当前不处理任何消息；关闭状态已保存，重启后仍然生效';
 
     // 作用角色勾选

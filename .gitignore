@@ -6,11 +6,15 @@ desktop-tauri/node_modules/
 desktop-tauri/src-tauri/target/
 desktop-tauri/src-tauri/gen/schemas/
 
-# 由 npm run build:backend 生成的运行时资源（node.exe 约 87MB + server.cjs）
+# 由 npm run build:backend 生成的 Node 版运行资源（server.cjs + node.exe）
+# 仅用于 Node CLI 场景；桌面端已是纯 Rust 进程内服务器，不再打包这些文件
 desktop-tauri/src-tauri/resources/
 
 # 本地开发过程产物
 .zcode/
+.verify/
+prototype/
+workbuddy-proxy-main/
 
 # 运行日志与截图产物
 logs/

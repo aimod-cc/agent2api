@@ -76,7 +76,12 @@ pub fn show_main_window(app: &AppHandle) {
 /// 先置位「正在退出」标志再 `exit(0)`：开启关闭到托盘时，`exit(0)` 同样会走
 /// `RunEvent::ExitRequested`，没有这个标志就会被当成「用户关窗」再拦一次，
 /// 表现为「托盘点了退出但进程还在」。
+///
+/// 这里还要显式回收后端：`exit(0)` 这种程序化退出不保证触发 `RunEvent::Exit`
+/// （Tauri 已知行为），只靠 lib.rs 的兜底分支会漏掉，node 会带着 3065 端口
+/// 残留在后台。shutdown 是幂等的，多调一次无害。
 pub fn request_exit(app: &AppHandle) {
     app.state::<AppState>().begin_exit();
+    crate::backend::shutdown(&app.state::<AppState>());
     app.exit(0);
 }

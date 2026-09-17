@@ -1,0 +1,471 @@
+/* ─────────────────────────────────────────────
+   账号页：卡片式账号列表
+   默认窗口 1060px、最小 820px。侧栏 216/68px + 内边距后，
+   卡片区可用宽度约 680–1500px。
+   ───────────────────────────────────────────── */
+
+/* 表格容器：外层定宽，内部统一滚动 */
+.account-table {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.acct-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  /* 常驻预留滚动条槽：有无滚动条时卡片区宽度一致，列数不会跳变 */
+  scrollbar-gutter: stable;
+}
+
+/* ─── 卡片网格 ───
+   轨道宽度被夹在 340–353px，列数随可用宽度自适应。
+
+   为什么不用 fr：fr 会让卡片随窗口等比变宽。窗口 1900px 时单卡能到 600px 以上，
+   卡片内部「转发顺序 ↔ 操作按钮」又会被拉开一道空白 —— 那正是要修的毛病
+   换到卡片内部重演。封顶 353px 才能保证卡片始终紧凑。
+
+   353 这个上限是逆推的：默认窗口内容区 804px，减网格内边距 32px 得 772px；
+   两列需要 353×2 + 12 = 718px，排得下。取到 360 就要 732px 才够，仍是两列，
+   但更宽窗口下会少排一列。
+
+   340 是下限：最小窗口 820px 时轨道区约 680px，两列需要 692px，排不下 → 单列。
+   这个下限同时决定卡片最窄宽度，底部操作区按它校验过（见文末容器查询）。 */
+.acct-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 353px));
+  gap: 12px;
+  padding: 14px 16px 16px;
+  justify-content: center;
+  /* 卡片各按自身内容定高：默认的 stretch 会让同行卡片一起等高，
+     某张卡展开积分明细后旁边两张被拉成一样高，中间空出一大块。 */
+  align-items: start;
+}
+
+/* 分组标题（国内 / 国际）横跨整行 */
+.acct-group-title {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+
+.acct-group-title::after { content: ""; flex: 1 1 auto; height: 1px; background: var(--border); }
+
+/* ─── 卡片本体 ─── */
+.acct-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 9px;
+  min-width: 0;
+  /* 命名容器：底部操作按钮的显隐按卡片自身宽度判断，而不是窗口宽度 */
+  container-type: inline-size;
+  container-name: card;
+  /* 横向 12px：队长那张卡底部要 328px（P 值带 ★ + 「已是首选」四个字），
+     13px 内边距下内容盒只有 326px 会溢出 2px；12px 得到 329px，刚好放下。 */
+  padding: 12px 12px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-1);
+  transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
+}
+
+.acct-card:hover { border-color: var(--border-strong); box-shadow: var(--shadow-2); }
+
+.acct-card.selected { border-color: var(--primary-bd); background: var(--primary-soft); }
+.acct-card.selected:hover { border-color: var(--primary); }
+
+/* 队首（该模型实际选中的账号）：左侧一道品牌色竖条，扫一片卡片时一眼能找到 */
+.acct-card.is-first { border-color: var(--primary-bd); }
+
+.acct-card.is-first::before {
+  content: "";
+  position: absolute;
+  left: -1px;
+  top: 11px;
+  bottom: 11px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
+  background: var(--primary);
+}
+
+/* 已禁用：整卡压暗，和可用账号区分开 */
+.acct-card.disabled { background: var(--surface-2); }
+.acct-card.disabled .who-name .name { color: var(--text-3); }
+.acct-card.disabled .rank { color: var(--text-3); }
+
+/* ─── ① 主体：勾选 / 账号 / 状态 ───
+   每一层都要显式写 min-width: 0。flex 项默认 min-width: auto，
+   会以「内容最小宽度」当底线 —— 而账号名是 white-space: nowrap 的长邮箱，
+   最小宽度就是整串文字，于是这一行撑破卡片、状态徽章被挤出右边缘。 */
+.card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+
+/* 勾选框：做成与账号名同高的 20px 盒并居中，中线与账号名重合。
+   不用 align-self: center —— 那会居中在「账号名 + 明细」整块上（偏低 10px），
+   读起来像挂在明细行上；勾选框属于账号本身，应该贴着账号名。 */
+.card-head .pick {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  height: 20px;
+}
+
+.card-head .pick input { width: 15px; height: 15px; margin: 0; accent-color: var(--primary); cursor: pointer; }
+
+.who { flex: 1 1 auto; min-width: 0; }
+
+.who-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+
+.who-name .name {
+  /* 同样要给 0 下限：默认 auto 会让省略号失效。
+     行高写死 20px，与 .pick 的高度共用同一个常量 —— 用 1.4 这类倍率的话，
+     字号一改这里的对齐又会悄悄偏掉。 */
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: 14.5px;
+  font-weight: 650;
+  letter-spacing: -.1px;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.who-name .badge { flex: 0 0 auto; }
+
+.who-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.who-meta .tail { font-family: var(--font-mono); font-size: 10.5px; }
+.who-meta .sep { opacity: .5; }
+.who-meta .proxy { color: var(--info); }
+
+/* ─── 状态徽章：贴在账号名右侧 ───
+   状态是账号的属性，贴着账号读最顺；放在卡片右上角也避免它被拉离账号。 */
+.card-state {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  max-width: 46%;
+}
+
+.card-state .badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+
+/* 「正常」是绝大多数，做成低饱和的绿点 + 灰字，整片扫下来是安静的底噪；
+   429 / 代理异常继续用彩色徽章，一眼跳出来 —— 这一区要回答的是
+   「哪个账号有问题」，而不是「哪些账号正常」。 */
+.card-state .badge.tag.ok {
+  gap: 5px;
+  min-height: 0;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+  font-weight: 500;
+}
+
+.card-state .badge.tag.ok::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--ok);
+}
+
+/* 禁用账号的「未启用」同样压暗，不和异常状态抢注意力 */
+.acct-card.disabled .card-state .badge {
+  min-height: 0;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+  font-weight: 500;
+}
+
+/* ─── ② 异常提示条 ───
+   状态徽章只说「是什么」，这一行补「怎么办」。
+   只在异常时渲染，正常卡片不占这行高度。 */
+.card-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 9px;
+  border-radius: var(--r-xs);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.card-note .ico { flex: 0 0 auto; }
+.card-note.warn { border: 1px solid var(--warn-bd); background: var(--warn-soft); color: var(--warn); }
+.card-note.bad { border: 1px solid var(--danger-bd); background: var(--danger-soft); color: var(--danger); }
+
+/* ─── ③ 底部：转发顺序 + 操作 ─── */
+.card-foot {
+  /* 定位祖先：⋯ 菜单挂在它下面，从按钮下方展开 */
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.rank {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+
+.rank .p { color: var(--text-3); font-weight: 500; }
+.rank.is-first { color: var(--primary-fg); }
+.rank.is-first .p { color: var(--primary-fg); opacity: .7; }
+.rank .star { margin-right: 4px; font-size: 10px; line-height: 1; }
+
+.card-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  /* 不允许折行：按钮换行会把卡片撑高，破坏「一张卡一个账号」的扫读节奏 */
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.card-actions button {
+  height: 25px;
+  padding: 0 8px;
+  border-radius: var(--r-xs);
+  font-size: 11.5px;
+}
+
+.card-actions button:hover:not(:disabled) {
+  border-color: var(--primary-bd);
+  background: var(--surface);
+  color: var(--primary-fg);
+}
+
+/* ─── 「已是首选」：反色实心块 ───
+   它不是可点的操作，而是「这支账号就是队首」的状态声明；
+   disabled 只用于阻止重复点击，视觉上不能按禁用态处理。
+   卡片一多就需要一眼扫到首选在哪张，所以做成整排按钮里唯一的实心块。
+
+   反色靠令牌互换实现，两套主题各自自动反向：
+     --text    浅色 #0f172a（近黑）/ 深色 #e9edf6（近白）
+     --surface 浅色 #ffffff（白）  / 深色 #12161f（近黑）
+   于是浅色下深底浅字、深色下浅底深字，不必分别写两套规则。 */
+.card-actions button.is-current {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--surface);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+}
+
+/* 压过 .btn:disabled 的透明度 —— 否则实心块被冲淡成灰色，
+   在浅色主题下又和普通按钮分不出来了 */
+.card-actions button.is-current:disabled { opacity: 1; }
+
+/* ↑/↓ 拼成一组 */
+.order-btns { display: inline-flex; flex: 0 0 auto; }
+
+.order-btns button {
+  width: 24px;
+  padding: 0;
+  border-radius: 0;
+  color: var(--text-2);
+  font-size: 10.5px;
+  line-height: 1;
+}
+
+.order-btns button:first-child { border-radius: var(--r-xs) 0 0 var(--r-xs); }
+.order-btns button:last-child { border-radius: 0 var(--r-xs) var(--r-xs) 0; }
+.order-btns button + button { margin-left: -1px; }
+.order-btns button:hover:not(:disabled) { position: relative; z-index: 1; }
+.order-btns button:disabled { opacity: .3; }
+
+/* ⋯ 更多菜单：点击才插入 DOM。绝对定位相对 .card-foot（见上面的 position: relative），
+   于是它从按钮下方展开，并随卡片一起滚动，不会浮在别的卡上。 */
+.more-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 4;
+  min-width: 152px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-3);
+}
+
+.more-menu button {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  height: auto;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-2);
+  font-size: 12px;
+  text-align: left;
+}
+
+.more-menu button:hover { background: var(--surface-3); border-color: transparent; color: var(--text); }
+.more-menu button.danger { color: var(--danger); }
+.more-menu button.danger:hover { background: var(--danger-soft); }
+.more-menu hr { margin: 4px 6px; border: 0; border-top: 1px solid var(--hairline); }
+
+/* ─── 卡片内的明细面板（积分 / 签到） ───
+   追加在卡片末尾（卡片本身是 flex 列），随卡片一起增高，
+   同行其他卡片不受影响。 */
+.row-panels { display: contents; }
+
+.acct-card .row-panel {
+  margin: 0;
+  /* 右侧多留 30px 给绝对定位的「收起」按钮，内容不会压到它下面 */
+  padding: 10px 30px 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-size: 11.5px;
+  /* 横向排列 + 换行：面板内容本来就是「总剩余 / 套餐 / 奖励」这类短字段，
+     排成一行最紧凑（353px 卡片里约两行）。改成纵向的话每个字段独占一行，
+     面板高度从 ~46px 涨到 ~130px，卡片被撑得很空。 */
+  display: flex;
+  align-items: baseline;
+  gap: 4px 12px;
+  flex-wrap: wrap;
+  position: relative;
+}
+
+.acct-card .row-panel.error { border-color: var(--danger-bd); background: var(--danger-soft); color: var(--danger); }
+
+/* 「收起」按钮固定到右上角。
+   面板是 flex 容器，让按钮跟在内容后面自然排布的话，
+   它会被当成最后一个 flex 项、挤在文字后面（窄卡片里还会换行独占一行）。 */
+.acct-card .row-panel .panel-close {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.acct-card .row-panel .panel-close:hover { background: var(--surface-3); border-color: transparent; color: var(--text); }
+
+.acct-card .row-panel-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+
+.acct-card .row-panel .big { color: var(--ok); font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.acct-card .row-panel b { color: var(--text); font-variant-numeric: tabular-nums; }
+.acct-card .row-panel .error { color: var(--danger); }
+
+.acct-card .row-panel .panel-label { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.acct-card .row-panel .row { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+
+/* ─── 批量栏 ─── */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+
+.batch-bar.active { background: var(--primary-soft); border-bottom-color: var(--primary-bd); }
+
+.batch-select-all { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; white-space: nowrap; }
+.batch-select-all input { width: 14px; height: 14px; margin: 0; accent-color: var(--primary); cursor: pointer; }
+.batch-select-all span { white-space: nowrap; }
+
+.batch-count { color: var(--text-3); white-space: nowrap; }
+.batch-count b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+.batch-hidden { color: var(--warn); font-size: 11px; }
+
+.batch-actions { margin-left: auto; display: flex; gap: 5px; flex-wrap: wrap; }
+
+.batch-actions button {
+  height: 25px;
+  padding: 0 9px;
+  border-radius: var(--r-xs);
+  font-size: 11.5px;
+}
+
+/* ─── 页脚 ─── */
+.table-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 11px;
+  flex-wrap: wrap;
+}
+
+.table-foot .spacer { flex: 1 1 auto; }
+
+/* ─── 卡片过窄时收起「设为首选」 ───
+   卡片宽度由网格固定在 340–353px，与窗口宽度无关，
+   所以这里必须按卡片自身宽度判断（容器查询），不能用 media query：
+   窗口 900px 时窗口很窄、卡片却仍是 353px 宽，按窗口收会白收一通。
+
+   阈值按**内容盒**算：container-type: inline-size 量的是内容盒
+   （353 − 左右内边距 24 = 329px）。底部操作区在队首卡上需要 328px
+   （P 值 41 + 间距 7 + 按钮组 280），所以 325px 以下才需要收起。
+   「设为首选」在「⋯」菜单与账号设置里都能完成，收起不影响可达性。 */
+@container card (max-width: 325px) {
+  .card-actions button.wide { display: none; }
+}
