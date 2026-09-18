@@ -1,5 +1,6 @@
 /* ─────────────────────────────────────────────
-   日志页：时间线
+   日志页：两个视图（系统事件时间线 / 模型请求明细）
+   颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
    ───────────────────────────────────────────── */
 
 .log-filters {
@@ -13,11 +14,42 @@
 
 .log-filters select { width: auto; min-width: 120px; }
 
-.log-filters input[type="search"] { flex: 1 1 180px; }
+/* 关键词输入框是这一行唯一的弹性项：它吃掉剩余宽度，其余控件定宽。
+   basis 从原先的 180px 收到 140px —— 新增的时间档位占掉约 235px，
+   默认窗口（1060px、内容区约 772px）下这一行本来就贴着边：
+   按 180px 算，输入框会被压到小于自身 min-content 而硬顶出换行；
+   140px 仍放得下十来个汉字，也让「今天」这档在窄一点的窗口下才换行。
+   min-width 必须显式写：search 框不给的话，flex 收缩会被它自身 size 属性
+   算出的 min-content 卡住，收缩量不受控。 */
+.log-filters input[type="search"] { flex: 1 1 140px; min-width: 120px; }
 
-/* 两个开关（不看脱敏 / 自动刷新）作为一组推向最右，彼此紧挨 */
-.log-filters .switch { margin-left: auto; }
-.log-filters .switch + .switch { margin-left: 0; }
+/* 时间范围的分段控件：与报表页 #report-range、账号页工具条是同一个组件，
+   gap 跟着筛选行的 8px 走，不再单独放宽。段数多（5 档）时不给它伸缩：
+   挤不下就整组换行，压扁会让「本月」和「30 天」看着像同一个按钮。 */
+.log-filters .seg { flex: 0 0 auto; }
+
+/* 「不看脱敏」是筛选行里唯一的开关，放在关键词输入框之后。
+   输入框 flex-grow:1 已经把剩余宽度吃干净，所以它自然落到行尾，
+   不需要 margin-left:auto（那样在输入框被换成更短控件时会把它甩到很远）。 */
+.log-filters .switch { flex: 0 0 auto; }
+
+/* 请求视图筛选行右侧的读数（当前档位 + 状态口径） */
+.log-filters .panel-sub {
+  color: var(--text-3);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+/* 窄窗口：页头的视图切换与自动刷新整行铺开，与报表页的时间范围同款处理
+   （那里是 #report-range 折行）。不折的话两段控件会压在标题文案上换行，
+   标题与 intro 各自占一行，读起来像断了半句。 */
+@media (max-width: 900px) {
+  .page[data-page="logs"] .page-head .head-actions {
+    flex-basis: 100%;
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+}
 
 .log-list {
   display: flex;
@@ -27,7 +59,8 @@
   min-height: 0;
   overflow-y: auto;
   border: 1px solid var(--border);
-  border-radius: var(--r-md);
+  /* 承载整列日志的容器，跟面板同档的大圆角 */
+  border-radius: var(--r-lg);
   background: var(--surface-inset);
 }
 
@@ -35,8 +68,8 @@
 .log-row {
   display: grid;
   grid-template-columns: 10px minmax(0, 1fr) auto;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: 12px;
+  padding: 11px 14px;
   border-bottom: 1px solid var(--hairline);
   transition: background .12s ease;
   /* 列表是 flex 列容器：条目不许被压缩，超出的一律交给列表滚动 */
@@ -54,11 +87,13 @@
   padding-top: 4px;
 }
 
+/* 竖线从圆点光环下方（4 + 7 + 3）起，画到下一行的分隔线为止：
+   bottom 抵消本行的下内边距 + 1px 分隔线，行内边距改了这里要跟着改。 */
 .log-rail::after {
   content: "";
   position: absolute;
   top: 14px;
-  bottom: -11px;
+  bottom: -12px;
   width: 1px;
   background: var(--hairline);
 }
@@ -71,6 +106,7 @@
   flex: 0 0 auto;
   border-radius: 50%;
   background: var(--text-3);
+  /* 光环取列表底色，圆点才像从轨道上「挖」出来的；悬浮时底色换成行底色 */
   box-shadow: 0 0 0 3px var(--surface-inset);
 }
 
@@ -90,7 +126,7 @@
 .log-line {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   flex-wrap: wrap;
   min-width: 0;
 }
@@ -99,8 +135,8 @@
 .log-cat {
   display: inline-flex;
   align-items: center;
-  height: 18px;
-  padding: 0 7px;
+  height: 20px;
+  padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: var(--r-xs);
   background: var(--surface-3);
@@ -113,13 +149,15 @@
 .log-row.warn .log-cat { background: var(--warn-soft); border-color: var(--warn-bd); color: var(--warn); }
 .log-row.error .log-cat { background: var(--danger-soft); border-color: var(--danger-bd); color: var(--danger); }
 
-/* 级别（色块 + 文字） */
+/* 级别徽章：淡底 + 描边 + 深字，与分类标签并排等高于一行 */
 .log-lvl {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0 6px;
-  height: 18px;
+  height: 20px;
+  padding: 0 7px;
+  /* 先给一层透明描边占位：四个级别切换时尺寸不跳 */
+  border: 1px solid transparent;
   border-radius: var(--r-xs);
   font-family: var(--font-mono);
   font-size: 10px;
@@ -129,16 +167,19 @@
   white-space: nowrap;
 }
 
-.log-lvl.info { color: var(--info); background: var(--info-soft); }
-.log-lvl.debug { color: var(--text-3); background: var(--surface-3); }
-.log-lvl.warn { color: var(--warn); background: var(--warn-soft); }
-.log-lvl.error { color: var(--danger); background: var(--danger-soft); }
+.log-lvl.info { color: var(--info); background: var(--info-soft); border-color: var(--info-bd); }
+/* debug 没有专属语义色，用文字色 + 中性面 + 常规描边凑成同一套三件套 */
+.log-lvl.debug { color: var(--text-3); background: var(--surface-3); border-color: var(--border); }
+.log-lvl.warn { color: var(--warn); background: var(--warn-soft); border-color: var(--warn-bd); }
+.log-lvl.error { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-bd); }
 
+/* 正文用等宽：日志里混着账号 ID、路径、端点，列对齐了才扫得快 */
 .log-row .msg {
   min-width: 0;
   color: var(--text);
+  font-family: var(--font-mono);
   font-size: 12px;
-  line-height: 1.55;
+  line-height: 1.6;
   word-break: break-word;
 }
 
@@ -150,7 +191,7 @@
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  padding: 3px 9px;
+  padding: 4px 10px;
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
   background: var(--surface);
@@ -177,6 +218,7 @@
 .log-row.error:hover { background: var(--danger-soft); }
 
 .log-empty {
+  /* 与组件层的 .empty 保持同一档留白，两者是同一种空态 */
   padding: 30px 16px;
   color: var(--text-3);
   font-size: 12.5px;
@@ -191,14 +233,153 @@
 .log-pager {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   /* 页脚允许换行：窄窗口下分页整组一起掉到下一行，不会被拆散 */
   flex: 0 0 auto;
 }
+
+/* 翻页按钮按行内控件档收圆角，与上面同排的筛选控件保持一致。
+   带上 .sm 是为了压过组件层给 .sm 的小圆角，不靠文件加载顺序取胜。 */
+.log-pager button.sm { border-radius: var(--r-sm); }
 
 .log-pager-info {
   color: var(--text-2);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+
+/* ─── 模型请求明细（第二个视图） ───
+   与事件日志共用 .log-list（同一档边框 / 圆角 / 凹槽底 / 滚动行为）与 .log-empty
+   （空态居中靠的是 .log-list > .log-empty:only-child），这里只补表格本身。
+   为什么用 CSS Grid 而不是 <table>：这一块的每行都要在窄窗口下重排，
+   Grid 的列定义与媒体查询是同一套写法，表格的 colgroup 做不到按断点换列。 */
+
+/* 六列：时间 / 模型 / 账号 / 状态 / 耗时 / Token。
+   时间与耗时、Token 定宽（等宽数字 + tabular-nums，竖着比对才齐），
+   模型与账号各占一份弹性宽度（都是不定长的标识符，给固定宽度会互相挤）；
+   账号列给的是 minmax(0, 0.8fr)：它比模型短，且长昵称要能省略号收住。 */
+.req-row,
+.req-head {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1.6fr) minmax(0, 0.9fr) 62px 78px minmax(0, 96px);
+  gap: 12px;
+  align-items: center;
+  padding: 10px 14px;
+  /* 列表是 flex 列容器：条目不许被压缩，超出的一律交给列表滚动 */
+  flex: none;
+}
+
+/* 表头：粘在列表顶部。列表自身滚动，滚动条是它自己的（不是页面），
+   sticky 的参照物就是 .log-list，因此顶部偏移写 0。 */
+.req-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+
+.req-row { border-bottom: 1px solid var(--hairline); transition: background .12s ease; }
+.req-row:last-child { border-bottom: none; }
+.req-row:hover { background: var(--surface-2); }
+
+/* 表头里耗时 / Token 两格跟数值同侧对齐（数值列是右对齐的，见 .req-num） */
+.req-head .req-dur,
+.req-head .req-tok { text-align: right; }
+
+/* 失败行轻微着色，与事件日志 error 行同一手法（不干扰阅读的淡底） */
+.req-row.failed { background: color-mix(in srgb, var(--danger-soft) 45%, transparent); }
+.req-row.failed:hover { background: var(--danger-soft); }
+
+/* 时间列：明细跨天，给到秒 + 月日，用等宽避免每一行的冒号错位 */
+.req-time {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 模型名：标识符用等宽，超长从尾部省略（完整值在 title 里） */
+.req-model {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.req-acct {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 无账号（请求在任何账号接手前就失败）用破折号：空着会被当成渲染缺失 */
+.req-acct.is-empty { color: var(--text-3); }
+
+/* 耗时 / Token：数字用等宽 + 右对齐，相邻两列排下来能直接竖着比大小；
+   附加说明（重试次数 / 缓存读取）在主数字下方，跟随同一边。 */
+.req-num {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 附加说明（重试次数 / 缓存读取）：比主读数小一号、淡一档，
+   不抢主数字但同行可比 */
+.req-sub {
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+
+/* 错误摘要横跨整行：它是失败原因，读的是句子而不是单元格，
+   挤在 84px 的时间列里只能截断；占满一行也让失败行在扫读时先跳出来 */
+.req-error {
+  grid-column: 1 / -1;
+  padding: 5px 9px;
+  border: 1px solid var(--danger-bd);
+  border-radius: var(--r-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* 窄窗口：后三列收纳成第二行，免得每一列都缩成省略号。
+   断点取 1000px 的依据是内容区实际宽度 —— 默认窗口 1060px 时内容区约 772px，
+   六列里模型列还有 250px 左右（够放 `claude-sonnet-4-5` 这种长度的名字），
+   再窄一档模型名与账号名就开始互相挤，此时折成两行更好读。
+   820px 最小窗口下侧栏已收成 68px，四列反而比六列宽松得多。 */
+@media (max-width: 1000px) {
+  .req-row,
+  .req-head {
+    grid-template-columns: 78px minmax(0, 1fr) minmax(0, 0.8fr) 56px;
+    row-gap: 4px;
+  }
+  /* 表头里对应的两格直接隐藏（列数变了，留着会对错位） */
+  .req-head .req-dur,
+  .req-head .req-tok { display: none; }
+  .req-row .req-dur { grid-column: 1 / 3; }
+  .req-row .req-tok { grid-column: 3 / 5; }
 }

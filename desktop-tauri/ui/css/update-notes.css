@@ -1,0 +1,292 @@
+/* WorkBuddy 本地代理 · 设置页「软件更新」的更新日志与更新提示样式
+ *
+ * 为什么单独一个文件（而不是并进 page-settings.css）：
+ *   page-settings.css 里是各设置面板的排版（表单行、保留天数表格…），
+ *   这里则是「一段渲染出来的 Markdown 正文」的排版 + 版本卡片 + 导航小胶囊，
+ *   关注点不同；分开后更新日志的观感要整体调整时只动这一个文件。
+ *   本文件在 page-settings.css 之后加载（见 index.html 的样式顺序）。
+ *
+ * 颜色一律走 tokens.css 的变量，深浅两套主题自动适配。
+ */
+
+/* ─── 导航「设置」项上的更新提示 ───
+   复用 layout.css 里 .count 胶囊的尺寸/排版（与账号计数、日志未读同一套），
+   只把配色换成提示色：有新版本是好消息，用日志未读那种警示红会让人以为出了故障。
+   这里用 ID 选择器，是为了稳定压过 .nav-item .count:not(.muted) 的红色。 */
+#nav-count-update {
+  border-color: var(--warn-bd);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.nav-item.active #nav-count-update { background: var(--surface); }
+
+/* ─── 关于作者 / 收藏项目 ─── */
+.update-author {
+  display: flex;
+  align-items: center;
+  gap: 10px 14px;
+  flex-wrap: wrap;
+  padding: 11px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.update-author-text {
+  flex: 1 1 320px;
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.7;
+}
+
+.update-author-text strong { color: var(--text); font-weight: 650; margin-right: 6px; }
+
+.update-author-text a {
+  color: var(--primary-fg);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.update-author-text a:hover { text-decoration: underline; }
+
+.update-author-actions { display: flex; gap: 7px; margin-left: auto; }
+
+/* ─── 更新日志：外壳 ─── */
+.update-log {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.update-log-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+/* 用 span 而不是 h3：卡片正文里的 Markdown 标题已占用 h3~h6，
+   这里再插一个同级标题会让大纲层级与视觉层级打结 */
+.update-log-title { color: var(--text); font-size: 12.5px; font-weight: 650; }
+
+.update-log-meta {
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 列表区：不再自带滚动条。
+   折叠态每版只占一行，20 个版本远不到「非限高不可」的程度；而设置页右栏
+   （.settings-panes）本来就是滚动容器，这里再套一层就会变成「框里框外都能滚」——
+   滚到底部时继续滚会带着外层的设置项一起跳。整条时间轴直接铺开，只留一个滚动条。 */
+.update-log-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 加载中 / 空态 / 失败态的统一文案块：与面板既有的 .detail 一个观感 */
+.update-log-hint {
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.update-log-hint.bad { color: var(--danger); }
+
+.update-log-hint button { margin-left: 8px; }
+
+/* ─── 更新日志：最新一版的说明 ───
+   只展示最新一次发布，所以不再需要「列表 / 时间轴 + 逐条折叠」那套结构：
+   一份正文直接平铺成一张静态卡片，版本号与日期做卡头，正文接在下面。
+
+   为什么不做成折叠：只有这一份说明，折叠只会让用户多一次点击才能看到内容，
+   而看不到的风险是「不知道这次更新改了什么」—— 这正是这块 UI 存在的理由。
+   历史版本若有需要，卡尾的「在 GitHub 查看完整说明」直接跳到 Releases 页面。 */
+
+.rel-note {
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+/* 卡头：版本号 + 预发布标记 + 发布日期 */
+.rel-note-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface-2);
+}
+
+/* 版本号：等宽字体 + 表格数字，与面板里其它版本号读数同一套写法 */
+.rel-tag {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.rel-date {
+  margin-left: auto;      /* 靠右，与卡头左端的版本号分列两端 */
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.rel-note-body { padding: 10px 12px 12px; }
+
+/* 「在 GitHub 查看完整说明」：与正文里的链接同一套观感 */
+.rel-foot { margin-top: 10px; }
+
+.rel-foot a {
+  color: var(--primary-fg);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.rel-foot a:hover { text-decoration: underline; }
+
+/* ─── Markdown 正文排版 ───
+   作用域收在 .md-body 里，不污染面板上其它文字。 */
+.md-body {
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.75;
+  word-break: break-word;
+}
+
+/* 首元素不留上边距：卡片顶部已经有一层内边距，再叠一次会显得空 */
+.md-body > :first-child { margin-top: 6px; }
+
+.md-body .md-h {
+  /* 标题颜色比正文重一档，在密集的列表说明里能一眼切分段落 */
+  color: var(--text);
+  font-weight: 650;
+  line-height: 1.5;
+  margin: 14px 0 6px;
+}
+
+.md-body h3.md-h { font-size: 13px; }
+.md-body h4.md-h { font-size: 12.5px; }
+.md-body h5.md-h,
+.md-body h6.md-h { font-size: 12px; color: var(--text-2); }
+
+.md-body p { margin: 7px 0; }
+
+.md-body .md-list {
+  margin: 7px 0;
+  padding-left: 20px;      /* 列表缩进：嵌套层靠这个逐级内收 */
+}
+
+.md-body .md-list .md-list { margin: 4px 0; }
+
+.md-body li { margin: 3px 0; }
+
+/* 行内代码：与 .hint code 同款（描边 + 浅底），在正文里既不抢眼又能认出是代码 */
+.md-body .md-code {
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface-3);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+/* 代码块：内容原样保留（不折行），超出横向滚动 */
+.md-body .md-pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-inset);
+  overflow-x: auto;
+}
+
+.md-body .md-pre code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre;
+}
+
+.md-body .md-quote {
+  margin: 8px 0;
+  padding: 2px 0 2px 10px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--text-3);
+}
+
+.md-body .md-quote p { margin: 4px 0; }
+
+.md-body .md-hr {
+  margin: 12px 0;
+  border: 0;
+  border-top: 1px solid var(--hairline);
+}
+
+/* 版本没写说明时的占位（与上面的正文同一字号，不显得像报错） */
+.md-body .md-body-empty {
+  margin: 7px 0;
+  color: var(--text-3);
+}
+
+.md-body a {
+  color: var(--primary-fg);
+  text-decoration: none;
+}
+
+.md-body a:hover { text-decoration: underline; }
+
+.md-body strong { color: var(--text); font-weight: 650; }
+
+.md-body del { color: var(--text-3); }
+
+/* 任务列表：勾选框用方框 + 勾画出来（不引原生 input，见 markdown.js 的说明） */
+.md-body .md-task { list-style: none; }
+
+.md-body .md-task-box {
+  position: relative;
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  margin-right: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+  vertical-align: -1px;
+}
+
+.md-body .md-task-done .md-task-box {
+  border-color: var(--ok-bd);
+  background: var(--ok-soft);
+}
+
+.md-body .md-task-done .md-task-box::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0;
+  width: 4px;
+  height: 7px;
+  border-right: 1.5px solid var(--ok);
+  border-bottom: 1.5px solid var(--ok);
+  transform: rotate(45deg);
+}

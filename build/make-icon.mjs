@@ -2,7 +2,7 @@
 /**
  * 生成应用图标源图（1024×1024 PNG），供 `tauri icon` 派生出各尺寸图标。
  *
- * 设计：圆角方形渐变底 + 白色双向箭头（呼应「本地代理转发」）。
+ * 设计：圆角方形苹果蓝底（#007AFF）+ 白色双向箭头（呼应「本地代理转发」）。
  * 不依赖任何图形库：手写 SDF 光栅化 + 3×3 超采样抗锯齿 + 手写 PNG 编码。
  */
 
@@ -126,7 +126,7 @@ function shapeAlpha(nx, ny) {
 const SS = 3;
 const pixels = Buffer.alloc(SIZE * SIZE * 4);
 
-/** 对角渐变：左上偏靛蓝 → 右下偏紫 */
+/** 线性插值：目前只用于把纯白箭头按覆盖率混到纯色底上 */
 function lerp(a, b, t) {
   return a + (b - a) * t;
 }
@@ -149,10 +149,11 @@ for (let y = 0; y < SIZE; y++) {
     const arrowA = arrowHits / total;
     if (rectA === 0) continue;
 
-    const t = (x / SIZE + y / SIZE) / 2;
-    let r = lerp(0x4f, 0x7c, t);
-    let g = lerp(0x46, 0x3a, t);
-    let b = lerp(0xe5, 0xed, t);
+    // 底色改为纯苹果蓝 #007AFF（与 iOS/macOS 系统蓝同族的观感），不再做对角渐变，
+    // 这样图标在浅色/深色壁纸和 Dock 里都保持同一个可辨识的品牌蓝。
+    let r = 0x00;
+    let g = 0x7a;
+    let b = 0xff;
     // 箭头为纯白，按覆盖率与底色混合
     if (arrowA > 0) {
       r = lerp(r, 255, arrowA);

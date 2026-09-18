@@ -25,7 +25,9 @@
   flex-direction: column;
   gap: 12px;
   padding: 14px 12px 10px;
-  background: var(--surface-2);
+  /* 侧栏相对内容画布「退」一档：--surface-inset 浅色下是略灰的近白、深色下比画布更深，
+     同一个变量即可让两种模式都成立，无需分主题写死。 */
+  background: var(--surface-inset);
   border-right: 1px solid var(--border);
 }
 
@@ -38,19 +40,17 @@
   border-bottom: 1px solid var(--hairline);
 }
 
+/* 品牌标：图形由 icons.js 注入（与应用图标 icon.png 同一造型的 SVG）。
+   这里只负责占位与对齐 —— 蓝底、圆角、箭头都在 SVG 里，
+   所以不设 background / color / font-size，避免与图形自身的配色打架。 */
 .brand-logo {
   flex: 0 0 auto;
-  width: 32px;
-  height: 32px;
   display: grid;
   place-items: center;
-  border-radius: 9px;
-  background: linear-gradient(150deg, var(--primary-top) 0%, #7b5cff 100%);
-  box-shadow: var(--glow);
-  color: #fff;
-  font-size: 15px;
-  font-weight: 700;
 }
+
+/* SVG 是行内元素，垂直方向会多出一截基线间隙，压掉它 */
+.brand-logo svg { display: block; }
 
 .brand-text { min-width: 0; }
 
@@ -105,8 +105,11 @@
   width: 100%;
   padding: 8px 10px;
   border: 1px solid transparent;
-  border-radius: var(--r-md);
+  border-radius: var(--r-sm);
   background: transparent;
+  /* 导航项是 <button>，components.css 里通用的 button 规则会给它带上 --shadow-1，
+     与「平铺的导航列表」冲突；这里显式清掉（.seg-item 也是同样的处理）。 */
+  box-shadow: none;
   color: var(--text-2);
   font-size: 12.5px;
   font-weight: 500;
@@ -120,8 +123,8 @@
   height: 17px;
   display: grid;
   place-items: center;
+  /* 图标与文字同色：color 由 .nav-item 下发，这里不再降低透明度（旧代码的 .85 会让图标比文字虚） */
   color: currentColor;
-  opacity: .85;
 }
 
 /* SVG 图标：尺寸由 .ico 决定，颜色跟随 currentColor（选中态自动变主题色）。
@@ -129,16 +132,27 @@
    且部分会被系统当成 emoji 渲染成彩色，无法控制。 */
 .nav-item .ico svg { display: block; }
 
-.nav-item:hover { background: var(--surface-3); color: var(--text); border-color: transparent; }
+/* hover：一层极淡的叠加底。用 --text 派生的透明色，
+   浅色下是淡灰、深色下是淡白，同一个表达式两套主题都对；
+   比选中态（--primary-soft）更轻，两者形成明确的层级差。
+   带 :not(:disabled) 是为了压过 components.css 里通用的 button:hover ——
+   那个选择器后加载且特异性更高，否则会盖掉这里的叠加底并给导航项描边
+   （与本项目 .seg-item / .copy-btn 的写法一致）。 */
+.nav-item:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--text) 6%, transparent);
+  color: var(--text);
+  border-color: transparent;
+}
 
-.nav-item.active {
+/* 选中态：底用品牌浅色，文字与图标点亮。
+   一并声明 .active:hover，让悬停选中项时仍保持选中态，不会被 hover 的浅底顶掉。 */
+.nav-item.active,
+.nav-item.active:hover {
   color: var(--primary-fg);
   background: var(--primary-soft);
   border-color: transparent;
   font-weight: 600;
 }
-
-.nav-item.active .ico { opacity: 1; }
 
 /* 选中项左侧的指示条 */
 .nav-item.active::before {
@@ -147,9 +161,9 @@
   left: -12px;
   top: 50%;
   transform: translateY(-50%);
-  width: 3px;
+  width: 2px;
   height: 17px;
-  border-radius: 0 3px 3px 0;
+  border-radius: 0 var(--r-xs) var(--r-xs) 0;
   background: var(--primary);
 }
 
@@ -161,7 +175,9 @@
   padding: 0 6px;
   border-radius: var(--r-pill);
   border: 1px solid var(--border);
-  background: var(--surface-3);
+  /* 计数用 --surface：两套主题里都比侧栏底和 hover 叠加底更亮，小胶囊才浮得起来；
+     原来的 --surface-3 在深色下比侧栏亮出一大截，会把视线从导航文字上抢走。 */
+  background: var(--surface);
   color: var(--text-2);
   font-size: 10.5px;
   font-weight: 600;
@@ -198,7 +214,8 @@
   gap: 7px;
   padding: 7px 10px;
   border: 1px solid var(--border);
-  border-radius: var(--r-md);
+  border-radius: var(--r-sm);
+  /* 侧栏整体是「陷入」的底色，状态卡用 --surface 抬起来，两种主题下都是凸起的一层 */
   background: var(--surface);
   color: var(--text-2);
   font-size: 11.5px;
@@ -242,9 +259,12 @@
   display: flex;
   gap: 2px;
   padding: 3px;
-  border-radius: var(--r-md);
+  border-radius: var(--r-sm);
   border: 1px solid var(--border);
-  background: var(--surface-3);
+  /* 槽取 --surface-inset（两套主题里都比 --surface 低一档）、选中段取 --surface，
+     于是浅色深色都是「亮块浮在凹槽上」。这里不能用 --surface-3 做槽：
+     深色下它比 --surface 更亮，选中块会反过来显得是凹进去的。 */
+  background: var(--surface-inset);
 }
 
 .theme-switch button {
@@ -253,15 +273,20 @@
   border: 0;
   border-radius: var(--r-xs);
   background: transparent;
+  /* 同样要清掉通用 button 的投影：只有选中的那一档才该浮起来 */
+  box-shadow: none;
   color: var(--text-3);
   font-size: 11px;
   white-space: nowrap;
   transition: background .15s ease, color .15s ease;
 }
 
-.theme-switch button:hover { color: var(--text); }
+/* 同样是给通用 button:hover 让路的问题：这里补 :not(:disabled) 提高特异性，
+   再排除 .active，让悬停已选中的档位时保持不变（否则会被盖成灰底）。 */
+.theme-switch button:hover:not(:disabled):not(.active) { background: color-mix(in oklab, var(--text) 6%, transparent); color: var(--text); }
 
-.theme-switch button.active {
+.theme-switch button.active,
+.theme-switch button.active:hover {
   background: var(--surface);
   color: var(--text);
   font-weight: 600;
@@ -298,8 +323,10 @@
   /* 与 .content-inner 用同一套「居中后左右留白」算法，让面包屑和内容左边缘对齐：
      内容区超过上限时内层会居中，顶栏必须跟着让出同样的留白，否则两者错开。 */
   padding: 0 max(var(--pad), calc((100% - var(--content-max)) / 2));
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  /* 顶栏不占一层表面：直接透出内容画布，只用一条极淡的底边与内容分隔，
+     视觉重量全部让给内容与卡片（侧栏才是唯一有底的区域）。 */
+  border-bottom: 1px solid var(--hairline);
+  background: transparent;
 }
 
 .crumb {
@@ -345,6 +372,13 @@
   display: flex;
   flex-direction: column;
 }
+
+/* 注意：这里不按页面覆盖 --content-max。内容区宽度是全站统一的版式基线，
+   任何页面（含账号页）都沿用 tokens.css 的默认限宽居中；
+   设置页「账号列表两侧留白」开关作用在账号卡片网格自身上，分两层：关闭（默认）
+   时保留与内容区同源的 --pad 两侧间距、轨道切 1fr 瓜分剩余宽度且下限降 300px（为四列），
+   列表占满面板宽度、卡片随宽；
+   见 page-accounts.css 中 .acct-grid 上的 :root[data-content='full'] 规则。 */
 
 .page { display: none; }
 
@@ -413,7 +447,9 @@
   gap: 10px;
   padding: 9px 16px;
   border-top: 1px solid var(--hairline);
-  background: var(--surface-2);
+  /* 卡内下沉条：--surface-inset 在两套主题里都比卡片主体（--surface）低一档，
+     浅色下近白略灰、深色下比卡片更深，收敛方向一致（--surface-2 在深色下会反过来变亮）。 */
+  background: var(--surface-inset);
   color: var(--text-2);
   font-size: 11.5px;
   line-height: 1.6;
@@ -429,7 +465,11 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  padding-bottom: 0;
+  /* 这里曾把底部内边距归零以榨干高度，代价是贴底的面板页脚条（.table-foot）
+     直接顶到窗口下缘、视觉上被压住；且 .content 的 padding 底部本就是 0，没有兜底。
+     补回与左右留白同源的 --pad：只让出一点呼吸空间，外框仍由 flex:1 + min-height:0
+     锁死、滚动依旧只发生在列表内部，不产生新的页面级滚动条。 */
+  padding-bottom: var(--pad);
 }
 
 .page[data-page="accounts"] .page-head { flex: none; }
@@ -453,7 +493,9 @@
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  padding-bottom: 0;
+  /* 同上：底部内边距归零会让分页栏/页脚条紧贴窗口下缘，补回 --pad 留出呼吸空间；
+     这段留白从列表可视高度里让出（面板 flex:1 自适应），锁高结构不受影响。 */
+  padding-bottom: var(--pad);
 }
 
 .page[data-page="logs"] .page-head { flex: none; }

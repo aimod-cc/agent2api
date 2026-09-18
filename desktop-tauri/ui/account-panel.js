@@ -131,8 +131,17 @@
         enabled: $('account-enabled-input').checked,
         proxy,
       });
+      // 先关窗并反馈成功：改动已经落库，刷新只是让列表卡片跟上，
+      // 不该让用户对着「保存中…」再多等一次网络往返（刷新若被排队更是等不到头）。
       closeSettings();
       toast('✅ 账号设置已保存');
+      // 保存后必须主动刷新列表：以前只关窗不刷新，卡片上的代理/优先级等仍是旧数据，
+      // 要等 app.js 每 20 秒一次的轮询才更新 —— 用户看到的就是「保存完十几秒才变」。
+      // 单独兜一层错：刷新失败只影响本次界面同步（后续轮询会自愈），
+      // 不能掉进下面的 catch 被报成「保存失败」（保存其实已经成功了）。
+      try {
+        await wbApp.refresh?.();
+      } catch { /* 刷新失败不影响保存结果，交给下一次轮询 */ }
     } catch (error) {
       // 后端校验失败（如优先级冲突）：留在弹窗里显示原因，方便直接改
       $('account-modal-status').innerHTML = `<span style="color:var(--danger)">${esc(error.message)}</span>`;

@@ -1,20 +1,10 @@
 {
   "name": "workbuddy-local-proxy",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "WorkBuddy Local Proxy - OpenAI-compatible API via 腾讯 WorkBuddy 登录态，附带积分/签到与桌面端账号管理",
   "type": "module",
-  "main": "server.mjs",
   "private": true,
   "scripts": {
-    "serve": "node server.mjs --port 3065",
-    "login": "node server.mjs --login",
-    "logout": "node server.mjs --logout",
-    "status": "node server.mjs --status",
-    "usage": "node server.mjs --usage",
-    "checkin": "node server.mjs --checkin",
-    "endpoints": "node server.mjs --endpoints",
-    "test": "node tests/smoke-test.mjs",
-    "build:backend": "node build/build-backend.mjs",
     "build:icon": "node build/make-icon.mjs",
     "tauri:install": "npm --prefix desktop-tauri install",
     "tauri:dev": "npm --prefix desktop-tauri run dev",
@@ -31,15 +21,13 @@
     "llm",
     "checkin"
   ],
-  "license": "MIT",
+  "author": "aimod-cc",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aimod-cc/workbuddy-proxy.git"
+  },
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=18.17.0"
-  },
-  "dependencies": {
-    "undici": "^8.10.2",
-    "yaml": "^2.9.1"
-  },
-  "devDependencies": {
-    "esbuild": "^0.25.9"
   }
 }

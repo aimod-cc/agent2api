@@ -11,8 +11,9 @@
 //!   rotate.rs    账号选路与 429 轮换：selectTargetAccount / WAF 退避 /
 //!                限额标记 / 429 结构化事件上报
 //!   request.rs   请求构造：头集合、URL、system 注入、上游错误解析
-//!   sse.rs       SSE reasoning 帧合并（跨 chunk 半行缓冲）
-//!   aggregate.rs 非流式聚合（SSE → 完整 chat.completion）
+//!   sse.rs       SSE reasoning 帧合并（跨 chunk 半行缓冲）+ usage 旁路提取
+//!   aggregate.rs 非流式聚合（SSE → 完整 chat.completion）+ usage 旁路提取
+//!   usage.rs     usage 旁路槽：token 用量 / 尝试账号 / 尝试次数的共享记录点
 //!
 //! ── 与 Node 版的两处结构差异（都是为了 Rust 的所有权模型）────
 //!   1. Node 是「先 writeHead、再一边读上游一边写 res」的回调推进模式；
@@ -32,6 +33,7 @@ pub mod aggregate;
 pub mod request;
 mod rotate;
 pub mod sse;
+pub mod usage;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,6 +147,13 @@ pub struct ForwardRequest {
     pub stream: bool,
     /// 请求体 sha256（去重键；空串表示不去重）
     pub dedupe_key: String,
+    /// usage / 尝试次数的旁路槽。
+    ///
+    /// 为什么走「调用方建好、随请求传进来」而不是由 responder 自己造一个：
+    /// 流式转发的收尾发生在 handler 返回之后（流被 axum 拉完才算结束），
+    /// 那时数据必须落在**调用方仍持有**的句柄里才拿得到。调用方（记账点）
+    /// 拿同一个 `Arc` 的另一份克隆，就能在流收尾时读到最终值。
+    pub telemetry: Arc<usage::RequestTelemetry>,
 }
 
 /// 转发结果：要么是可直接下发的流，要么是聚合好的 JSON
@@ -264,6 +273,21 @@ impl UpstreamService {
         for _ in 0..=MAX_ROUTE_ATTEMPTS {
             let target = rotate::select_target_account(self, &model, &tried_ids).await?;
             let session = rotate::session_for(self, target.account_id.as_deref()).await?;
+            // ── 旁路记账：本账号就是这一轮的承载账号 ──────────────
+            // 每轮选路都记一次，于是 attempts = 本次请求实际用过的账号数
+            // （429 降级会多走几轮，即「换了几个账号」）；同一账号内的 11128
+            // 退避重试不算一轮，故不计入（口径见 usage.rs）。account 取最后
+            // 一轮的值 —— 它才是真正承载本次请求的那个账号。
+            // 只写旁路槽，不改本轮任何控制流：拿不到账号信息时传 None，
+            // 记账点按「无账号记录（默认登录态）」处理。
+            request.telemetry.note_attempt(
+                target.account_id.as_deref(),
+                &account_label(
+                    target.account.as_ref(),
+                    target.account_id.as_deref().unwrap_or(""),
+                    &session,
+                ),
+            );
             let request_id = new_request_id();
             let url = chat_completions_url(&session, &self.auth.default_context().base_url);
             let headers = chat_headers(&session, &request_id, Some("text/event-stream"));
@@ -408,10 +432,15 @@ impl UpstreamService {
                 return Ok(ForwardOutcome::Stream {
                     status,
                     // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者
-                    stream: Box::new(ForwardStream::new(response, slot)),
+                    stream: Box::new(ForwardStream::new(
+                        response,
+                        slot,
+                        request.telemetry.clone(),
+                    )),
                 });
             }
-            let aggregated = aggregate::aggregate_sse_completion(response).await?;
+            let aggregated =
+                aggregate::aggregate_sse_completion(response, request.telemetry.clone()).await?;
             let choice = aggregated.body.get("choices").and_then(|value| value.get(0));
             let content_chars = choice
                 .and_then(|choice| choice.pointer("/message/content"))
@@ -477,16 +506,23 @@ pub struct ForwardStream {
     /// 在途槽位凭证：本流被 drop 时释放（含客户端断开、上游断开两条路径）。
     /// `Option` 只是为了让它能在结构里可选传入，实际总是 Some。
     _slot: Option<InFlightGuard>,
+    /// usage / 尝试次数的旁路槽：与合并器共用同一份（见 `ForwardStream::new`）
+    telemetry: Arc<usage::RequestTelemetry>,
 }
 
 impl ForwardStream {
-    fn new(response: reqwest::Response, slot: Option<InFlightGuard>) -> Self {
+    fn new(
+        response: reqwest::Response,
+        slot: Option<InFlightGuard>,
+        telemetry: Arc<usage::RequestTelemetry>,
+    ) -> Self {
         Self {
             inner: Box::pin(response.bytes_stream()),
-            coalescer: ReasoningCoalescer::new(),
+            coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone()),
             upstream_done: false,
             pending: std::collections::VecDeque::new(),
             _slot: slot,
+            telemetry,
         }
     }
 }
@@ -530,6 +566,9 @@ impl Stream for ForwardStream {
                     let detail = crate::server::core::egress::describe_error_detail(&error);
                     let message = format!("上游流中断: {detail}");
                     logging::log("[Model]", &format!("❌ {message}"));
+                    // 旁路记账：断流原因要进请求明细（客户端此时已收到部分内容，
+                    // HTTP 状态早就是 200，只有这里能解释「为什么这条是失败的」）
+                    self.telemetry.note_error(&message);
                     self.pending.push_back(self::sse::sse_frame(&json!({
                         "error": {
                             "message": message,

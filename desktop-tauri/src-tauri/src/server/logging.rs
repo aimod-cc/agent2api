@@ -52,12 +52,19 @@ static VERBOSE: OnceLock<bool> = OnceLock::new();
 /// 初始化日志库。重复调用只生效一次（OnceLock 语义），返回是否本次装入成功。
 ///
 /// 在 `server::start()` 里最先调用 —— 之后其它模块再写日志就能入库。
+///
+/// 保留天数走**回调**（每次裁剪时动态取 `config::retention_settings()`）：
+/// 于是设置页改完天数，下一次写日志 / 显式 prune 就生效，不需要重启进程
+/// （与 `RequestStats` 的 `get_retention` 同一模式）。
+/// 读的是配置的**内存快照**而不是每次读盘 —— 写日志是相对频繁的路径。
 pub fn init_store(directory: &std::path::Path, verbose: bool) -> bool {
     let _ = VERBOSE.set(verbose);
     if STORE.get().is_some() {
         return false;
     }
-    let _ = STORE.set(LogStore::new(directory));
+    let _ = STORE.set(LogStore::new(directory, || {
+        crate::server::config::retention_settings().log_days
+    }));
     true
 }
 

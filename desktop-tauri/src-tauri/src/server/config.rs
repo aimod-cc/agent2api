@@ -24,6 +24,66 @@ pub const DEFAULT_MODEL: &str = "auto";
 /// 计费接口默认语言（对应 Node 版 `--locale` 默认值）
 pub const DEFAULT_LOCALE: &str = "zh-CN";
 
+// ─── 保留期设置的键名与边界（config.json 里的字段名**就是契约**）─────
+// 命名风格与既有字段（apiKey / locale / lastRequestModel / autoCheckin）一致：
+// camelCase。这里把键名提成常量，是因为**读侧与写侧必须用同一个字符串** ——
+// 任一处手写拼错都不会报错，只会静默地读到默认值。
+
+/// 事件日志（logs.jsonl）保留天数
+pub const KEY_LOG_RETENTION_DAYS: &str = "logRetentionDays";
+/// 请求明细（requests.jsonl）保留天数
+pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestRetentionDays";
+/// 按天聚合（request-daily.jsonl）保留天数
+pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyRetentionDays";
+
+/// 三档保留天数的默认值（缺失时用它们）
+pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
+pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 30;
+pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 365;
+
+/// 天数的合法范围：下限 1 天（保留 0 天等于什么都不存，不是有效配置），
+/// 上限 10 年（防手改 config.json 写个天文数字让裁剪逻辑空转）。
+///
+/// **写侧（`stats_api::parse_days`）与读侧（`days_field`）共用这两个常量**：
+/// 若两边各写一套数字，手改文件与走接口设值就会出现两套口径
+/// （比如接口拒绝 5000 而读侧接受它）。两侧的处理方式不同是有意的：
+/// 走接口的非法值给 400（用户当场能改），手改文件的非法值回落到默认（不打扰）。
+pub const RETENTION_MIN_DAYS: i64 = 1;
+pub const RETENTION_MAX_DAYS: i64 = 3650;
+
+/// 三档保留天数（设置页「数据保留」区域）。
+///
+/// 用独立结构而不是三个散落的取值函数：三个值总是一起用（GET 一起返回、
+/// 裁剪时各自取用），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetentionSettings {
+    /// 事件日志保留天数
+    pub log_days: i64,
+    /// 请求明细保留天数
+    pub request_days: i64,
+    /// 按天聚合保留天数
+    pub daily_days: i64,
+}
+
+impl Default for RetentionSettings {
+    fn default() -> Self {
+        Self {
+            log_days: DEFAULT_LOG_RETENTION_DAYS,
+            request_days: DEFAULT_REQUEST_RETENTION_DAYS,
+            daily_days: DEFAULT_DAILY_RETENTION_DAYS,
+        }
+    }
+}
+
+/// 保留期的**部分**更新入参（PUT /api/retention 允许只传其中几项）。
+/// `None` = 这一项不动（对应「允许部分字段」的契约）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RetentionPatch {
+    pub log_days: Option<i64>,
+    pub request_days: Option<i64>,
+    pub daily_days: Option<i64>,
+}
+
 /// 运行期生效的配置快照。
 ///
 /// 字段是「本切片真正会用到的」子集，其余未知字段留在 `raw` 里原样保留，
@@ -34,6 +94,12 @@ pub struct RuntimeConfig {
     locale: String,
     default_model: String,
     last_request_model: Option<String>,
+    /// 三档保留天数（事件日志 / 请求明细 / 按天聚合）。
+    ///
+    /// 为什么解析进字段而不是让调用方每次去 `raw` 里翻：保留期要被**每次记账 / 写日志**
+    /// 取用（回调形式），从 `Value` 里逐个取值要处理类型不符、缺字段、范围夹紧，
+    /// 放在这里解析一次即可；`raw` 仍是写盘时的唯一底稿。
+    retention: RetentionSettings,
     /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
     raw: Map<String, Value>,
 }
@@ -115,6 +181,40 @@ fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 从原始 JSON 里取天数：缺字段 / 类型不符 / 非整数 / 越界一律回落到 `default`。
+///
+/// **越界回落而非夹紧**：手改 config.json 写了 99999 时，静默改成 3650
+/// 会让人以为「设置生效了」，回默认值至少与用户在设置页看到的不一致时好排查。
+/// 走接口写入的值在 `stats_api::parse_days` 里已按同一范围校验过（那里是 400 报错）。
+///
+/// 接受 `30.0` 这种整值浮点（与 `parse_days` 同一口径）：JSON 里
+/// `30` 与 `30.0` 都是合法数字，为后者回落到默认值会显得莫名其妙
+/// （用户手改文件时把 30 写成 30.0 是完全可能的事）。
+fn days_field(map: &Map<String, Value>, key: &str, default: i64) -> i64 {
+    let parsed = map.get(key).and_then(|value| match value {
+        Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|raw| raw.is_finite() && raw.fract() == 0.0)
+                .map(|raw| raw as i64)
+        }),
+        _ => None,
+    });
+    parsed
+        .filter(|value| (RETENTION_MIN_DAYS..=RETENTION_MAX_DAYS).contains(value))
+        .unwrap_or(default)
+}
+
+/// 由原始 JSON 解析三档保留天数（缺字段各自用默认值）
+fn retention_from(map: &Map<String, Value>) -> RetentionSettings {
+    let defaults = RetentionSettings::default();
+    RetentionSettings {
+        log_days: days_field(map, KEY_LOG_RETENTION_DAYS, defaults.log_days),
+        request_days: days_field(map, KEY_REQUEST_RETENTION_DAYS, defaults.request_days),
+        daily_days: days_field(map, KEY_DAILY_RETENTION_DAYS, defaults.daily_days),
+    }
+}
+
 /// 读磁盘上的 config.json（缺失/损坏都当空对象，对应 Node 版 catch 分支）
 fn read_raw() -> Map<String, Value> {
     let Ok(text) = std::fs::read_to_string(config_file()) else {
@@ -128,6 +228,7 @@ fn read_raw() -> Map<String, Value> {
 
 /// 由磁盘内容 + 环境变量构造运行期配置（对应 Node 版 applyConfig 的优先级）
 fn build(raw: Map<String, Value>) -> RuntimeConfig {
+    let retention = retention_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）
         api_key: string_field(&raw, "apiKey").or_else(env_api_key),
@@ -136,6 +237,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .unwrap_or_else(|| DEFAULT_LOCALE.to_string()),
         default_model: env_text("WORKBUDDY_DEFAULT_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string()),
         last_request_model: string_field(&raw, "lastRequestModel"),
+        retention,
         raw,
     }
 }
@@ -163,6 +265,25 @@ pub fn current() -> RuntimeConfig {
         }
     }
     build(Map::new())
+}
+
+/// 只取保留期设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 为什么不让调用方用 `current().retention()`：保留期是在**每次记账 / 写日志**
+/// 上调用的（`RequestStats::record` → `retention_bounds`，`LogStore::append`
+/// → 裁剪），而 `current()` 每次都会克隆整个 `raw` Map —— 热路径上没必要。
+/// 这里只读锁取一个 `Copy` 值。
+///
+/// 读的是内存快照而不是磁盘：`update()` 落盘后会同步刷新快照，所以
+/// 「设置页刚保存 → 下一次裁剪就用新值」成立，且不必每次读文件。
+/// 未初始化（理论上只有启动极早期）时给默认值。
+pub fn retention_settings() -> RetentionSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.retention;
+        }
+    }
+    RetentionSettings::default()
 }
 
 /// 用一个变换函数原子地更新配置（读 → 改 → 落盘 → 回写内存）。
@@ -254,5 +375,35 @@ pub fn update_raw_field(key: &str, value: Value) -> bool {
         if key == "apiKey" {
             config.api_key = string_field(&config.raw, "apiKey");
         }
+    })
+}
+
+/// 更新三档保留天数（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`stats_api::put_retention`）**必须先校验范围**：本函数按「已合法」
+/// 处理，越界值会被 `days_field` 的回读逻辑丢弃（那会让用户以为设置生效了）。
+///
+/// 内存快照与 raw 底稿一起改（与 `set_api_key` 同一模式）：前者让下一次裁剪
+/// 立刻用新值，后者保证写盘时不会把字段吃掉。无论写盘成功与否内存都已更新
+/// （与其它 setter 一致），所以「设置页保存 → 立即清理」不依赖磁盘 IO。
+pub fn set_retention(patch: RetentionPatch) -> bool {
+    update(|config| {
+        let mut next = config.retention;
+        // 只写传进来的项：缺省项保持原值，也**不落盘**成默认值 ——
+        // 否则「只改日志天数」会把另外两项一并固化成默认值，抹掉用户设置
+        let mut apply = |key: &str, value: Option<i64>, slot: &mut i64| {
+            if let Some(days) = value {
+                config.raw.insert(key.to_string(), Value::from(days));
+                *slot = days;
+            }
+        };
+        apply(KEY_LOG_RETENTION_DAYS, patch.log_days, &mut next.log_days);
+        apply(
+            KEY_REQUEST_RETENTION_DAYS,
+            patch.request_days,
+            &mut next.request_days,
+        );
+        apply(KEY_DAILY_RETENTION_DAYS, patch.daily_days, &mut next.daily_days);
+        config.retention = next;
     })
 }

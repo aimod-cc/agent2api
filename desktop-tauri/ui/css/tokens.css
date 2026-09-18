@@ -1,6 +1,6 @@
 /* ─────────────────────────────────────────────
    WorkBuddy 本地代理 · 设计令牌
-   所有颜色都以变量下发，浅色 / 深色两套在这里统一定义。
+   全站统一使用 oklch 色板，浅色 / 深色两套变量都在这里定义。
    组件与页面只引用变量，不再各自写死颜色。
    ───────────────────────────────────────────── */
 
@@ -11,66 +11,90 @@
   --font-mono: Consolas, "Cascadia Mono", "Courier New", monospace;
 
   /* 画布与表面：三层高度，越靠上越亮 */
-  --bg: #eaeef7;
-  --bg-grad-a: rgba(255, 255, 255, .85);
-  --bg-grad-b: rgba(226, 234, 255, .7);
-  --surface: #ffffff;
-  --surface-2: #f6f8fd;
-  --surface-3: #eef2fa;
-  --surface-inset: #f3f6fc;
-  --border: #e3e8f2;
-  --border-strong: #ccd5e6;
-  --hairline: rgba(15, 23, 42, .07);
+  --bg: oklch(0.96 0 0);
+  --surface: oklch(1 0 0);
+  --surface-2: oklch(0.97 0 0);
+  --surface-3: oklch(0.95 0 0);
+  /* 凹槽色：承担两类用途 —— ①侧栏底（.sidebar）、②面板底注（.panel-foot），
+     以及 .field / .switch-card / .modal-section 这类「凹槽底 + 1px 描边」的内嵌块。
+     这里从 0.955 加深到 0.93（与画布 0.96 相差 0.03）：原来的 0.955 只比画布深一点点，
+     属于「略有区分」的弱区分，在侧栏这类大面积的底上够用，但在「凹槽底 + 描边」的
+     内嵌块里会让描边与底色糊在一起，撑不起一个明确的凹槽边界。
+     深一档后与画布的层次立刻分开，两类用途的方向仍然一致（都比承载它的面更深）。
+     注：账号列表（.acct-scroll）原先是第③类用途，现改用下面的 --surface-well ——
+     列表区要的是「几乎贴着白、只压一点点」的浅凹，与这里的深凹槽不是一档。 */
+  --surface-inset: oklch(0.93 0 0);
+  /* 列表区的「浅凹」底：账号卡片列表（.acct-scroll）专用。
+     取值方向与 --surface-inset 相反 —— 它比画布（--bg 0.96）略亮、比卡片（--surface 1.0）
+     略暗，卡片仍有浮起关系，但整体是「一片近白的浅底」，不再是被压深的槽底。
+     之所以单独成一个令牌，而不是复用 --surface-2：--surface-2 在深色主题下是 0.305，
+     比卡片（0.285）更亮 —— 方向反了，卡片会从「浮起」变成「陷下去」；
+     本令牌在深色下走的是加深方向（见深色块），两套主题的收敛方向才一致。
+     oklch(0.97 0 0) 换算到 sRGB 即 #F5F5F5，与用户给定的目标色一致。 */
+  --surface-well: oklch(0.97 0 0);
+  /* 边框：必须比凹槽底（--surface-inset 0.93）深一档。
+     凹槽底从 0.955 加深到 0.93 后与旧边框值（0.93）撞成了同一个色，
+     于是 .field / .switch-card / .modal-section 这类「凹槽底 + 1px 描边」的内嵌块
+     描边与底色同色、整条边隐形。故整体下调一档恢复可见描边：
+     常规边框 0.93 → 0.90（比凹槽底深、比画布 0.96 深），
+     强边框 0.88 → 0.84 同步下调，两者间隔仍是 0.05，两档层次不塌。 */
+  --border: oklch(0.90 0 0);
+  --border-strong: oklch(0.84 0 0);
+  --hairline: oklch(0.145 0 0 / 8%);
 
   /* 文本三档 */
-  --text: #0f172a;
-  --text-2: #4a5668;
-  --text-3: #7d8798;
+  --text: oklch(0.145 0 0);
+  --text-2: oklch(0.37 0 0);
+  --text-3: oklch(0.49 0 0);
 
   /* 品牌 */
-  --primary: #3d6ff5;
-  --primary-hover: #2f5fe6;
-  --primary-top: #5a86ff;
-  --primary-soft: #e9efff;
-  --primary-bd: #c6d6ff;
-  --primary-fg: #1e4fd0;
+  --primary: oklch(0.603 0.218 257.3);
+  --primary-hover: oklch(0.543 0.218 257.3);
+  --primary-soft: color-mix(in srgb, var(--primary) 10%, white);
+  --primary-bd: color-mix(in srgb, var(--primary) 28%, white);
+  --primary-fg: oklch(0.48 0.2 257.3);
+
+  /* 背景渐变：由品牌色淡化而来，故排在品牌之后 */
+  --bg-grad-a: color-mix(in srgb, var(--primary) 3%, white);
+  --bg-grad-b: color-mix(in srgb, var(--primary) 6%, white);
 
   /* 语义色 */
-  --ok: #0f9d63;
-  --ok-soft: #e2f7ec;
-  --ok-bd: #b1e6cd;
-  --warn: #b0741a;
-  --warn-soft: #fdf3de;
-  --warn-bd: #f0d9a6;
-  --danger: #d5444f;
-  --danger-soft: #fdeced;
-  --danger-bd: #f5c5ca;
-  --info: #2f7dd1;
-  --info-soft: #eaf3fd;
-  --info-bd: #c3dcf6;
+  --ok: oklch(0.596 0.145 163.225);
+  --ok-soft: color-mix(in srgb, var(--ok) 10%, white);
+  --ok-bd: color-mix(in srgb, var(--ok) 28%, white);
+  --warn: oklch(0.681 0.162 75.834);
+  --warn-soft: color-mix(in srgb, var(--warn) 10%, white);
+  --warn-bd: color-mix(in srgb, var(--warn) 28%, white);
+  --danger: oklch(0.577 0.245 27.325);
+  --danger-soft: color-mix(in srgb, var(--danger) 10%, white);
+  --danger-bd: color-mix(in srgb, var(--danger) 28%, white);
+  --info: oklch(0.588 0.158 241.966);
+  --info-soft: color-mix(in srgb, var(--info) 10%, white);
+  --info-bd: color-mix(in srgb, var(--info) 28%, white);
 
   /* 版本标签 */
-  --cn: #d9544b;
-  --cn-soft: #fdecea;
-  --cn-bd: #f6cdc9;
-  --intl: #4a63d8;
-  --intl-soft: #ecf0ff;
-  --intl-bd: #ccd6fb;
+  --cn: oklch(0.577 0.245 27.325);
+  --cn-soft: color-mix(in srgb, var(--cn) 10%, white);
+  --cn-bd: color-mix(in srgb, var(--cn) 28%, white);
+  --intl: oklch(0.52 0.16 268);
+  --intl-soft: color-mix(in srgb, var(--intl) 10%, white);
+  --intl-bd: color-mix(in srgb, var(--intl) 28%, white);
 
-  /* 形状 */
-  --r-xs: 6px;
-  --r-sm: 8px;
-  --r-md: 10px;
-  --r-lg: 14px;
-  --r-xl: 18px;
+  /* 形状：所有圆角都由 --radius 派生，改一个值即可整体缩放 */
+  --radius: 1rem;
+  --r-xs: calc(var(--radius) * 0.5);
+  --r-sm: calc(var(--radius) * 0.6);
+  --r-md: calc(var(--radius) * 0.8);
+  --r-lg: var(--radius);
+  --r-xl: calc(var(--radius) * 1.4);
   --r-pill: 999px;
 
   /* 阴影 */
-  --shadow-1: 0 1px 2px rgba(15, 23, 42, .05);
-  --shadow-2: 0 1px 2px rgba(15, 23, 42, .05), 0 10px 26px -16px rgba(15, 23, 42, .34);
-  --shadow-3: 0 2px 8px rgba(15, 23, 42, .06), 0 22px 54px -22px rgba(15, 23, 42, .42);
-  --glow: 0 1px 2px rgba(20, 40, 90, .16), 0 10px 22px -12px rgba(61, 111, 245, .7);
-  --ring: 0 0 0 3px rgba(61, 111, 245, .2);
+  --shadow-1: 0 1px 2px oklch(0.145 0 0 / 5%);
+  --shadow-2: 0 1px 3px oklch(0.145 0 0 / 6%), 0 10px 26px -16px oklch(0.145 0 0 / 20%);
+  --shadow-3: 0 2px 8px oklch(0.145 0 0 / 7%), 0 22px 54px -22px oklch(0.145 0 0 / 26%);
+  --glow: 0 1px 2px oklch(0.145 0 0 / 6%), 0 10px 22px -12px color-mix(in srgb, var(--primary) 45%, transparent);
+  --ring: 0 0 0 3px color-mix(in srgb, var(--primary) 25%, transparent);
 
   /* 尺寸 */
   --sidebar-w: 216px;
@@ -79,7 +103,12 @@
   /* 内容区最大宽度（不含侧边栏）。用 vw 而不是 %：
      % 相对的是「已排除侧边栏和内边距」的可用宽度，那样任何窗口下都会被限制成 80%，
      内容永远占不满；vw 相对整个窗口，于是窗口 ≤1280px 时内容占满、
-     更宽时才收在 80vw 并居中（默认 1060px 窗口不受影响）。 */
+     更宽时才收在 80vw 并居中（默认 1060px 窗口不受影响）。
+     这个变量只描述内容区的限宽，不参与设置页的「账号列表两侧留白」开关：
+     全站所有页面（含账号页）一律用它，不存在按页面的覆盖。
+     那个开关作用在 .acct-grid 自身的左右 padding 与轨道口径上：关闭（默认）时保留与
+     内容区同源的 --pad 两侧间距、轨道切 1fr 瓜分且下限降 300px（为让宽屏排下 4 列），
+     与本变量无关；取舍细节见 page-accounts.css 中关闭态规则上方的注释。 */
   --content-max: 80vw;
   --sb-w: 11px;          /* 滚动条宽度：表头对齐要靠它补偿 */
 }
@@ -87,53 +116,62 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --bg: #090c13;
-  --bg-grad-a: rgba(24, 33, 53, .9);
-  --bg-grad-b: rgba(22, 32, 58, .75);
-  --surface: #12161f;
-  --surface-2: #171c27;
-  --surface-3: #1e2431;
-  --surface-inset: #0e1219;
-  --border: #232a39;
-  --border-strong: #333d51;
-  --hairline: rgba(255, 255, 255, .07);
+  --bg: oklch(0.21 0 0);
+  --bg-grad-a: oklch(1 0 0 / 3%);
+  --bg-grad-b: oklch(0.623 0.206 255.3 / 6%);
+  --surface: oklch(0.285 0 0);
+  --surface-2: oklch(0.305 0 0);
+  --surface-3: oklch(0.335 0 0);
+  /* 凹槽色：用途与浅色同（侧栏底 / 面板底注 / 内嵌块）。
+     从 0.205 加深到 0.19：原来只比画布（0.21）深 0.005，几乎看不出来，
+     撑不起「凹槽底 + 描边」这类内嵌块的边界。加深后与画布差 0.02，
+     仍比画布更深（凹陷方向不变）。 */
+  --surface-inset: oklch(0.19 0 0);
+  /* 列表区的「浅凹」底（.acct-scroll）：深色下没有「比画布亮」的余量可用 ——
+     画布已是 0.21、卡片 0.285，再往上加亮会逼近卡片，卡片就浮不起来了；
+     于是走反方向：比画布（0.21）更深一档，取 0.19。
+     数值与 --surface-inset 相同，但语义独立：这里是「列表区要一个比画布略沉的底」，
+     那边是「内嵌块的凹槽」，将来任一方调整都不必迁就另一方。 */
+  --surface-well: oklch(0.19 0 0);
+  --border: oklch(1 0 0 / 10%);
+  --border-strong: oklch(1 0 0 / 17%);
+  --hairline: oklch(1 0 0 / 7%);
 
-  --text: #e9edf6;
-  --text-2: #a4aec0;
-  --text-3: #6e7a8e;
+  --text: oklch(0.965 0 0);
+  --text-2: oklch(0.85 0 0);
+  --text-3: oklch(0.78 0 0);
 
-  --primary: #5b8cff;
-  --primary-hover: #7099ff;
-  --primary-top: #6d99ff;
-  --primary-soft: rgba(91, 140, 255, .15);
-  --primary-bd: rgba(91, 140, 255, .36);
-  --primary-fg: #a9c3ff;
+  --primary: oklch(0.623 0.206 255.3);
+  --primary-hover: oklch(0.68 0.206 255.3);
+  --primary-soft: oklch(0.623 0.206 255.3 / 15%);
+  --primary-bd: oklch(0.623 0.206 255.3 / 38%);
+  --primary-fg: oklch(0.75 0.12 255.3);
 
-  --ok: #38c98c;
-  --ok-soft: rgba(56, 201, 140, .14);
-  --ok-bd: rgba(56, 201, 140, .32);
-  --warn: #e2a94f;
-  --warn-soft: rgba(226, 169, 79, .14);
-  --warn-bd: rgba(226, 169, 79, .32);
-  --danger: #f2707c;
-  --danger-soft: rgba(242, 112, 124, .14);
-  --danger-bd: rgba(242, 112, 124, .32);
-  --info: #62a6f0;
-  --info-soft: rgba(98, 166, 240, .14);
-  --info-bd: rgba(98, 166, 240, .3);
+  --ok: oklch(0.696 0.17 162.48);
+  --ok-soft: oklch(0.696 0.17 162.48 / 14%);
+  --ok-bd: oklch(0.696 0.17 162.48 / 32%);
+  --warn: oklch(0.769 0.188 70.08);
+  --warn-soft: oklch(0.769 0.188 70.08 / 14%);
+  --warn-bd: oklch(0.769 0.188 70.08 / 32%);
+  --danger: oklch(0.704 0.191 22.216);
+  --danger-soft: oklch(0.704 0.191 22.216 / 14%);
+  --danger-bd: oklch(0.704 0.191 22.216 / 32%);
+  --info: oklch(0.613 0.14 239.919);
+  --info-soft: oklch(0.613 0.14 239.919 / 14%);
+  --info-bd: oklch(0.613 0.14 239.919 / 32%);
 
-  --cn: #f0837a;
-  --cn-soft: rgba(240, 131, 122, .14);
-  --cn-bd: rgba(240, 131, 122, .3);
-  --intl: #93a9ff;
-  --intl-soft: rgba(122, 148, 255, .14);
-  --intl-bd: rgba(122, 148, 255, .3);
+  --cn: oklch(0.704 0.191 22.216);
+  --cn-soft: oklch(0.704 0.191 22.216 / 14%);
+  --cn-bd: oklch(0.704 0.191 22.216 / 32%);
+  --intl: oklch(0.68 0.14 268);
+  --intl-soft: oklch(0.68 0.14 268 / 14%);
+  --intl-bd: oklch(0.68 0.14 268 / 32%);
 
-  --shadow-1: 0 1px 2px rgba(0, 0, 0, .4);
-  --shadow-2: 0 1px 2px rgba(0, 0, 0, .4), 0 12px 28px -18px rgba(0, 0, 0, .8);
-  --shadow-3: 0 2px 10px rgba(0, 0, 0, .45), 0 26px 60px -24px rgba(0, 0, 0, .85);
-  --glow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 22px -14px rgba(91, 140, 255, .9);
-  --ring: 0 0 0 3px rgba(91, 140, 255, .28);
+  --shadow-1: 0 1px 2px oklch(0 0 0 / 40%);
+  --shadow-2: 0 1px 2px oklch(0 0 0 / 40%), 0 12px 28px -18px oklch(0 0 0 / 80%);
+  --shadow-3: 0 2px 10px oklch(0 0 0 / 45%), 0 26px 60px -24px oklch(0 0 0 / 85%);
+  --glow: 0 1px 2px oklch(0 0 0 / 40%), 0 10px 22px -14px oklch(0.623 0.206 255.3 / 50%);
+  --ring: 0 0 0 3px oklch(0.623 0.206 255.3 / 30%);
 }
 
 /* system 模式跟随系统深浅 */
@@ -141,53 +179,55 @@
   :root[data-theme="system"] {
     color-scheme: dark;
 
-    --bg: #090c13;
-    --bg-grad-a: rgba(24, 33, 53, .9);
-    --bg-grad-b: rgba(22, 32, 58, .75);
-    --surface: #12161f;
-    --surface-2: #171c27;
-    --surface-3: #1e2431;
-    --surface-inset: #0e1219;
-    --border: #232a39;
-    --border-strong: #333d51;
-    --hairline: rgba(255, 255, 255, .07);
+    --bg: oklch(0.21 0 0);
+    --bg-grad-a: oklch(1 0 0 / 3%);
+    --bg-grad-b: oklch(0.623 0.206 255.3 / 6%);
+    --surface: oklch(0.285 0 0);
+    --surface-2: oklch(0.305 0 0);
+    --surface-3: oklch(0.335 0 0);
+    /* 必须与上方 :root[data-theme="dark"] 的取值完全一致：
+       两者描述的是同一套深色主题，只是触发方式不同（显式深色 / 跟随系统）。 */
+    --surface-inset: oklch(0.19 0 0);
+    --surface-well: oklch(0.19 0 0);
+    --border: oklch(1 0 0 / 10%);
+    --border-strong: oklch(1 0 0 / 17%);
+    --hairline: oklch(1 0 0 / 7%);
 
-    --text: #e9edf6;
-    --text-2: #a4aec0;
-    --text-3: #6e7a8e;
+    --text: oklch(0.965 0 0);
+    --text-2: oklch(0.85 0 0);
+    --text-3: oklch(0.78 0 0);
 
-    --primary: #5b8cff;
-    --primary-hover: #7099ff;
-    --primary-top: #6d99ff;
-    --primary-soft: rgba(91, 140, 255, .15);
-    --primary-bd: rgba(91, 140, 255, .36);
-    --primary-fg: #a9c3ff;
+    --primary: oklch(0.623 0.206 255.3);
+    --primary-hover: oklch(0.68 0.206 255.3);
+    --primary-soft: oklch(0.623 0.206 255.3 / 15%);
+    --primary-bd: oklch(0.623 0.206 255.3 / 38%);
+    --primary-fg: oklch(0.75 0.12 255.3);
 
-    --ok: #38c98c;
-    --ok-soft: rgba(56, 201, 140, .14);
-    --ok-bd: rgba(56, 201, 140, .32);
-    --warn: #e2a94f;
-    --warn-soft: rgba(226, 169, 79, .14);
-    --warn-bd: rgba(226, 169, 79, .32);
-    --danger: #f2707c;
-    --danger-soft: rgba(242, 112, 124, .14);
-    --danger-bd: rgba(242, 112, 124, .32);
-    --info: #62a6f0;
-    --info-soft: rgba(98, 166, 240, .14);
-    --info-bd: rgba(98, 166, 240, .3);
+    --ok: oklch(0.696 0.17 162.48);
+    --ok-soft: oklch(0.696 0.17 162.48 / 14%);
+    --ok-bd: oklch(0.696 0.17 162.48 / 32%);
+    --warn: oklch(0.769 0.188 70.08);
+    --warn-soft: oklch(0.769 0.188 70.08 / 14%);
+    --warn-bd: oklch(0.769 0.188 70.08 / 32%);
+    --danger: oklch(0.704 0.191 22.216);
+    --danger-soft: oklch(0.704 0.191 22.216 / 14%);
+    --danger-bd: oklch(0.704 0.191 22.216 / 32%);
+    --info: oklch(0.613 0.14 239.919);
+    --info-soft: oklch(0.613 0.14 239.919 / 14%);
+    --info-bd: oklch(0.613 0.14 239.919 / 32%);
 
-    --cn: #f0837a;
-    --cn-soft: rgba(240, 131, 122, .14);
-    --cn-bd: rgba(240, 131, 122, .3);
-    --intl: #93a9ff;
-    --intl-soft: rgba(122, 148, 255, .14);
-    --intl-bd: rgba(122, 148, 255, .3);
+    --cn: oklch(0.704 0.191 22.216);
+    --cn-soft: oklch(0.704 0.191 22.216 / 14%);
+    --cn-bd: oklch(0.704 0.191 22.216 / 32%);
+    --intl: oklch(0.68 0.14 268);
+    --intl-soft: oklch(0.68 0.14 268 / 14%);
+    --intl-bd: oklch(0.68 0.14 268 / 32%);
 
-    --shadow-1: 0 1px 2px rgba(0, 0, 0, .4);
-    --shadow-2: 0 1px 2px rgba(0, 0, 0, .4), 0 12px 28px -18px rgba(0, 0, 0, .8);
-    --shadow-3: 0 2px 10px rgba(0, 0, 0, .45), 0 26px 60px -24px rgba(0, 0, 0, .85);
-    --glow: 0 1px 2px rgba(0, 0, 0, .4), 0 10px 22px -14px rgba(91, 140, 255, .9);
-    --ring: 0 0 0 3px rgba(91, 140, 255, .28);
+    --shadow-1: 0 1px 2px oklch(0 0 0 / 40%);
+    --shadow-2: 0 1px 2px oklch(0 0 0 / 40%), 0 12px 28px -18px oklch(0 0 0 / 80%);
+    --shadow-3: 0 2px 10px oklch(0 0 0 / 45%), 0 26px 60px -24px oklch(0 0 0 / 85%);
+    --glow: 0 1px 2px oklch(0 0 0 / 40%), 0 10px 22px -14px oklch(0.623 0.206 255.3 / 50%);
+    --ring: 0 0 0 3px oklch(0.623 0.206 255.3 / 30%);
   }
 }
 

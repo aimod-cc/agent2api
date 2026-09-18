@@ -5,7 +5,7 @@
  * 独立于 app.js 的账号视图模块：账号列表的渲染（含优先级 / 启用 / 代理徽章）
  * 与行内批量操作（积分查询、签到）集中在这里，主脚本只负责账号级的切换/删除/设置。
  *
- * 依赖 window.wbApp：esc / toast / formatTime / formatShortTime / getState，
+ * 依赖 window.wbApp：esc / toast / formatTime / getState，
  * 通过 window.wbAccountsView 暴露给 app.js：
  *   render()                     重绘账号列表（筛选、分组、徽章、行内面板）
  *   renderNavCount()             导航上的账号数徽标
@@ -100,11 +100,18 @@
    * model 为当前筛选的模型 id（空串 = 不限模型）。
    *
    * 卡片结构（自上而下，信息密度递减）：
-   *   ① 主体：勾选 / 账号名 + 版本徽章 / 状态徽章（贴账号名右侧）
-   *   ② 明细：额度类型 · 有效期 · 尾号 · 出口
+   *   ① 主体：勾选 / 账号名 + 状态区（版本徽章 + 状态徽章，贴卡片右缘）
+   *   ② 明细：额度类型 · 有效期 · 代理（未配置代理时只显示前两项）
    *   ③ 提示：仅异常时出现的一行说明（429 恢复时间 / 代理异常）
    *   ④ 底部：转发顺序在左，操作按钮在右
-   * 频繁用到的操作留在卡内；刷新 Token 与删除收进「⋯」菜单（点击才生成内容）。
+   * 状态区（.card-state）是**名字行（.who-name）内部的末尾项**，不是 .card-head 的
+   * 独立一列：它靠 margin-left: auto 贴住名字行右缘，视觉上仍在卡片右上角；
+   * 而 .who 因此独占 .card-head 的剩余宽度，下面的明细行（.who-meta）拿到通栏宽度，
+   * 「代理」这类长项能多显示一大截（此前被状态区那一列白扣掉约 110–127px）。
+   * 版本徽章与状态徽章同处卡片右缘，是因为两者合起来回答的是同一个问题
+   * ——「这是什么账号、现在能不能用」；版本徽章若挂在账号名后面，名字会被两枚
+   * 标签夹住，扫读时先撞见标签、再找到名字。
+   * 频繁用到的操作留在卡内；启用/禁用、刷新 Token 与删除收进「⋯」菜单（点击才生成内容）。
    */
   function accountCardHtml(account, routedId, position, total, model = '') {
     const isCurrent = account.id === routedId;
@@ -122,7 +129,7 @@
         + `</span>`,
       `<button data-action="settings" data-id="${esc(account.id)}">设置</button>`,
       isCurrent
-        ? '<button class="is-current" disabled title="已是转发顺序第一位，无需再置顶">已是首选</button>'
+        ? '<button class="is-current" disabled title="已是转发顺序第一位，无需再置顶">首选</button>'
         : `<button class="wide" data-action="switch" data-id="${esc(account.id)}" title="把该账号移到转发顺序第一位，并启用它">设为首选</button>`,
       `<button data-action="usage" data-id="${esc(account.id)}" title="查询该账号剩余积分">积分</button>`,
       // 签到按钮保持可见（国际版无签到活动，故仅国内版显示）
@@ -147,11 +154,10 @@
         <div class="who">
           <div class="who-name"${title ? ` title="${esc(title)}"` : ''}>
             <span class="name">${esc(account.nickname || account.name || account.uid || '未命名账号')}</span>
-            ${editionCell(account)}
+            <div class="card-state">${editionCell(account)}${accountTags(account, routedId, model) || '<span class="badge tag plain">—</span>'}</div>
           </div>
           <div class="who-meta">${metaLine(account, position)}</div>
         </div>
-        <div class="card-state">${accountTags(account, routedId, model) || '<span class="badge tag plain">—</span>'}</div>
       </div>
       ${cardNoteHtml(account, model)}
       <div class="card-foot">
@@ -162,15 +168,51 @@
     </article>`;
   }
 
+  /** 无有效恢复时间时的退化文案：它本身就是完整一句，调用方据此不再拼「，恢复时间：」 */
+  const RESET_UNKNOWN = '已限流';
+
+  /** 某时刻所在自然日的零点（本地时区），用于按「日历天」计算今天 / 明天 */
+  const startOfDay = value => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+
   /**
-   * 异常提示条：状态徽章只说「是什么」（429 / 代理异常），这一行补「怎么办」。
+   * 限流恢复时间文案：今天 HH:mm / 明天 HH:mm / M月d日 HH:mm。
+   *
+   * 为什么带「今天 / 明天」而不是相对毫秒数或完整时间戳：限流是自动解除的，
+   * 用户扫过卡片时最关心「到点了没、还要等多久」——「明天 01:04」比
+   * 「09-19 01:04」少一步换算，也不会像「6 小时后」那样一过夜就说不清是哪天。
+   *
+   * 无有效时间戳（缺失 / 非法 / 已过，后者说明数据异常）时返回 RESET_UNKNOWN，
+   * 由调用方退化成只输出这一句。
+   */
+  function formatResetText(resetAt) {
+    const time = Number(resetAt);
+    if (!Number.isFinite(time) || time <= 0 || time <= Date.now()) return RESET_UNKNOWN;
+    const date = new Date(time);
+    const clock = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    // 按自然日求差而不是按 24 小时：今晚 23:50 到明天 00:10 只差 20 分钟，
+    // 但用户嘴里它就是「明天」，按毫秒差算会显示成「今天」，与直觉相反。
+    const days = Math.round((startOfDay(date) - startOfDay(new Date())) / 86400e3);
+    if (days === 0) return `今天 ${clock}`;
+    if (days === 1) return `明天 ${clock}`;
+    return `${date.getMonth() + 1}月${date.getDate()}日 ${clock}`;
+  }
+
+  /**
+   * 异常提示条：状态徽章只说「是什么」（限流 / 代理异常），这一行补「怎么办」。
    * 只在有异常时返回内容，正常卡片不占这行高度 —— 否则整片卡片都被拉高，
    * 却只为了重复一遍「一切正常」。
    */
   function cardNoteHtml(account, model = '') {
     const notes = [];
     if (isEnabled(account) && isRateLimited(account, model)) {
-      notes.push('该模型已达上限，期间的请求会自动改用后面的账号');
+      // 带恢复时间：用户最想知道的不是「被限流了」，而是「什么时候自动回来」——
+      // 写清楚时间点就不必去日志页翻限额切换记录。
+      // 时间点包 <strong> 加粗：这一行真正要读的是「几点回来」，「已限流，恢复时间：」
+      // 只是引出它的定语；两者同权重时时间点会被前七个字淹没。不在 strong 上写样式，
+      // 用浏览器默认的加粗即可（本项目其它 strong 也只调整文字色，见 components.css）。
+      // 退化态（无有效时间戳）没有可强调的对象，保持纯文本，不包空标签。
+      const resetText = formatResetText(account.rateLimits?.[model]?.resetAt);
+      notes.push(resetText === RESET_UNKNOWN ? resetText : `已限流，恢复时间：<strong>${resetText}</strong>`);
     }
     if (account.proxy?.error) {
       notes.push(`代理不可用（${esc(account.proxy.error)}），转发时会回退直连`);
@@ -189,10 +231,49 @@
    * 之所以不是常驻隐藏（display:none），是因为布局探针会把「常驻但隐藏」的
    * 按钮算进行内按钮集合，导致测量结果与实际可见操作不一致。
    */
-  let openMenu = null;   // 当前展开的菜单元素
+  let openMenu = null;          // 当前展开的菜单元素
+  let menuScrollHost = null;    // 菜单展开期间挂着 scroll 监听的滚动容器
+  let menuScrollHandler = null; // 与之配对的监听函数，收起时用来摘掉
 
   function closeMoreMenu() {
     if (openMenu) { openMenu.remove(); openMenu = null; }
+    if (menuScrollHost && menuScrollHandler) {
+      menuScrollHost.removeEventListener('scroll', menuScrollHandler);
+    }
+    menuScrollHost = null;
+    menuScrollHandler = null;
+  }
+
+  /**
+   * 决定菜单往下弹还是往上弹（加 / 摘 .more-menu.flip）。
+   *
+   * 为什么必须量：菜单是卡片内的绝对定位块，而卡片网格在 .acct-scroll 这个
+   * 滚动容器里。列表底部那几张卡下方已经没有可视空间，固定往下弹的菜单会超出
+   * 容器底部被裁掉 —— 既看不见也点不到。反过来，卡片在列表顶部时下方空间充足，
+   * 又该正常往下弹，所以只能按当下的几何量出来判。
+   *
+   * 判定口径：菜单下沿越过「滚动容器可视底」与「视口底」里更靠上的那个，
+   * 就说明往下放不下。容器取不到时（防御，理论上不会发生）只跟视口底比。
+   *
+   * 为什么不用循环二次校验：翻转后的锚点是 .card-foot 的**上沿**（不是卡片上沿），
+   * 菜单底边离它只有 4px。会触发翻转的卡片本就处在可视区靠下的位置，锚点上方
+   * 至少还有整张卡的主体（账号名 + 明细行）再加容器里上方的余量，
+   * 而菜单最高也只是「三项 + 一条分隔线」，所以定一次方向就够。
+   */
+  function applyMenuDirection(menu) {
+    // 列表重绘会把菜单连同卡片一起换掉，此时元素已脱离文档，量不出有意义的值
+    if (!menu.isConnected) return;
+    // 先摘掉翻转态再量：带着 flip 量到的是「向上」的矩形，用它判定会一直得出
+    // 「下方有空间」，下一次滚动就把翻转撤销了 —— 必须量默认的向下位置。
+    // （同一帧内摘掉再加回不会闪：浏览器只在本轮 JS 跑完后绘制。）
+    menu.classList.remove('flip');
+    const rect = menu.getBoundingClientRect();
+    const scroller = menu.closest('.acct-scroll');
+    const bottomLimit = Math.min(
+      scroller ? scroller.getBoundingClientRect().bottom : Infinity,
+      document.documentElement.clientHeight,
+    );
+    menu.classList.toggle('flip', rect.bottom > bottomLimit);
   }
 
   function toggleMoreMenu(button, account) {
@@ -204,17 +285,28 @@
     menu.className = 'more-menu';
     menu.dataset.for = account.id;
 
+    // 菜单按「影响面」从大到小排：启用/禁用会改变这个账号是否参与转发，
+    // 是最重的一项，故放在最前；删除账号同理，排在最后并由 <hr> 隔开。
+    // 启用/禁用在本文件自行消化（见下方 data-menu-action 分支）：app.js 的
+    // runAccountAction 只认 switch / refresh / remove，未知 action 会被静默忽略。
+    // 两项都标 danger（同「删除账号」的红色）：它们会立刻改变转发可用性，
+    // 禁用还有可能把唯一可用账号停掉，颜色上必须先给一次警示。
     const items = [];
+    items.push(isEnabled(account)
+      ? { action: 'disable', label: '禁用', danger: true }
+      : { action: 'enable', label: '启用', danger: true });
     if (account.hasRefreshToken) {
       items.push({ action: 'refresh', label: '刷新 Token' });
-    }
-    if (isEnabled(account) && supportsCheckin(account)) {
-      items.push({ action: 'checkin', label: '签到' });
     }
     if (!account.desktop) {
       items.push({ action: 'remove', label: '删除账号', danger: true });
     }
     // 菜单内不再重复行内已有的操作（设置/积分/设为首选都留在行上）
+    // 签到同属此列：它的入口只保留行内按钮一处（启用 + 国内版才渲染），
+    // 菜单里再挂一项等于同一动作有两个入口 —— 用户会疑心两者行为不同，
+    // 菜单也多出一行没有信息量的项。
+    // 分隔线只在 danger 项前面插：新加的启用/禁用落在 index 0，此处不会给它插前置线，
+    // 它本来就该是菜单的第一项，上方无需分隔。
     menu.innerHTML = items.map((item, index) => {
       const hr = item.danger && index > 0 ? '<hr>' : '';
       return `${hr}<button data-menu-action="${item.action}" data-id="${esc(account.id)}"`
@@ -226,6 +318,23 @@
     const host = button.closest('.card-foot') || button.closest('.acct-card');
     host.appendChild(menu);
     openMenu = menu;
+
+    // 插入后立刻按当下几何定一次方向：列表底部的卡片改用向上弹
+    applyMenuDirection(menu);
+
+    // 菜单开着时盯着滚动：滚动会带着卡片和菜单一起移动，原本放得下的方向可能
+    // 变得放不下（反之亦然），所以持续重测、只增删 flip 类，不关菜单。
+    // 监听用 passive 且只读几何，不干扰滚动性能；closeMoreMenu 时统一摘掉。
+    menuScrollHost = menu.closest('.acct-scroll');
+    if (menuScrollHost) {
+      menuScrollHandler = () => {
+        // 列表被整体重绘（后台推送刷新等）时，菜单会随旧卡片一起被换掉。
+        // 这里自行收尾，别把监听留在滚动容器上引用一个已脱离文档的节点。
+        if (!menu.isConnected) { closeMoreMenu(); return; }
+        applyMenuDirection(menu);
+      };
+      menuScrollHost.addEventListener('scroll', menuScrollHandler, { passive: true });
+    }
   }
 
   /** 转发顺序下的位置表：accountId → 第几位（1 起） */
@@ -612,14 +721,17 @@ function bindEvents() {
       render();
       return;
     }
-    // ⋯ 菜单里的菜单项（刷新 Token / 签到 / 删除）
+    // ⋯ 菜单里的菜单项（启用/禁用 / 刷新 Token / 删除账号）
     const menuItem = event.target.closest('button[data-menu-action]');
     if (menuItem) {
       const { menuAction, id } = menuItem.dataset;
       closeMoreMenu();
-      if (menuAction === 'checkin') {
-        setPanelOpen(id, 'checkin', true);
-        await runCheckin(id);
+      // 启用/禁用在这里自行消化，不交给 app.js 的 runAccountAction ——
+      // 那个入口只处理 switch / refresh / remove，未知 action 会被静默忽略
+      // （不报错也不生效）。走同一套桥接方法 updateAccount（PATCH /api/accounts/<id>），
+      // 与卡片设置弹窗里勾选「启用」保存的是同一条链路，语义一致。
+      if (menuAction === 'enable' || menuAction === 'disable') {
+        await toggleAccountEnabled(id, menuAction === 'enable');
         return;
       }
       window.wbApp.runAccountAction?.(menuAction, id);
@@ -675,6 +787,29 @@ function bindEvents() {
     // 切换 / 刷新 / 删除 / 设置：交给 app.js 的统一入口
     window.wbApp.runAccountAction?.(action, id);
   });
+
+  /**
+   * 启用 / 禁用单个账号（⋯ 菜单的第一项）。
+   *
+   * 为什么放在这里而不是 app.js 的 runAccountAction：那个入口的 switch 分支只认
+   * switch / refresh / remove，别的 action 会静默走完不做事；本次改动不越界改 app.js，
+   * 于是在菜单的 data-menu-action 分支里先拦下来自行处理。
+   *
+   * 用 updateAccount 走 PATCH —— 与卡片「设置」弹窗里勾选启用保存是同一条桥接方法，
+   * 后端 apply_patch 只改显式传入的字段，这里只传 enabled，别的一概不动。
+   * 成功后 refresh() 会重新拉 getState 并 render()，所以状态徽章（已禁用）、
+   * 行内按钮（签到按启用状态显隐）与下次打开的菜单文案会立即跟着变。
+   */
+  async function toggleAccountEnabled(id, enabled) {
+    try {
+      await api.updateAccount(id, { enabled });
+      await wbApp.refresh?.();
+      toast(enabled ? '✅ 已启用' : '✅ 已禁用');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      toast(`操作失败：${message}`, 'err');
+    }
+  }
 
   /** 单个账号签到：展开明细 → 串行请求 → 就地刷新结果 */
   async function runCheckin(id) {

@@ -1,13 +1,134 @@
 /* ─────────────────────────────────────────────
-   设置页：分组卡片 / 自动签到 / 软件更新
+   设置页：左侧分类导航 + 右侧内容栏 / 分组卡片 / 自动签到 / 软件更新
    ───────────────────────────────────────────── */
 
-/* 设置项容器：开关纵向堆叠 */
+/* ─── 页面骨架：滚动归属 ───
+   设置项按分类拆开后，导航必须常驻可点，不能跟着内容一起滚走 ——
+   所以这里与账号页 / 日志页同一套范式：页面本身不再滚动（overflow: hidden），
+   滚动交给右侧内容栏（.settings-panes），左栏因此天然「不动」。
+   若沿用 .page.active 默认的整页滚动，两栏会一起滚，导航滚出视野后
+   还得先滚回顶部才能切分类。 */
+.page.active[data-page="settings"] {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* 底部留白移交给 .settings-panes 自己：否则滚动条会拖到页面外框上，
+     和内容栏的高度对不齐 */
+  padding-bottom: 0;
+}
+
+.page[data-page="settings"] .page-head { flex: none; }
+
+.settings-layout {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: var(--pad);
+}
+
+/* ─── 左栏：分类导航 ───
+   观感对齐主侧栏的 .nav-item，但不能直接复用那个类名：
+   app.js 的 showPage 会遍历所有 .nav-item 并按 data-page 重置 active，
+   设置页的分类项会被顺手清掉选中态（点分类后一切页就跳回「通用」）。 */
+.settings-nav {
+  flex: 0 0 auto;
+  width: 140px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 4px;
+  /* 分类多到装不下时自己可滚：此时出现第二条滚动条是正确的，
+     但内容装得下时不会有任何滚动条 */
+  overflow-y: auto;
+}
+
+.settings-nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  /* 纯文字项要左对齐：通用 button 是 justify-content:center，
+     不覆盖的话三个分类会各自居中，看着不像一排导航 */
+  justify-content: flex-start;
+  width: 100%;
+  /* 高度沿用通用 button 的 30px，与主侧栏 .nav-item 等高（那儿的高度也来自这条基线）。
+     不另设 height / line-height：12.5px 的行盒远小于 30px，不会溢出 */
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  /* 分类项是 <button>，components.css 里通用的 button 规则会给它带上
+     --shadow-1 —— 与「平铺的导航列表」冲突，这里显式清掉（.nav-item 同样处理） */
+  box-shadow: none;
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  transition: background .15s ease, color .15s ease;
+}
+
+/* hover：一层极淡的中性叠加底（与主侧栏同款表达式，浅色叠灰、深色叠白）。
+   带 :not(:disabled) 是为了压过 components.css 里通用的 button:hover ——
+   那个选择器特异性更高，否则会盖掉叠加底并给导航项描边。 */
+.settings-nav-item:hover:not(:disabled) {
+  background: color-mix(in oklab, var(--text) 6%, transparent);
+  border-color: transparent;
+  color: var(--text);
+}
+
+/* 选中态：品牌浅底 + 主题色字，与主侧栏选中项同一口径。
+   一并声明 .active:hover，让悬停选中项时仍保持选中态。 */
+.settings-nav-item.active,
+.settings-nav-item.active:hover {
+  background: var(--primary-soft);
+  border-color: transparent;
+  color: var(--primary-fg);
+  font-weight: 600;
+}
+
+/* ─── 右栏：分类内容 ───
+   唯一的滚动容器；面板自带 margin-bottom 14px，这里只补回原来
+   .page.active 的 padding-bottom，让最后一张卡片不贴着底边。 */
+.settings-panes {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 20px;
+}
+
+.settings-pane { display: none; }
+.settings-pane.active { display: block; }
+
+/* 窄窗口（与主侧栏收起的断点一致）：两栏退化为「导航在上、内容在下」，
+   导航转横排铺满整行。窗口最小 720px，四个分类横排放得下。 */
+@media (max-width: 900px) {
+  .settings-layout { flex-direction: column; gap: 12px; }
+
+  .settings-nav {
+    width: auto;
+    flex-direction: row;
+    gap: 4px;
+    padding-bottom: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .settings-nav-item {
+    width: auto;
+    flex: 0 0 auto;
+    padding: 0 12px;
+  }
+}
+
+/* 设置项容器：开关纵向堆叠。
+   嵌在面板（--r-lg）里面，圆角收一档到 --r-md，套嵌层次才看得出来 */
 .settings-switches {
   display: flex;
   flex-direction: column;
-  gap: 9px;
-  padding: 10px 12px;
+  gap: 10px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
@@ -22,16 +143,22 @@
   color: var(--text-2);
   font-size: 12px;
   line-height: 1.65;
+  word-break: break-word;
 }
 
-.settings-state code { padding: 1px 5px; border: 1px solid var(--border); border-radius: var(--r-xs); background: var(--surface-3); }
+.settings-state code {
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface-3);
+}
 
 /* 导入导出结果 */
 .io-result {
   display: flex;
   align-items: flex-start;
-  gap: 8px;
-  padding: 10px 12px;
+  gap: 9px;
+  padding: 12px 14px;
   border: 1px solid var(--ok-bd);
   border-radius: var(--r-md);
   background: var(--ok-soft);
@@ -45,7 +172,7 @@
 
 /* 危险提示区（导出含凭证） */
 .danger-zone {
-  padding: 10px 12px;
+  padding: 12px 14px;
   border: 1px solid var(--danger-bd);
   border-radius: var(--r-md);
   background: var(--danger-soft);
@@ -64,21 +191,25 @@
 .field-row > .pf-username,
 .field-row > .pf-password { flex: 0 1 150px; }
 
-.pf-test-result { word-break: break-word; }
+/* 测试出口的结果里混着状态码、IP 与耗时，数字等宽才不会左右跳 */
+.pf-test-result {
+  word-break: break-word;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ─── 软件更新 ─── */
 .update-version {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
 .version-pill {
   display: inline-flex;
   align-items: baseline;
-  gap: 7px;
-  padding: 6px 12px;
+  gap: 8px;
+  padding: 7px 13px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
@@ -96,22 +227,92 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* 有新版时整枚药丸转成成功色：淡底 + 描边 + 深字 */
 .version-pill.new { border-color: var(--ok-bd); background: var(--ok-soft); }
 .version-pill.new .v { color: var(--ok); }
 
 .version-arrow { color: var(--text-3); font-size: 13px; }
 
-/* 更新说明：等宽换行展示 Release notes */
-.update-notes {
-  padding: 11px 12px;
-  max-height: 176px;
-  overflow: auto;
+/* 更新说明区（原 .update-notes）：已升级成带 Markdown 渲染与多版本折叠的更新日志，
+   排版移到 update-notes.css 的 .update-log / .md-body 下（那个文件在本文件之后加载）。 */
+
+/* ─── 数据保留 ───
+   三项设置的结构完全相同（标签 + 数字输入 + 单位 + 一行说明），所以用一个容器
+   纵向堆叠、每行按「标签定宽 + 输入紧随其后」两列排，说明文字另起一行占满整行
+   （与页面里其它设置项的读数习惯一致：先看值，再看解释）。
+   标签列定宽而不是 max-content：三行各自是一个独立网格，用 max-content 的话
+   列宽由各行自己的文案决定，标签长短一变输入框就会各自错开。定宽 118px 足够
+   放下当前 8 个汉字（约 100px），万一以后文案更长，也是标签折行、不会叠到输入框上。 */
+.retention-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
-  color: var(--text-2);
-  font-size: 11.5px;
-  line-height: 1.75;
-  white-space: pre-wrap;
-  word-break: break-word;
 }
+
+.retention-row {
+  display: grid;
+  /* 定宽标签列 + 吃掉剩余宽度的输入列（输入自身定宽，所以它紧跟标签、不会飘到行尾） */
+  grid-template-columns: 118px auto;
+  align-items: center;
+  gap: 5px 10px;
+}
+
+.retention-row > label {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+/* 输入 + 单位：单位紧贴在数字框右侧，三行的「天」因此也对齐在同一条竖线上 */
+.retention-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+/* 覆盖 components.css 的 input[type=number]{max-width:130px}：这里要收窄到 92px，
+   三行等宽；数字用等宽字形，改了位数一眼看得出来。左对齐（不右对齐）是为了
+   让显示出来的步进箭头不推着数字走 —— Chromium 的箭头在 hover / focus 时才占位，
+   右对齐会让数字在那一下左右跳。 */
+.retention-input input[type="number"] {
+  flex: 0 0 auto;
+  width: 92px;
+  max-width: 92px;
+  font-variant-numeric: tabular-nums;
+}
+
+.retention-input .unit { color: var(--text-3); font-size: 12px; }
+
+/* 说明另起一行、占满整行（从标签左边缘开始，不必再缩进）。
+   字号 / 行高沿用 components.css 的 .hint，这里只管换行位置 */
+.retention-row > .hint { grid-column: 1 / -1; }
+
+/* 面板底注：这行说的是「改小会立刻删数据」这件不可恢复的事，
+   所以不只当普通小字 —— 用 warn 语义的浅底 + 描边单独框一行，
+   在用户动手之前就把风险摆在明面上（点保存时还会再弹一次确认）。
+   颜色全部取自令牌的 warn 三件套，深浅主题各自成立；
+   字号 / 行高沿用同一个元素上的 .hint，这里不重复声明 */
+.retention-note {
+  padding: 9px 12px;
+  border: 1px solid var(--warn-bd);
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+}
+
+/* 窄窗口：设置页两栏已退化为上下排（见上面的媒体查询），行的横向空间反倒更宽，
+   这里只把标签列放宽一点，避免「按天聚合保留天数」在 118px 里挤成两行 */
+@media (max-width: 900px) {
+  .retention-row { grid-template-columns: max-content 1fr; }
+}
+
+/* ─── 保留期改小确认弹窗 ───
+   复用 .modal 外壳（components.css），只覆盖宽度：
+   确认框只有一句话加两个按钮，620px 太宽、文字会散开，收窄到 440px 更聚拢。
+   危险动作的样式不由这里负责 —— 确认键用既有的 button.danger。 */
+.modal-confirm { width: min(440px, 100%); }
+

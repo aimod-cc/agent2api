@@ -1,4 +1,4 @@
-# 服务端依赖（undici / yaml）
+# 依赖目录
 node_modules/
 
 # Tauri 工程依赖与构建产物
@@ -6,16 +6,17 @@ desktop-tauri/node_modules/
 desktop-tauri/src-tauri/target/
 desktop-tauri/src-tauri/gen/schemas/
 
-# 由 npm run build:backend 生成的 Node 版运行资源（server.cjs + node.exe）
-# 仅用于 Node CLI 场景；桌面端已是纯 Rust 进程内服务器，不再打包这些文件
-desktop-tauri/src-tauri/resources/
+# cargo 编译产物（src-tauri/.cargo/config.toml 把 target-dir 指到了项目根）
+/target/
 
 # 本地开发过程产物
 .zcode/
 .verify/
 prototype/
-workbuddy-proxy-main/
 
 # 运行日志与截图产物
 logs/
 desktop-tauri/window-shot.png
+
+# 发布说明草稿（只用于发布 Release，不入库）
+.release-notes-*.md

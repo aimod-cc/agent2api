@@ -4,13 +4,13 @@
 /**
  * 从 accounts-view.js 抽出的「纯逻辑 + 标签 HTML」层：
  * 判定账号是否可用 / 是否限流、生成状态标签与第二行小字。
- * 这些函数不读写模块状态、不碰事件，只依赖 window.wbApp 的 esc / formatTime /
- * formatShortTime，因此单独成文件，让账号视图聚焦在渲染与交互上。
+ * 这些函数不读写模块状态、不碰事件，只依赖 window.wbApp 的 esc / formatTime，
+ * 因此单独成文件，让账号视图聚焦在渲染与交互上。
  *
  * 通过 window.wbAccountsModel 暴露；accounts-view.js 与 app.js（顶栏状态）都会用到。
  */
 (() => {
-  const { esc, formatTime, formatShortTime } = wbApp;
+  const { esc, formatTime } = wbApp;
 
   // ─── 基础判定 ──────────────────────────────
 
@@ -78,10 +78,15 @@
   }
 
   /**
-   * 限额标签：状态码 + 恢复时间。
+   * 限额标签：表面只写「限流」（多个模型同时限额时标「限流 +N」），
+   * 各模型的状态码与恢复时间留在 title 悬浮详情里。
+   *
+   * 为什么把「状态码 · 恢复时间」从徽章表面收进悬浮层：卡片右上角是「哪个账号有问题」的
+   * 扫读位，「429 · 09-11 18:00 恢复」这种长文案在窄卡片上会被省略号截断，
+   * 反而连「限流」两个字都看不全；恢复时间点开卡片提示条也能看到（见 cardNoteHtml）。
    *
    * 选了模型时只看该模型的限额（列表已是该模型的队列，别的模型的限额与本视图无关，
-   * 显示出来只会造成「标着 429 却还能用」的困惑）；未选模型时汇总展示。
+   * 显示出来只会造成「标着限流却还能用」的困惑）；未选模型时汇总展示。
    */
   function rateLimitTag(account, model = '') {
     const limits = account.rateLimits || {};
@@ -92,20 +97,19 @@
       .filter(item => !model || item.model === model)
       .sort((a, b) => a.resetAt - b.resetAt);
     if (!active.length) return '';
-    const first = active[0];
     const extra = active.length > 1 ? ` +${active.length - 1}` : '';
     const title = [
       '已达上限的模型（其它模型不受影响）：',
       ...active.map(item => `${item.model}: ${item.status}，${formatTime(item.resetAt)} 恢复`),
     ].join('\n');
-    return statusTag(`${first.status} · ${formatShortTime(first.resetAt)} 恢复${extra}`, 'warn', title);
+    return statusTag(`限流${extra}`, 'warn', title);
   }
 
   /**
    * 状态标签集合：这一区只表达**健康状态**。
    *
    * 「首选」不在这里 —— 它表达的是转发顺序（队首），不是账号健康状况。
-   * 卡片底部已有 ★ 与「已是首选」实心块表达同一件事，再在状态区重复一遍
+   * 卡片底部已有 ★ 与「首选」实心块表达同一件事，再在状态区重复一遍
    * 只会让这一列没法收窄，也混淆「正常 / 限流 / 禁用」的语义。
    *
    * 只标「需要关注的状态」；一切正常时给一个「正常」标签 ——
@@ -140,15 +144,26 @@
     return `${Math.floor(left / 24 / 3600e3)} 天后过期`;
   }
 
-  /** 第二行小字：额度类型 / 有效期 / 尾号 / 出口 */
+  /**
+   * 第二行小字：额度类型 · 有效期 · 代理。
+   *
+   * 尾号（account.tokenTail）已按需求下线：它是导入时的辅助标识，账号名/uid 已经能
+   * 唯一认出账号，多一项只是占宽度 —— 窄卡片上它正好把最先被挤掉的位置留给了更有用的代理。
+   * 代理项只在「配了且没解析出错」时出现：没配代理不显示（显示「直连」等于给绝大多数
+   * 账号都加一项噪音），代理异常也不在这里显示 —— 那属于必须处理的故障，
+   * 已经由状态徽章（代理异常）与卡片提示条（cardNoteHtml）专门说明，这里再写一遍是重复。
+   * 该 span 是明细行的可收缩项，长代理名由 CSS 加省略号收尾（见 page-accounts.css 的 .who-meta）。
+   */
   function metaLine(account) {
     const parts = [
       `<span title="该账号的额度类型">${esc(typeLabel(account.type))}</span>`,
-      `<span>${esc(expiryText(account.expiresAt))}</span>`,
+      // 也带 title：没配代理时这一项就是明细行的末项，会被 CSS 当作可收缩项，
+      // 极端窄卡片下加省略号后仍能悬浮看到完整文案（与代理项同一口径）
+      `<span title="Token 有效期">${esc(expiryText(account.expiresAt))}</span>`,
     ];
-    if (account.tokenTail) parts.push(`<span>尾号 <span class="tail">${esc(account.tokenTail)}</span></span>`);
     if (account.proxy && !account.proxy.error) {
-      parts.push(`<span class="proxy" title="该账号经此出口访问上游">出口 ${esc(account.proxy.label || '已设置')}</span>`);
+      // title 保留：代理名被省略号截断后，悬浮仍能看到完整值
+      parts.push(`<span class="proxy" title="该账号经此代理访问上游">代理 ${esc(account.proxy.label || '已设置')}</span>`);
     }
     return parts.join('<span class="sep">·</span>');
   }

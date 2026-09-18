@@ -1,0 +1,174 @@
+/* ─────────────────────────────────────────────
+   报表页：时间范围 / 统计概览 / 热力图 / 缓存命中率 / 两个趋势图
+   颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明；
+   热力图五档用 --hm-* 变量集中定义，格子与图例共用，色值只有一处。
+   ───────────────────────────────────────────── */
+
+/* ─── 热力图色阶 ───
+   品牌色按透明度分档，而不是写五个色值：
+   浅色主题下品牌蓝叠在近白底上、深色下叠在深灰底上，
+   同一个 color-mix 表达式两套主题自然收敛（深色需要更高不透明度才看得见，
+   所以深色块里单独覆盖一次，这是唯一按主题分写的地方）。
+   两个基色都取令牌：浅色叠 --surface-3（比画布深一档的槽色）、
+   深色叠 --surface-inset（深色下唯一比画布更深的凹槽色），
+   这样「最浅一档」在两套主题里都稳稳低于任何一档着色格。 */
+:root {
+  --hm-0: var(--surface-3);
+  --hm-1: color-mix(in srgb, var(--primary) 22%, var(--surface-3));
+  --hm-2: color-mix(in srgb, var(--primary) 45%, var(--surface-3));
+  --hm-3: color-mix(in srgb, var(--primary) 70%, var(--surface-3));
+  --hm-4: var(--primary);
+}
+
+:root[data-theme="dark"] {
+  --hm-1: color-mix(in srgb, var(--primary) 34%, var(--surface-inset));
+  --hm-2: color-mix(in srgb, var(--primary) 56%, var(--surface-inset));
+  --hm-3: color-mix(in srgb, var(--primary) 78%, var(--surface-inset));
+  --hm-4: var(--primary);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --hm-1: color-mix(in srgb, var(--primary) 34%, var(--surface-inset));
+    --hm-2: color-mix(in srgb, var(--primary) 56%, var(--surface-inset));
+    --hm-3: color-mix(in srgb, var(--primary) 78%, var(--surface-inset));
+    --hm-4: var(--primary);
+  }
+}
+
+/* ─── 页头里的时间范围筛选 ───
+   分段控件复用 components.css 的 .seg / .seg-item（不另造一套），
+   .head-actions 自带 margin-left:auto，于是筛选与刷新按钮自动靠右，
+   这里不需要任何额外定位声明。 */
+
+/* 概览小格：数字上等宽，切换范围时 1 → 10 不会让整块左右跳 */
+.page[data-page="overview"] .field .value {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Top 模型是标识符（含连字符与版本号），等宽更易比对 */
+.page[data-page="overview"] .field .value.mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  word-break: break-all;
+}
+
+/* 缓存窗口的百分比：比普通读数大一号，四个窗口横向一排时更有分量 */
+.page[data-page="overview"] .field.rate .value.big { font-size: 17px; font-weight: 650; }
+
+.page[data-page="overview"] .field .sub {
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── 热力图 ───
+   53 列（365 天）在格子下限 7px 时约 550px 宽，正常窗口都放得下；
+   overflow-x 只是兜底：窗口被拖到极窄时让方格网横向滚动，
+   而不是把格子压成看不清的细条（所以这里**不**给 SVG 加 max-width:100%，
+   否则会被等比缩小、滚动条永远不出现，等于白设了这道兜底）。 */
+.heat-wrap {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding-bottom: 2px;
+}
+
+.report-svg { display: block; }
+
+.hm-cell {
+  fill: var(--hm-0);
+  /* 描边取承载面颜色：格子之间留出细微缝隙，密集时也数得清 */
+  stroke: var(--surface);
+  stroke-width: 1;
+  transition: fill .12s ease;
+}
+
+.hm-cell:hover { stroke: var(--text-3); stroke-width: 1; }
+
+/* 档位只看数值，不带任何其它维度 —— 见 report.js 里 heatmapHtml 的分档注释 */
+.hm-cell.l0 { fill: var(--hm-0); }
+.hm-cell.l1 { fill: var(--hm-1); }
+.hm-cell.l2 { fill: var(--hm-2); }
+.hm-cell.l3 { fill: var(--hm-3); }
+.hm-cell.l4 { fill: var(--hm-4); }
+
+/* 坐标轴文字：日期 / 百分比标签，统一走次要文字色 */
+.hm-axis,
+.chart-axis {
+  fill: var(--text-3);
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 图例：五档色块横排，与格子共用同一组变量 */
+.heat-legend { display: inline-flex; align-items: center; gap: 3px; }
+.heat-legend span {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  border: 1px solid var(--border);
+  background: var(--hm-0);
+}
+.heat-legend span.l1 { background: var(--hm-1); border-color: transparent; }
+.heat-legend span.l2 { background: var(--hm-2); border-color: transparent; }
+.heat-legend span.l3 { background: var(--hm-3); border-color: transparent; }
+.heat-legend span.l4 { background: var(--hm-4); border-color: transparent; }
+
+.heat-scale-label { color: var(--text-3); font-size: 11px; }
+
+/* ─── 图表容器 ───
+   宽度由面板决定，SVG 按量到的像素宽度绘制；容器本身不设最小宽度，
+   免得 ResizeObserver 把「被压缩的宽度」当成真实宽度反复重算。 */
+.chart-wrap { position: relative; width: 100%; overflow: hidden; }
+.chart-wrap.tall { min-height: 210px; }
+
+/* 网格线：比边框更淡，只做读数辅助，不与柱子抢视觉 */
+.chart-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+  shape-rendering: crispEdges;
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--primary);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+/* 折线上的点：填充取表面色 + 主色描边，悬停那一带不被线吃掉 */
+.chart-dot { fill: var(--surface); stroke: var(--primary); stroke-width: 2; }
+
+.bar { fill: var(--primary); }
+
+/* 热区层：单独一层 SVG 覆盖在图形之上，指针事件只落在这里。
+   这样柱子 / 折线自身不必承担 hover 语义，零值日也能有读数。
+   也正因为它在最上层，柱子的 hover 反馈要由 .chart-hit:hover 表达（见下），
+   给 .bar 写 :hover 是够不到的 —— 指针永远先被这层接走。 */
+.chart-hit-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.chart-hit {
+  fill: transparent;
+  pointer-events: all;
+  cursor: default;
+}
+
+.chart-hit:hover { fill: color-mix(in srgb, var(--primary) 8%, transparent); }
+
+.chart-empty { fill: var(--text-3); font-size: 12px; }
+
+/* 错误态：与 .empty 同档，但用危险色点明「这些数字现在不可信」 */
+.report-error { color: var(--danger); }
+
+/* 窄窗口（与侧栏收起同断点）：四个缓存窗口退成两列，页头筛选整行铺开 */
+@media (max-width: 900px) {
+  .page[data-page="overview"] .page-head .head-actions { flex-basis: 100%; margin-left: 0; justify-content: flex-start; }
+}

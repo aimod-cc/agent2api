@@ -2,13 +2,13 @@
 
 把腾讯 WorkBuddy 桌面端的登录态包装成本地 **OpenAI 兼容 API 网关**，附带多账号管理、积分查询、每日签到、出网代理、内容脱敏与运行日志，并提供一个开箱即用的 Tauri 桌面端。
 
-装上桌面端（或跑一条 `node server.mjs`）后，任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 为端点直接使用 WorkBuddy 的模型额度——不需要 API Key，不需要改客户端源码。
+装上桌面端后，任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 为端点直接使用 WorkBuddy 的模型额度——不需要 API Key，不需要改客户端源码。
 
 ```
 OpenAI 客户端 / 任意 SDK
         │  POST /v1/chat/completions   （OpenAI 兼容，SSE）
         ▼
-  本网关（桌面端：Rust 进程内服务；CLI：server.mjs）  ← 本机 127.0.0.1:3065
+  本网关（Rust 进程内服务）                        ← 本机 127.0.0.1:3065
   登录态复用 · 多账号选路 · 429 降级 · 出网代理 · 内容脱敏
         │  HTTPS
         ▼
@@ -28,7 +28,6 @@ OpenAI 客户端 / 任意 SDK
 - [快速开始](#快速开始)
 - [HTTP 接口](#http-接口)
 - [核心概念](#核心概念)
-- [命令行用法](#命令行用法)
 - [配置项](#配置项)
 - [数据目录](#数据目录)
 - [项目结构](#项目结构)
@@ -76,49 +75,38 @@ OpenAI 客户端 / 任意 SDK
 
 **可观测性**
 
-- 运行日志落到 `logs.jsonl`（环形保留最近 500 条，重启后仍可查），分 `debug/info/warn/error` 四级与 7 个分类，429 自动切换带结构化的「原账号 → 目标账号 + 恢复时间」字段。
-- 日志页支持按级别/分类/关键词筛选、分页浏览（默认每页 50 条，只滚动列表本身）、一键开关「不看脱敏」（默认开启，隐藏脱敏命中日志，设置会被记住）。
-- `--verbose` 输出每个入站请求与上游交互的细节，并把最近一次请求体落盘到 `debug/last-request.json` 便于重放分析。
+- **报表页**：时间范围（今天 / 7 天 / 30 天 / 本月 / 全部，选择会记住）内的总请求数、成功率、总 Token、活跃天数与连续使用天数、Top 模型占比；近 365 天活跃热力图（按当天请求量分档着色）；缓存命中率的四个时间窗口（10 分钟 / 1 小时 / 24 小时 / 7 天）与近 24 小时命中率折线、按天 Token 柱状图。
+- **日志页双视图**：「系统事件」记录登录、账号切换、429 降级这类事件；「模型请求」逐条记录转发到上游的每次请求（模型、承载账号、HTTP 状态、耗时、token 用量与缓存读取量、失败原因），支持时间范围与成功/失败筛选、服务端分页。两个视图的筛选条件各自独立保存。
+- 运行日志落到 `logs.jsonl`，分 `debug/info/warn/error` 四级与 7 个分类，429 自动切换带结构化的「原账号 → 目标账号 + 恢复时间」字段。
+- **数据保留天数可配置**：事件日志、请求明细、按天聚合三档各自独立（1–3650 天，默认 30 / 30 / 365），改完立即生效、无需重启；改小会删除超出的历史数据，保存前有二次确认。
+- 设 `WORKBUDDY_VERBOSE=1` 后输出每个入站请求与上游交互的细节。另外，最近一次入站请求体始终会落盘到 `debug/last-request.json`（覆盖写，便于重放分析），与该开关无关；同目录的 `last-request.meta.txt` 记一行时间戳与请求摘要。
 
 **桌面端**
 
 - Tauri 2 打包，**后端网关以 Rust 重写并运行在应用进程内**，随包不携带任何外部运行时（`node.exe` 已移除），安装包约 **2.4 MB**，安装后开箱即用。
-- 六个页面：概览、账号、网关、脱敏、日志、设置；支持明暗主题、系统托盘、开机自启、关闭窗口最小化到托盘、单实例。
-- 覆盖升级时会自动收口旧版本残留：若检测到旧版网关进程仍占用 3065 端口（例如旧版被强杀后留下的孤儿 `node` 进程），确认是本产品进程且位于本应用安装目录内才会结束它，并清理安装目录里遗留的 `resources\node.exe`。用户自己 `npm start` 起的服务在安装目录之外，绝不会被误杀。
+- 六个页面：报表、账号、网关、脱敏、日志、设置。设置页为左侧分类导航（通用 / 账号 / 服务 / 数据）加右侧内容栏；支持明暗主题与跟随系统、系统托盘、开机自启、关闭窗口最小化到托盘、单实例。
+- 交互细节：下拉选择为浮层列表（支持键盘操作与选中标记），设置项的长说明收在标题旁的问号气泡里，账号卡片可直接启用 / 禁用。
+- 覆盖升级时会自动收口旧版本残留：若检测到旧版网关进程仍占用 3065 端口（例如旧版被强杀后留下的孤儿 `node` 进程），确认是本产品进程且位于本应用安装目录内才会结束它，并清理安装目录里遗留的 `resources\node.exe` 与 `resources\server.cjs`。用户自己在安装目录外另起的服务，绝不会被误杀。
 
 ---
 
 ## 快速开始
 
-### 方式一：桌面端（推荐）
+### 安装与启动
 
 从 Releases 下载安装包（NSIS，简体中文，按当前用户安装），安装后启动即可，**无需安装 Node 或任何其它运行时**：
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口。
-2. 到「概览」页点「登录 / 添加账号」，选账号版本（国内版 / 国际版）与登录方式（内嵌窗口 / 系统默认浏览器），完成一次官方登录。
+2. 点「报表」或「账号」页上的「登录 / 添加账号」，选账号版本（国内版 / 国际版）与登录方式（内嵌窗口 / 系统默认浏览器），完成一次官方登录。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。
 
-从 1.0.x 覆盖升级时无需手工处理旧进程：新版启动会自动结束旧版遗留的网关进程并清理安装目录里的旧运行时文件（判定条件见[桌面端](#主要特性)一节）。
+从 1.0.x 覆盖升级时无需手工处理旧进程：新版启动会自动结束旧版遗留的网关进程并清理安装目录里的旧运行时文件（`node.exe` / `server.cjs`，判定条件见[桌面端](#主要特性)一节）。
 
-### 方式二：命令行
+### 验证
 
-命令行方式跑的是仓库里的 Node 版实现（桌面端则使用等价的 Rust 实现，两者 HTTP 契约与数据文件格式一致）。需要 Node.js **>= 18.17**（推荐 20 或更高）。
-
-```bash
-git clone https://github.com/aimod-cc/workbuddy-proxy.git
-cd workbuddy-proxy
-npm install
-
-# 1. 登录（打印一个链接，浏览器完成登录后自动保存 token）
-npm run login
-
-# 2. 启动网关
-npm run serve          # 等价 node server.mjs --port 3065
-```
-
-启动后终端会打印接口清单与当前账号路由顺序。验证：
+网关起来后，用 curl 确认联通性：
 
 ```bash
 curl http://127.0.0.1:3065/health
@@ -146,9 +134,9 @@ print(resp.choices[0].message.content)
 
 `GET /v1/models` 返回的清单有两个来源：内置兜底清单，以及运行时从上游 `GET /v3/config` 拉回的真实清单（后者在启动和每次访问 `/v1/models` 时异步刷新）。默认模型是 `auto`。
 
-清单**只收录对话模型**：判定规则见 `src/workbuddy-models.mjs` 的 `isChatModel`，非对话项（内部补全/工具模型、图像/视频模型）不会出现在对外目录里。
+清单**只收录对话模型**：判定规则见 `desktop-tauri/src-tauri/src/server/core/models.rs` 的 `is_chat_model`，非对话项（内部补全/工具模型、图像/视频模型）不会出现在对外目录里。
 
-**网关不会静默改写模型名**：请求里点名的模型必须在目录中真实存在，否则直接返回 400 并附上近似名提示（`model_not_found`）。这是有意为之——把 `deepseek-v4.1-flash` 悄悄换成别的模型会造成「请求 4.1 实跑 V4」这类难以察觉的事故。需要收窄可选模型时，在 `src/workbuddy-models.mjs` 的 `MODEL_ALLOWLIST` 填入白名单（默认空数组即全量放行）。
+**网关不会静默改写模型名**：请求里点名的模型必须在目录中真实存在，否则直接返回 400 并附上近似名提示（`model_not_found`）。这是有意为之——把 `deepseek-v4.1-flash` 悄悄换成别的模型会造成「请求 4.1 实跑 V4」这类难以察觉的事故。需要收窄可选模型时，在 `desktop-tauri/src-tauri/src/server/core/models.rs` 的 `MODEL_ALLOWLIST` 填入白名单（默认空数组即全量放行）。
 
 ---
 
@@ -225,10 +213,15 @@ print(resp.choices[0].message.content)
 | PUT / POST / DELETE | `/api/desensitize/terms` | 全量替换 / 追加 / 删除词 |
 | POST | `/api/desensitize/reset` | 恢复默认词表 |
 | POST | `/api/desensitize/stats/reset` | 清空命中统计 |
-| GET | `/api/logs` | 查询运行日志（`limit` / `level` / `category` / `keyword` / `sinceId`） |
+| GET | `/api/logs` | 查询运行日志（`limit` / `level` / `category` / `keyword` / `sinceId` / `start` / `end`，后两个为毫秒时间戳） |
 | GET | `/api/logs/stats` | 各级别与分类计数 |
 | GET | `/api/logs/download` | 导出 JSONL 附件 |
 | DELETE | `/api/logs` | 清空日志 |
+| GET | `/api/stats/summary` | 报表聚合（`range=today \| 7 \| 30 \| month \| all`，缺省 `7`）：概览、热力图、缓存命中率、趋势 |
+| GET | `/api/stats/requests` | 请求明细（`offset` / `limit` / `model` / `status` / `start` / `end`，服务端分页） |
+| DELETE | `/api/stats/requests` | 清空请求明细与按天聚合 |
+| GET | `/api/retention` | 读取三档数据保留天数 |
+| PUT | `/api/retention` | 更新保留天数并立即触发清理（`{logRetentionDays?, requestRetentionDays?, dailyRetentionDays?}`） |
 
 设置了 API Key 后，除 `/health`、`/v1/models`、`/api/session`、`/api/endpoints` 这几个只读探针接口外，其余接口都需要在 `Authorization: Bearer <key>` 或 `X-API-Key` 头里带上它。
 
@@ -255,7 +248,7 @@ print(resp.choices[0].message.content)
 - **Clash Verge 监听器**：只记录监听器 uid，端口每次从 `verge.yaml` 实时读取（3 秒 TTL 缓存）。在 Clash 里改端口不必回来重配；删掉某个监听器后，引用它的账号会解析失败并回退直连，同时在日志里提醒。
 - **自定义代理**：`{ protocol: 'http' | 'socks5', host, port, username?, password? }`。
 
-出网统一走 undici（Node 内置 `fetch` 不接受外部 dispatcher，无法按请求指定代理）。dispatcher 按出口缓存复用（最多 24 个，超出按 LRU 回收），否则每个请求都会新建一条到代理的连接。为了让「能转发就一定能刷 token」，token 续期与计费查询也复用账号自己的出口。
+出网统一走 `desktop-tauri/src-tauri/src/server/core/egress.rs`：按出口缓存 `reqwest::Client`（`Client` 自带连接池，因此「一个出口一个 Client」就是「一个出口一个连接池」），否则每个请求都要重新和代理建一条 TCP 连接。缓存最多保留 24 个出口，超出按「最久未用」淘汰。为了让「能转发就一定能刷 token」，token 续期与计费查询也复用账号自己的出口。
 
 ### 内容脱敏
 
@@ -265,7 +258,7 @@ print(resp.choices[0].message.content)
 DoS  →  D​oS      （中间是一个 U+200B，人眼与模型读到的不变）
 ```
 
-默认开启，默认作用于 `system` 与 `user` 两种角色（可扩展到 `assistant` / `tool` / `developer`），内置 31 个默认词，词表上限 2000 词、单词 200 字符。纯 ASCII 词会加词边界，避免 `0day` 命中 `100days`、`XSS` 命中 `XSSRF` 这类误伤。词表持久化在 `~/.workbuddy-proxy/desensitize.json`，命中统计在内存中累计。
+默认开启，默认作用于 `system` 与 `user` 两种角色（可扩展到 `assistant` / `tool` / `developer`），内置 32 个默认词，词表上限 2000 词、单词 200 字符。纯 ASCII 词会加词边界，避免 `0day` 命中 `100days`、`XSS` 命中 `XSSRF` 这类误伤。词表持久化在 `~/.workbuddy-proxy/desensitize.json`，命中统计在内存中累计。
 
 ### 防重试风暴
 
@@ -273,49 +266,6 @@ DoS  →  D​oS      （中间是一个 U+200B，人眼与模型读到的不变
 
 - **请求合并**：相同 body（sha256 去重键）的请求在代理内排队串行，等待上限 45 秒。
 - **风控退避**：命中 `11128` 时按 10 秒 / 25 秒退避重试，最多 2 次。间隔故意拉长，因为拉黑期间的每次重试都会给黑名单续期，宁可让客户端拿到明确错误也不要形成重试风暴。
-
----
-
-## 命令行用法
-
-```bash
-node server.mjs [options]
-```
-
-| 参数 | 说明 |
-| --- | --- |
-| `--port <port>` | 监听端口（默认 3065） |
-| `--host <addr>` | 监听地址（默认 127.0.0.1） |
-| `--api-key <key>` | 启用网关 API Key 认证（监听非回环地址时建议开启） |
-| `--edition <cn\|intl>` | 默认账号版本（多账号时以账号记录为准） |
-| `--endpoint <url>` | 覆盖上游端点 |
-| `--prefix-path <path>` | 覆盖鉴权路径前缀（国内版 `/plugin`，国际版为空） |
-| `--default-model <id>` | 客户端未指定模型时的默认值（默认 `auto`） |
-| `--locale <locale>` | 计费接口的 `Accept-Language`（默认 `zh-CN`） |
-| `--desensitize` / `--no-desensitize` | 本次运行强制开启 / 关闭脱敏（不写回配置文件） |
-| `--login` | 无头登录 |
-| `--logout` | 清除本地登录态 |
-| `--status` | 查看登录态（未登录时退出码为 1） |
-| `--usage` | 查询积分/额度 |
-| `--checkin` | 执行签到并打印最新积分 |
-| `--endpoints` | 打印已逆向的上游接口清单 |
-| `-v, --verbose` | 详细日志（入站请求、上游交互、模型目录刷新等） |
-| `-h, --help` | 帮助 |
-
-对应的 npm 快捷脚本：`serve` / `login` / `logout` / `status` / `usage` / `checkin` / `endpoints`。
-
-`--checkin` 的输出形如：
-
-```
-  今日已签到 : 否
-  连续天数   : 3
-  累计天数   : 12
-  签到结果   : ✅ 领取成功
-
-  总剩余积分   : 1280
-  套餐基础积分 : 1000
-  平台奖励积分 : 280
-```
 
 ---
 
@@ -336,24 +286,26 @@ node server.mjs [options]
 | `WORKBUDDY_PROXY_HOME` | 配置目录（默认 `~/.workbuddy-proxy`） |
 | `WORKBUDDY_DESENSITIZE` | `1` 开启 / `0` 关闭内容脱敏 |
 | `WORKBUDDY_LOCALE` | 计费语言 |
-| `WORKBUDDY_VERBOSE` | `1` 等价于 `--verbose` |
-| `WORKBUDDY_PROXY_STANDALONE` | `1` 时不做入口判定直接启动服务（被外部进程管理器拉起时用） |
+| `WORKBUDDY_VERBOSE` | `1` 时输出详细日志（入站请求、上游交互、模型目录刷新等） |
 | `WORKBUDDY_PROXY_PORT` | 桌面端使用的网关端口（默认 3065） |
 | `WORKBUDDY_SKIP_OPEN_BROWSER` | `1` 时不自动打开系统浏览器（桌面端调试用） |
 | `WORKBUDDY_UPDATE_REPO` | 软件更新检测的 GitHub 仓库（默认 `aimod-cc/workbuddy-proxy`） |
-| `WORKBUDDY_GITHUB_TOKEN` | 可选。检查更新用的 GitHub token，仅用于提高 API 频率限额（不填也能用） |
+| `WORKBUDDY_GITHUB_TOKEN` | 可选。检查更新用的 GitHub token，仅用于提高 API 频率限额（不填也能用；也接受通用的 `GITHUB_TOKEN`，前者优先） |
 
 ### 配置文件
 
 | 文件 | 内容 |
 | --- | --- |
-| `config.json` | 网关 API Key、计费语言、最近一次请求所用模型、自动签到设置（`autoCheckin`） |
+| `config.json` | 网关 API Key、计费语言、最近一次请求所用模型、自动签到设置（`autoCheckin`）、三档数据保留天数（`logRetentionDays` / `requestRetentionDays` / `dailyRetentionDays`） |
 | `accounts.json` | 账号列表（凭证、优先级、启用状态、代理、限额记录） |
 | `auth.json` | 旧版单账号登录态（仅在账号列表为空时迁移一次） |
 | `desensitize.json` | 脱敏开关、词表、作用角色 |
-| `logs.jsonl` | 运行日志（JSONL，一行一条） |
+| `logs.jsonl` | 运行日志（JSONL，一行一条；保留期默认 30 天） |
+| `requests.jsonl` | 请求明细（JSONL，一行一次请求；保留期默认 30 天） |
+| `request-daily.jsonl` | 按天聚合的用量（一行一天，供报表与热力图；保留期默认 365 天） |
 | `desktop-settings.json` | 桌面端设置：关闭到托盘、开机自启 |
 | `debug/last-request.json` | 最近一次入站请求体（覆盖写，便于重放） |
+| `debug/last-request.meta.txt` | 对应的一行摘要（时间戳、方法、路径、字节数、UA） |
 | `updates/` | 软件更新下载的安装包（覆盖写，同版本只保留一份） |
 
 账号文件的读取每次实时走磁盘，手工编辑后下一次请求即生效；`priority` / `enabled` / `proxy` 等字段都可以直接改（优先级仍需保持唯一）。
@@ -387,46 +339,30 @@ node server.mjs [options]
 
 ## 项目结构
 
-代码分两条线：**桌面端（Rust，推荐）** 与 **命令行（Node）**。两条线实现同一套 HTTP 契约、读写同一份数据文件，可以互换使用（但不要同时监听同一端口）。
+网关与桌面端都在 `desktop-tauri/`：后端是 `src-tauri/` 下的 Rust 进程内 HTTP 服务器，前端是 `ui/` 下的原生 HTML/CSS/JS。
 
 ```
 workbuddy/
-├─ server.mjs                    命令行后端入口：HTTP 服务、路由分发、CLI 子命令
-├─ src/                          Node 版后端模块（命令行使用；桌面端不打包这些文件）
-│  ├─ workbuddy-endpoints.mjs    上游接口清单（唯一事实来源）+ 版本/UA/商品码常量
-│  ├─ workbuddy-auth.mjs         登录态存储、无头登录、token 自动刷新
-│  ├─ workbuddy-account-store.mjs 多账号存储、优先级规则、限额记录
-│  ├─ workbuddy-account-transfer.mjs 账号导入/导出（纯逻辑，依赖注入）
-│  ├─ workbuddy-account-routes.mjs /api/accounts 与 /api/proxies 路由
-│  ├─ workbuddy-routing.mjs      账号选路（优先级 + 限额判定）
-│  ├─ workbuddy-upstream-client.mjs 请求头复刻、SSE 透传/聚合、429 降级
-│  ├─ workbuddy-models.mjs       模型目录（内置兜底 + /v3/config 远程刷新）
-│  ├─ workbuddy-billing.mjs      积分、额度、签到、运营活动
-│  ├─ workbuddy-proxy.mjs        出网代理（Clash Verge 同步、dispatcher 缓存、出口测试）
-│  ├─ workbuddy-desensitize.mjs  脱敏纯函数与词表管理
-│  ├─ workbuddy-desensitize-routes.mjs
-│  ├─ workbuddy-auto-checkin.mjs 定时签到调度（轮询 + 当天去重 + 启动补签）
-│  ├─ workbuddy-update.mjs       GitHub Release 检测与安装包下载
-│  ├─ workbuddy-logs.mjs / workbuddy-log-routes.mjs 运行日志
-│  ├─ workbuddy-cli.mjs          CLI 子命令与启动自检输出
-│  └─ workbuddy-banner.mjs       启动横幅
 ├─ desktop-tauri/
 │  ├─ src-tauri/src/
-│  │  ├─ server/                 桌面端的网关实现（Rust，进程内 HTTP 服务器）
+│  │  ├─ server/                 网关实现（Rust，进程内 HTTP 服务器）
 │  │  │  ├─ mod.rs               服务组装：ServerState、启动与优雅停机
 │  │  │  ├─ http.rs              路由表、CORS、API Key 中间件、body 限制
 │  │  │  ├─ config.rs / logging.rs / logs_store.rs / errors.rs
+│  │  │  ├─ request_stats.rs     请求统计存储（明细 + 按天聚合，供报表页）
+│  │  │  ├─ request_stats/       统计的时钟窗口、记录写入、聚合与裁剪
 │  │  │  ├─ core/                领域逻辑（按职责分子目录）
-│  │  │  │  ├─ endpoints.rs      上游接口清单（与 Node 版同源）
-│  │  │  │  ├─ account_store/    账号存储、优先级、限额记录、导入导出
+│  │  │  │  ├─ endpoints.rs      上游接口清单（唯一事实来源）+ 版本/UA/商品码常量
+│  │  │  │  ├─ account_store/    账号存储、优先级、限额记录
+│  │  │  │  ├─ account_transfer.rs                账号导入导出（merge 语义）
 │  │  │  │  ├─ auth.rs / auth_http.rs / login.rs   会话、出网传输、无头登录
-│  │  │  │  ├─ upstream/         请求头复刻、SSE 透传与帧合并、429 轮换、聚合
+│  │  │  │  ├─ upstream/         请求头复刻、SSE 透传与帧合并、429 轮换、聚合、usage 旁路
 │  │  │  │  ├─ models.rs / routing.rs              模型目录、账号选路
 │  │  │  │  ├─ billing/          积分、额度、签到、运营活动
 │  │  │  │  ├─ proxies.rs / clash.rs / egress.rs   出网代理与按出口缓存 Client
 │  │  │  │  ├─ desensitize/      脱敏引擎与词表
-│  │  │  │  ├─ auto_checkin.rs / update/           定时签到、软件更新
-│  │  │  └─ api/                 各路由 handler（health/session/accounts/chat/…）
+│  │  │  │  └─ auto_checkin.rs / update/           定时签到、软件更新
+│  │  │  └─ api/                 各路由 handler（health/session/accounts/chat/stats/…）
 │  │  ├─ lib.rs                  应用入口：窗口生命周期、插件与命令注册
 │  │  ├─ backend.rs              进程内服务器生命周期 + 覆盖升级迁移
 │  │  ├─ gateway.rs              壳侧访问管理 API 的 HTTP 客户端
@@ -434,13 +370,12 @@ workbuddy/
 │  │  ├─ commands.rs             暴露给前端的 invoke 命令
 │  │  ├─ bridge.rs               注入 window.workbuddyDesktop 的桥接脚本
 │  │  ├─ update.rs               安装包路径校验与启动（更新功能中壳侧的部分）
-│  │  ├─ settings.rs / state.rs / tray.rs
+│  │  └─ settings.rs / state.rs / tray.rs
 │  ├─ ui/                        前端（原生 HTML/CSS/JS，无框架）
 │  └─ src-tauri/tauri.conf.json  打包配置（NSIS）
 ├─ build/
-│  ├─ build-backend.mjs          esbuild 打包 Node 版后端（仅命令行分发用）
 │  └─ make-icon.mjs              生成应用图标源图
-└─ tests/                        Node 版冒烟测试、HTTP 契约测试、脱敏端到端测试
+└─ package.json                  构建脚本入口（tauri:dev / tauri:build / build:icon）
 ```
 
 ---
@@ -449,53 +384,44 @@ workbuddy/
 
 ### 环境要求
 
-- Rust >= 1.77 与 Tauri 2 工具链（桌面端；Windows 上还需 WebView2 运行时）
-- Node.js >= 18.17（仅命令行方式与 Node 版测试需要）
+- Rust >= 1.77 与 Tauri 2 工具链（编译桌面端本体；Windows 上还需 WebView2 运行时）
+- Node.js >= 18.17（仅用来执行 `npm run tauri:*` 与 `build/make-icon.mjs` 这些前端构建脚本，桌面端运行时不依赖 Node，也不会打包任何 Node 产物）
 
 ### 常用脚本
 
 ```bash
-npm install                # 安装 Node 版依赖（undici / yaml / esbuild）
-
-npm run serve              # 启动命令行网关（3065 端口）
-npm run login              # 无头登录
-npm run endpoints          # 打印上游接口清单
-
-npm run build:backend      # 打包 Node 版后端 → desktop-tauri/src-tauri/resources/server.cjs
-npm run build:icon         # 生成图标源图（改图标设计后执行，再跑 tauri icon）
-
-npm run tauri:install      # 安装桌面端依赖
+npm run tauri:install      # 安装桌面端依赖（等价 npm --prefix desktop-tauri install）
 npm run tauri:dev          # 开发模式调起桌面端（自动热重载）
 npm run tauri:build        # 构建桌面端安装包
+
+npm run build:icon         # 生成图标源图（改图标设计后执行，再跑 tauri icon）
 ```
 
-打包产物为 `desktop-tauri/src-tauri/target/release/bundle/nsis/*.exe`（约 2.4 MB）。
+根项目本身没有运行期依赖，`package.json` 只提供上面这些快捷脚本入口。打包产物为 `target/release/bundle/nsis/*.exe`（约 2.4 MB；`src-tauri/.cargo/config.toml` 把 cargo 的 `target-dir` 指到了项目根的 `target/`，所以产物不在 `src-tauri/target/` 下）。
 
 ### 关于后端实现
 
-桌面端的网关是**壳进程内的 Rust HTTP 服务器**（`desktop-tauri/src-tauri/src/server/`），与 Node 版 `server.mjs` 保持逐字段一致的 HTTP 契约与磁盘格式。这样做的好处：
+网关是**壳进程内的 Rust HTTP 服务器**（`desktop-tauri/src-tauri/src/server/`），这是项目唯一的后端实现。这样做的好处：
 
 - **安装包小**：不再随包分发外部运行时（旧版曾内置官方 `node.exe`，约 87 MB），安装包从约 24 MB 降到约 2.4 MB。
 - **没有子进程**：不存在「升级时杀不掉后端进程导致覆盖安装失败」的问题，退出只是关闭本进程内的监听器。
-- **前端零改动**：界面只依赖 `window.workbuddyDesktop` 与 HTTP 接口，两条后端线可以无缝替换。
+- **单一实现**：HTTP 契约与磁盘格式只有一处定义，不存在多份实现之间「行为漂移」的维护负担。
 
-Node 版仍完整保留，供命令行使用（`npm run serve`），也是迁移对照时的参考实现。两者的数据文件（`accounts.json` / `config.json` / `logs.jsonl` / `desensitize.json`）完全兼容，可以混用。
-
-> 历史说明：早期版本曾评估过用 Bun 编译或 Node SEA 打成单文件，都因 SOCKS5 支持缺失（Bun 的 undici shim 不含 `Socks5ProxyAgent`）或注入后二进制签名失效被安全软件误报（Node SEA）而放弃。Rust 重写后这些取舍不再适用。
+> 历史说明：早期版本曾评估过用 Bun 编译或 Node SEA 打成单文件随包分发，都因 SOCKS5 支持缺失（Bun 的 undici shim 不含 `Socks5ProxyAgent`）或注入后二进制签名失效被安全软件误报（Node SEA）而放弃。Rust 重写后这些取舍不再适用。
 
 ### 前端桥接
 
-界面代码只依赖 `window.workbuddyDesktop` 这一个接口，由 `bridge.rs` 在页面脚本执行前注入，内部把每个方法映射到 Tauri 的 `invoke`。因此 UI 代码里不出现任何 Tauri 字样——这也是桌面端从 Electron 迁到 Tauri、后端从 Node 换成 Rust 时前端都没改过的原因。
+界面代码只依赖 `window.workbuddyDesktop` 这一个接口，由 `bridge.rs` 在页面脚本执行前注入，内部把每个方法映射到 Tauri 的 `invoke`。因此 UI 代码里不出现任何 Tauri 字样——这也是桌面端从 Electron 迁到 Tauri 时前端都没改过的原因。
 
 ### 测试
 
+仓库当前**没有自动化测试**：Rust 后端里没有 `#[test]`，也没有 `tests/` 目录。验证方式是构建后手动跑：
+
 ```bash
-npm test                              # 冒烟测试：请求头复刻、SSE 聚合、脱敏纯函数、账号存储
-node tests/http-test.mjs              # HTTP 契约测试：起真实 server 进程 + 假账号，验证各路由
-node tests/desensitize-e2e.mjs        # 端到端：假上游 + 真实网关，验证出站请求体确实被改写
+npm run tauri:dev          # 开发模式启动，肉眼验证界面与转发
 ```
 
-三个脚本都用临时配置目录（`WORKBUDDY_PROXY_HOME` 指向 mkdtemp），不会碰你本机的账号数据，也不会访问真实上游。它们针对的是 Node 版实现。
+手动验证转发链路时，可用 `WORKBUDDY_PROXY_HOME` 指向一个临时目录，避免影响本机账号数据。
 
 ---
 
@@ -510,11 +436,13 @@ node tests/desensitize-e2e.mjs        # 端到端：假上游 + 真实网关，�
 - **自动签到用轮询而非单定时器**：`setTimeout` 在系统休眠、锁屏、时钟被改之后会漂移甚至整段错过，因此改为每 30 秒比对一次「是否已过今天的触发点」，并在启动时补签当天遗漏的一次。判定用「当天日期去重」，与本地时区绑定。
 - **国际版无签到活动**：相关操作会被明确跳过（批量）或报错（单个），不会伪装成「签到失败」。
 - **代理配置不是「严格镜像」Clash**：账号里只存监听器 uid，端口每次实时读取。Clash 里删了监听器，对应账号回退直连并记日志提醒，不会静默换出口。
-- **无鉴权时假设仅本机可访问**：默认监听 `127.0.0.1`；若改为监听非回环地址，启动时会打印安全提醒，此时应当设置 API Key。
+- **只监听 `127.0.0.1`，没有改监听地址的入口**：Rust 版把监听地址写死在回环地址上（不再有 Node 版的 `--host`），因此无鉴权时也只有本机进程能访问。若同机存在不受信任的程序，建议在设置页启用 API Key。
 - **账号数上限 20 个**，token 长度上限 8192 字符，脱敏词表上限 2000 词。
-- **接口形态来自逆向观察**：上游可能随时调整路径、鉴权头或风控策略，届时需要更新 `src/workbuddy-endpoints.mjs`（该项目里所有上游接口的唯一事实来源，改这一处即可）。
+- **接口形态来自逆向观察**：上游可能随时调整路径、鉴权头或风控策略，届时需要更新 `desktop-tauri/src-tauri/src/server/core/endpoints.rs`（该项目里所有上游接口的唯一事实来源，改这一处即可）。
 - **端口被占用时不再「复用已运行的服务」**：旧版桌面端探测到 3065 已有网关就直接复用，这会让管理 API 落到一个版本可能不匹配的外部进程上。现在进程内服务器必须自己绑定成功；若占用者是本产品的旧版进程且位于本应用安装目录内，会自动结束它以完成升级迁移，其余情况给出可操作的错误提示（也可用 `WORKBUDDY_PROXY_PORT` 换端口）。
-- **日志的过滤与分页在前端做**：接口一次返回整个保留窗口（最多 500 条），「不看脱敏」与翻页都不再请求后端——交互即时，也不会和 10 秒自动刷新抢状态。副作用是隐藏了多少条只在界面层可见，接口本身不认识这个开关。
+- **日志有容量与时间两个保留约束**：容量是 500 条的环形保留（管「最多几条」），时间是可配置的保留天数（管「最多留多久」，默认 30 天）。两者同时生效，取先到者；改小天数会把超出的历史记录从内存与文件里一并裁掉。
+- **两个视图的分页策略不同，因为数据口径不同**：事件日志一次最多 500 条，因此「不看脱敏」过滤与翻页都在前端做——交互即时，也不会和自动刷新抢状态；副作用是隐藏了多少条只在界面层可见，接口本身不认识这个开关。模型请求明细没有条数上限（一次拉全不现实），走后端 `offset` / `limit` 真分页。
+- **请求统计不影响转发链路**：统计所用的 token 用量是旁路提取的，`chat.rs` 的记账包装保证「客户端收到的字节序列与不接统计时完全一致」。
 
 ---
 

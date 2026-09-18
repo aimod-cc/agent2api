@@ -1,0 +1,191 @@
+/* ─────────────────────────────────────────────
+   组件：下拉控件（select.js 增强出来的触发器 + 浮层）
+   颜色一律取 tokens.css 的语义变量，浅色 / 深色共用同一组声明。
+   尺寸向 components.css 里的表单控件看齐（高 30px、字号 12.5px、内边距 10px、
+   圆角 --r-md），这样下拉和同一行的 input 摆在一起不会高矮参差。
+   ───────────────────────────────────────────── */
+
+/* ─── 外壳 ───
+   原生 select 并没有被 display:none 摘出布局：它留在外壳里当「宽度与高度的锚」，
+   只把可见性藏掉（见下方 .select-shell select）。这样外壳的尺寸就等于原生控件，
+   .model-select 的 max-width、.log-filters select 的 min-width、.proxy-select 的
+   max-width 这些既有规则照旧在管宽度 —— 换成「触发器自己撑宽度」的话，
+   宽度会随选中项的文案忽宽忽窄，工具条与筛选行整行跟着抖，等于把版式改坏了。 */
+.select-shell {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* 锚：占位但不显示。
+   为什么用 visibility 而不是 display:none —— display:none 的元素所有尺寸都量成 0，
+   外壳会塌成 0 宽，上面那些既有宽度规则就全失效了。
+   visibility:hidden 的元素不接收指针事件、也不进 Tab 序列与无障碍树，
+   交互与语义都交给触发器，正好是需要的行为。 */
+.select-shell select {
+  display: block;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* ─── 触发器 ─── */
+.select-trigger {
+  position: absolute;
+  inset: 0;
+  /* 高度交给 inset 拉伸（height:auto 才不会和 button 基础样式的 30px 打架） */
+  height: auto;
+  width: auto;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 400;
+  text-align: left;
+  /* 原生 select 不带投影，这里也去掉：触发器要与同行的 input 观感一致，
+     button 基类的 --shadow-1 会让它比输入框「浮」一档 */
+  box-shadow: none;
+  transition: background .15s ease, border-color .15s ease;
+}
+
+.select-trigger:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+}
+
+.select-trigger:focus-visible {
+  border-color: var(--primary);
+  box-shadow: var(--ring);
+}
+
+.select-trigger:disabled {
+  /* 比 button:disabled 的 .45 稍强一点：下拉文案要读得清「当前选的是什么」 */
+  opacity: .6;
+  background: var(--surface-3);
+  color: var(--text-3);
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+.select-value {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 下拉为空（还没填选项）时给一个占位符宽度的空格，避免触发器塌成一条线 */
+.select-value.is-empty::after { content: "\200b"; }
+
+.select-caret {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--text-3);
+  transition: transform .18s ease;
+}
+
+.select-trigger.is-open .select-caret { transform: rotate(180deg); }
+
+/* ─── 既有业务类名的外观镜像 ───
+   宽度交给原生 select 自己体现（见文件头说明），但「强调档」这类纯外观声明
+   需要显式搬到触发器上，否则账号页的模型下拉会比改动前弱一档。
+   components.css 的 .model-select 用的是强调边框 + 加粗（而不是加字重硬顶），
+   这里照抄同一口径，保持「这个下拉比同排普通控件重」的既有设计意图。 */
+.select-shell:has(> .model-select) > .select-trigger {
+  border-color: var(--border-strong);
+  font-weight: 600;
+}
+
+.select-shell:has(> .model-select) > .select-trigger:hover:not(:disabled) {
+  border-color: var(--primary);
+}
+
+/* ─── 浮层 ───
+   z-index 取 35：要在弹窗遮罩（.modal-mask，30）之上 —— 账号设置 / 批量操作
+   两个弹窗里就有出网代理下拉；又要留在轻提示（#toast，40）之下，
+   提示消息不该被下拉挡住。 */
+.select-popover {
+  position: fixed;
+  z-index: 35;
+  display: none;
+  max-height: 260px;
+  padding: 5px;
+  overflow-y: auto;
+  /* 选项多时滚轮翻列表；滚动不会误关浮层（见 select.js 的滚动处理） */
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-3);
+  /* 只淡入、不做位移或缩放：打开后立刻要量尺寸摆位置，
+     transform 动画会让量到的坐标带上缩放系数 */
+  animation: select-popover-in .12s ease;
+}
+
+.select-popover.open { display: block; }
+
+@keyframes select-popover-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* ─── 选项 ─── */
+.select-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 9px;
+  border-radius: var(--r-sm);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.4;
+  cursor: pointer;
+  user-select: none;
+  transition: background .12s ease, color .12s ease;
+}
+
+/* 中性叠加：深色叠白、浅色叠黑，同一行声明两边都成立（与侧栏导航 hover 同款） */
+.select-option:hover,
+.select-option.is-highlight {
+  background: color-mix(in oklab, var(--text) 6%, transparent);
+}
+
+/* 选中项走品牌浅底，与导航选中态、分段控件保持一致 */
+.select-option.is-selected {
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+  font-weight: 600;
+}
+
+.select-option.is-selected:hover,
+.select-option.is-selected.is-highlight {
+  background: color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
+.select-option-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.select-option-check {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--primary);
+}
+
+/* 禁用项不可点、不参与高亮 */
+.select-option.is-disabled {
+  color: var(--text-3);
+  cursor: not-allowed;
+  pointer-events: none;
+  background: transparent;
+  font-weight: 400;
+}

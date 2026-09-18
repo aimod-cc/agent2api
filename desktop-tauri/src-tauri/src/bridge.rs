@@ -171,6 +171,20 @@ pub const BRIDGE_JS: &str = r#"
     clearLogs: () => call('DELETE', '/api/logs'),
     exportLogs: () => invoke('export_logs'),
 
+    // ── 请求统计报表 / 数据保留 ──
+    // range 只认 today / 7 / 30 / month / all，非法值由后端返回 400
+    // （不在这里静默改口径：界面选了什么就该拿到什么，报错比默默换区间好排查）
+    getStatsSummary: range => call('GET', '/api/stats/summary?range=' + encodeURIComponent(range)),
+    // 筛选条件是可选对象，复用上面 toQuery 的「空值跳过」语义：
+    // 清空的输入框不该变成 `?model=` 这种永不命中的条件
+    getStatsRequests: query => call('GET', '/api/stats/requests' + toQuery(query)),
+    clearStatsRequests: () => call('DELETE', '/api/stats/requests'),
+    getRetention: () => call('GET', '/api/retention'),
+    // PUT 是后端已定契约（允许部分字段 + 立即清理）。
+    // gateway.rs 的 request_builder 支持 GET/POST/PUT/PATCH/DELETE，
+    // 且对 PUT 无 body 时会补一个空对象，所以这里直接透传即可。
+    saveRetention: patch => call('PUT', '/api/retention', patch),
+
     // ── 事件 ──
     onStateChanged: callback => on('accounts:state-changed', callback),
     onAutoMaintained: callback => on('accounts:auto-maintained', callback),
@@ -179,9 +193,14 @@ pub const BRIDGE_JS: &str = r#"
     getBackendStatus: () => invoke('backend_status'),
 
     // ── 本壳特有：窗口主题 ──
-    // 渲染层只知道 light/dark，这里统一整形：非 'dark' 一律按浅色下发，
-    // 免得 undefined 之类的值被当成「跟随系统」而漏掉标题栏同步。
-    setWindowTheme: theme => invoke('set_window_theme', { theme: theme === 'dark' ? 'dark' : 'light' }),
+    // 三态语义：'dark' / 'light' 把窗口主题钉死，null 交回系统跟随（对应 Rust 侧的 None）。
+    // 跟随系统时必须真的传 null，不能整形回只有两态：窗口被手动主题钉住时，
+    // WebView2 的 prefers-color-scheme 会跟着窗口主题走而不是系统主题，
+    // 渲染层再读 matchMedia 就拿到被污染的值，切「跟随系统」会卡在手动主题上。
+    // 其它非法值（undefined 等）没有明确语义，按跟随系统兜底，同样走 null。
+    setWindowTheme: theme => invoke('set_window_theme', {
+      theme: theme === 'dark' || theme === 'light' ? theme : null,
+    }),
 
     // ── 本壳特有：应用设置与账号导入导出 ──
     // 这四项不走 api_request：设置存在桌面端本地（与后端无关），

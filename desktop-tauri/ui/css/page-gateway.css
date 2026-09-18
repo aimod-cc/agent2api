@@ -15,7 +15,7 @@
 .models {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   max-height: 244px;
   overflow-y: auto;
   padding: 2px;
@@ -28,7 +28,7 @@
   gap: 6px;
   height: 27px;
   max-width: 100%;
-  padding: 0 10px;
+  padding: 0 11px;
   border: 1px solid var(--border);
   border-radius: var(--r-pill);
   background: var(--surface-inset);
@@ -39,10 +39,11 @@
   transition: border-color .15s ease, background .15s ease, transform .1s ease;
 }
 
+/* 悬浮即「可点复制」的提示：整体走品牌色浅底 + 描边 + 深字 */
 .model-chip:hover:not(:disabled) {
   border-color: var(--primary-bd);
   background: var(--primary-soft);
-  color: var(--text);
+  color: var(--primary-fg);
   transform: translateY(-1px);
 }
 
@@ -102,13 +103,14 @@
    脱敏页
    ───────────────────────────────────────────── */
 
-/* 作用角色选择 */
+/* 作用角色选择：面板内嵌的一个控件组，圆角比外层面板降一档（--r-md），
+   与 .field / .switch-card 这些内嵌块保持同一层级观感 */
 .role-picks {
   display: flex;
   align-items: center;
   gap: 15px;
   flex-wrap: wrap;
-  padding: 10px 12px;
+  padding: 11px 13px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
@@ -124,7 +126,7 @@
 .terms {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   max-height: 220px;
   overflow-y: auto;
   padding: 2px;
@@ -149,7 +151,7 @@
   height: 16px;
   padding: 0;
   border: 0;
-  border-radius: 50%;
+  border-radius: var(--r-pill);
   background: transparent;
   box-shadow: none;
   color: var(--text-3);
@@ -157,17 +159,25 @@
   line-height: 1;
 }
 
-.term-chip button:hover:not(:disabled) { background: var(--danger); border-color: transparent; color: #fff; }
+/* 删除态：小尺寸按钮需要明确的可点反馈，仍走实心红底。
+   前景从 --surface 向白提亮派生，而不是直接把 --surface 当文字色 ——
+   后者在深色主题下会压出近黑，与红色底分辨不开。 */
+.term-chip button:hover:not(:disabled) {
+  background: var(--danger);
+  border-color: transparent;
+  color: color-mix(in srgb, var(--surface) 8%, white);
+}
 
 /* 命中统计：数据条 */
 .stat-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
-  gap: 9px;
+  gap: 10px;
 }
 
+/* 统计块：同样是内嵌块，随 .field 一档 */
 .stat-cell {
-  padding: 11px 12px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
@@ -191,7 +201,7 @@
 .stat-cell.warn .n { color: var(--warn); }
 
 /* 命中排行：词 + 次数药丸 */
-.stat-terms { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.stat-terms { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 
 .stat-term {
   display: inline-flex;

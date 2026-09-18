@@ -10,7 +10,8 @@
 //! ── 路由分组（后续切片照这个模式扩展）────────────────────────
 //!   `public`    免鉴权：/health、/api/session、/api/endpoints
 //!               （Node 版这三条确实都没调 checkApiKey）
-//!   `protected` 需鉴权：/api/config、/api/logs*、/api/accounts*、/api/proxies*、
+//!   `protected` 需鉴权：/api/config、/api/logs*、/api/stats*、/api/retention、
+//!               /api/accounts*、/api/proxies*、
 //!               /api/usage、/api/checkin*、/api/activity/*、/api/desensitize*、
 //!               /api/auto-checkin*、/api/update/*、
 //!               /api/session/login/*、/api/session/refresh|logout、/auth/*
@@ -83,6 +84,31 @@ pub fn router(state: ServerState) -> Router {
         // 而不是全局兜底的 OpenAI 形状
         .route("/api/logs/", any(api::logs_api::not_found))
         .route("/api/logs/{*rest}", any(api::logs_api::not_found))
+        // ── 统计报表与数据保留（切片 7 之后的扩展，非 Node 版对齐项）──
+        // 三条 /api/stats/* 与两条 /api/retention 都挂 protected：
+        // 它们能读到全部请求明细（含模型、账号、token 用量）并能删数据 / 改保留期，
+        // 与 /api/logs 同级敏感，必须和日志接口一样走 API Key 检查。
+        // 未知 /api/stats/* 子路径返回管理信封 404（照 logs_api::not_found 的做法，
+        // 而不是全局兜底的 OpenAI 形状）—— 同一前缀下的 404 形状保持一致。
+        .route("/api/stats/summary", get(api::stats_api::stats_summary))
+        .route(
+            "/api/stats/requests",
+            get(api::stats_api::stats_requests).delete(api::stats_api::clear_stats_requests),
+        )
+        // 无尾段的 `/api/stats` 也登记成管理信封 404：这个前缀下没有「列表」端点
+        // （报表有三条子路径），但同一前缀下的 404 形状必须一致 ——
+        // 前端拼错路径时拿到的若是 OpenAI 形状，会误以为是转发链路的问题
+        .route("/api/stats", any(api::stats_api::not_found))
+        .route("/api/stats/", any(api::stats_api::not_found))
+        .route("/api/stats/{*rest}", any(api::stats_api::not_found))
+        // 保留期：GET 读三档天数，PUT（允许部分字段）更新并**立即**触发清理。
+        // 与 /api/config 的区别：config 管鉴权与语言，这条只管数据保留策略 ——
+        // 放在独立端点是因为它的写操作带副作用（删数据），不该混进 config 的
+        // 「无副作用设置」里，误调一次 config 不该把历史数据裁掉。
+        .route(
+            "/api/retention",
+            get(api::stats_api::get_retention).put(api::stats_api::put_retention),
+        )
         // ── 账号管理（对照 workbuddy-account-routes.mjs）──
         // 用 any(...) 注册两条入口（无尾段 + 通配尾段），方法/路径的判定交给
         // api::accounts::dispatch —— 这是为了复刻 Node 版 tryHandle 的判定顺序
@@ -335,4 +361,34 @@ pub fn parse_body(bytes: &[u8]) -> Result<Value, errors::GatewayError> {
     }
     serde_json::from_str(&text)
         .map_err(|error| errors::GatewayError::bad_request(format!("请求体不是合法 JSON: {error}")))
+}
+
+/// 把查询串里的时间戳解析成毫秒整数（供 `/api/logs` 与 `/api/stats/*` 共用）。
+///
+/// **为什么不放在某个 api 模块里**：两个路由模块都要按同一口径解析 `start` / `end`，
+/// 各写一份的话两份实现迟早会漂（今天一个容忍小数、明天一个不容忍），
+/// 而这两个参数在两端表达的是同一件事。与 `parse_body` 一样归到 HTTP 层公共设施。
+///
+/// 解析规则（**非法一律返回 None，由调用方忽略该边界，不报错**）：
+///   - 空串 / 全空白 → None（前端把筛选框清空时会发 `?start=`，这是合法形态）
+///   - 整数优先按 `i64` 直解，避免大数值经浮点往返丢精度
+///   - 其余尝试 `f64`（容忍 JS 侧 `Date.now()/1000` 之类带小数的形态），
+///     但**只接受整值**：时间戳带小数没有意义，截断会悄悄挪动区间边界
+///   - 非有限值（NaN / inf）与超出 i64 范围的取值 → None
+///
+/// 为什么不报错：`start` / `end` 是筛选条件，为一次填错让整页（日志页 / 报表页）
+/// 报错，不如把该维度当作没筛 —— 页面照常出数据，只是范围宽一点。
+pub fn parse_query_ms(value: Option<&String>) -> Option<i64> {
+    let text = value?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(number) = text.parse::<i64>() {
+        return Some(number);
+    }
+    let number = text.parse::<f64>().ok().filter(|item| item.is_finite())?;
+    if number.fract() != 0.0 || number.abs() > i64::MAX as f64 {
+        return None;
+    }
+    Some(number as i64)
 }

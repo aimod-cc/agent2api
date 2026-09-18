@@ -30,6 +30,8 @@
 //!                   POST /auth/login、POST /auth/logout
 //!     config_api.rs GET/POST /api/config
 //!     logs_api.rs   GET /api/logs、/stats、/download、DELETE
+//!     stats_api.rs  GET /api/stats/summary、/api/stats/requests、DELETE /api/stats/requests、
+//!                   GET/PUT /api/retention（统计报表 + 数据保留策略）
 //!     accounts.rs   /api/accounts*（增删改查/切换/排序/批量/导入导出/刷新）
 //!     proxies.rs    /api/proxies*（Clash 实时读取 + 出口连通性测试）
 //!     billing.rs    /api/usage、/api/checkin*、/api/activity/*（对照 server.mjs 871-911）
@@ -62,8 +64,9 @@
 //!     upstream/    对话转发：
 //!       mod.rs       转发主链路（选路循环 / 429 轮换 / 去重排队 / SSE 流）
 //!       request.rs   请求构造（头集合、URL、system 注入、错误解析）
-//!       sse.rs       SSE reasoning 帧合并（跨 chunk 半行缓冲）
-//!       aggregate.rs 非流式聚合（SSE → 完整 chat.completion）
+//!     sse.rs       SSE reasoning 帧合并（跨 chunk 半行缓冲）
+//!     aggregate.rs 非流式聚合（SSE → 完整 chat.completion）
+//!     usage.rs     usage 旁路槽（token 用量 / 承载账号 / 尝试账号数）
 //! ```
 //!
 //! ── 给后续切片留的接入点 ────────────────────────────────────
@@ -77,6 +80,14 @@
 //!   - 定时签到：`ServerState::auto_checkin()`；停机清理走
 //!     `core::auto_checkin::stop_global()`（backend::shutdown 里调用）。
 //!   - 软件更新：`ServerState::update()`。
+//!   - 请求统计：写入侧是 `api::chat` 的记账点 → `RequestStats::record`；
+//!     读取侧是 `api::stats_api` 的三条路由（报表 / 明细查询 / 清空），
+//!     句柄取 `ServerState::request_stats()`；退出时在 `start()` 的 serve 任务
+//!     收尾处 `flush()`。
+//!   - 数据保留期：`config::retention_settings()`（内存快照，热路径用）与
+//!     `config::set_retention()`（写盘）；三个消费点都走**回调动态取值**
+//!     （`RequestStats` / `LogStore` / `PUT /api/retention` 的立即清理），
+//!     所以改完设置不需要重启进程。
 //!   - 配置读写：`config::current()`（不读盘）+ `config::apply_update()`（写盘）。
 //!   - 日志：`logging::log` / `logging::verbose` / `logging::log_event`。
 //!   - 出网代理：`core::egress::client_for` 是唯一出网点（按出口复用连接池；
@@ -97,9 +108,11 @@ pub mod errors;
 pub mod http;
 pub mod logging;
 pub mod logs_store;
+pub mod request_stats;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
@@ -112,6 +125,7 @@ use crate::server::core::login::LoginService;
 use crate::server::core::models::ModelCatalog;
 use crate::server::core::update::UpdateManager;
 use crate::server::core::upstream::UpstreamService;
+use crate::server::request_stats::{RequestStats, Retention};
 
 /// 服务器共享状态。handler 通过 `axum::extract::State` 拿到它的克隆。
 ///
@@ -143,22 +157,35 @@ pub struct ServerState {
     auto_checkin: AutoCheckin,
     /// 软件更新句柄（GitHub Release 检测 / 安装包下载；内部 Mutex）
     update: UpdateManager,
+    /// 请求统计存储句柄（明细 + 按天聚合）。
+    ///
+    /// 外面包一层 `Arc` 而不是像其它 store 那样自带内部 `Arc<Inner>`：
+    /// 存储本体的公开接口（`RequestStats::new`）已经定型，本切片不再改它，
+    /// 而 `ServerState` 是 `Clone` 的（handler 靠克隆拿状态），
+    /// 所以共享语义由这层 `Arc` 提供 —— 与 `AccountStore` 的 `Arc<Inner>`
+    /// 是同一个效果，只是包的位置在外侧。
+    request_stats: Arc<RequestStats>,
 }
 
 impl ServerState {
     /// 构造服务状态，并完成启动期的准备工作。
     ///
     /// 顺序很重要（对照 server.mjs 336-353 行）：
-    ///   1. 先装日志库 —— 后面所有模块的日志才能入库；
-    ///   2. 读配置 —— 启动横幅要打真实的默认模型/语言；
+    ///   1. 读配置 —— 保留期（日志天数）要在装日志库之前就位；
+    ///   2. 装日志库 —— 后面所有模块的日志才能入库；
     ///   3. 账号库载入 + 旧版 auth.json 迁移（仅账号列表为空时）+ 优先级去重迁移。
+    ///
+    /// ①/② 的顺序是本切片刚从「先装日志库」调过来的：日志库载入历史时就会按
+    /// 保留天数裁一次，而保留天数来自配置 —— 若配置还没读进来，那次裁剪会退回
+    /// 默认 30 天，把用户设了更长保留期的旧日志当场裁掉并落盘（**不可逆的数据丢失**）。
+    /// 两个函数都不写日志，交换它们不会让任何一行启动日志丢失。
     pub fn bootstrap(port: u16) -> Self {
         let config_dir = config::config_dir();
         // 与 Node 版一致：verbose 由环境变量 WORKBUDDY_VERBOSE=1 打开，
         // 决定 debug 级别日志要不要入库（默认只有 info 以上入库，避免刷屏）
         let verbose = std::env::var("WORKBUDDY_VERBOSE").map(|v| v.trim() == "1").unwrap_or(false);
-        logging::init_store(&config_dir, verbose);
         let snapshot = config::init();
+        logging::init_store(&config_dir, verbose);
 
         // 账号库 + 鉴权 + 登录 + 计费（四者共享同一个 store 句柄）
         let store = AccountStore::with_config_dir();
@@ -195,6 +222,25 @@ impl ServerState {
         // 更新管理器：下载目录 `{config_dir}/updates`，与壳侧 update::download_dir() 同源
         let update = core::update::init_global(UpdateManager::new(config_dir.clone()));
 
+        // 请求统计：数据目录与 LogStore **同源**（都是 config_dir，见
+        // `logging::init_store(&config_dir, ...)`）—— 明细 `requests.jsonl`
+        // 与聚合 `request-daily.jsonl` 就落在配置目录里，与 logs.jsonl 并排。
+        //
+        // 保留期走**回调**，每次裁剪时动态读配置：明细天数来自
+        // `requestRetentionDays`、聚合天数来自 `dailyRetentionDays`
+        // （`config::retention_settings()` 读的是 config::init() 装好的内存快照，
+        // 而 `PUT /api/retention` 会同步刷新它）——
+        // 于是设置页改完天数，下一次记账 / prune 立即生效，**不需要重启进程**，
+        // 也不必改这里的构造方式。这也正是 RequestStats::new 把保留期做成
+        // 回调而不是构造参数的原因（见那边的注释）。
+        let request_stats = Arc::new(RequestStats::new(config_dir.clone(), || {
+            let settings = config::retention_settings();
+            Retention {
+                request_days: settings.request_days,
+                daily_days: settings.daily_days,
+            }
+        }));
+
         // 旧版单账号 auth.json 迁移（仅当账号列表为空时导入一次）
         let legacy = read_legacy_session();
         if let Some(legacy) = legacy {
@@ -222,6 +268,7 @@ impl ServerState {
             desensitize,
             auto_checkin,
             update,
+            request_stats,
         };
         logging::log("[Server]", "WorkBuddy 本地代理（Rust 进程内服务）启动中…");
         logging::log("[Config]", &format!("API 端口: {}", port));
@@ -387,6 +434,15 @@ impl ServerState {
     pub fn update(&self) -> &UpdateManager {
         &self.update
     }
+
+    /// 请求统计句柄（对话链路的记账点写入；报表/明细 API 由后续切片接线）
+    ///
+    /// 返回 `Arc<RequestStats>` 的所有权克隆（而不是像其它 store 那样返回
+    /// `&T`）：流式请求要把它移进**响应流**里，而响应流活得比 handler 的
+    /// 栈帧久，拿不到借用。
+    pub fn request_stats(&self) -> Arc<RequestStats> {
+        self.request_stats.clone()
+    }
 }
 
 /// 读旧版单账号 auth.json（缺失/损坏都当没有，对应 Node 版 `loadStoredSession`）
@@ -432,6 +488,9 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, String> {
         .map_err(|error| format!("设置监听为非阻塞失败: {error}"))?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    // 停机收尾要用的统计句柄：先克隆出来再移进任务（`state` 是借用，不能
+    // 随 async move 一起走）
+    let request_stats = state.request_stats();
     tauri::async_runtime::spawn(async move {
         // 运行时上下文在这里必然成立，from_std 不会 panic
         let listener = match tokio::net::TcpListener::from_std(listener) {
@@ -450,6 +509,12 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, String> {
             Ok(()) => logging::log("[Server]", "服务已停止"),
             Err(error) => logging::log("[Server]", &format!("❌ 服务异常退出: {error}")),
         }
+        // 统计补写：放在 serve 返回**之后**（graceful shutdown 已等在途请求
+        // 跑完），此时不会再有新的记账进来，这一次 flush 的结果就是终态。
+        // 为什么必须显式调用：聚合行是延迟落盘的（变更满 50 次或距上次落盘
+        // 超 60 秒才重写整个文件），不补这一次，用户刚看到的请求在下次启动后
+        // 会少一截（明细走追加写，不受影响）。
+        request_stats.flush();
     });
 
     Ok(shutdown_tx)

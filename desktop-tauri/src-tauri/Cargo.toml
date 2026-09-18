@@ -1,9 +1,17 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "1.1.1"
+version = "1.2.0"
 description = "WorkBuddy 本地代理桌面端 — 会话与多账号管理"
+authors = ["aimod-cc"]
 edition = "2021"
 rust-version = "1.77"
+# 许可：LICENSE 正文是逐字的标准 MIT 条款，但文件末尾附有「使用声明」，
+# 其第 3 条禁止商业用途 / 二次分发牟利，属于 MIT 之外的附加限制；
+# 根 README「许可」一节也写明两者共同构成完整的授权与使用约定。
+# 因此不单独声明 SPDX 的 "MIT"（会漏掉附加限制），改为指向实际的 LICENSE 文件。
+license-file = "../../LICENSE"
+repository = "https://github.com/aimod-cc/workbuddy-proxy"
+homepage = "https://github.com/aimod-cc/workbuddy-proxy"
 
 [lib]
 name = "workbuddy_proxy_desktop_lib"
@@ -47,6 +55,22 @@ tokio-stream = "0.1"
 # 都要用 bytes::Bytes（reqwest 只再导出 Response，不导出 Bytes 本身），
 # 转发链路要自己拼 SSE 帧，所以显式依赖（版本与 axum/reqwest 内部一致）
 bytes = "1"
+
+# 查端口监听者与结束进程树改用纯 Win32 API（iphlpapi 的 GetExtendedTcpTable、
+# Toolhelp 进程快照 + OpenProcess/TerminateProcess）。原先靠 spawn taskkill /
+# powershell 实现，「监听本地端口 + 拉起 powershell 查进程 + taskkill 杀进程」
+# 这套字符串与行为特征命中了杀软（联想电脑管家 / 火绒引擎）对流量拦截类木马的
+# 启发式，进程一启动就被拦杀（报 Trojan/Intercept.a，退出码 0xFFFFFFFF）。
+# 换 API 后导入表里只剩 kernel32 / iphlpapi，不再有任何命令行工具的名字。
+# 只对 Windows 目标生效：非 Windows 平台是桩实现，不需要这份依赖。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Threading",
+] }
 
 [features]
 default = ["custom-protocol"]

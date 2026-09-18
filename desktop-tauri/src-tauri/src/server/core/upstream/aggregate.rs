@@ -13,13 +13,21 @@
 //!   - `finish_reason` 取最后一次非空
 //!   - 帧里的 `error` 字段 → 抛 502（上游把错误写在流里）
 //!   - id/created 缺失时给 `wb-agg-<毫秒>` / 当前秒兜底
+//!
+//! ── usage 旁路提取（请求统计）────────────────────────────────
+//! `consume_chunk` 里顺手把 `usage` 抄进 `usage::RequestTelemetry`。
+//! **不影响响应体**：决定下发 `usage` 字段的是 `self.usage`（本文件的
+//! 既有逻辑），旁路只写另一个结构体，两者互不干扰。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use serde_json::{json, Map, Value};
 
 use crate::server::errors::GatewayError;
+
+use super::usage::RequestTelemetry;
 
 /// 流式读取的上限保护：单条 SSE 行长度（解析失败的行会原样丢掉，
 /// 但不能让一条畸形行把内存吃满）
@@ -36,8 +44,14 @@ pub struct AggregatedCompletion {
 /// `on_chunk` 参数已去掉：Node 里 `controller.signal.aborted` 检查的作用是
 /// 「客户端断开时停止聚合」，Rust 侧等价物是 caller 在 select! 里取消整个
 /// future（见 forward.rs）—— 无需在循环里重复检查。
+///
+/// `telemetry` 是 usage 旁路槽（`Arc` 而非引用：聚合要在 await 之间持用，
+/// 而转发链路本身是异步的）。它只被写入、不参与 `acc` 的构建 ——
+/// **不影响返回的 body**（usage 的透传口径由 aggregate 自己的
+/// `self.usage` 负责，与这里无关，两条路径互不干扰）。
 pub async fn aggregate_sse_completion(
     response: reqwest::Response,
+    telemetry: Arc<RequestTelemetry>,
 ) -> Result<AggregatedCompletion, GatewayError> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
@@ -58,7 +72,7 @@ pub async fn aggregate_sse_completion(
             if line.is_empty() {
                 continue;
             }
-            acc.consume_line(&line)?;
+            acc.consume_line(&line, &telemetry)?;
         }
         if buffer.len() > MAX_LINE_BYTES {
             return Err(GatewayError::with_status(502, "上游返回的单行数据过大，已中断"));
@@ -67,7 +81,7 @@ pub async fn aggregate_sse_completion(
     // 尾行（上游没以换行结尾）
     let tail = buffer.trim().to_string();
     if !tail.is_empty() {
-        acc.consume_line(&tail)?;
+        acc.consume_line(&tail, &telemetry)?;
     }
 
     Ok(acc.into_completion())
@@ -90,7 +104,7 @@ struct CompletionAccumulator {
 
 impl CompletionAccumulator {
     /// 处理一行 SSE（`data: {...}` / `data: [DONE]` / 其他）
-    fn consume_line(&mut self, line: &str) -> Result<(), GatewayError> {
+    fn consume_line(&mut self, line: &str, telemetry: &RequestTelemetry) -> Result<(), GatewayError> {
         let Some(data) = line.strip_prefix("data:") else {
             return Ok(());
         };
@@ -103,13 +117,22 @@ impl CompletionAccumulator {
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             return Ok(());
         };
-        self.consume_chunk(&chunk)
+        self.consume_chunk(&chunk, telemetry)
     }
 
-    fn consume_chunk(&mut self, chunk: &Value) -> Result<(), GatewayError> {
+    fn consume_chunk(&mut self, chunk: &Value, telemetry: &RequestTelemetry) -> Result<(), GatewayError> {
         let Some(object) = chunk.as_object() else {
             return Ok(());
         };
+        // ── usage 旁路提取（请求统计）──────────────────────────────
+        // 放在错误判定**之前**：上游把错误写在流里时也可能带上已消耗的
+        // usage（提示词已计费），旁路先抄一份不影响下面照常抛 502。
+        // 为什么这里的失败同样是「无副作用」的：只读 `chunk` 的一个成员，
+        // 不碰 `self.usage`（那才是决定响应体 usage 字段的那份），
+        // 所以返回值与不接钩子时完全一致。
+        if let Some(usage) = object.get("usage") {
+            telemetry.report_usage(usage);
+        }
         if let Some(error) = object.get("error") {
             let message = error
                 .get("message")

@@ -1,0 +1,4 @@
+# 编译产物统一放到项目根的 target/ 下（默认是 src-tauri/target/）。
+# 目的：target 目录层级更浅、便于清理，也让源码目录保持干净。
+[build]
+target-dir = "../../target"

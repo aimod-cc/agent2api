@@ -5,6 +5,8 @@ const api = window.workbuddyDesktop;
 const $ = id => document.getElementById(id);
 let state = null;
 let currentConfig = null;
+// busy 是「全局一次只干一件事」的互斥锁：刷新、切换账号、登录、保存配置等都要先占它。
+// 注意它与 account-panel.js 里的 panelBusy 是两把互不相干的锁：弹窗内的保存不占这把锁。
 let busy = false;
 
 // 3065 是官方默认端口，但主进程可能被 WORKBUDDY_PROXY_PORT 覆盖，
@@ -36,16 +38,6 @@ function formatTime(value) {
   return date.toLocaleString('zh-CN', { hour12: false });
 }
 
-/** 短时间：同天显示 HH:mm，跨天显示 MM-DD HH:mm（用于限额恢复时间） */
-function formatShortTime(value) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '';
-  const sameDay = date.toDateString() === new Date().toDateString();
-  return date.toLocaleString('zh-CN', sameDay
-    ? { hour: '2-digit', minute: '2-digit', hour12: false }
-    : { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
-}
-
 function formatRemaining(ms) {
   if (!Number.isFinite(ms) || !ms) return '';
   const diff = ms - Date.now();
@@ -59,13 +51,34 @@ function formatRemaining(ms) {
 
 function applyTheme(mode) {
   document.documentElement.dataset.theme = mode;
+  // 同步操作系统标题栏的深浅色：界面切深色但标题栏仍是系统主题时，顶部会留一条白带。
+  // 浏览器直开时没有桥，用可选链 + try 吞掉，避免影响主题本身生效。
+  // 跟随系统时必须传 null 把窗口主题交回系统，不要在这里把它整形回 dark/light 两态：
+  // 窗口一旦被手动主题钉住，WebView2 的 prefers-color-scheme 会跟着窗口走而非系统，
+  // 下面读到的就是被污染的值，界面会永远卡死在手动主题上。
+  // 这行还要排在读 matchMedia 之前：先交回系统才读得到真实值；
+  // 交回系统是异步生效的，读到旧值时靠「change 监听 + 落定后复核」双保险兜住。
+  let pendingWindowTheme;
+  try {
+    pendingWindowTheme = window.workbuddyDesktop?.setWindowTheme?.(mode === 'system' ? null : mode);
+  } catch { /* 非桌面环境忽略 */ }
   // system 模式下 color-scheme 也要跟随系统，否则原生控件会停留在浅色
   const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
   const effective = mode === 'dark' || (mode === 'system' && systemDark) ? 'dark' : 'light';
   document.documentElement.style.colorScheme = effective;
-  // 同步操作系统标题栏的深浅色：界面切深色但标题栏仍是系统主题时，顶部会留一条白带。
-  // 浏览器直开时没有桥，用可选链 + try 吞掉，避免影响主题本身生效。
-  try { window.workbuddyDesktop?.setWindowTheme?.(effective); } catch { /* 非桌面环境忽略 */ }
+  // 双保险①：文件末尾的 change 监听，兜「运行中系统主题变化」（以及多数切回 system 的场景）。
+  // 双保险②：这里的落定后复核，兜「切回 system 时 WebView2 未必派发 change」——
+  // 窗口主题真正恢复后若与本次判定不符，说明本次读到的是污染值，就按真实值再算一遍；
+  // 再算时 matchMedia 已是真实值、条件自然不成立，所以最多多跑一轮，不会递归下去。
+  // 非桌面环境下桥返回 undefined，可选链保证整条链静默跳过。
+  pendingWindowTheme?.then?.(() => {
+    // 手动 dark/light 是同步钉死窗口主题的语义，不存在污染，无需复核
+    if (mode !== 'system') return;
+    // 复核期间用户若已改成手动主题，以用户选择为准，不能拿本次判定覆盖回去
+    if ((localStorage.getItem('workbuddy-desktop-theme') || 'system') !== 'system') return;
+    const settledDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if ((settledDark ? 'dark' : 'light') !== effective) applyTheme('system');
+  })?.catch?.(() => { /* 命令失败时不做复核，界面保持本次结果 */ });
   localStorage.setItem('workbuddy-desktop-theme', mode);
   document.querySelectorAll('#theme-switch button').forEach(item => {
     item.classList.toggle('active', item.dataset.mode === mode);
@@ -76,9 +89,10 @@ function applyTheme(mode) {
 
 const PAGE_KEY = 'workbuddy-desktop-page';
 const PAGES = ['overview', 'accounts', 'gateway', 'desensitize', 'logs', 'settings'];
-/** 页签中文名：顶栏面包屑用 */
+/** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」（内部标识保持不变：
+ *  localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它） */
 const PAGE_LABELS = {
-  overview: '概览',
+  overview: '报表',
   accounts: '账号',
   gateway: '网关',
   desensitize: '脱敏',
@@ -101,6 +115,10 @@ function showPage(name, { persist = true } = {}) {
   const crumb = $('crumb-page');
   if (crumb) crumb.textContent = PAGE_LABELS[page] || page;
   if (persist) localStorage.setItem(PAGE_KEY, page);
+  // 切到报表页时拉一次统计（面板内部自持时间范围与数据，这里只做转发）
+  if (page === 'overview') {
+    window.wbReport?.load?.();
+  }
   // 切到日志页时清掉未读标记，并立即拉一次最新日志
   if (page === 'logs') {
     clearLogsBadge();
@@ -111,6 +129,9 @@ function showPage(name, { persist = true } = {}) {
     window.wbSettingsPanel?.load?.();
   }
   renderTopbarStatus();
+  // 导航项上的内容随页面变：日志未读徽标交给日志面板，更新提示在这里重画
+  // （校验更新提示的可见性与所在页面有关，见 syncUpdateBadge）
+  syncUpdateBadge();
 }
 
 // ─── 顶栏状态 ─────────────────────────────────
@@ -193,6 +214,48 @@ function updateLogsBadge(stats) {
   badge.style.display = '';
 }
 
+// ─── 新版本可用提示 ───────────────────────────
+
+/** 最近一次检查结果。存下来是为了换页时能重画提示（检查本身只在启动与手动触发时跑） */
+let lastUpdateInfo = null;
+/**
+ * 已经看过提示的版本号。看过一次就没必要每次换页再闪一遍 ——
+ * 与日志未读徽标的处理同一个取向（不打扰）。存版本号而不是布尔值：
+ * 之后又发了更新的版本，提示该重新出现。
+ */
+let seenUpdateVersion = '';
+
+/**
+ * 按当前状态重画「设置」导航项上的更新提示。
+ * 更新是设置页里的功能，所以提示挂在设置项上，不新增顶级页面。
+ * 无更新、检查失败、版本号无法比较一律不显示（启动阶段的网络失败不该打扰用户）；
+ * 人已经在设置页时也不显示 —— 面板里的「有新版本」徽标已经把话说完了。
+ */
+function syncUpdateBadge() {
+  const badge = $('nav-count-update');
+  if (!badge) return;
+  const info = lastUpdateInfo;
+  const latest = String(info?.latestVersion || '').trim();
+  // 进设置页即视为「已看到」：结果与更新日志就在那个面板里
+  if (currentPage === 'settings') seenUpdateVersion = latest;
+  if (info?.hasUpdate !== true || !latest || latest === seenUpdateVersion) {
+    badge.style.display = 'none';
+    return;
+  }
+  // 只放一个「新」字而不是数字：这里没有「未读条数」的含义，
+  // 写成数字容易被误会成还有多少个版本可以更新
+  badge.textContent = '新';
+  badge.title = `发现新版本 ${latest}（当前 ${info.currentVersion || '未知'}），`
+    + '点开「设置 - 软件更新」可查看更新日志并下载';
+  badge.style.display = '';
+}
+
+/** 检查更新结束后由软件更新面板调用（result 为 null 表示检查失败） */
+function updateUpdateBadge(info) {
+  lastUpdateInfo = info || null;
+  syncUpdateBadge();
+}
+
 // ─── 渲染：会话状态 ────────────────────────────
 
 function renderSession() {
@@ -200,6 +263,10 @@ function renderSession() {
   const health = state?.health || {};
   const badge = $('session-badge');
   const currentAccount = state?.accounts?.accounts?.find(a => a.id === state.accounts.currentAccountId);
+
+  // title 还被「加载失败」用来挂后端不可达的原因（见 refresh 的 catch），
+  // 每次重渲染都先清空：否则恢复后鼠标悬停仍会读到上一次的失败提示
+  badge.title = '';
 
   if (!health.upstreamConfigured) {
     badge.className = 'badge bad';
@@ -380,17 +447,24 @@ function renderConfig() {
     : '未启用（仅监听 127.0.0.1，建议本机使用）';
 }
 
+/**
+ * 「本地代理状态」卡片已随报表页改造删除（原有信息与侧栏底部的网关状态、
+ * 顶栏徽标重复）。这里保留判空只是为了让历史书签 / 旧 DOM 不报错：
+ * 元素在就写，不在就静默跳过 —— 不该为了一个已删除的展示位把 render() 拖崩。
+ */
 function renderProxyStatus() {
+  const box = $('proxy-status');
+  if (!box) return;
   const health = state?.health;
   if (!health?.upstreamConfigured) {
-    $('proxy-status').innerHTML = `<span style="color:var(--danger)">不可用：${esc(health?.unavailableReason || '无法连接代理')}</span>`;
+    box.innerHTML = `<span style="color:var(--danger)">不可用：${esc(health?.unavailableReason || '无法连接代理')}</span>`;
     return;
   }
   // 首选项取自列表的派生值（转发顺序第一位）；具体某次请求走谁还受按模型的限额影响
   const snapshot = state?.accounts;
   const current = snapshot?.accounts?.find(a => a.id === snapshot.currentAccountId);
   const who = current ? (current.nickname || current.name || current.uid || current.id) : '—';
-  $('proxy-status').textContent = `运行正常 · ${health.upstreamBaseUrl || ''} · 首选账号 ${who}（P${current?.priority ?? '—'}）`;
+  box.textContent = `运行正常 · ${health.upstreamBaseUrl || ''} · 首选账号 ${who}（P${current?.priority ?? '—'}）`;
 }
 
 function render() {
@@ -417,8 +491,40 @@ function renderNavCounts() {
 
 // ─── 加载 ─────────────────────────────────────
 
+/**
+ * 忙碌期间被压下的刷新请求（合并成一次待办）。
+ * 为什么需要它：refresh() 过去在 busy 时直接 return，请求被静默丢弃 ——
+ * 保存账号设置后主动调刷新，恰好撞上 20 秒轮询或别的操作，这次刷新就白丢了，
+ * 界面只能等下一次轮询才更新（用户看到的就是「保存完十几秒才变」）。
+ */
+let refreshQueued = false;
+
+/**
+ * 释放 busy 锁，并把排队的刷新补跑掉。
+ *
+ * 为什么所有持锁函数都要经由它释放（而不是各自写 busy = false）：
+ * 锁是共用的，排队标记却可能是在别人持锁期间被置上的（比如轮询撞上「等待网页登录」）。
+ * 只在 refresh() 自己的 finally 里补跑，遇到「锁被非刷新操作持有」时就会漏掉这次请求，
+ * 又要等下一个 20 秒。统一从这里释放，才能保证「锁一放开就补跑」。
+ *
+ * 补跑用 void 触发、不 await：调用方（如 runAccountAction）可能正持着锁，
+ * 若在这里 await 补跑，就等于把锁借给别人、还会形成递归等待链。
+ * 末尾挂 catch 只做兜底 —— refresh() 正常会把错误渲染成「加载失败」，
+ * 但 render() 自身抛错时 Promise 会拒绝，void 出去的拒绝没人接就变成控制台噪音。
+ * 此处 busy 已提前置 false，故补跑的那次 refresh() 一定拿得到锁。
+ */
+function releaseBusy() {
+  busy = false;
+  if (!refreshQueued) return;
+  refreshQueued = false;
+  refresh().catch(() => { /* 兜底：避免 void 出去的 Promise 拒绝无人处理 */ });
+}
+
 async function refresh() {
-  if (busy) return;
+  // 忙碌时不丢弃请求，先排队；多次请求合并成一次补跑，避免连续触发时打出一串重复请求。
+  // 这里立即返回（不等补跑完成）：调用方可能正持着锁等这个 Promise（如 runAccountAction
+  // 内的 await refresh()），若返回的 Promise 依赖锁释放，就会自己把自己锁死。
+  if (busy) { refreshQueued = true; return; }
   busy = true;
   try {
     const next = await api.getState();
@@ -433,9 +539,14 @@ async function refresh() {
   } catch (error) {
     state = null;
     render();
-    $('proxy-status').innerHTML = `<span style="color:var(--danger)">加载失败：${esc(error.message)}</span>`;
+    // 「本地代理状态」卡片已随报表页改造删除，加载失败改挂到会话徽标的 title 上：
+    // 徽标此时本来就显示「⚠️ 未登录」，悬停即可看到真实原因（后端不可达 / 接口报错）。
+    // 不用 toast：refresh() 每 20 秒轮询一次，后端长时间不可用会变成刷屏。
+    const badge = $('session-badge');
+    if (badge) badge.title = `加载失败：${error.message}`;
+    console.warn('加载状态失败:', error.message);
   } finally {
-    busy = false;
+    releaseBusy();
   }
 }
 
@@ -484,7 +595,7 @@ async function runAccountAction(action, id) {
   } catch (error) {
     toast(`操作失败：${error.message}`, 'err');
   } finally {
-    busy = false;
+    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
   }
 }
 
@@ -584,7 +695,7 @@ async function startWebLogin() {
   } catch (error) {
     toast(`登录失败：${error.message}`, 'err');
   } finally {
-    busy = false;
+    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
     // 以主进程状态为准复位按钮，避免这里与真实状态不一致
     const state = await api.getLoginState().catch(() => null);
     applyLoginState(state?.active);
@@ -618,7 +729,7 @@ async function uploadAccount() {
   } catch (error) {
     toast(`导入失败：${error.message}`, 'err');
   } finally {
-    busy = false;
+    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
     button.disabled = !$('auth-json-input').value.trim();
   }
 }
@@ -704,7 +815,7 @@ $('btn-refresh-token').addEventListener('click', async () => {
   } catch (error) {
     toast(`刷新失败：${error.message}`, 'err');
   } finally {
-    busy = false;
+    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
   }
 });
 $('btn-logout').addEventListener('click', async () => {
@@ -718,7 +829,7 @@ $('btn-logout').addEventListener('click', async () => {
   } catch (error) {
     toast(`退出失败：${error.message}`, 'err');
   } finally {
-    busy = false;
+    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
   }
 });
 $('btn-add-account').addEventListener('click', openModal);
@@ -736,7 +847,7 @@ $('btn-save-key').addEventListener('click', async () => {
   } catch (error) {
     toast(`保存失败：${error.message}`, 'err');
   } finally {
-    busy = false;
+    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
   }
 });
 $('btn-clear-key').addEventListener('click', async () => {
@@ -750,7 +861,7 @@ $('btn-clear-key').addEventListener('click', async () => {
   } catch (error) {
     toast(`清除失败：${error.message}`, 'err');
   } finally {
-    busy = false;
+    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
   }
 });
 
@@ -791,13 +902,14 @@ window.wbApp = {
   esc,
   toast,
   formatTime,
-  formatShortTime,
   showPage,
   get currentPage() { return currentPage; },
   getState: () => state,
   runAccountAction,
   refresh,
   updateLogsBadge,
+  // 软件更新面板在每次检查结束后回调它，把「有新版本」翻译成导航上的提示
+  updateUpdateBadge,
 };
 
 // ─── 启动自动维护：主进程会拉一次临期 token 刷新 + 余额查询 ───
@@ -817,23 +929,45 @@ $('nav').addEventListener('click', event => {
 });
 
 /**
- * 导航图标注入：index.html 里的 .ico 只留空占位，图标从这里填。
- * 放在 JS 而不是写死在 HTML 里，是为了让六个图标的定义集中在一处
+ * 图标注入：index.html 里的 .ico 与 .brand-logo 只留空占位，图形从这里填。
+ * 放在 JS 而不是写死在 HTML 里，是为了让图标的定义集中在一处
  * （icons.js），后续换图标只改一个文件，不必在 HTML 里翻找。
+ *
+ * 品牌标与应用图标（icons/icon.png）同一造型，所以它也跟着这里注入 ——
+ * 哪天图标换了，改 icons.js 的 brand 项即可，不会出现「窗口图标换了、
+ * 侧栏还停在旧图形」这种不一致。
  */
-function paintNavIcons() {
+function paintIcons() {
   const icon = window.wbIcons?.icon;
   if (!icon) return;
   document.querySelectorAll('.nav-item[data-icon] .ico').forEach(slot => {
     const name = slot.closest('.nav-item').dataset.icon;
     slot.innerHTML = icon(name, 17);
   });
+  document.querySelectorAll('.brand-logo').forEach(slot => {
+    slot.innerHTML = icon('brand', 32);
+  });
 }
-paintNavIcons();
+paintIcons();
 
 showPage(localStorage.getItem(PAGE_KEY) || 'overview', { persist: false });
 
 refresh();
+
+/**
+ * 启动即自动检查一次更新：有新版本时在「设置」导航项上给提示。
+ *
+ * 放在 DOMContentLoaded 里而不是直接调用：app.js 在 index.html 里排得比
+ * update-panel.js 靠前，脚本执行到这里时 window.wbUpdatePanel 还没挂上，
+ * 直接调会静默什么都不做；DOMContentLoaded 在所有同步脚本执行完之后触发，
+ * 那时面板已经就位。不 await（void 触发）—— 这是网络请求，首屏不该等它；
+ * 失败静默（面板里留一条失败记录，导航提示不显示）。
+ *
+ * 面板的 load() 只读下载进度、不查版本，所以这里这一下不会和它重复请求。
+ */
+document.addEventListener('DOMContentLoaded', () => {
+  void window.wbUpdatePanel?.check?.();
+}, { once: true });
 
 // 定时轮询：限额标记（429 + 恢复时间）与账号状态变化自动刷新；窗口隐藏时暂停
 setInterval(() => { if (!document.hidden) refresh(); }, 20_000);

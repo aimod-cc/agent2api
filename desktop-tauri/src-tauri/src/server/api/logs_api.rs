@@ -1,6 +1,6 @@
 //! 运行日志路由（对照 src/workbuddy-log-routes.mjs 逐字段实现）。
 //!
-//!   GET    /api/logs          查询（?limit=&level=&category=&keyword=&sinceId=）
+//!   GET    /api/logs          查询（?limit=&level=&category=&keyword=&sinceId=&start=&end=）
 //!   GET    /api/logs/stats    各级别 / 分类计数（导航徽标、筛选下拉）
 //!   GET    /api/logs/download 导出 JSONL 附件
 //!   DELETE /api/logs          清空
@@ -16,6 +16,11 @@
 //! 日志参数解析是本文件的重点：查询串里的值都是字符串，
 //! 与 Node 的 `Number(...)` / `Math.min(Math.max(...))` 语义要一一对上
 //! （NaN 视作缺省、limit 夹在 1..MAX_ENTRIES）。
+//!
+//! `start` / `end`（毫秒时间戳）是**新增的可选**参数，Node 版没有：
+//! 日志页的时间筛选需要它。解析规则与报表 API 一致 —— 非法（空串 / 非数字）
+//! **忽略而不是报错**（前端可能发空串表示「不限时间」），
+//! 不传时的过滤链与以前完全一致。
 
 use std::collections::HashMap;
 
@@ -25,7 +30,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Number, Value};
 
-use crate::server::http::{ok_json, raw_json};
+use crate::server::http::{ok_json, parse_query_ms, raw_json};
 use crate::server::logging;
 use crate::server::logs_store::{self, Query as LogQuery};
 use crate::server::ServerState;
@@ -88,6 +93,9 @@ pub async fn query_logs(State(_state): State<ServerState>, Query(params): Query<
         category: params.get("category").cloned(),
         keyword: params.get("keyword").cloned(),
         since_id: parse_number(params.get("sinceId")).map(|value| value.max(0.0) as u64),
+        // 时间筛选：非法值解析成 None（= 该边界不生效），与 Node 版「有则用、无则忽略」同调
+        start: parse_query_ms(params.get("start")),
+        end: parse_query_ms(params.get("end")),
     };
 
     let result = store.query(&query);

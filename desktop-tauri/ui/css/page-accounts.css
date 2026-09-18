@@ -19,30 +19,95 @@
   overflow-x: hidden;
   /* 常驻预留滚动条槽：有无滚动条时卡片区宽度一致，列数不会跳变 */
   scrollbar-gutter: stable;
+  /* 列表区铺 --surface-well 做一层「浅凹」槽底，卡片浮在它上面。
+     这里不能用 --bg：面板外的页面画布就是 --bg，两者同色会让面板内外连成一整片、
+     面板边界只剩 1px 边框在划界 —— 也就是「看不到面板在哪」的观感。
+     也不能用 --surface-inset：那个是「内嵌块的深凹槽」（浅色 0.93 / 深色 0.19），
+     压得太深，一片大面积的列表铺上去会显得整块发暗（用户反馈「有点深了」）；
+     列表区要的是「几乎贴着白、只压一点点」的浅凹，故改用列表区专用的 --surface-well。
+     两个令牌在深色下同值（0.19）、浅色下差 0.04（0.97 vs 0.93），语义与取值都各自独立。
+     深浅两套取值的方向是相反的，但「比卡片暗、卡片浮起」的关系两边都成立：
+       浅色：画布 0.96 → 列表 0.97（比画布略亮）→ 卡片 1.0（最亮）
+       深色：画布 0.21 → 列表 0.19（比画布更深，没有更亮的余量可走）→ 卡片 0.285
+     注意面板底与卡片同是 --surface（浅色 1.0 / 深色 0.285），这两层本来就分不出明度差 ——
+     卡片能浮起来靠的是「坐落在列表底（0.97 / 0.19）之上」这一步，以及 1px 描边与 --shadow-1；
+     列表区正是把这层底垫出来的那一层，所以它必须与卡片有色差，而不是与画布比谁亮。
+     若这里不写背景，会透出 .panel 的 --surface —— 与卡片完全同色，卡片边界就没了。
+     工具条仍在面板白底（--surface）上；批量栏与表脚是 --surface-2 的浅灰条
+     （浅色 0.97 / 深色 0.305）。浅色下这两条与列表区**同值**（都是 0.97）——
+     这是「列表底要 #F5F5F5」的直接结果：#F5F5F5 换算成 oklch 正好是 --surface-2 的 0.97。
+     它们之间还剩 --hairline 那条 1px 分界线，以及卡片网格上下的 16/18px 内边距，
+     边界仍在，只是不再靠色差；深色下列表区 0.19 vs 浅灰条 0.305 差 0.115，分层照旧。
+     背景不会引起滚动条跳动：滚动条槽由上面的 scrollbar-gutter 常驻预留。 */
+  background: var(--surface-well);
 }
 
 /* ─── 卡片网格 ───
-   轨道宽度被夹在 340–353px，列数随可用宽度自适应。
+   轨道宽度被夹在 340–353px，列数随可用宽度自适应（留白关闭态的例外见下）。
 
    为什么不用 fr：fr 会让卡片随窗口等比变宽。窗口 1900px 时单卡能到 600px 以上，
    卡片内部「转发顺序 ↔ 操作按钮」又会被拉开一道空白 —— 那正是要修的毛病
    换到卡片内部重演。封顶 353px 才能保证卡片始终紧凑。
 
-   353 这个上限是逆推的：默认窗口内容区 804px，减网格内边距 32px 得 772px；
-   两列需要 353×2 + 12 = 718px，排得下。取到 360 就要 732px 才够，仍是两列，
-   但更宽窗口下会少排一列。
+   353 这个上限是逆推的：默认窗口内容区 804px，按「留白开启」这一最紧的口径算，
+   减网格左右内边距 32px 得 772px；两列需要 353×2 + 14 = 720px，排得下。
+   取到 360 就要 734px 才够，仍是两列，但更宽窗口下会少排一列。
 
-   340 是下限：最小窗口 820px 时轨道区约 680px，两列需要 692px，排不下 → 单列。
-   这个下限同时决定卡片最窄宽度，底部操作区按它校验过（见文末容器查询）。 */
+   例外：设置页「账号列表两侧留白」关闭态（data-content=full）是刻意的例外 ——
+   那时轨道切到「300 下限 + 1fr 瓜分宽度」，不再封顶，卡片会随窗口变宽，
+   见下方关闭态规则。上面这套「封顶才紧凑」的取舍，只描述开关开启（默认口径）
+   与未命中关闭态的其余情况。
+
+   340 是下限：最小窗口 820px 时轨道区约 680px，两列需要 694px，排不下 → 单列。
+   这个下限同时决定卡片最窄宽度，底部操作区按它校验过（见文末容器查询）。
+   例外：关闭留白时下限降到 300px（为让宽屏下一行排下 4 列），见下方关闭态规则。 */
 .acct-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(340px, 353px));
-  gap: 12px;
-  padding: 14px 16px 16px;
+  gap: 14px;
+  padding: 16px 16px 18px;
   justify-content: center;
   /* 卡片各按自身内容定高：默认的 stretch 会让同行卡片一起等高，
      某张卡展开积分明细后旁边两张被拉成一样高，中间空出一大块。 */
   align-items: start;
+}
+
+/* 设置页「账号列表两侧留白」开关的关闭态（默认）：JS 会给 <html> 标上 data-content=full。
+   这里的「占满」= 两侧保留与主要内容区（.content）同源的 var(--pad)（20px）+ 轨道切到
+   1fr 瓜分宽度。「占满」是说列表不再多留一道自己的 16px 留白、把面板可用宽度用尽，
+   并不等于贴边：padding 归零会横向顶到面板边框（左侧 0 间距，右侧只剩滚动条常驻槽的
+   11px），间距口径也和正文的 20px 对不上。统一用与内容区同源的 --pad，
+   卡片的缩进口径才和内容区一致 —— 这就是「保留一点点间距」的标准。
+
+   必须同时做两件事才成立 —— 只把两侧 padding 调窄（哪怕调到 0）都无效：
+   上面主注释里轨道被封在 340–353px，多出来的可用宽度既不会分给列数（不够多排一列时），
+   也不会分给卡片，只会被 justify-content: center 均摊回卡片两侧的空白里 ——
+   空隙换了名字、列数与卡片宽度都没动，看起来就是「开关毫无反应」。
+   所以轨道口径还要从「340–353 封顶」换成「300 下限 + 1fr 瓜分」：
+   1fr 让轨道把全部剩余宽度吃掉，窗口越宽卡片越宽，列数也随可用宽度自然增加。
+
+   下限为什么从 340 降到 300：这次恢复了两侧 --pad（共 40px），若仍保留下限 340，
+   4 列需要 4×340 + 3×14 = 1402px 网格宽，加上两侧 --pad、面板边框 2px、滚动条常驻槽 11px，
+   内容区要 1455px、即窗口 ≥1819px 才排得下 —— 1600 档只有 3 列，1920 也只是刚过线。
+   降到 300 后 4 列只要 4×300 + 42 = 1242px 网格宽、内容区 1295px 即可，
+   窗口 ≥1619px 就能四列（同样恢复 --pad 的前提下，1619–1818 这一段的列数由 3 变 4），
+   1920 全屏每列约 360px，与「封顶口径」的卡片宽度相近。300 仍保住卡片的基本可用性：
+   内容盒 276px（300 − 左右内边距 24）落在文末 @container 的 325px 保护线之下，
+   会按设计收起「设为首选」这个次要按钮 —— 这正是那条保护要兜的场景。
+
+   代价是用户显式选择「占满」后要接受的：轨道不再封顶，卡片会比 353px 的口径宽
+   —— 超宽窗口下更明显，单列窗口里唯一一张卡也会铺满整行；
+   卡片内部「转发顺序 ↔ 操作按钮」的间距随之拉开（这正是默认封顶要避免的形态，
+   只在关闭留白时出现）。
+
+   竖向留白（上 16px / 下 18px）保留 —— 它负责网格与上方批量栏、下方表脚的分隔，
+   与开关要控制的「两侧」无关。内容区自身的居中限宽（--content-max）也不在此列，
+   任何页面都保持默认；开关开启（data-content=margin 或属性缺失）时不命中这条规则，
+   沿用上方 .acct-grid 里 padding: 16px 16px 18px 的透气态与封顶口径。 */
+:root[data-content='full'] .acct-grid {
+  padding-left: var(--pad);
+  padding-right: var(--pad);
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
 }
 
 /* 分组标题（国内 / 国际）横跨整行 */
@@ -72,11 +137,22 @@
   /* 命名容器：底部操作按钮的显隐按卡片自身宽度判断，而不是窗口宽度 */
   container-type: inline-size;
   container-name: card;
-  /* 横向 12px：队长那张卡底部要 328px（P 值带 ★ + 「已是首选」四个字），
-     13px 内边距下内容盒只有 326px 会溢出 2px；12px 得到 329px，刚好放下。 */
+  /* 横向 12px 的来历（封顶口径：轨道 340–353px）：队首卡底部那排最宽 ——
+     P 值带 ★ 41px + 间距 7px + 按钮组 280px = 328px；353px 轨道的内容盒 329px
+     （353 − 12×2）刚好容下，13px 内边距只剩 327px 就不够，于是取 12px。
+     口径与文末 @container 小节一致：内容盒按「轨道宽 − 左右内边距」估。
+     文案缩短成「首选」后这枚按钮从 64px（4 字 46 + 内边距 16 + 描边 2）降到 41px
+     （2 字 23 + 16 + 2），按钮组 280 → 257px、那排 328 → 305px：353px 轨道余 24px，
+     最窄的 340px 轨道（内容盒 316px）余 11px —— 当初的紧约束由此松开，横向内边距
+     要放宽到约 17.5px（340 − 2×17.5 = 305）才会重新吃紧。12px 如今只剩「卡片紧凑」
+     这层观感理由，值维持不动。非队首卡那排是 314px（不带 ★ 少 14px，但换回四字的
+     「设为首选」），也不会被挤到：内容盒 ≤325px 时文末 @container 已把它收起，
+     >325px 时本身就进得去。
+     注：留白关闭态最窄轨道 300px（内容盒 276px）连 305px 也容不下，属既有情形，
+     与这里的取值无关。 */
   padding: 12px 12px 11px;
   border: 1px solid var(--border);
-  border-radius: var(--r-md);
+  border-radius: var(--r-lg);
   background: var(--surface);
   box-shadow: var(--shadow-1);
   transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
@@ -90,26 +166,44 @@
 /* 队首（该模型实际选中的账号）：左侧一道品牌色竖条，扫一片卡片时一眼能找到 */
 .acct-card.is-first { border-color: var(--primary-bd); }
 
+/* 竖条上下留出卡片圆角的量，否则两端会压在弧线上显得毛糙 */
 .acct-card.is-first::before {
   content: "";
   position: absolute;
   left: -1px;
-  top: 11px;
-  bottom: 11px;
+  top: calc(var(--r-lg) - 2px);
+  bottom: calc(var(--r-lg) - 2px);
   width: 3px;
-  border-radius: 0 3px 3px 0;
+  border-radius: 0 var(--r-pill) var(--r-pill) 0;
   background: var(--primary);
 }
 
-/* 已禁用：整卡压暗，和可用账号区分开 */
-.acct-card.disabled { background: var(--surface-2); }
+/* 已禁用：整卡压暗，和可用账号区分开。
+   底色仍用 --surface，不能用 --surface-2，两套主题下都不成立：
+     浅色：--surface-2 是 0.97，与列表底 --surface-well（0.97）**完全同值** ——
+       禁用卡会与列表底融成一片、只剩 1px 描边在划界，比正常卡（1.0）更看不出边界，
+       与「禁用卡只是退后一档、仍是一张卡」的意图相反；
+     深色：--surface-2 是 0.305，比正常卡（0.285）更亮 —— 方向反了，禁用卡反而更「凸」。
+   保持与正常卡同为 --surface（1.0）后，卡片与列表底（0.97）的浅凹差仍然托得住它；
+   禁用的弱化交给文字压灰（见下面两条 --text-3）与既有描边表达。 */
+.acct-card.disabled { background: var(--surface); }
 .acct-card.disabled .who-name .name { color: var(--text-3); }
 .acct-card.disabled .rank { color: var(--text-3); }
 
 /* ─── ① 主体：勾选 / 账号 / 状态 ───
    每一层都要显式写 min-width: 0。flex 项默认 min-width: auto，
    会以「内容最小宽度」当底线 —— 而账号名是 white-space: nowrap 的长邮箱，
-   最小宽度就是整串文字，于是这一行撑破卡片、状态徽章被挤出右边缘。 */
+   最小宽度就是整串文字，于是这一行撑破卡片、状态徽章被挤出右边缘。
+
+   这一行里只剩两个子项：勾选框与 .who（状态区已移入名字行内部，不再是第三列）。
+   于是 .who 独占扣除勾选框后的全部宽度，明细行 .who-meta 随之变成通栏行 ——
+   这正是本轮改动要的结果：此前状态区作为独立列白扣掉 119.5–159.4px
+   （实测 353px 卡里带「正常」扣 119.5px、带「限流 +2」扣 136.3px、
+   两枚 bad 徽章扣 159.4px），明细行的「代理」在那一列左边的空白处就被迫省略，
+   而右侧看着还有一大片空。一行容不下时让位的仍是账号名
+   （.name 自己收缩加省略号），不是徽章。
+   代价是名字行的高度现在由状态区决定（常态 21.8px，比账号名行高 20px 多 1.8px），
+   明细行与卡片因此各下移/增高约 1.8px —— 换来的通栏宽度远不止这个量级。 */
 .card-head {
   display: flex;
   align-items: flex-start;
@@ -131,7 +225,12 @@
 
 .who { flex: 1 1 auto; min-width: 0; }
 
-.who-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* 这里必须保持 flex，不能换回 block：账号名的省略号依赖「flex 项 + min-width: 0」
+   这条链（.who → .who-name → .name 每层都要给 0 下限）。改成 block 后 .name
+   退回行内元素，text-overflow: ellipsis 直接失效，长邮箱会撑破卡片。
+   这条链同时也是状态区（.card-state）在本行内被约束的前提：
+   .who 给了 0 下限，名字行才收得住，状态区才有右缘可贴。 */
+.who-name { display: flex; align-items: center; min-width: 0; }
 
 .who-name .name {
   /* 同样要给 0 下限：默认 auto 会让省略号失效。
@@ -139,6 +238,14 @@
      字号一改这里的对齐又会悄悄偏掉。 */
   flex: 0 1 auto;
   min-width: 0;
+  /* 顶对齐，不能被父行的 align-items: center 居中：
+     状态区（.card-state）现在住在本行里，它是本行最高的一项（常态 21.8px，
+     两枚徽章换行时 44.9px）。若让 .name 跟着居中，它就落到这一行的垂直中点
+     —— 勾选框（.pick 20px，随 .card-head 的 flex-start 贴顶）与账号名的中线
+     会拉开，两行徽章时实测偏 12.4px，看起来像勾选框脱离了账号名。
+     顶对齐后 .name 的 20px 盒与 .pick 的 20px 盒同顶，中线差回到 0，
+     与状态区移入之前的表现完全一致。 */
+  align-self: flex-start;
   font-size: 14.5px;
   font-weight: 650;
   letter-spacing: -.1px;
@@ -148,7 +255,13 @@
   white-space: nowrap;
 }
 
-.who-name .badge { flex: 0 0 auto; }
+/* 注：这里原有一条「.who-name .badge」的兜底（防止版本徽章被 flex 压缩），
+   版本徽章移入 .card-state 后 who-name 里不再有徽章，故随之删除。
+   现在 .card-state 自己也住进了 .who-name，徽章在 DOM 上又成了它的后代 ——
+   但那条兜底仍然不需要恢复：徽章的抗压缩由 .card-state 这一层负责
+   （flex: 0 0 auto 不参与收缩 + wrap 兜底 + 自身的 max-width），
+   而 .who-name 里真正需要收缩的只有账号名，多写一条宽泛的 .badge 规则
+   反而会和 .card-state 的换行策略打架。 */
 
 .who-meta {
   display: flex;
@@ -162,51 +275,155 @@
   overflow: hidden;
 }
 
-.who-meta .tail { font-family: var(--font-mono); font-size: 10.5px; }
+/* 明细行的三项（额度类型 · 有效期 · 代理）挤不进一行时怎么收场。
+   原来只有容器上的 overflow: hidden —— 超出部分被硬裁，末尾半个字突然消失，
+   既不提示「还有内容」，也看不出是数据缺失还是排版截断。
+
+   这一行现在是通栏的：状态区已移入名字行（见 .card-state），.who-meta 的可用宽度
+   不再被卡片右缘那一列扣掉 119.5–159.4px —— 改动前 353px 卡里只有 143.6–183.5px，
+   代理名（「代理 Clash 混合端口 7890」实测 124.7px）在徽章左边的空白处就被迫省略，
+   而卡片右下方看着还有一大片空；现在同一张卡里它宽 303px，常态组合整条放得下。
+   下面的收缩策略仍然保留 —— 通栏只是把「什么时候收」推后，代理名本身长度不可控，
+   极端窄卡（留白关闭态轨道下限 300px，明细行仅 250px）下照样会越线。
+
+   改法是让**可预期的长项**自己收，其余项保持原宽：
+   代理名是用户在设置里自由填的（可能是一长串 Clash 节点名），长度不可控，
+   所以把收缩与省略号落在它身上；额度类型只有「个人 / 旗舰 / 企业」两字、
+   有效期是「30 天后过期」这类定长文案，宽度可控，不需要参与收缩
+   （收缩它们会让定长字段平白变短，读起来更费劲）。
+
+   为什么规则必须落在 flex 子项上：.who-meta 是 flex 容器，flex 子项的
+   text-overflow 只对它自己盒内的文本生效；写在容器上时容器既不裁子项、也无法
+   给子项加省略号（容器上的 overflow: hidden 只会把超出的子项整体切掉）。
+   子项还要 min-width: 0 —— flex 项默认 min-width: auto 会以「内容最小宽度」为底线，
+   nowrap 下这个底线就是整串文字，省略号永远没机会出现。
+
+   末项兜底（> span:last-child）：没配代理时最后一项是有效期，同样可能被挤到，
+   于是把「可收缩」的角色交给当前排在最后的那一项 —— 有代理时它命中 .proxy、
+   与上面的规则重合，没有时兜住有效期。前面的项（含 .sep 分隔点）一律 flex: 0 0 auto，
+   不允许被压窄。
+
+   容器上原有的 overflow: hidden 保留：子项各自收好之后它已裁不到内容，
+   但作为最后一道保险仍然留着（将来若有新的明细项忘了加收缩规则，宁可裁掉也不要
+   撑破卡片 —— .who-meta 的父链 .who / .card-head 都写了 min-width: 0，
+   一旦这里溢出，账号名那一行也会被连带推歪）。 */
+.who-meta > span { flex: 0 0 auto; }
+
+.who-meta .proxy,
+.who-meta > span:last-child {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .who-meta .sep { opacity: .5; }
 .who-meta .proxy { color: var(--info); }
 
-/* ─── 状态徽章：贴在账号名右侧 ───
-   状态是账号的属性，贴着账号读最顺；放在卡片右上角也避免它被拉离账号。 */
+/* ─── 状态区：名字行末尾的一行「版本 + 状态」 ───
+   它现在是「名字行」.who-name 里的末项（此前是 .card-head 的独立一列），
+   靠 margin-left: auto 贴住名字行右缘 —— 视觉位置没变，仍在卡片右上角，
+   但 .card-head 那行只剩「勾选框 + .who」两项，.who 因此独占剩余宽度，
+   下面的明细行 .who-meta 拿到通栏宽度可用（本轮改动的目的）。
+   为什么必须是 auto margin 而不是让父行 justify-content: flex-end：
+   .who-name 里还排着账号名，父行一旦改成 flex-end，账号名也会被推到右边；
+   而 auto margin 只把自己的外侧撑开，账号名照旧贴左。
+   （.card-state 自己的 justify-content: flex-end 管的是它内部两枚徽章
+   在换行后如何贴右缘，与它在父行里的位置是两回事。）
+
+   版本徽章（国内版 / 国际版）与状态徽章（正常 / 限流 / 已禁用…）合起来回答的是
+   同一个问题 ——「这是什么账号、现在能不能用」，所以并排收在卡片右缘，
+   而不是一枚挂在账号名后面、另一枚贴在右下角。
+
+   横排（row）而不是原来的竖排：这两枚本就是一次扫读里的两段信息，
+   竖排会让状态区高度翻倍，在「正常」这种只占一行的常态下平白多出半行空白。
+   justify-content 取 flex-end —— wrap 兜底触发换行时，第二行也要贴着右缘，
+   否则会左对齐、与卡片右侧的视觉基线断开。
+   align-items: center 负责版本徽章与状态徽章的高度对齐：前者的类目是 .badge
+   （min-height 21px + 1px 上下内边距），后者是 .badge.tag（min-height 19px），
+   两者天然差约 2.8px；居中后视觉中线重合即可，不必去改徽章自身的形制。
+   顺带地，这个 center 也让状态区与账号名在同一行里中线对齐（见下面 max-width 一节）。
+
+   flex-wrap: wrap 是并排后的兜底（以下数字均为真实 Chromium 实测）：
+   常态两枚「国际版 + 正常」110.5px，在 353px 卡的名字行（实测 303px）里只占 36%，
+   离 46% 那条线很远；但窄卡片（留白关闭时轨道下限 300px，名字行仅 250px，
+   46% 即 115px）遇上「国际版 + 限流 +2」（实测 127.3px）就已经越线 ——
+   实测它在该宽度下 max-width 生效、状态区变成 115x44.86 的两行，两枚徽章都完整可读。
+   此时宁可叠成两行，也不能让 max-width 压缩徽章：被裁掉的正是这一区要读的那几个字，
+   两行相比「从来看不全」是划算的。两行间距由上面的 4px 行间距给出。
+
+   max-width 仍取 46%，口径从 .card-head 换成了 .who-name：
+   百分比对 flex 子项而言解析的是「父 flex 容器的内容盒」，
+   改动前父容器是 .card-head（353px 卡的内容盒 327px → 上限 150px），
+   现在父容器是 .who-name（同一张卡里 303px → 上限 139.4px）。
+   两条线相差约 11px，而这一区的实际用宽由内容决定（常态仅 110.5px），
+   所以 46% 在新口径下依然不构成挤压 —— 实测 353/340px 卡里
+   「国际版 + 限流 +2」（127.3px）仍是单行、两枚都未被裁，账号名还留着 163–175px；
+   仅 300px 卡（上限 115px）会按设计叠行。
+   结论：数值不动，只把它现在相对谁计算写清楚：
+     · 353px 卡：上限 139.4px，两枚常态徽章 110.5px 只占 79%，账号名还剩 174.6px；
+     · 340px 卡：上限 133.4px，常态两枚装得下，账号名仍保 162.7px（限流 +2 时）；
+     · 300px 卡：上限 115px，常态两枚（110.5px）刚好单行，越线则按 wrap 叠行。
+   这条线的语义没变，仍是「状态区最多能占多宽、剩余全给账号名」的分界。
+   抬上限会直接吃掉账号名的宽度，让本就长的邮箱更早出现省略号；
+   何况越线时已有换行兜底，不需要靠放宽上限来腾地方。 */
 .card-state {
   flex: 0 0 auto;
+  /* 名字行里的末项，靠 auto margin 贴右缘（父行不能改成 flex-end，
+     否则账号名也会被推到右边去） */
+  margin-left: auto;
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 4px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  /* 行间距沿用原竖排的 4px；列间距 5px 与 .who-meta、徽章内圆点同一档 */
+  gap: 4px 5px;
   max-width: 46%;
 }
 
 .card-state .badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 
-/* 「正常」是绝大多数，做成低饱和的绿点 + 灰字，整片扫下来是安静的底噪；
-   429 / 代理异常继续用彩色徽章，一眼跳出来 —— 这一区要回答的是
-   「哪个账号有问题」，而不是「哪些账号正常」。 */
+/* 「正常」是绝大多数，用语义色三件套做成一枚安静的淡底绿徽章：
+   底色与描边都取 soft/bd 档，强度落在「有存在感但不抢眼」之间；
+   429 / 代理异常继续用暖色与红色徽章，一眼跳出来 ——
+   这一区要回答的是「哪个账号有问题」，而不是「哪些账号正常」。 */
 .card-state .badge.tag.ok {
   gap: 5px;
-  min-height: 0;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
-  color: var(--text-3);
+  background: var(--ok-soft);
+  border-color: var(--ok-bd);
+  color: var(--ok);
   font-weight: 500;
 }
 
-.card-state .badge.tag.ok::before {
+/* 徽章前的状态圆点：颜色跟随徽章文字色，两套主题下都不必单独指定。
+   「正常」与「限流」共用这一段 —— 两枚都是「账号当下的可用性」这类可自愈的状态，
+   圆点让它们在扫读时与文字标签区分开；已禁用 / 代理异常（.bad）语义是故障、
+   要的是更强的告警形制，不需要这层区分，故不纳入。
+   圆点与文字的间距来自 components.css 的 .badge { gap: 5px }：
+   伪元素同样是 flex 项，gap 一并作用于它，两类徽章自动一致，无需在此重复声明。 */
+.card-state .badge.tag.ok::before,
+.card-state .badge.tag.warn::before {
   content: "";
   flex: 0 0 auto;
   width: 6px;
   height: 6px;
   border-radius: var(--r-pill);
-  background: var(--ok);
+  background: currentColor;
 }
 
-/* 禁用账号的「未启用」同样压暗，不和异常状态抢注意力 */
+/* 禁用账号的徽章统一退成中性档：保留淡底 + 描边的徽章形制，
+   只把语义色换成灰阶，避免已经停用的账号还在整片卡片里发红抢注意力。
+
+   注意这条规则现在也会命中版本徽章 —— 版本徽章从 who-name 移入 card-state 后
+   就落进了这里的选择器范围（更早之前它在 who-name 里，不受影响）。
+   本轮 card-state 整体搬进 who-name，选择器走的是类名不受 DOM 位置影响，
+   命中情况与之前完全一致，无需改动。
+   这是有意保留的：整张禁用卡从账号名到状态区一致压灰，读起来才是一块「已停用」
+   的整体；要单独放过版本徽章，把选择器收窄成 .card-state .badge.tag 即可。 */
 .acct-card.disabled .card-state .badge {
-  min-height: 0;
-  padding: 0;
-  border-color: transparent;
-  background: transparent;
+  background: var(--surface-3);
+  border-color: var(--border);
   color: var(--text-3);
   font-weight: 500;
 }
@@ -218,8 +435,8 @@
   display: flex;
   align-items: flex-start;
   gap: 6px;
-  padding: 6px 9px;
-  border-radius: var(--r-xs);
+  padding: 7px 10px;
+  border-radius: var(--r-md);
   font-size: 11px;
   line-height: 1.5;
 }
@@ -271,29 +488,30 @@
 .card-actions button {
   height: 25px;
   padding: 0 8px;
-  border-radius: var(--r-xs);
+  border-radius: var(--r-sm);
   font-size: 11.5px;
 }
 
 .card-actions button:hover:not(:disabled) {
   border-color: var(--primary-bd);
-  background: var(--surface);
+  background: var(--primary-soft);
   color: var(--primary-fg);
 }
 
-/* ─── 「已是首选」：反色实心块 ───
+/* ─── 「首选」：品牌色实心块 ───
    它不是可点的操作，而是「这支账号就是队首」的状态声明；
    disabled 只用于阻止重复点击，视觉上不能按禁用态处理。
    卡片一多就需要一眼扫到首选在哪张，所以做成整排按钮里唯一的实心块。
 
-   反色靠令牌互换实现，两套主题各自自动反向：
-     --text    浅色 #0f172a（近黑）/ 深色 #e9edf6（近白）
-     --surface 浅色 #ffffff（白）  / 深色 #12161f（近黑）
-   于是浅色下深底浅字、深色下浅底深字，不必分别写两套规则。 */
+   底色用 --primary 而非正文色，让队首选中态与全站品牌色统一：
+   该令牌浅色即品牌蓝（与亮蓝观感一致），深色自动调亮，两套主题都协调。
+   前景取「表面色向白提亮」的近白派生，而不是直接用 --surface ——
+   后者在深色主题下是近黑，会变成蓝底黑字、读不清。
+   这也是 components.css 里主按钮 button.primary 的既有手法，保持一致。 */
 .card-actions button.is-current {
-  background: var(--text);
-  border-color: var(--text);
-  color: var(--surface);
+  background: var(--primary);
+  border-color: var(--primary);
+  color: color-mix(in srgb, var(--surface) 8%, white);
   font-weight: 600;
   box-shadow: var(--shadow-1);
 }
@@ -314,25 +532,47 @@
   line-height: 1;
 }
 
-.order-btns button:first-child { border-radius: var(--r-xs) 0 0 var(--r-xs); }
-.order-btns button:last-child { border-radius: 0 var(--r-xs) var(--r-xs) 0; }
+.order-btns button:first-child { border-radius: var(--r-sm) 0 0 var(--r-sm); }
+.order-btns button:last-child { border-radius: 0 var(--r-sm) var(--r-sm) 0; }
 .order-btns button + button { margin-left: -1px; }
 .order-btns button:hover:not(:disabled) { position: relative; z-index: 1; }
 .order-btns button:disabled { opacity: .3; }
 
 /* ⋯ 更多菜单：点击才插入 DOM。绝对定位相对 .card-foot（见上面的 position: relative），
-   于是它从按钮下方展开，并随卡片一起滚动，不会浮在别的卡上。 */
+   于是它从按钮下方展开，并随卡片一起滚动，不会浮在别的卡上。
+
+   宽度取整后 122px（原 152px 的 80%，用户要求「窄一点」）。
+   这里只给 min-width，不写死 width —— 绝对定位 + 只锚 right 时宽度走 shrink-to-fit，
+   内容更长时会被自动撑开，不会把文字挤出去；基类 button 带 white-space: nowrap，
+   文字本身也不会折行（下面核算证明当前宽度下不会触发任何收缩）。
+   宽度核算（12px 字号；菜单实际宽度 = 最长项的内容盒 + 容器内边距 5×2 + 边框 1×2）：
+     「刷新 Token」（最长项）：中文 2×12 = 24 + 空格 ≈ 3 + 西文 Token ≈ 34 → 文字 ≈ 61px
+       加按钮左右内边距 10×2 = 20 → 内容盒 ≈ 81px
+       加容器内边距 10 与边框 2 → 菜单实际占 ≈ 93px
+     余量 122 − 93 = 29px，既不换行也不溢出，所以取整后的 122px 直接可用，不必上调。
+     其余各项更短：「删除账号」4 字 → 48 + 20 + 12 ≈ 80px；
+     「签到 / 启用 / 禁用」2 字 → 24 + 20 + 12 ≈ 56px。 */
 .more-menu {
   position: absolute;
   right: 0;
   top: calc(100% + 4px);
   z-index: 4;
-  min-width: 152px;
-  padding: 4px;
+  min-width: 122px;
+  padding: 5px;
   border: 1px solid var(--border-strong);
-  border-radius: var(--r-md);
+  border-radius: var(--r-lg);
   background: var(--surface);
   box-shadow: var(--shadow-3);
+}
+
+/* 翻转态：改成从按钮上方弹出。
+   列表底部那几张卡片下面没有空间，菜单会超出 .acct-scroll 的可视区被裁掉，
+   用户既看不到也点不到。由 JS（accounts-view.js 的 toggleMoreMenu）量出
+   下方空间不足时加上这个类，只换 top/bottom 两个方向值 ——
+   依旧绝对定位跟着 .card-foot，「随卡片滚动」的既有特性不变。 */
+.more-menu.flip {
+  top: auto;
+  bottom: calc(100% + 4px);
 }
 
 .more-menu button {
@@ -340,9 +580,9 @@
   align-items: center;
   width: 100%;
   height: auto;
-  padding: 7px 9px;
+  padding: 8px 10px;
   border: 0;
-  border-radius: var(--r-xs);
+  border-radius: var(--r-sm);
   background: transparent;
   box-shadow: none;
   color: var(--text-2);
@@ -363,9 +603,9 @@
 .acct-card .row-panel {
   margin: 0;
   /* 右侧多留 30px 给绝对定位的「收起」按钮，内容不会压到它下面 */
-  padding: 10px 30px 10px 11px;
+  padding: 10px 30px 10px 12px;
   border: 1px solid var(--border);
-  border-radius: var(--r-xs);
+  border-radius: var(--r-md);
   background: var(--surface-inset);
   color: var(--text-2);
   font-size: 11.5px;
@@ -386,12 +626,13 @@
    它会被当成最后一个 flex 项、挤在文字后面（窄卡片里还会换行独占一行）。 */
 .acct-card .row-panel .panel-close {
   position: absolute;
-  top: 5px;
-  right: 5px;
+  top: 6px;
+  right: 6px;
   width: 22px;
   height: 22px;
   padding: 0;
   border-color: transparent;
+  border-radius: var(--r-xs);
   background: transparent;
   box-shadow: none;
   color: var(--text-3);
@@ -409,14 +650,17 @@
 .acct-card .row-panel .panel-label { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
 .acct-card .row-panel .row { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
 
-/* ─── 批量栏 ─── */
+/* ─── 批量栏 ───
+   夹在工具条与卡片区之间的一条状态带：通栏铺满面板，四角交给面板自身的圆角裁切。
+   分隔线用 --hairline —— 这一带自带 --surface-2 底色，已经和卡片区分开，
+   再压一道深边框会平白多出一条重线。 */
 .batch-bar {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  padding: 8px 16px;
-  border-bottom: 1px solid var(--border);
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--hairline);
   background: var(--surface-2);
   color: var(--text-2);
   font-size: 11.5px;
@@ -433,12 +677,12 @@
 
 .batch-hidden { color: var(--warn); font-size: 11px; }
 
-.batch-actions { margin-left: auto; display: flex; gap: 5px; flex-wrap: wrap; }
+.batch-actions { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
 
 .batch-actions button {
   height: 25px;
   padding: 0 9px;
-  border-radius: var(--r-xs);
+  border-radius: var(--r-sm);
   font-size: 11.5px;
 }
 
@@ -447,8 +691,8 @@
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 16px;
-  border-top: 1px solid var(--border);
+  padding: 10px 16px;
+  border-top: 1px solid var(--hairline);
   background: var(--surface-2);
   color: var(--text-3);
   font-size: 11px;

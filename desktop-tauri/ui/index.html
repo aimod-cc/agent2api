@@ -14,6 +14,18 @@
       document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
     })();
   </script>
+  <script>
+    // 与「账号列表两侧留白」偏好配合：同样在 CSS 解析前先贴上 data-content，
+    // 避免首屏先按「无留白」渲染、再跳成有留白（未设置按「关闭留白」处理）。
+    // 该属性只影响账号卡片网格（page-accounts.css 的 .acct-grid）：关闭（默认）时保留与
+    // 内容区同源的 --pad 两侧间距、把轨道切成「300 下限 + 1fr 瓜分」（宽屏一行 4 张卡），
+    // 开启时恢复两侧 16px 留白与 340–353px 封顶口径；
+    // 不改变任何页面的内容区限宽。
+    (() => {
+      const margin = localStorage.getItem('workbuddy-desktop-accounts-margin') || 'off';
+      document.documentElement.dataset.content = margin === 'on' ? 'margin' : 'full';
+    })();
+  </script>
   <link rel="stylesheet" href="css/tokens.css">
   <link rel="stylesheet" href="css/layout.css">
   <link rel="stylesheet" href="css/components.css">
@@ -21,13 +33,23 @@
   <link rel="stylesheet" href="css/page-gateway.css">
   <link rel="stylesheet" href="css/page-logs.css">
   <link rel="stylesheet" href="css/page-settings.css">
+  <!-- 更新日志（Markdown 正文 / 版本卡片 / 导航更新提示）：排在页面样式之后，
+       需要时可覆盖 page-settings.css 里为旧的纯文本说明写的规则 -->
+  <link rel="stylesheet" href="css/update-notes.css">
+  <link rel="stylesheet" href="css/page-report.css">
+  <!-- 下拉控件外观（select.js 增强出来的触发器 + 浮层）：排在页面样式之后，
+       需要时可覆盖各页面对原生 select 的尺寸约束 -->
+  <link rel="stylesheet" href="css/select.css">
+  <!-- 小问号提示外观（tooltip.js 增强出来的气泡）：同样排在页面样式之后 -->
+  <link rel="stylesheet" href="css/tooltip.css">
 </head>
 <body>
   <div class="shell">
     <!-- ─── 左侧导航 ─── -->
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-logo">W</div>
+        <!-- 品牌标由 icons.js 注入（与应用图标 icon.png 同一造型，见 icons.js 的 brand 项） -->
+        <div class="brand-logo"></div>
         <div class="brand-text">
           <h1>WorkBuddy 本地代理</h1>
           <div class="sub">OpenAI 兼容网关</div>
@@ -37,7 +59,7 @@
       <!-- 图标由 icons.js + app.js 注入（内联 SVG，见 icons.js 顶部说明） -->
       <nav class="nav" id="nav">
         <div class="nav-group-label">运行状态</div>
-        <button class="nav-item active" data-page="overview" data-icon="overview"><span class="ico"></span><span class="label">概览</span></button>
+        <button class="nav-item active" data-page="overview" data-icon="overview"><span class="ico"></span><span class="label">报表</span></button>
         <button class="nav-item" data-page="accounts" data-icon="accounts"><span class="ico"></span><span class="label">账号</span><span class="count muted" id="nav-count-accounts">0</span></button>
 
         <div class="nav-group-label">转发能力</div>
@@ -46,7 +68,7 @@
 
         <div class="nav-group-label">诊断</div>
         <button class="nav-item" data-page="logs" data-icon="logs"><span class="ico"></span><span class="label">日志</span><span class="count" id="nav-count-logs" style="display:none">0</span></button>
-        <button class="nav-item" data-page="settings" data-icon="settings"><span class="ico"></span><span class="label">设置</span></button>
+        <button class="nav-item" data-page="settings" data-icon="settings"><span class="ico"></span><span class="label">设置</span><span class="count" id="nav-count-update" style="display:none">新</span></button>
       </nav>
 
       <div class="sidebar-foot">
@@ -69,7 +91,7 @@
         <div class="crumb">
           <span>WorkBuddy 本地代理</span>
           <span class="sep">/</span>
-          <span class="cur" id="crumb-page">概览</span>
+          <span class="cur" id="crumb-page">报表</span>
         </div>
         <div class="spacer"></div>
         <div class="topbar-actions" id="topbar-status"></div>
@@ -78,11 +100,21 @@
       <div class="content">
         <div class="content-inner">
 
-        <!-- ─── 概览 ─── -->
+        <!-- ─── 报表（内部标识仍是 overview，见 app.js 的 PAGES）─── -->
         <section class="page active" data-page="overview">
           <div class="page-head">
-            <h2>概览</h2>
-            <p class="intro">登录会打开 WorkBuddy 官方登录页；登录成功后自动加入账号列表，并排在转发顺序最后（不会抢占正在使用的账号）。</p>
+            <h2>报表</h2>
+            <p class="intro">会话状态与请求统计。时间范围只影响概览、缓存四窗口与按天 Token 趋势；热力图固定近 365 天、缓存趋势固定近 24 小时。</p>
+            <div class="head-actions">
+              <div class="seg" id="report-range" role="tablist" aria-label="报表时间范围">
+                <button class="seg-item" data-range="today">今天</button>
+                <button class="seg-item active" data-range="7">7 天</button>
+                <button class="seg-item" data-range="30">30 天</button>
+                <button class="seg-item" data-range="month">本月</button>
+                <button class="seg-item" data-range="all">全部</button>
+              </div>
+              <button id="btn-report-refresh" title="重新拉取全部报表数据">刷新</button>
+            </div>
           </div>
 
           <section class="panel">
@@ -127,11 +159,75 @@
             </div>
           </section>
 
+          <!-- ── 统计概览 ── -->
           <section class="panel">
-            <div class="panel-head"><h2>本地代理状态</h2></div>
+            <div class="panel-head">
+              <h2>统计概览</h2>
+              <span class="panel-sub" id="report-range-label">近 7 天</span>
+            </div>
             <div class="panel-body">
-              <div class="detail" id="proxy-status">正在检查本地代理…</div>
-              <p class="hint">账号数据保存在 <code>~/.workbuddy-proxy/accounts.json</code>。关闭此窗口不会删除账号或登录态。</p>
+              <div class="field-grid" id="report-overview">
+                <div class="empty" style="padding:14px 0">正在加载…</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ── 热力图（固定 365 天，与时间范围筛选解耦）── -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>活跃热力图</h2>
+              <span class="panel-sub">近 365 天，按天请求数着色</span>
+            </div>
+            <div class="panel-body">
+              <div class="heat-wrap" id="report-heatmap">
+                <div class="empty" style="padding:14px 0">正在加载…</div>
+              </div>
+            </div>
+            <div class="panel-foot">
+              <span class="heat-scale-label">少</span>
+              <span class="heat-legend" id="report-heat-legend"></span>
+              <span class="heat-scale-label">多</span>
+              <div class="spacer"></div>
+              <span>方格为本地自然日，无请求显示为空槽</span>
+            </div>
+          </section>
+
+          <!-- ── 缓存命中率四窗口 ── -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>缓存命中率</h2>
+              <span class="tip-q" data-tip="命中率 = 缓存读取 Token / 输入 Token（promptTokens）。窗口越短越贴近「此刻」：上游把缓存读取与输入分开上报时，该比值合法地可能超过 100%，此处不夹取值、如实展示。"></span>
+            </div>
+            <div class="panel-body">
+              <div class="field-grid" id="report-cache-rates">
+                <div class="empty" style="padding:14px 0">正在加载…</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ── 近 24 小时缓存命中率趋势（固定 24 个整点）── -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>近 24 小时缓存命中率趋势</h2>
+              <span class="panel-sub">按本地整点，无请求的整点为 0%</span>
+            </div>
+            <div class="panel-body">
+              <div class="chart-wrap" id="report-cache-trend">
+                <div class="empty" style="padding:14px 0">正在加载…</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- ── 按天 Token 趋势（随时间范围变化）── -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>按天 Token 趋势</h2>
+              <span class="panel-sub" id="report-trend-label">—</span>
+            </div>
+            <div class="panel-body">
+              <div class="chart-wrap tall" id="report-daily-trend">
+                <div class="empty" style="padding:14px 0">正在加载…</div>
+              </div>
             </div>
           </section>
         </section>
@@ -209,18 +305,8 @@
             <div class="table-foot">
               <span>P 值越小越先用，「★」= 转发顺序第一位</span>
               <div class="spacer"></div>
-              <span>「正常」= 该账号可用且未触发限额</span>
+              <span>「正常」= 该账号可用且未触发限额 · 「限流」= 该模型当日额度用尽，请求自动改用后续账号，到恢复时间自动回归</span>
             </div>
-
-            <details class="hint">
-              <summary>操作说明（勾选账号后点「批量操作」，在弹窗里选择动作）</summary>
-              <p>
-                勾选卡片左上角的复选框，或用上方的「全选当前筛选结果」，再点批量栏右侧的「批量操作」，在弹窗中选择启用 / 禁用 / 改代理 / 删除，最后点「执行」；批量操作只作用于勾选的账号，被筛掉的账号不受影响。
-                卡片底部的「积分」「签到」按钮只对单个账号生效；
-                「全部签到」只对国内版账号生效并按顺序串行执行（避免触发上游 code 11128 风控），单个账号失败不影响其他账号；
-                国际版暂无签到活动，其签到入口不显示。账号因限额（429）被自动切换时，可在「日志」页看到完整记录。
-              </p>
-            </details>
           </section>
         </section>
 
@@ -377,14 +463,33 @@
           </section>
         </section>
 
-        <!-- ─── 日志 ─── -->
+        <!-- ─── 日志 ───
+             页内两个视图（系统事件 / 模型请求明细），同一个 .seg 切换：
+             两边数据源、筛选维度、分页口径都不同，所以各占一个 .panel，
+             靠 hidden 把非当前视图整个摘出布局（tokens.css 的 [hidden] 是 display:none !important）。
+             「自动刷新」在这里而不是某个视图内部：它管的是整个日志页的轮询节奏，
+             放在视图内部会变成「切到另一个视图就没法开关」。
+             当前视图只存在内存里（不落 localStorage）：本次运行内切页回来还停在原处，
+             重启后回到「系统事件」—— 导航未读徽标只统计事件日志，默认落在这里语义更顺。 -->
         <section class="page" data-page="logs">
           <div class="page-head">
             <h2>运行日志</h2>
-            <p class="intro">记录登录、token 刷新、账号切换、模型目录刷新、限额自动切换（429）等系统事件。</p>
+            <p class="intro">记录登录、token 刷新、账号切换、模型目录刷新、限额自动切换（429）等系统事件，以及网关每次转发到上游的模型请求明细。</p>
+            <div class="head-actions">
+              <div class="seg" id="logs-view" role="tablist" aria-label="日志视图">
+                <button class="seg-item active" data-view="events">系统事件</button>
+                <button class="seg-item" data-view="requests">模型请求</button>
+              </div>
+              <label class="switch" title="每 10 秒刷新当前视图">
+                <input type="checkbox" id="logs-auto" checked>
+                <span class="track"></span>
+                <span>自动刷新</span>
+              </label>
+            </div>
           </div>
 
-          <section class="panel">
+          <!-- ── 视图一：系统事件 ── -->
+          <section class="panel" id="logs-panel-events">
             <div class="panel-head">
               <h2>系统事件</h2>
               <span id="logs-badge" class="badge">—</span>
@@ -397,6 +502,14 @@
 
             <div class="panel-body">
               <div class="log-filters">
+                <!-- 时间档位与报表页 #report-range 一致，默认「全部」= 不加时间条件（与加筛选之前的行为相同） -->
+                <div class="seg" id="logs-range" role="tablist" aria-label="事件日志时间范围">
+                  <button class="seg-item" data-range="today">今天</button>
+                  <button class="seg-item" data-range="7">7 天</button>
+                  <button class="seg-item" data-range="30">30 天</button>
+                  <button class="seg-item" data-range="month">本月</button>
+                  <button class="seg-item active" data-range="all">全部</button>
+                </div>
                 <select id="logs-level" title="按最低级别筛选">
                   <option value="">全部级别</option>
                   <option value="debug">debug 及以上</option>
@@ -412,11 +525,6 @@
                   <input type="checkbox" id="logs-hide-desensitize" checked>
                   <span class="track"></span>
                   <span>不看脱敏</span>
-                </label>
-                <label class="switch">
-                  <input type="checkbox" id="logs-auto" checked>
-                  <span class="track"></span>
-                  <span>自动刷新</span>
                 </label>
               </div>
 
@@ -435,164 +543,254 @@
               </div>
             </div>
           </section>
+
+          <!-- ── 视图二：模型请求日志 ──
+               明细按后端保留期存盘（默认 30 天，可通过 /api/retention 调整），
+               所以这里没有「导出 / 清空」按钮：这两件事不在本视图的需求范围内。
+               列宽交给 CSS Grid 各自定义，行内数值一律等宽，便于竖着比对耗时与 Token。 -->
+          <section class="panel" id="logs-panel-requests" hidden>
+            <div class="panel-head">
+              <h2>模型请求</h2>
+              <span id="req-badge" class="badge">—</span>
+              <span class="panel-sub">网关每次转发到上游的请求，按时间倒序</span>
+              <div class="head-actions">
+                <button id="btn-req-refresh">刷新</button>
+              </div>
+            </div>
+
+            <div class="panel-body">
+              <div class="log-filters">
+                <div class="seg" id="req-range" role="tablist" aria-label="请求日志时间范围">
+                  <button class="seg-item" data-range="today">今天</button>
+                  <button class="seg-item" data-range="7">7 天</button>
+                  <button class="seg-item" data-range="30">30 天</button>
+                  <button class="seg-item" data-range="month">本月</button>
+                  <button class="seg-item active" data-range="all">全部</button>
+                </div>
+                <select id="req-status" title="按请求结果筛选">
+                  <option value="">全部状态</option>
+                  <option value="ok">成功</option>
+                  <option value="error">失败</option>
+                </select>
+                <div class="spacer"></div>
+                <span class="panel-sub" id="req-summary">—</span>
+              </div>
+
+              <div class="log-list" id="req-list"><div class="log-empty">正在加载请求明细…</div></div>
+            </div>
+
+            <div class="panel-foot">
+              <span>上报的是网关报文里的模型名，别名 / 映射后的名字按上游收到的那次记录</span>
+              <span>账号为空表示请求在选定账号之前就失败了</span>
+              <div class="spacer"></div>
+              <div class="log-pager">
+                <button id="btn-req-prev" class="sm" disabled>上一页</button>
+                <button id="btn-req-next" class="sm" disabled>下一页</button>
+                <span id="req-page-info" class="log-pager-info">第 1 / 1 页</span>
+              </div>
+            </div>
+          </section>
         </section>
 
         <!-- ─── 设置 ─── -->
         <section class="page" data-page="settings">
           <div class="page-head">
             <h2>设置</h2>
-            <p class="intro">桌面端的启动行为与账号数据的导入 / 导出。这些设置保存在本机，重启后依然生效。</p>
+            <p class="intro">桌面端的启动与托盘行为、账号数据的导入 / 导出，以及自动签到、软件更新与数据保留天数。这些设置保存在本机，重启后依然生效。</p>
           </div>
 
-          <!-- 启动与托盘 -->
-          <section class="panel">
-            <div class="panel-head">
-              <h2>启动与托盘</h2>
-              <span id="settings-badge" class="badge">检测中…</span>
-            </div>
-            <div class="panel-body">
-              <div class="settings-switches">
-                <label class="switch">
-                  <input type="checkbox" id="settings-close-to-tray">
-                  <span class="track"></span>
-                  <span>关闭窗口时最小化到托盘</span>
-                </label>
-                <label class="switch">
-                  <input type="checkbox" id="settings-autostart">
-                  <span class="track"></span>
-                  <span>开机自动启动</span>
-                </label>
-              </div>
-              <div class="settings-state" id="settings-state">—</div>
-              <p class="hint">
-                默认<strong>关闭窗口不会退出程序</strong>，而是把窗口缩到系统托盘，转发继续在后台运行（OpenAI 客户端不受影响）；
-                要彻底退出程序，请在托盘图标上右键选「退出」。关掉这个开关后，点关闭按钮即退出程序、转发随之中断。
-                「开机自动启动」开启后，登录系统时会自动启动本程序（通常直接驻留托盘），不需要手动打开。
-              </p>
-            </div>
-          </section>
+          <!-- 左侧分类导航 + 右侧内容栏：分类按 data-cat 通用匹配（见 settings-panel.js），
+               新增分类只需各加一个 .settings-nav-item 与一个 .settings-pane（面板内的 id 与 DOM 顺序不变）。 -->
+          <div class="settings-layout">
+            <nav class="settings-nav" id="settings-nav">
+              <button class="settings-nav-item active" data-cat="general">通用</button>
+              <button class="settings-nav-item" data-cat="account">账号</button>
+              <button class="settings-nav-item" data-cat="service">服务</button>
+              <button class="settings-nav-item" data-cat="data">数据</button>
+            </nav>
 
-          <!-- 账号导入 / 导出 -->
-          <section class="panel">
-            <div class="panel-head">
-              <h2>账号导入 / 导出</h2>
-              <div class="head-actions">
-                <button id="btn-settings-export">导出账号</button>
-                <button id="btn-settings-import" class="primary">导入账号</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div class="danger-zone">
-                <strong>导出文件内含 accessToken / refreshToken 等凭证</strong>，可直接用于登录。请妥善保管，不要外传或上传到公共位置。
-              </div>
-              <p class="hint" style="margin:0">
-                导出会把全部账号写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。
-                导入采用<strong>合并策略</strong>：按账号 UID 去重 —— 已存在的账号只更新凭证，<strong>保留本机原有的优先级顺序</strong>；
-                新账号追加到转发顺序末尾，不会抢占当前正在使用的账号。
-              </p>
-              <div class="io-result" id="settings-io-result" style="display:none"></div>
-            </div>
-          </section>
-
-          <!-- 网关地址 -->
-          <section class="panel">
-            <div class="panel-head">
-              <h2>网关地址</h2>
-              <span id="settings-gateway-badge" class="badge">检测中…</span>
-              <div class="head-actions">
-                <button id="btn-settings-refresh">刷新</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div class="endpoint-grid">
-                <div class="endpoint">
-                  <div class="k">Base URL</div>
-                  <div class="v">
-                    <code class="url" id="settings-gateway-base">—</code>
-                    <button class="copy-btn" data-copy-from="settings-gateway-base" title="复制">⧉</button>
+            <div class="settings-panes">
+              <!-- ── 通用：启动与托盘 + 界面显示 ── -->
+              <div class="settings-pane active" data-cat="general">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>启动与托盘</h2>
+                    <span class="tip-q" data-tip="默认关闭窗口不会退出程序，而是把窗口缩到系统托盘，转发继续在后台运行（OpenAI 客户端不受影响）；要彻底退出程序，请在托盘图标上右键选「退出」。关掉这个开关后，点关闭按钮即退出程序、转发随之中断。「开机自动启动」开启后，登录系统时会自动启动本程序（通常直接驻留托盘），不需要手动打开。"></span>
+                    <span id="settings-badge" class="badge">检测中…</span>
                   </div>
-                </div>
-                <div class="endpoint">
-                  <div class="k">对话端点</div>
-                  <div class="v">
-                    <code class="url" id="settings-gateway-chat">—</code>
-                    <button class="copy-btn" data-copy-from="settings-gateway-chat" title="复制">⧉</button>
+                  <div class="panel-body">
+                    <div class="settings-switches">
+                      <label class="switch">
+                        <input type="checkbox" id="settings-close-to-tray">
+                        <span class="track"></span>
+                        <span>关闭窗口时最小化到托盘</span>
+                      </label>
+                      <label class="switch">
+                        <input type="checkbox" id="settings-autostart">
+                        <span class="track"></span>
+                        <span>开机自动启动</span>
+                      </label>
+                    </div>
+                    <div class="settings-state" id="settings-state">—</div>
                   </div>
-                </div>
-                <div class="endpoint">
-                  <div class="k">监听端口</div>
-                  <div class="v"><code class="url" id="settings-gateway-port">—</code></div>
-                </div>
-              </div>
-              <p class="hint">
-                把 <code>Base URL</code> 填进 OpenAI 客户端的 <code>base_url</code> / <code>api_base</code> 即可接入。
-                端口由主程序在启动时确定；若显示的地址连不上，点右上角「刷新」重新读取。
-                网关只监听 <code>127.0.0.1</code>，仅本机可用。
-              </p>
-            </div>
-          </section>
+                </section>
 
-          <!-- 自动签到 -->
-          <section class="panel">
-            <div class="panel-head">
-              <h2>自动签到</h2>
-              <span id="checkin-badge" class="badge">检测中…</span>
-              <div class="head-actions">
-                <button id="btn-checkin-now">立即签到</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div class="settings-switches">
-                <label class="switch">
-                  <input type="checkbox" id="settings-auto-checkin">
-                  <span class="track"></span>
-                  <span>每天定时执行全部账号签到</span>
-                </label>
-                <label class="switch switch-time">
-                  <span>触发时刻</span>
-                  <input type="time" id="settings-auto-checkin-time" value="00:01">
-                </label>
-              </div>
-              <div class="settings-state" id="settings-checkin-state">—</div>
-              <p class="hint">
-                到点后会自动签到<strong>全部已启用的国内版账号</strong>（国际版没有签到活动，会被跳过）；
-                多个账号串行执行，避免同时请求触发上游风控。
-                若启动时当天的时间点已过且当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。
-                上游签到接口是幂等的，重复执行只会返回「已领取」，不会重复扣减。
-              </p>
-            </div>
-          </section>
-
-          <!-- 软件更新 -->
-          <section class="panel">
-            <div class="panel-head">
-              <h2>软件更新</h2>
-              <span id="update-badge" class="badge">未检查</span>
-              <div class="head-actions">
-                <button id="btn-update-check">检查更新</button>
-                <button id="btn-update-download" class="primary" style="display:none">下载并安装</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div class="update-version">
-                <span class="version-pill">
-                  <span class="k">当前版本</span><span class="v" id="update-current">—</span>
-                </span>
-                <span class="version-arrow">→</span>
-                <span class="version-pill new">
-                  <span class="k">最新版本</span><span class="v" id="update-latest">—</span>
-                </span>
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>界面显示</h2>
+                    <span class="tip-q" data-tip="只影响账号页的卡片列表：这里控制的是列表与面板边缘之间的留白。开启后列表两侧留出内边距，卡片不贴着面板边、更透气；关闭（默认）则列表占满面板宽度、仅保留与内容区一致的两侧间距，窗口足够宽时（约 ≥1620px）一行可排下 4 张卡片。内容区整体的居中限宽不受这个开关影响，其它页面也不受影响。这项偏好只记在本机，切换后立即生效，无需重启。"></span>
+                  </div>
+                  <div class="panel-body">
+                    <div class="settings-switches">
+                      <label class="switch">
+                        <input type="checkbox" id="settings-content-margin">
+                        <span class="track"></span>
+                        <span>账号列表两侧留白</span>
+                      </label>
+                    </div>
+                  </div>
+                </section>
               </div>
 
-              <div class="detail" id="update-state">点击「检查更新」查询 GitHub 上的最新发布版本。</div>
-              <div class="progress" id="update-progress" hidden><div class="bar"></div></div>
-              <div class="update-notes" id="update-notes" style="display:none"></div>
-              <p class="hint">
-                更新包从项目的 GitHub Release 下载，下载完成后可直接启动安装程序并自动重启本程序。
-                安装包会先校验来源域名与文件完整性。若网络访问 GitHub 较慢，会自动尝试通过 Clash Verge 的混合端口重试一次。
-              </p>
+              <!-- ── 账号：导入 / 导出 ── -->
+              <div class="settings-pane" data-cat="account">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>账号导入 / 导出</h2>
+                    <span class="tip-q" data-tip="导出会把全部账号写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：按账号 UID 去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号。"></span>
+                    <div class="head-actions">
+                      <button id="btn-settings-export">导出账号</button>
+                      <button id="btn-settings-import" class="primary">导入账号</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="danger-zone">
+                      <strong>导出文件内含 accessToken / refreshToken 等凭证</strong>，可直接用于登录。请妥善保管，不要外传或上传到公共位置。
+                    </div>
+                    <div class="io-result" id="settings-io-result" style="display:none"></div>
+                  </div>
+                </section>
+              </div>
+
+              <!-- ── 服务：自动签到 + 软件更新 ── -->
+              <div class="settings-pane" data-cat="service">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>自动签到</h2>
+                    <span class="tip-q" data-tip="到点后会自动签到全部已启用的国内版账号（国际版没有签到活动，会被跳过）；多个账号串行执行，避免同时请求触发上游风控。若启动时当天的时间点已过且当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。上游签到接口是幂等的，重复执行只会返回「已领取」，不会重复扣减。"></span>
+                    <span id="checkin-badge" class="badge">检测中…</span>
+                    <div class="head-actions">
+                      <button id="btn-checkin-now">立即签到</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="settings-switches">
+                      <label class="switch">
+                        <input type="checkbox" id="settings-auto-checkin">
+                        <span class="track"></span>
+                        <span>每天定时执行全部账号签到</span>
+                      </label>
+                      <label class="switch switch-time">
+                        <span>触发时刻</span>
+                        <input type="time" id="settings-auto-checkin-time" value="00:01">
+                      </label>
+                    </div>
+                    <div class="settings-state" id="settings-checkin-state">—</div>
+                  </div>
+                </section>
+
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>软件更新</h2>
+                    <span class="tip-q" data-tip="更新包从项目的 GitHub Release 下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。若网络访问 GitHub 较慢，会自动尝试通过 Clash Verge 的混合端口重试一次。"></span>
+                    <span id="update-badge" class="badge">未检查</span>
+                    <div class="head-actions">
+                      <button id="btn-update-check">检查更新</button>
+                      <button id="btn-update-download" class="primary" style="display:none">下载并安装</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="update-version">
+                      <span class="version-pill">
+                        <span class="k">当前版本</span><span class="v" id="update-current">—</span>
+                      </span>
+                      <span class="version-arrow">→</span>
+                      <span class="version-pill new">
+                        <span class="k">最新版本</span><span class="v" id="update-latest">—</span>
+                      </span>
+                    </div>
+
+                    <div class="detail" id="update-state">点击「检查更新」查询 GitHub 上的最新发布版本。</div>
+                    <div class="progress" id="update-progress" hidden><div class="bar"></div></div>
+
+                    <!-- 关于作者 + 收藏项目：作者主页与仓库地址都从接口返回的 repository 现拼
+                         （fork 后自动指向 fork 者，代码里不写死任何账号），拿到数据前整行隐藏 -->
+                    <div class="update-author" id="update-author" hidden>
+                      <div class="update-author-text"><strong>关于作者</strong><span>本工具由 <a id="update-author-link" target="_blank" rel="noopener">项目作者</a> 个人开发并开源维护，免费使用、不带广告，也不会收集你的账号数据。如果它帮到了你，欢迎到项目仓库点个 Star 支持一下。</span></div>
+                      <div class="update-author-actions">
+                        <button type="button" class="sm" id="btn-update-favorite" title="在浏览器中打开项目仓库，点 Star 支持作者">收藏项目</button>
+                      </div>
+                    </div>
+
+                    <!-- 更新日志：只展示最新一次发布的说明，数据来自「检查更新」的结果
+                         （与上方「最新版本」同源，见 update-panel.js 的 renderChangelog） -->
+                    <div class="update-log" id="update-notes">
+                      <div class="update-log-head">
+                        <span class="update-log-title">更新日志</span>
+                        <span class="update-log-meta" id="update-log-meta"></span>
+                      </div>
+                      <div class="update-log-body" id="update-log-body"></div>
+                    </div>
+                  </div>
+                </section>
+              </div>
+
+              <!-- ── 数据：保留天数 ──
+                   这三项读写的都是后端 config.json（经 /api/retention，HTTP 桥），
+                   与主进程本地的 getAppSettings / saveAppSettings 不是一套。 -->
+              <div class="settings-pane" data-cat="data">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>数据保留</h2>
+                    <span class="tip-q" data-tip="三类数据各自独立计时，超出保留天数的部分会被删除：事件日志是登录、账号切换、429 切换这类系统事件；请求明细是「请求日志」页里的逐条记录；按天聚合供报表页的热力图与按天趋势使用。把某一档改小（例如 30 天改成 7 天）保存后会立即删除超出的历史数据，此操作不可恢复；改大或保持不变不会删除任何数据。三项的可填范围均为 1–3650 天。"></span>
+                    <span id="retention-badge" class="badge">检测中…</span>
+                    <div class="head-actions">
+                      <button id="btn-retention-refresh">刷新</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="retention-list">
+                      <div class="retention-row">
+                        <label for="settings-retention-log">事件日志保留天数</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-retention-log" min="1" max="3650" step="1" inputmode="numeric">
+                          <span class="unit">天</span>
+                        </span>
+                        <div class="hint">登录 / 账号切换 / 429 切换等系统事件，可填 1–3650 天。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="settings-retention-request">请求明细保留天数</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-retention-request" min="1" max="3650" step="1" inputmode="numeric">
+                          <span class="unit">天</span>
+                        </span>
+                        <div class="hint">「请求日志」页的逐条请求记录，可填 1–3650 天。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="settings-retention-daily">按天聚合保留天数</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-retention-daily" min="1" max="3650" step="1" inputmode="numeric">
+                          <span class="unit">天</span>
+                        </span>
+                        <div class="hint">报表页的热力图与按天趋势，可填 1–3650 天。</div>
+                      </div>
+                    </div>
+                    <div class="hint retention-note">保存后立即生效：改小保留天数会立刻删除超出的历史数据，且不可恢复。</div>
+                  </div>
+                </section>
+              </div>
             </div>
-          </section>
+          </div>
         </section>
 
         </div>
@@ -755,16 +953,54 @@
     </div>
   </div>
 
+  <!-- ─── 保留天数改小确认弹窗 ───
+       改小保留期会让后端立刻删除超出的历史数据（不可恢复），比原生 confirm 更值得
+       把「将删除什么」摊开说，所以复用设置页的弹窗外壳（.modal-mask / .modal），
+       与账号弹窗同一套观感；宽度与按钮由 settings-panel.js 驱动。 -->
+  <div id="retention-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="retention-modal-title">
+    <div class="modal modal-confirm">
+      <div class="modal-head">
+        <h2 id="retention-modal-title">确认缩短保留天数</h2>
+        <button id="retention-modal-close" title="关闭">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="danger-zone" id="retention-modal-text">—</div>
+      </div>
+
+      <div class="modal-foot">
+        <div class="spacer"></div>
+        <button id="retention-modal-cancel">取消</button>
+        <button id="retention-modal-ok" class="danger">继续并清理</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" role="status" aria-live="polite"></div>
   <script src="icons.js"></script>
+  <!-- 下拉控件增强：必须在 app.js 之前 —— 业务模块（accounts-view / logs-panel /
+       proxy-form）执行时就会读写原生 select，外壳要在这之前就位。
+       静态 select 在解析到这里时已存在，弹窗与代理表单里动态生成的由它自己的
+       MutationObserver 接住，页面无需任何手动调用。 -->
+  <script src="select.js"></script>
+  <!-- 小问号提示增强：与 select.js 同为「自动增强」型组件，扫描 [data-tip] 即可工作，
+       业务模块一行都不用改；排在业务脚本之前，页面里的静态问号在这里就完成增强。 -->
+  <script src="tooltip.js"></script>
   <script src="app.js"></script>
   <!-- accounts-model 必须在 accounts-view 之前：后者引用它的判定与标签渲染 -->
   <script src="accounts-model.js"></script>
   <script src="accounts-view.js"></script>
   <script src="desensitize-panel.js"></script>
   <script src="logs-panel.js"></script>
+  <!-- 报表面板：同样依赖 window.wbApp（esc / toast / currentPage），必须排在 app.js 之后；
+       图表全部手写 SVG，不依赖任何图形库，故与其它面板并列即可。
+       它内部用 ResizeObserver 重绘图表，容器宽度变化（改窗口、切列数）都能自适应。 -->
+  <script src="report.js"></script>
   <script src="proxy-form.js"></script>
   <script src="account-panel.js"></script>
+  <!-- Markdown 渲染器：更新日志用。纯函数、无依赖，只认白名单语法（见文件头说明）；
+       必须在 update-panel.js 之前加载 -->
+  <script src="markdown.js"></script>
   <!-- update-panel 必须在 settings-panel 之前：后者在设置页首持加载时会调它 -->
   <script src="update-panel.js"></script>
   <script src="settings-panel.js"></script>

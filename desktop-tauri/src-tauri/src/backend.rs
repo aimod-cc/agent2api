@@ -25,10 +25,36 @@
 //!      `cleanup_legacy_resources` 在服务就绪后清掉。
 //! 两个都只在升级后的第一次启动有实际动作，正常启动零开销。
 
+#[cfg(windows)]
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use tauri::{AppHandle, Manager};
+
+// 端口归属查询与进程树结束改用 Win32 API 的原因见 Cargo.toml 里 windows-sys
+// 依赖处的说明：外部命令（taskkill / powershell）的字符串与进程创建行为会被
+// 杀软的流量拦截木马启发式命中。这里按需导入，非 Windows 平台不带这份依赖。
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, INVALID_HANDLE_VALUE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetExtendedTcpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID, MIB_TCP_STATE_LISTEN,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_CLASS, TCP_TABLE_OWNER_PID_LISTENER,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, QueryFullProcessImageNameW, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE,
+};
 
 use crate::gateway::proxy_port;
 use crate::server;
@@ -121,7 +147,7 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), String> {
 ///   2. 监听该端口的进程，其可执行文件位于**本应用安装目录**之内
 ///      （即旧版随包分发的 resources\node.exe）。用户自己 `npm start`
 ///      起的系统 node 在安装目录之外 —— 只提示、不杀；
-///   3. taskkill 成功，且端口在宽限期内释放（旧服务的 /health 不再应答）。
+///   3. 结束进程树成功，且端口在宽限期内释放（旧服务的 /health 不再应答）。
 async fn reclaim_port_from_legacy(port: u16) -> bool {
     if !health_reports_workbuddy(port).await {
         return false;
@@ -170,51 +196,202 @@ async fn reclaim_port_from_legacy(port: u16) -> bool {
     }
 }
 
-/// 结束进程树（taskkill /T /F）。
+/// 结束进程树（等价于 `taskkill /PID <pid> /T /F`）。
 ///
-/// **必须加 CREATE_NO_WINDOW**：这是个控制台程序，不加标志时 Windows 会为它
-/// 分配一个控制台窗口 —— 用户在升级后的首次启动会看到黑窗一闪。同理，
-/// 下面查监听进程的 PowerShell 也要加（见 `creation_flags_no_window`）。
+/// 用 Toolhelp 快照 + TerminateProcess 而不是 spawn taskkill：后者会在二进制里
+/// 留下 `taskkill` 字符串与进程创建行为，与「监听本地端口」叠加正好命中杀软
+/// 对流量拦截类木马的启发式（详见 Cargo.toml 中 windows-sys 依赖处的说明）。
+#[cfg(windows)]
 fn kill_process_tree(pid: u32) -> bool {
-    std::process::Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags_no_window()
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    // 先把整棵子树收集完再动手：一旦结束父进程，子进程会变成孤儿（父 PID 指向
+    // 一个已消失的进程），快照里就再也还原不出这层父子关系了。
+    // 结束顺序与 taskkill /T 一致：先子孙、最后目标本身。
+    let mut descendants = descendant_pids(pid);
+    descendants.reverse();
+    for child in descendants {
+        // 子进程结束失败不影响主进程的结果判定：旧实现的 taskkill /T 同样容忍
+        // 「部分子进程已退出 / 权限不足打不开」这类情况。
+        terminate_process(child);
+    }
+    terminate_process(pid)
 }
 
-/// 给当前进程 spawn 出的控制台程序加 `CREATE_NO_WINDOW`。
+#[cfg(not(windows))]
+fn kill_process_tree(_pid: u32) -> bool {
+    // 本项目只发布 Windows 版；桩实现让本文件保持跨平台可编译。
+    false
+}
+
+/// 收集 `root` 的全部后代 PID（不含 `root` 自身）。
+#[cfg(windows)]
+fn descendant_pids(root: u32) -> Vec<u32> {
+    // 一次快照读全表，比递归时反复枚举快照便宜；更重要的是避免「父进程已退出、
+    // 关系断裂」导致漏杀。
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        // 拿不到快照只能退化成「只结束目标进程」——进程可能确实没有子进程，
+        // 所以这里不能当作失败。
+        return Vec::new();
+    }
+
+    // dwSize 必须先填结构体大小，否则 Process32FirstW 会直接失败。
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    let mut children_by_parent: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        children_by_parent
+            .entry(entry.th32ParentProcessID)
+            .or_default()
+            .push(entry.th32ProcessID);
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+
+    // HashSet 既去重也防环：PID 复用期间可能出现自指的父子关系，防一手免得死循环。
+    // 环里可能绕回 root 自身，必须排除 —— 否则 root 会被当成后代多杀一次，
+    // 最后那次 terminate_process(root) 就会因为进程已消失而误判为失败。
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut pending = vec![root];
+    let mut result = Vec::new();
+    while let Some(current) = pending.pop() {
+        let Some(children) = children_by_parent.get(&current) else {
+            continue;
+        };
+        for &child in children {
+            if child == root || child == 0 || !seen.insert(child) {
+                continue;
+            }
+            result.push(child);
+            pending.push(child);
+        }
+    }
+    result
+}
+
+/// 结束单个进程；失败（打不开句柄 / 结束被拒）返回 false。
+#[cfg(windows)]
+fn terminate_process(pid: u32) -> bool {
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let ok = unsafe { TerminateProcess(handle, 1) };
+    unsafe { CloseHandle(handle) };
+    ok != 0
+}
+
+/// 监听该端口的进程（PID + 可执行文件路径）。
 ///
-/// 只在 Windows 生效；非 Windows 平台返回 `&mut Command` 本身，调用点无需
-/// 平台分支。理由：GUI 应用（本程序无控制台）拉起 powershell/taskkill 这类
-/// 控制台程序时，若不加标志 Windows 会新建一个控制台窗口并显示出来。
+/// 用 GetExtendedTcpTable 取代原来的 `powershell Get-NetTCPConnection`：既是
+/// 杀软误报的根源（powershell 字符串 + 进程创建），也省掉一次解释器冷启动。
+/// 表类型用 TCP_TABLE_OWNER_PID_LISTENER（只列监听态），比 ALL 少遍历大量
+/// 已建立连接。IPv4 查不到再兜底查 IPv6 —— 本程序与旧版网关都是 IPv4，
+/// IPv6 只覆盖「用户手工用 ::1 起了旧服务」这种边角情况。
 #[cfg(windows)]
-trait NoWindowExt {
-    fn creation_flags_no_window(&mut self) -> &mut Self;
-}
-
-#[cfg(windows)]
-impl NoWindowExt for std::process::Command {
-    fn creation_flags_no_window(&mut self) -> &mut Self {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        self.creation_flags(CREATE_NO_WINDOW)
-    }
+fn listener_process(port: u16) -> Option<(u32, String)> {
+    let pid = listener_pid(AF_INET as u32, port).or_else(|| listener_pid(AF_INET6 as u32, port))?;
+    let path = process_image_path(pid)?;
+    Some((pid, path))
 }
 
 #[cfg(not(windows))]
-trait NoWindowExt {
-    fn creation_flags_no_window(&mut self) -> &mut Self;
+fn listener_process(_port: u16) -> Option<(u32, String)> {
+    // 本项目只发布 Windows 版；桩实现让本文件保持跨平台可编译。
+    None
 }
 
-#[cfg(not(windows))]
-impl NoWindowExt for std::process::Command {
-    fn creation_flags_no_window(&mut self) -> &mut Self {
-        self
+/// 在指定地址族的监听表里找出占用 `port` 的 PID。
+#[cfg(windows)]
+fn listener_pid(family: u32, port: u16) -> Option<u32> {
+    let buffer = tcp_listener_table(family)?;
+
+    if family == AF_INET as u32 {
+        let table = buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
+        // 表声明里 table 只有 1 项，真实条目数由 dwNumEntries 给出，所以先取首行
+        // 地址再按条目数切成切片遍历（IPv4 行是 6 个 u32，布局与声明完全一致）。
+        let rows = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>(),
+                (*table).dwNumEntries as usize,
+            )
+        };
+        return rows
+            .iter()
+            .find(|row| {
+                row.dwState == MIB_TCP_STATE_LISTEN as u32 && tcp_port(row.dwLocalPort) == port
+            })
+            .map(|row| row.dwOwningPid);
     }
+
+    let table = buffer.as_ptr() as *const MIB_TCP6TABLE_OWNER_PID;
+    // 同 IPv4：IPv6 行按 MIB_TCP6ROW_OWNER_PID 布局解释，端口字段同样取低位 ntohs。
+    let rows = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::addr_of!((*table).table).cast::<MIB_TCP6ROW_OWNER_PID>(),
+            (*table).dwNumEntries as usize,
+        )
+    };
+    rows.iter()
+        .find(|row| row.dwState == MIB_TCP_STATE_LISTEN as u32 && tcp_port(row.dwLocalPort) == port)
+        .map(|row| row.dwOwningPid)
+}
+
+/// 取监听表（`TCP_TABLE_OWNER_PID_LISTENER`）的原始字节。
+///
+/// 表是变长结构，只能两趟调用：第一趟传空指针探大小（返回
+/// ERROR_INSUFFICIENT_BUFFER，同时把所需字节数写进 size），第二趟拿按大小分配好
+/// 的缓冲区去填。缓冲区用 `Vec<u32>` 而不是 `Vec<u8>`：表的行只含 u32 字段
+/// （对齐要求 4），用 u32 承载才能保证把裸缓冲区解释成表时指针对齐是成立的。
+#[cfg(windows)]
+fn tcp_listener_table(family: u32) -> Option<Vec<u32>> {
+    let class: TCP_TABLE_CLASS = TCP_TABLE_OWNER_PID_LISTENER;
+    let mut size: u32 = 0;
+    // 探大小：null 指针必然失败，只看它回填的 size
+    let probe = unsafe { GetExtendedTcpTable(std::ptr::null_mut(), &mut size, 0, family, class, 0) };
+    if probe != ERROR_INSUFFICIENT_BUFFER || size == 0 {
+        return None;
+    }
+
+    let mut buffer = vec![0u32; size as usize / 4 + 1];
+    // 第二趟按缓冲区真实字节数报 size（比探测值多出补齐的零头），避免 API
+    // 认为缓冲区比实际更大
+    let mut capacity = std::mem::size_of_val(buffer.as_slice()) as u32;
+    let filled =
+        unsafe { GetExtendedTcpTable(buffer.as_mut_ptr().cast(), &mut capacity, 0, family, class, 0) };
+    if filled != ERROR_SUCCESS {
+        return None;
+    }
+    Some(buffer)
+}
+
+/// 结构体里的端口是「网络字节序值放在 u32 高位」的形态，取低 16 位再 ntohs。
+#[cfg(windows)]
+fn tcp_port(raw: u32) -> u16 {
+    u16::from_be((raw & 0xFFFF) as u16)
+}
+
+/// 进程的可执行文件绝对路径（拿不到路径返回 None，不回退到任何外部命令）。
+#[cfg(windows)]
+fn process_image_path(pid: u32) -> Option<String> {
+    // PROCESS_QUERY_LIMITED_INFORMATION：Vista 之后的最低查询权限，对「同用户但
+    // 完整性级别不同」的进程（旧版网关就是这种）也能成功打开，足以拿路径。
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+
+    let mut buffer = [0u16; 1024];
+    let mut length = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+
+    // 成功时 length 是不含结尾 NUL 的字符数。
+    Some(String::from_utf16_lossy(&buffer[..length as usize]))
 }
 
 /// 端口上的服务是否是 WorkBuddy 网关（读 /health 的 product 特征字段）。
@@ -232,42 +409,10 @@ async fn health_reports_workbuddy(port: u16) -> bool {
     payload.get("product").and_then(|value| value.as_str()) == Some("WorkBuddy")
 }
 
-/// 找到监听该端口的进程（PID + 可执行文件路径）。
-///
-/// 用 PowerShell 的 Get-NetTCPConnection：netstat 的输出在中文系统上
-/// State 列是 GBK 编码的「侦听」，按文本解析容易碎。`[Console]::OutputEncoding`
-/// 必须显式设为 UTF-8 —— 安装目录含中文（产品名就是中文），默认控制台
-/// 编码会把路径弄坏。IPv4/IPv6 可能各有一条监听记录，取第一个能解析的。
-fn listener_process(port: u16) -> Option<(u32, String)> {
-    let script = format!(
-        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
-         Get-NetTCPConnection -LocalPort {port} -State Listen | ForEach-Object {{ \
-           $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; \
-           if ($p -and $p.Path) {{ Write-Output ($_.OwningProcess.ToString() + '|' + $p.Path) }} \
-         }}"
-    );
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .creation_flags_no_window()
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .find_map(|line| {
-            let (pid, path) = line.split_once('|')?;
-            let pid: u32 = pid.trim().parse().ok()?;
-            Some((pid, path.trim().to_string()))
-        })
-}
-
 /// 进程的可执行文件是否位于本应用安装目录之内。
 ///
 /// 两侧都 canonicalize 再比前缀：消除大小写差异、8.3 短路径与
-/// `\\?\` verbatim 前缀的形态差（PowerShell 返回的是普通路径，
+/// `\\?\` verbatim 前缀的形态差（进程路径返回的是普通盘符路径，
 /// canonicalize 后两侧形态一致，starts_with 才可靠）。
 fn inside_install_dir(candidate: &str) -> bool {
     let Ok(current) = std::env::current_exe() else {

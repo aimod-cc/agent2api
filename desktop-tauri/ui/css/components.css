@@ -1,5 +1,7 @@
 /* ─────────────────────────────────────────────
    组件：按钮 / 徽章 / 卡片内元素 / 表单 / 开关 / 弹窗
+   颜色一律取 tokens.css 的语义变量，浅色 / 深色共用同一组声明，
+   不在本文件里写死任何色值（必要的浅色 tint 用 color-mix 从令牌派生）。
    ───────────────────────────────────────────── */
 
 /* ─── 按钮 ───
@@ -12,9 +14,9 @@ button {
   justify-content: center;
   gap: 6px;
   height: 30px;
-  padding: 0 11px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
   background: var(--surface);
   color: var(--text);
   font-size: 12.5px;
@@ -24,30 +26,38 @@ button {
   transition: background .15s ease, border-color .15s ease, color .15s ease, transform .08s ease;
 }
 
-button:hover:not(:disabled) { background: var(--surface-3); border-color: var(--text-3); }
+button:hover:not(:disabled) { background: var(--surface-3); border-color: var(--border-strong); }
 button:active:not(:disabled) { transform: translateY(.5px); }
 button:disabled { opacity: .45; box-shadow: none; cursor: not-allowed; }
 
+/* 主按钮：平铺主色 + 近白文字。前景从 --surface 向白提亮派生：浅色得到纯白，
+   深色得到近白；直接用 --surface / --primary-fg 会在深色主题压出近黑或浅蓝，读不清。
+   背景去掉原来的竖向渐变，改用平色 + --glow，与新体系「平色 + 品牌柔光」一致 */
 button.primary {
-  background: linear-gradient(180deg, var(--primary-top) 0%, var(--primary) 100%);
+  background: var(--primary);
   border-color: var(--primary);
-  color: #fff;
+  color: color-mix(in srgb, var(--surface) 8%, white);
   font-weight: 600;
   box-shadow: var(--glow);
 }
 
-button.primary:hover:not(:disabled) {
-  background: linear-gradient(180deg, var(--primary-hover) 0%, var(--primary-hover) 100%);
-  border-color: var(--primary-hover);
-}
+button.primary:hover:not(:disabled) { background: var(--primary-hover); border-color: var(--primary-hover); }
 
 button.danger { color: var(--danger); border-color: var(--danger-bd); background: var(--danger-soft); }
-button.danger:hover:not(:disabled) { background: var(--danger); border-color: var(--danger); color: #fff; }
+
+/* 危险按钮 hover 不铺满实色：实色底 + 近白字在深色主题对比不足，
+   改成「语义色 × 表面」加深底色，浅色变浅粉、深色变深红，两边都成立 */
+button.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 22%, var(--surface));
+  border-color: var(--danger-bd);
+}
 
 button.ghost { background: transparent; border-color: transparent; box-shadow: none; color: var(--text-2); }
 button.ghost:hover:not(:disabled) { background: var(--surface-3); color: var(--text); border-color: transparent; }
 
-button.sm { height: 26px; padding: 0 9px; font-size: 12px; border-radius: var(--r-xs); }
+/* 小号按钮按比例收一号圆角：26px 高配 12.8px 圆角会显得过圆。
+   行内控件档（分页、卡片内操作）都落在这一档 */
+button.sm { height: 26px; padding: 0 10px; font-size: 12px; border-radius: var(--r-sm); }
 button.icon { width: 30px; padding: 0; }
 button.icon.sm { width: 26px; }
 
@@ -57,8 +67,8 @@ button.icon.sm { width: 26px; }
   align-items: center;
   gap: 5px;
   min-height: 21px;
-  padding: 1px 8px;
-  border: 1px solid var(--border-strong);
+  padding: 1px 9px;
+  border: 1px solid var(--border);
   border-radius: var(--r-pill);
   background: var(--surface-3);
   color: var(--text-2);
@@ -78,7 +88,7 @@ button.icon.sm { width: 26px; }
 .badge.edition-intl { background: var(--intl-soft); border-color: var(--intl-bd); color: var(--intl); }
 
 /* 行内状态标签：比徽章更方、更小 */
-.badge.tag { min-height: 19px; padding: 0 7px; border-radius: var(--r-xs); font-size: 11px; }
+.badge.tag { min-height: 19px; padding: 0 8px; border-radius: var(--r-xs); font-size: 11px; }
 .badge.tag.ok { background: var(--ok-soft); border-color: var(--ok-bd); color: var(--ok); }
 .badge.tag.warn { background: var(--warn-soft); border-color: var(--warn-bd); color: var(--warn); }
 /* 无状态占位（账号无任何状态可标时用的破折号），不要边框底色 */
@@ -88,12 +98,12 @@ button.icon.sm { width: 26px; }
 .field-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(178px, 1fr));
-  gap: 9px;
+  gap: 10px;
 }
 
 .field {
   min-width: 0;
-  padding: 10px 12px;
+  padding: 12px 13px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
@@ -103,7 +113,7 @@ button.icon.sm { width: 26px; }
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 3px;
+  margin-bottom: 4px;
   color: var(--text-3);
   font-size: 11.5px;
 }
@@ -160,8 +170,8 @@ button.icon.sm { width: 26px; }
 .banner {
   display: flex;
   align-items: flex-start;
-  gap: 9px;
-  padding: 10px 12px;
+  gap: 10px;
+  padding: 11px 13px;
   border: 1px solid var(--info-bd);
   border-radius: var(--r-md);
   background: var(--info-soft);
@@ -176,41 +186,6 @@ button.icon.sm { width: 26px; }
 .banner.danger { border-color: var(--danger-bd); background: var(--danger-soft); }
 .banner.danger .ico { color: var(--danger); }
 .banner strong { color: var(--text); }
-
-/* 可折叠说明：默认收成一行，不占版面 */
-details.hint {
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface-inset);
-  font-size: 11.5px;
-  line-height: 1.7;
-  color: var(--text-2);
-  overflow: hidden;
-}
-
-details.hint > summary {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 8px 12px;
-  color: var(--text-2);
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-}
-
-details.hint > summary::-webkit-details-marker { display: none; }
-
-details.hint > summary::before {
-  content: "▸";
-  color: var(--text-3);
-  font-size: 10px;
-  transition: transform .15s ease;
-}
-
-details.hint[open] > summary::before { transform: rotate(90deg); }
-details.hint > summary:hover { background: var(--surface-3); }
-details.hint > p { margin: 0; padding: 0 12px 10px 27px; color: var(--text-2); }
 
 /* ─── 空状态 ─── */
 .empty {
@@ -242,10 +217,10 @@ details.hint > p { margin: 0; padding: 0 12px 10px 27px; color: var(--text-2); }
   z-index: 40;
   display: none;
   max-width: 76vw;
-  padding: 9px 16px;
+  padding: 10px 16px;
   transform: translateX(-50%);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
   background: var(--surface);
   box-shadow: var(--shadow-3);
   color: var(--text);
@@ -266,8 +241,8 @@ textarea {
   min-width: 0;
   height: 30px;
   padding: 0 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
   background: var(--surface);
   color: var(--text);
   font-size: 12.5px;
@@ -280,7 +255,7 @@ input[type="text"], input[type="password"], input[type="search"], input[type="nu
 textarea {
   height: auto;
   min-height: 104px;
-  padding: 9px 11px;
+  padding: 10px 12px;
   font-family: var(--font-mono);
   font-size: 12px;
   line-height: 1.6;
@@ -288,7 +263,7 @@ textarea {
 }
 
 input::placeholder, textarea::placeholder { color: var(--text-3); }
-input:hover:not(:disabled), select:hover:not(:disabled), textarea:hover:not(:disabled) { border-color: var(--text-3); }
+input:hover:not(:disabled), select:hover:not(:disabled), textarea:hover:not(:disabled) { border-color: var(--border-strong); }
 
 input:focus, select:focus, textarea:focus {
   border-color: var(--primary);
@@ -316,13 +291,13 @@ input[type="number"] { max-width: 130px; }
 .field-row {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
   flex-wrap: wrap;
 }
 
 .field-row > label { color: var(--text-2); font-size: 12.5px; white-space: nowrap; }
 
-/* 输入框 + 前后缀 */
+/* 输入框 + 前后缀（affix 的左偏移与 input 自身 10px 内边距对齐） */
 .input-affix { position: relative; display: flex; align-items: center; flex: 1 1 auto; }
 .input-affix .affix { position: absolute; left: 10px; color: var(--text-3); font-size: 12px; pointer-events: none; }
 .input-affix input { padding-left: 28px; }
@@ -332,9 +307,9 @@ input[type="number"] { max-width: 130px; }
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  padding: 6px 12px;
+  padding: 6px 13px;
   border: 1px solid var(--border);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-md);
   background: var(--surface);
   color: var(--text-2);
   font-size: 12.5px;
@@ -343,7 +318,7 @@ input[type="number"] { max-width: 130px; }
   transition: border-color .15s ease, background .15s ease, color .15s ease;
 }
 
-.edition-option:hover { border-color: var(--border-strong); background: var(--surface-2); }
+.edition-option:hover { border-color: var(--border-strong); background: var(--surface-3); }
 .edition-option input { accent-color: var(--primary); margin: 0; }
 
 .edition-option:has(input:checked) {
@@ -389,6 +364,8 @@ input[type="number"] { max-width: 130px; }
   transition: background .18s ease;
 }
 
+/* 滑块近白（同样从 --surface 向白提亮派生）：轨道浅色是浅灰、深色是深灰，
+   两种主题下滑块都要比轨道亮才立得住。阴影改用 --shadow-1，不另造投影 */
 .switch .track::after {
   content: "";
   position: absolute;
@@ -397,8 +374,8 @@ input[type="number"] { max-width: 130px; }
   width: 17px;
   height: 17px;
   border-radius: 50%;
-  background: #fff;
-  box-shadow: 0 1px 3px rgba(15, 23, 42, .3);
+  background: color-mix(in srgb, var(--surface) 8%, white);
+  box-shadow: var(--shadow-1);
   transition: transform .18s cubic-bezier(.3, 1.4, .6, 1);
 }
 
@@ -411,8 +388,8 @@ input[type="number"] { max-width: 130px; }
 .switch-card {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 10px 12px;
+  gap: 12px;
+  padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
@@ -439,18 +416,20 @@ input[type="number"] { max-width: 130px; }
   gap: 2px;
   padding: 2px;
   border: 1px solid var(--border);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-md);
   background: var(--surface-3);
 }
 
+/* 分段项嵌在 .seg 里，圆角要按「外圆角 - 内边距」收一号，
+   否则 24px 的项配上控制件的 12.8px 会比容器还圆，接缝处露出毛边 */
 .seg-item {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   height: 24px;
-  padding: 0 9px;
+  padding: 0 10px;
   border: 0;
-  border-radius: var(--r-xs);
+  border-radius: var(--r-sm);
   background: transparent;
   box-shadow: none;
   color: var(--text-2);
@@ -460,13 +439,14 @@ input[type="number"] { max-width: 130px; }
   transition: background .15s ease, color .15s ease;
 }
 
-.seg-item:hover:not(:disabled) { background: color-mix(in srgb, var(--surface) 60%, transparent); border-color: transparent; color: var(--text); }
+/* 未选中项用中性叠加：深色叠白、浅色叠黑，同一行声明两边都成立 */
+.seg-item:hover:not(:disabled) { background: color-mix(in oklab, var(--text) 6%, transparent); color: var(--text); }
 
+/* 选中项走品牌浅底，与导航选中态、单选卡片保持一致 */
 .seg-item.active {
-  background: var(--surface);
+  background: var(--primary-soft);
   color: var(--primary-fg);
   font-weight: 600;
-  box-shadow: var(--shadow-1);
 }
 
 .seg-item .seg-count {
@@ -482,7 +462,7 @@ input[type="number"] { max-width: 130px; }
   opacity: 1;
 }
 
-.seg-item.active .seg-count { background: var(--primary-soft); color: var(--primary-fg); }
+.seg-item.active .seg-count { background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary-fg); }
 
 /* 计数为 0 的分段弱化，减少视觉噪音 */
 .seg-item.zero:not(.active) { opacity: .45; }
@@ -495,7 +475,7 @@ input[type="number"] { max-width: 130px; }
   align-items: center;
   gap: 10px 12px;
   flex-wrap: wrap;
-  padding: 11px 16px;
+  padding: 12px 16px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -509,7 +489,8 @@ input[type="number"] { max-width: 130px; }
   .toolbar .actions { flex-basis: 100%; margin-left: 0; }
 }
 
-/* 模型筛选下拉：选中的模型决定「限额」口径与列表里的首选账号 */
+/* 模型筛选下拉：选中的模型决定「限额」口径与列表里的首选账号，
+   比同排普通下拉重一档，边框取强调色而不是用字重硬顶 */
 .model-select {
   max-width: 200px;
   height: 30px;
@@ -529,11 +510,14 @@ input[type="number"] { max-width: 130px; }
 .progress > .bar {
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, var(--primary) 0%, #7b5cff 100%);
+  background: var(--primary);
   transition: width .3s ease;
 }
 
 /* ─── 弹窗 ─── */
+/* 遮罩要「两个主题都压暗背景」，但令牌里没有这样的颜色：--text、--bg、--surface
+   都随主题翻转，拿它们当蒙层会在深色模式刷出一层白雾。所以按 tokens.css 里
+   浅色 tint 同款手法派生，只把基底换成黑，深浅两模式的方向就一致了。 */
 .modal-mask {
   position: fixed;
   inset: 0;
@@ -542,7 +526,7 @@ input[type="number"] { max-width: 130px; }
   align-items: center;
   justify-content: center;
   padding: 24px;
-  background: color-mix(in srgb, #0b1020 46%, transparent);
+  background: color-mix(in srgb, black 46%, transparent);
   backdrop-filter: blur(3px);
 }
 
@@ -557,7 +541,7 @@ input[type="number"] { max-width: 130px; }
   max-height: 100%;
   padding: 0;
   border: 1px solid var(--border);
-  border-radius: var(--r-xl);
+  border-radius: var(--r-lg);
   background: var(--surface);
   box-shadow: var(--shadow-3);
   overflow: hidden;
@@ -573,12 +557,13 @@ input[type="number"] { max-width: 130px; }
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 14px 18px;
+  padding: 15px 20px;
   border-bottom: 1px solid var(--hairline);
 }
 
 .modal-head h2 { flex: 1 1 auto; font-size: 14.5px; font-weight: 650; }
 
+/* 关闭按钮是透明底图标钮，圆角沿用 button 的 --r-md */
 .modal-head > button {
   width: 28px;
   height: 28px;
@@ -595,15 +580,15 @@ input[type="number"] { max-width: 130px; }
   display: flex;
   flex-direction: column;
   gap: 16px;
-  padding: 16px 18px;
+  padding: 18px 20px;
   overflow-y: auto;
 }
 
 .modal-section {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 13px;
+  gap: 9px;
+  padding: 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
@@ -616,7 +601,7 @@ input[type="number"] { max-width: 130px; }
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 12px 18px;
+  padding: 13px 20px;
   border-top: 1px solid var(--hairline);
   background: var(--surface-2);
 }
@@ -631,18 +616,18 @@ input[type="number"] { max-width: 130px; }
 .endpoint-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
-  gap: 9px;
+  gap: 10px;
 }
 
 .endpoint {
   min-width: 0;
-  padding: 11px 12px;
+  padding: 12px 13px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
 }
 
 .endpoint .k { color: var(--text-3); font-size: 11.5px; }

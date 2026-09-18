@@ -8,16 +8,32 @@
 //! 文件路径与 Node 版一致（`{directory}/logs.jsonl`）而非 `logs/` 子目录 ——
 //! 用户已有的历史日志就在这个位置，换目录会让升级后查不到旧记录。
 //!
+//! ── 两个保留约束（Node 版只有前者，后者是本次新增）─────────────
+//!   - **容量维度**：`MAX_ENTRIES = 500` 的环形保留，管「最多多少条」，
+//!     短时间内的日志风暴不该按天数比例吃光内存。**保持原样不动**。
+//!   - **时间维度**：可配置的保留天数（默认 30 天，见
+//!     `config::DEFAULT_LOG_RETENTION_DAYS`），管「最多多久」，
+//!     避免用户把保留期设短之后旧日志还赖在文件里。
+//!
+//! 两者**取更严的那个**：先按天数裁、再按条数裁，谁先到线谁生效。
+//!
+//! 天数由外部回调提供（`new` 的第二个参数），**每次裁剪时动态取** ——
+//! 于是设置页改完天数下一次写入就生效，不需要重启进程；回调读的是
+//! `config::retention_settings()` 的内存快照（不读盘）。
+//!
 //! 并发模型：Node 版是单线程事件循环，天然串行；这里用 `Mutex` 包住
 //! 「内存快照 + 落盘」整体操作，保证多请求并发时 id 不会重复、文件不会交错写。
 //!
 //! JSON 字段名与 Node 版一致：`id/ts/level/category/message/data`。
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+
+use crate::server::config;
 
 /// 日志文件名（与 Node 版 FILE_NAME 一致）
 pub const FILE_NAME: &str = "logs.jsonl";
@@ -84,6 +100,13 @@ pub struct Query {
     pub category: Option<String>,
     pub keyword: Option<String>,
     pub since_id: Option<u64>,
+    /// 起始毫秒时间戳（含）。None 不过滤 —— 这两个字段是**新增的可选**条件，
+    /// 不传时过滤链与以前完全一致（向后兼容）
+    pub start: Option<i64>,
+    /// 结束毫秒时间戳（**不含**）。闭开区间 `[start, end)` 的取舍同
+    /// `RequestQuery`：翻页时「上一页最后一条的 ts」可直接当下页的 end，
+    /// 不会把同一条重复取到两次
+    pub end: Option<i64>,
 }
 
 /// 级别归一：未知值一律 info（对应 Node 版 normalizeLevel）
@@ -170,6 +193,10 @@ fn clamp_message(text: &str) -> String {
 pub struct LogStore {
     directory: PathBuf,
     file: PathBuf,
+    /// 保留天数回调。**每次裁剪时动态调用**，于是设置改完天数下一次写入
+    /// 就用新值，不需要重启进程（与 `RequestStats::get_retention` 同一模式）。
+    /// 用 `Arc` 是为了让 `LogStore` 本身仍能放进 `OnceLock`（不需要 `&self` 生命周期）
+    get_retention_days: Arc<dyn Fn() -> i64 + Send + Sync>,
     inner: Mutex<Inner>,
 }
 
@@ -183,12 +210,29 @@ struct Inner {
 
 impl LogStore {
     /// 构造并载入历史日志。目录不存在不报错，首次写入时自动创建。
-    pub fn new(directory: impl AsRef<Path>) -> Self {
+    ///
+    /// **签名与 `RequestStats::new(directory, get_retention)` 统一**：两者是
+    /// 「同一份数据的两半」（事件日志 / 请求统计），数据目录同源、保留期同样
+    /// 由回调动态提供，构造方式不该有两套写法。
+    ///
+    /// 原签名 `new(directory)`（固定 30 天）在本改造中被替换掉而非保留为
+    /// 重载：它只有一个调用点（`logging::init_store`，本次必须改它才能接上配置），
+    /// 留一个无人调用的默认构造器只会变成需要 `#[allow(dead_code)]` 说明的死代码。
+    /// 保留天数的默认值因此只有一份事实来源：`config::DEFAULT_LOG_RETENTION_DAYS`
+    /// （缺配置时由 `config::retention_settings()` 兜底给出）。
+    ///
+    /// 回调每次裁剪时被调用，应读**内存快照**（如 `config::retention_settings()`），
+    /// 不要每次读盘 —— 写日志是相对频繁的路径。
+    pub fn new(
+        directory: impl AsRef<Path>,
+        get_retention_days: impl Fn() -> i64 + Send + Sync + 'static,
+    ) -> Self {
         let directory = directory.as_ref().to_path_buf();
         let file = directory.join(FILE_NAME);
         let store = Self {
             directory,
             file,
+            get_retention_days: Arc::new(get_retention_days),
             inner: Mutex::new(Inner {
                 entries: Vec::new(),
                 next_id: 1,
@@ -200,6 +244,24 @@ impl LogStore {
         store
     }
 
+    /// 当前保留期的毫秒下界（本地时区「今天往前推 N-1 天」的零点）。
+    ///
+    /// 保留 N 天 = 含今天在内的 N 个自然日，所以往前推 N-1 天 ——
+    /// 与 `RequestStats::retention_bounds` 的口径**逐字一致**：
+    /// 事件日志与请求明细的「30 天」必须是同一个 30 天。
+    /// 取值范围复用 `config` 的两个常量（那里是唯一事实来源，读侧夹紧与
+    /// 写侧校验共用同一组边界，手改 config.json 写个天文数字也不会让裁剪空转）。
+    fn retention_cutoff_ms(&self) -> i64 {
+        let days = (self.get_retention_days)()
+            .clamp(config::RETENTION_MIN_DAYS, config::RETENTION_MAX_DAYS);
+        let day = Local::now().date_naive() - ChronoDuration::days(days - 1);
+        day.and_hms_opt(0, 0, 0)
+            .and_then(|naive| Local.from_local_datetime(&naive).earliest())
+            .map(|value| value.timestamp_millis())
+            // 兜底：连当天零点都构造不出来时退到 epoch（极端日期越界才会发生）
+            .unwrap_or(0)
+    }
+
     /// 日志文件路径（桌面端「日志」页会直接展示它）。
     /// Node 版 `createLogStore` 返回对象里的 `file` 取值的对等物
     /// （stats() 的 `file` 字段已表达同一事实，这里保留供直读）。
@@ -209,7 +271,8 @@ impl LogStore {
     }
 
     /// 载入历史：逐行解析，损坏行跳过（不影响其余日志）；
-    /// 文件比内存上限大时标 dirty，下次写入收敛回上限。
+    /// 载入后按两个保留约束收敛（先时间后容量），文件比内存多时标 dirty，
+    /// 下次写入把文件收敛回同样的集合。
     fn load(&self) {
         let Ok(text) = std::fs::read_to_string(&self.file) else {
             // 文件不存在是正常情况（首次运行），不打扰用户
@@ -243,15 +306,22 @@ impl LogStore {
             });
         }
         let total = parsed.len();
-        let entries: Vec<LogEntry> = if total > MAX_ENTRIES {
-            parsed.split_off(total - MAX_ENTRIES)
+        // ① 时间维度：保留天数（与运行期同一套 cutoff，口径不会漂）
+        let cutoff = self.retention_cutoff_ms();
+        parsed.retain(|item| item.ts >= cutoff);
+        // ② 容量维度：环形上限（保持不变）
+        let entries: Vec<LogEntry> = if parsed.len() > MAX_ENTRIES {
+            parsed.split_off(parsed.len() - MAX_ENTRIES)
         } else {
             parsed
         };
         let next_id = entries.iter().map(|item| item.id).max().unwrap_or(0) + 1;
 
         if let Ok(mut guard) = self.inner.lock() {
-            guard.dirty = total > MAX_ENTRIES;
+            // dirty 的语义是「文件内容比内存多」：两种裁剪（超天数 / 超条数）
+            // 都会造成这种差异，任一发生就要在下次写入时整文件收敛 ——
+            // 否则重开程序又会把已裁掉的行载回来
+            guard.dirty = entries.len() < total;
             guard.entries = entries;
             guard.next_id = next_id;
             let count = guard.entries.len();
@@ -264,6 +334,40 @@ impl LogStore {
                 &format!("已载入运行日志 {count} 条"),
             );
         }
+    }
+
+    /// 立即按当前保留天数裁剪，并落盘（供「改小保留天数后立即清理」用）。
+    ///
+    /// 与 `append` 里那次顺带裁剪的分工：那里只是「不涨过头」（每次写日志顺手摘掉
+    /// 已过期的头部若干条），这里则是用户显式要求的清理，所以要**立刻落盘** ——
+    /// 调用方（设置页保存后）期待的是盘上也干净了，而不是等下一次日志写入才收敛。
+    ///
+    /// 只按时间维度裁：容量维度（MAX_ENTRIES）在 append/load 时已经守住，
+    /// 且改保留天数不会让条数超限。返回裁掉的条数（供调用方打一行控制台日志，
+    /// 确认「改小天数确实删了东西」）。
+    pub fn prune(&self) -> usize {
+        let cutoff = self.retention_cutoff_ms();
+        let Ok(mut guard) = self.inner.lock() else {
+            return 0;
+        };
+        let before = guard.entries.len();
+        // 逐条判定而不是「二分找分界点再 drain」：`ts` 是调用方传入的，
+        // 补写历史日志时可能逆序；上限 500 条，O(n) 扫描的成本可以忽略
+        guard.entries.retain(|item| item.ts >= cutoff);
+        let removed = before - guard.entries.len();
+        if removed == 0 {
+            return 0;
+        }
+        // 立即整文件收敛：内存与文件要么一起干净要么一起不干净。
+        // 落盘在**持锁期间**完成（与 `append` 的整文件重写路径同理）：
+        // 若先放锁再写，期间并发的 `append` 追加的那一行会被这次重写吃掉
+        // （内存里有、文件里没有，重开程序就少一条）。清理是低频的用户动作，
+        // 持锁写盘的开销可以接受。
+        let text = render_jsonl(&guard.entries);
+        guard.dirty = false;
+        guard.appends_since_compact = 0;
+        self.write_all(&text);
+        removed
     }
 
     /// 追加一条日志并落盘，返回生成的条目。
@@ -293,6 +397,22 @@ impl LogStore {
         };
         guard.next_id += 1;
         guard.entries.push(record.clone());
+        // ── 两个保留约束依次生效（见文件头：取更严的那个）──────
+        // ① 时间维度：按保留天数裁掉过期条目。
+        //    用 `retain` 而不是「数组头部连续摘掉」的写法：`ts` 由调用方传入
+        //    （`NewEntry::ts` 允许补写历史），数组不保证严格按 ts 有序，
+        //    逐条判定对乱序也安全；上限 500 条，一次 O(n) 扫描在这个频率下可忽略。
+        //    例外：**刚写入的这条**（按 id 精确匹配）即使超期也留下 ——
+        //    `append` 的契约是「返回写入的条目」，不能返回一条当场就被删掉的记录。
+        let cutoff = self.retention_cutoff_ms();
+        let before = guard.entries.len();
+        guard.entries.retain(|item| item.ts >= cutoff || item.id == record.id);
+        if guard.entries.len() != before {
+            // 内存比文件少 → 标 dirty，让本次写入把整文件收敛掉
+            // （否则文件里仍留着过期行，重开程序它们又回来了）
+            guard.dirty = true;
+        }
+        // ② 容量维度：环形上限（**保持不变**，与时间约束取更严的那个）
         if guard.entries.len() > MAX_ENTRIES {
             let overflow = guard.entries.len() - MAX_ENTRIES;
             guard.entries.drain(0..overflow);
@@ -349,8 +469,13 @@ impl LogStore {
         }
     }
 
-    /// 查询：按级别（含以上）、分类、关键词、起始 id 过滤，倒序返回最新在前。
+    /// 查询：按级别（含以上）、分类、关键词、起始 id、时间区间过滤，
+    /// 倒序返回最新在前。
     /// `limit` 语义与 Node 版一致：对过滤结果取**最后** N 条（即最新的 N 条）。
+    ///
+    /// `start` / `end` 是**新增的可选**条件（闭开区间 `[start, end)`，
+    /// 单位毫秒）：不传时（None）过滤链与以前完全一致 —— 这是向后兼容的关键，
+    /// 老调用方与老前端拿到的结果不会因为多了时间维度而变。
     pub fn query(&self, query: &Query) -> QueryResult {
         let Ok(guard) = self.inner.lock() else {
             return QueryResult { entries: Vec::new(), total: 0, matched: 0 };
@@ -396,6 +521,17 @@ impl LogStore {
             })
             .filter(|item| match query.since_id {
                 Some(from) => item.id > from,
+                None => true,
+            })
+            // 时间区间：闭开 [start, end)。放在最后一段是跟着「筛选强度」排的 ——
+            // 它与 since_id 一样是廉价比较，放在关键词（要转小写、做子串匹配）
+            // 之后能少做几次昂贵的匹配
+            .filter(|item| match query.start {
+                Some(from) => item.ts >= from,
+                None => true,
+            })
+            .filter(|item| match query.end {
+                Some(to) => item.ts < to,
                 None => true,
             })
             .collect();

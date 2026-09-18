@@ -1,19 +1,24 @@
 /* WorkBuddy 本地代理 · 设置页「软件更新」卡片 */
-/* global workbuddyDesktop, wbApp */
+/* global workbuddyDesktop, wbApp, wbMarkdown */
 
 /**
  * 独立面板模块（与 settings-panel / desensitize-panel 同构）。
  *
  * 壳命令契约（本文件只按此调用）：
- *   checkUpdate()                       → { currentVersion, latestVersion, hasUpdate, ... }
+ *   checkUpdate()                       → { currentVersion, latestVersion, hasUpdate,
+ *                                          notes, publishedAt, pageUrl, ... }
  *   downloadUpdate({ url, name })       → 下载任务快照
  *   updateProgress()                    → 下载任务快照
  *   cancelUpdate()                      → { canceled }
  *   runInstaller(path, restart)         → { launched, path, restart }
- *   openReleasePage(url)                → { url }
+ *   openReleasePage(url)                → { url }（打开外链的唯一出口）
  *
  * 下载进度用轮询而不是事件：后端下载是单任务的长轮询场景，
  * 轮询实现更简单，也便于页面重新进入时立刻拿到当前状态。
+ *
+ * 面板里两块数据同源，都来自 checkUpdate：版本号用于判断有没有新版本，
+ * 正文（notes）用于渲染更新日志。所以「检查更新」一次就把两块都刷新了，
+ * 不必再单独拉一次历史版本列表。
  */
 (() => {
   const api = workbuddyDesktop;
@@ -23,11 +28,43 @@
   /** 进度轮询间隔：下载 25MB 左右，1 秒足够顺滑又不会太密 */
   const POLL_MS = 1000;
 
-  let info = null;       // 最近一次检查结果
+  let info = null;       // 最近一次检查结果（更新日志也由它渲染）
   let polling = null;    // 进度轮询定时器
   let busy = false;
   let downloading = false;  // 本会话是否正在下载（决定按钮是「下载并安装」还是「取消下载」）
   let autoInstall = false;  // 本次下载完成后是否自动安装（避免页面重入时误装遗留任务）
+
+  let repository = '';      // owner/repo，来自接口：作者主页与仓库地址由它拼出来，不写死
+  let checkedAt = 0;        // 上次检查更新的时刻
+
+  // ─── 工具 ─────────────────────────────────────
+
+  /** 两位补零。与 logs-panel 的时间格式同一套写法（手工 pad + 本地时区），
+   *  不用 toLocaleString：它的输出随系统区域设置变，面板里的其它时间都是定宽格式 */
+  const pad2 = value => String(value).padStart(2, '0');
+
+  /** 发布 / 拉取时间 → `YYYY-MM-DD HH:mm`（publishedAt 是 UTC 的 ISO 串，这里转本地时区） */
+  function formatDateTime(value) {
+    const date = new Date(value);
+    if (!value || Number.isNaN(date.getTime())) return '';
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`
+      + ` ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  }
+
+  /** 「上次检查」只要时刻：同一天内的检查看几点几分几秒就够了 */
+  function formatClock(value) {
+    const date = new Date(value);
+    if (!value || Number.isNaN(date.getTime())) return '';
+    return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+  }
+
+  /** 外链白名单：只放行 http(s)（与后端 open_release_page 的口径一致，这里先挡一道） */
+  function safeExternal(value) {
+    const url = String(value || '').trim();
+    return /^https?:\/\//i.test(url) ? url : '';
+  }
+
+  // ─── 面板状态 ─────────────────────────────────
 
   function setBadge(text, kind) {
     const badge = $('update-badge');
@@ -53,13 +90,25 @@
       : '—';
   }
 
-  function renderNotes() {
-    const box = $('update-notes');
-    if (!box) return;
-    const notes = String(info?.notes || '').trim();
-    if (!notes) { box.style.display = 'none'; box.textContent = ''; return; }
-    box.style.display = '';
-    box.textContent = notes;
+  /** 把最近一次检查结果铺到面板上：检查成功后与「重新进入设置页」复用同一段 */
+  function renderCheckResult() {
+    renderVersions();
+    toggleActions();
+    if (!info) return;
+    const at = checkedAt ? `（检查于 ${formatClock(checkedAt)}）` : '';
+    if (info.hasUpdate === true) {
+      setBadge('有新版本', 'warn');
+      setState(`发现新版本 ${info.latestVersion}（当前 ${info.currentVersion}）。${at}`);
+    } else if (info.hasUpdate === false) {
+      setBadge('已是最新', 'ok');
+      setState(`当前已是最新版本（${info.currentVersion}）。${at}`);
+    } else {
+      // hasUpdate 为 null：版本号无法比较（本地是开发版或 tag 非语义化）
+      setBadge('无法比较', 'warn');
+      setState(info.latestVersion
+        ? `最新发布版本为 ${info.latestVersion}，但当前版本号「${info.currentVersion || '未知'}」无法解析，未做新旧判断。${at}`
+        : `仓库暂无发布版本。${at}`);
+    }
   }
 
   function toggleActions() {
@@ -69,6 +118,8 @@
     const actionable = info?.hasUpdate === true && !!info?.asset?.url;
     download.style.display = actionable ? '' : 'none';
   }
+
+  // ─── 下载 ─────────────────────────────────────
 
   function stopPolling() {
     if (polling) { clearInterval(polling); polling = null; }
@@ -163,8 +214,118 @@
     }
   }
 
+  // ─── 更新日志 ─────────────────────────────────
+
+  /** 仓库全名（owner/repo）来自接口；形态不对就不用，免得拼出个乱七八糟的链接 */
+  function applyRepository(value) {
+    const repo = String(value || '').trim();
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return;
+    repository = repo;
+    renderAuthor();
+  }
+
+  /** 仓库主页：收藏项目按钮的落点 */
+  const repoUrl = () => (repository ? `https://github.com/${repository}` : '');
+
+  /** 作者主页：取 repository 的 owner 段，这样 fork 之后自动指向 fork 者，不必改代码 */
+  const ownerUrl = () => (repository ? `https://github.com/${repository.split('/')[0]}` : '');
+
+  /**
+   * 「关于作者」那一行。文案是静态的，链接地址来自接口 ——
+   * 所以拿到数据之前整行隐藏，避免出现一个点了没反应的按钮。
+   */
+  function renderAuthor() {
+    const box = $('update-author');
+    const link = $('update-author-link');
+    const star = $('btn-update-favorite');
+    if (!box) return;
+    const owner = ownerUrl();
+    const repo = repoUrl();
+    if (!owner || !repo) { box.hidden = true; return; }
+    box.hidden = false;
+    if (link) {
+      link.href = owner;
+      link.dataset.external = owner;
+      link.textContent = repository.split('/')[0];
+    }
+    if (star) star.dataset.external = repo;
+  }
+
+  /**
+   * 更新日志只展示**最新一次**发布的说明，数据直接取自 checkUpdate 的返回。
+   *
+   * 为什么不再单独拉历史列表：历史版本对「本机现在要不要升级」没有帮助 ——
+   * 用户只需要知道最新这版改了什么，再早的改动去 GitHub Releases 页面看更合适。
+   * 顺带少了每次进设置页的一次 GitHub 请求（匿名限额 60 次/时）。
+   *
+   * 与上方「最新版本」天然同源：两者都来自同一次 checkUpdate，不会出现
+   * 版本号是新的、日志还是旧的这种情况。
+   */
+  function renderChangelog() {
+    const body = $('update-log-body');
+    if (!body) return;
+
+    const meta = $('update-log-meta');
+    if (meta) {
+      const tag = String(info?.latestVersion || '').trim();
+      meta.textContent = tag ? `${tag}${checkedAt ? ` · 检查于 ${formatClock(checkedAt)}` : ''}` : '';
+    }
+
+    const notes = String(info?.notes || '').trim();
+    if (!notes) {
+      body.innerHTML = '<div class="update-log-hint">'
+        + (info ? '这个版本没有填写发布说明。' : '点击「检查更新」后，这里会显示最新版本的更新说明。')
+        + '</div>';
+      return;
+    }
+
+    // 正文与「在 GitHub 查看」都在一张静态卡片里，不再折叠：
+    // 只有一份说明，展开/收起反而多一次点击才能看到内容
+    const pageUrl = safeExternal(info?.pageUrl);
+    const html = window.wbMarkdown?.render?.(notes) || '';
+    body.innerHTML = '<div class="rel-note">'
+      + '<div class="rel-note-head">'
+      + `<span class="rel-tag">${esc(info?.latestVersion || '最新版本')}</span>`
+      + (info?.prerelease === true ? '<span class="badge tag warn">预发布</span>' : '')
+      + (formatDateTime(info?.publishedAt)
+        ? `<span class="rel-date">${esc(formatDateTime(info.publishedAt))}</span>`
+        : '')
+      + '</div>'
+      + `<div class="rel-note-body"><div class="md-body">${html || '<p class="md-body-empty">这个版本没有填写发布说明。</p>'}</div>`
+      + (pageUrl
+        ? `<div class="rel-foot"><a href="${esc(pageUrl)}" data-external="${esc(pageUrl)}"`
+          + ' target="_blank" rel="noopener">在 GitHub 查看完整说明</a></div>'
+        : '')
+      + '</div></div>';
+  }
+
+  // ─── 事件 ─────────────────────────────────────
+
+  /** 打开外链：一律交给系统浏览器。webview 里直接导航会白屏，
+   *  而且本程序持有桥接权限，外部链接不该在应用内部打开 */
+  async function openExternal(url) {
+    const target = safeExternal(url);
+    if (!target) { toast('链接地址不受支持', 'err'); return; }
+    try {
+      await api.openReleasePage(target);
+    } catch (error) {
+      toast(`打开链接失败：${error.message}`, 'err');
+    }
+  }
+
+  /**
+   * 事件委托挂在整块面板上：时间轴条目是动态渲染出来的，逐个绑定既费事又容易漏；
+   * 而且 Markdown 正文里任意数量、任意位置的外链也要被同一套逻辑接住。
+   */
+  function onPanelClick(event) {
+    const trigger = event.target.closest('[data-external]');
+    if (!trigger) return;
+    event.preventDefault();   // 掐掉 webview 自己的导航（跳过去只会白屏）
+    void openExternal(trigger.dataset.external);
+  }
+
   async function check() {
-    if (busy) return;
+    if (busy) return null;
     busy = true;
     const button = $('btn-update-check');
     const original = button?.textContent;
@@ -173,32 +334,25 @@
     setState('正在查询 GitHub 上的最新发布版本…');
     try {
       info = await api.checkUpdate();
-      renderVersions();
-      renderNotes();
-      toggleActions();
-      if (info?.hasUpdate === true) {
-        setBadge('有新版本', 'warn');
-        setState(`发现新版本 ${info.latestVersion}（当前 ${info.currentVersion}）。`);
-      } else if (info?.hasUpdate === false) {
-        setBadge('已是最新', 'ok');
-        setState(`当前已是最新版本（${info.currentVersion}）。`);
-      } else {
-        // hasUpdate 为 null：版本号无法比较（本地是开发版或 tag 非语义化）
-        setBadge('无法比较', 'warn');
-        setState(info?.latestVersion
-          ? `最新发布版本为 ${info.latestVersion}，但当前版本号「${info.currentVersion || '未知'}」无法解析，未做新旧判断。`
-          : '仓库暂无发布版本。');
-      }
+      checkedAt = Date.now();
+      if (info?.repository) applyRepository(info.repository);
+      renderCheckResult();
+      // 更新日志与上面那段同源（都是这次 checkUpdate 的结果），一起重绘即可
+      renderChangelog();
     } catch (error) {
       info = null;
       renderVersions();
       toggleActions();
+      renderChangelog();
       setBadge('检查失败', 'bad');
       setState(`检查更新失败：${error.message}`, true);
     } finally {
       busy = false;
       if (button) { button.disabled = false; button.textContent = original; }
     }
+    // 左侧导航的提示：只有确实有新版本才亮，失败与「已是最新」都静默
+    wbApp.updateUpdateBadge?.(info);
+    return info;
   }
 
   async function downloadOrCancel() {
@@ -255,6 +409,10 @@
 
   /** 面板数据入口（切入设置页时调用） */
   async function load() {
+    // 日志与版本号同源，所以先按当前结果铺一次（含启动时那次自动检查）：
+    // 切回来时不会白着一块等接口
+    renderChangelog();
+
     // 先看有没有上次遗留的下载任务（页面切走再回来时进度不丢）
     try {
       const task = await api.updateProgress();
@@ -272,12 +430,22 @@
         return;
       }
     } catch { /* 后端未就绪：按未检查处理 */ }
+
+    // 启动时已经自动检查过一次的话，把那次结果原样铺回来（含检查时刻）。
+    // 这里曾经无条件重置成「未检查」，那样等于把启动检查的结果白白丢掉
+    if (info) { renderCheckResult(); return; }
+
     setBadge('未检查');
     setState('点击「检查更新」查询 GitHub 上的最新发布版本。');
   }
 
+  // ─── 绑定 ─────────────────────────────────────
+
   $('btn-update-check')?.addEventListener('click', check);
   $('btn-update-download')?.addEventListener('click', downloadOrCancel);
+
+  // 面板内的外链统一走委托（含「关于作者」与日志正文里的链接）
+  $('update-notes')?.closest('.panel')?.addEventListener('click', onPanelClick);
 
   window.wbUpdatePanel = { load, check };
 })();

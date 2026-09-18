@@ -5395,7 +5395,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workbuddy-proxy-desktop"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "axum",
  "bytes",
@@ -5414,6 +5414,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "url",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

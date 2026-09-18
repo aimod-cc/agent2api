@@ -23,11 +23,21 @@
 //! 实现方式是**手写状态机**而不是 `Stream` 适配器：转发链路需要
 //! 「请求 → 响应头 → 字节流」三段的显式控制（见 forward.rs），
 //! 状态机让「一个 chunk 进、零到多个 chunk 出」这件事直白可读。
+//!
+//! ── usage 旁路提取（请求统计）────────────────────────────────
+//! 本状态机是 SSE 逐行解析的**唯一入口**，所以 usage 提取挂在这里
+//! （`handle_line` 里那一段）：只读一眼 JSON 的 `usage` 成员、写进
+//! `usage::RequestTelemetry`，完全不参与帧的构造 —— 帧内容与不接钩子时
+//! 逐字节一致（详见该处的注释）。
+
+use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::Value;
 
 use crate::server::logging;
+
+use super::usage::RequestTelemetry;
 
 /// 思考（reasoning_content）帧合并阈值（照抄 Node 的 REASONING_COALESCE_CHARS）
 pub const REASONING_COALESCE_CHARS: usize = 60;
@@ -55,6 +65,11 @@ pub struct ReasoningCoalescer {
     /// 内容损坏。这里按字节缓冲、只在完整行上解码，行为上更正确；
     /// 对「正常分片」的输出与 Node 完全一致。
     tail: Vec<u8>,
+    /// usage 旁路槽（可选）：见 `report_usage` 与 `usage.rs` 的模块说明。
+    /// 放在这里是因为**本状态机就是 SSE 逐行解析的唯一入口** —— 上游每个
+    /// `data:` 帧都会经过 `handle_line`，顺手读一眼 `usage` 不需要再插一层
+    /// 转发器，也就不会给透传路径增加任何中间结构。
+    telemetry: Option<Arc<RequestTelemetry>>,
 }
 
 impl Default for ReasoningCoalescer {
@@ -65,7 +80,12 @@ impl Default for ReasoningCoalescer {
 
 impl ReasoningCoalescer {
     pub fn new() -> Self {
-        Self { acc: String::new(), meta: FrameMeta::default(), tail: Vec::new() }
+        Self { acc: String::new(), meta: FrameMeta::default(), tail: Vec::new(), telemetry: None }
+    }
+
+    /// 带 usage 旁路槽的合并器（流式转发用；`new()` 保留给无统计需求的调用点）
+    pub fn with_telemetry(telemetry: Arc<RequestTelemetry>) -> Self {
+        Self { telemetry: Some(telemetry), ..Self::new() }
     }
 
     /// 吃一段上游字节，吐出要下发给客户端的帧（0..n 个）
@@ -128,6 +148,18 @@ impl ReasoningCoalescer {
             return;
         };
         if chunk.is_object() {
+            // ── usage 旁路提取（请求统计）──────────────────────────
+            // 位置放在「已确定这是合法 JSON 对象」之后、「本行还没被改写」之前。
+            // 为什么**不会影响透传**：这里只读 `chunk` 的一个成员并把它拷进
+            // 另一个结构体，既不修改 `chunk` 也不参与下面 `out` 的构造 ——
+            // 无论命中与否，本函数吐出的帧都与不接这个钩子时逐字节一致。
+            // 提取失败（usage 缺失/非对象）静默跳过：统计少记一条可以接受，
+            // 因此这里没有错误分支，也就没有「异常帧被吞掉」的可能。
+            if let Some(telemetry) = &self.telemetry {
+                if let Some(usage) = chunk.get("usage") {
+                    telemetry.report_usage(usage);
+                }
+            }
             // 元数据取上游最近一帧的有效值（Node: `if (chunkObj.id) meta.id = ...`）
             if let Some(id) = chunk.get("id").filter(|value| is_truthy(value)) {
                 self.meta.id = Some(id.clone());

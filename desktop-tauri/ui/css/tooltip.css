@@ -1,0 +1,120 @@
+/* ─────────────────────────────────────────────
+   组件：小问号提示（tooltip.js 增强出来的气泡）
+   颜色一律取 tokens.css 的语义变量，浅色 / 深色共用同一组声明。
+   ───────────────────────────────────────────── */
+
+/* ─── 触发器：小问号 ───
+   排在分组标题的 <h2> 后面，承担原来常驻一大段的说明文字。
+   尺寸固定 16px，flex 不参与伸缩：标题行是 flex-wrap 布局，
+   问号被压扁或换行都会跟着标题一起乱。 */
+.tip-q {
+  flex: 0 0 auto;
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+  user-select: none;
+  transition: border-color .15s ease, color .15s ease, background .15s ease;
+}
+
+/* hover / 键盘聚焦 / 气泡展开：三者同一档强调，让「这条说明正开着」一眼可辨。
+   background 只提一点色相（--primary-soft），不做实心填充 ——
+   问号是标题的附属标记，实心块会在标题行里抢主次。 */
+.tip-q:hover,
+.tip-q:focus-visible,
+.tip-q.active {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+}
+
+/* 触发器自己要能聚焦（tooltip.js 会补 tabindex），聚焦环按全站口径走 */
+.tip-q:focus-visible { box-shadow: var(--ring); }
+
+@media (prefers-reduced-motion: reduce) {
+  .tip-q { transition: none; }
+}
+
+/* ─── 气泡 ───
+   position: fixed 且打开期间挂在 body 上：.panel 是 overflow:hidden，
+   absolute 的气泡会被卡片裁掉一截（select.js 同样处理，见 css/select.css）。
+   纯展示、不接收指针事件 —— 气泡跟着鼠标跑会挡住下面的控件，
+   也会让「移开问号就收起」的判定失效。 */
+.tip-bubble {
+  position: fixed;
+  z-index: 35;              /* 与下拉浮层同档：在弹窗遮罩（30）之上、轻提示（40）之下 */
+  display: none;
+  max-width: 288px;         /* 18rem 档；内容里有长串时由 tooltip.js 再放宽到 320px */
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  background: var(--primary);
+  /* 主色底上的前景：与主按钮（components.css 的 button.primary）同款派生 ——
+     直接用 --surface 在深色主题会得到近黑字，这里向白提亮才是可读的近白 */
+  color: color-mix(in srgb, var(--surface) 8%, white);
+  font-size: 11.5px;
+  line-height: 1.55;
+  /* 说明里可能带长 URL / 长单词，按词断行，必要时由 JS 升级为 anywhere */
+  overflow-wrap: break-word;
+  word-break: normal;
+  white-space: normal;
+  box-shadow: var(--shadow-3);
+  pointer-events: none;
+  /* 进场起点：由 tooltip.js 按方向下发（top 动画从下往上、bottom 从上往下） */
+  --tip-shift: -4px;
+  --tip-arrow-x: 50%;
+  --tip-origin: 50% 0%;
+}
+
+.tip-bubble.open {
+  display: block;
+  animation: tip-in .15s ease both;
+  transform-origin: var(--tip-origin);
+}
+
+/* ─── 箭头 ───
+   旋转 45° 的同色小方块，由 JS 下发的 --tip-arrow-x 落在锚点正对处。
+   贴在气泡与锚点相邻的那一侧：默认贴着上边缘（气泡在锚点下方），
+   翻到上方时（.is-top）换成下边缘。 */
+.tip-bubble::after {
+  content: "";
+  position: absolute;
+  left: var(--tip-arrow-x);
+  width: 8px;
+  height: 8px;
+  margin-left: -4px;
+  background: var(--primary);
+  transform: rotate(45deg);
+  /* 只留朝外的那一半：整块方块会把气泡边缘顶出一个鼓包 */
+  top: -4px;
+  border-radius: 1px;
+}
+
+.tip-bubble.is-top::after {
+  top: auto;
+  bottom: -4px;
+}
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--tip-shift)) scale(.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 只保留瞬显：缩放与位移一并关掉（透明度也一并去掉，
+     弱动效诉求里「闪一下」同样不受欢迎） */
+  .tip-bubble.open { animation: none; }
+}
