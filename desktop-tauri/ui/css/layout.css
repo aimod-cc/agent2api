@@ -25,10 +25,8 @@
   flex-direction: column;
   gap: 12px;
   padding: 14px 12px 10px;
-  /* 侧栏相对内容画布「退」一档：--surface-inset 浅色下是略灰的近白、深色下比画布更深，
-     同一个变量即可让两种模式都成立，无需分主题写死。 */
-  background: var(--surface-inset);
-  border-right: 1px solid var(--border);
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--sidebar-border);
 }
 
 /* 品牌 */
@@ -37,7 +35,7 @@
   align-items: center;
   gap: 10px;
   padding: 2px 4px 12px;
-  border-bottom: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--sidebar-border);
 }
 
 /* 品牌标：图形由 icons.js 注入（与应用图标 icon.png 同一造型的 SVG）。
@@ -63,7 +61,7 @@
 
 .brand .sub {
   margin-top: 2px;
-  color: var(--text-3);
+  color: var(--sidebar-muted);
   font-size: 11px;
   white-space: nowrap;
 }
@@ -86,7 +84,7 @@
 
 .nav-group-label {
   padding: 8px 8px 5px;
-  color: var(--text-3);
+  color: var(--sidebar-muted);
   font-size: 10.5px;
   font-weight: 600;
   letter-spacing: .09em;
@@ -110,7 +108,7 @@
   /* 导航项是 <button>，components.css 里通用的 button 规则会给它带上 --shadow-1，
      与「平铺的导航列表」冲突；这里显式清掉（.seg-item 也是同样的处理）。 */
   box-shadow: none;
-  color: var(--text-2);
+  color: var(--sidebar-fg);
   font-size: 12.5px;
   font-weight: 500;
   text-align: left;
@@ -132,39 +130,19 @@
    且部分会被系统当成 emoji 渲染成彩色，无法控制。 */
 .nav-item .ico svg { display: block; }
 
-/* hover：一层极淡的叠加底。用 --text 派生的透明色，
-   浅色下是淡灰、深色下是淡白，同一个表达式两套主题都对；
-   比选中态（--primary-soft）更轻，两者形成明确的层级差。
-   带 :not(:disabled) 是为了压过 components.css 里通用的 button:hover ——
-   那个选择器后加载且特异性更高，否则会盖掉这里的叠加底并给导航项描边
-   （与本项目 .seg-item / .copy-btn 的写法一致）。 */
+/* 覆盖通用按钮悬停态，选中项仍保持独立的导航底色。 */
 .nav-item:hover:not(:disabled) {
-  background: color-mix(in oklab, var(--text) 6%, transparent);
+  background: var(--nav-hover);
   color: var(--text);
   border-color: transparent;
 }
 
-/* 选中态：底用品牌浅色，文字与图标点亮。
-   一并声明 .active:hover，让悬停选中项时仍保持选中态，不会被 hover 的浅底顶掉。 */
 .nav-item.active,
-.nav-item.active:hover {
-  color: var(--primary-fg);
-  background: var(--primary-soft);
-  border-color: transparent;
+.nav-item.active:hover:not(:disabled) {
+  color: var(--nav-selected-fg);
+  background: var(--nav-selected-bg);
+  border-color: var(--nav-selected-border);
   font-weight: 600;
-}
-
-/* 选中项左侧的指示条 */
-.nav-item.active::before {
-  content: "";
-  position: absolute;
-  left: -12px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 2px;
-  height: 17px;
-  border-radius: 0 var(--r-xs) var(--r-xs) 0;
-  background: var(--primary);
 }
 
 .nav-item .label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -174,18 +152,16 @@
   min-width: 20px;
   padding: 0 6px;
   border-radius: var(--r-pill);
-  border: 1px solid var(--border);
-  /* 计数用 --surface：两套主题里都比侧栏底和 hover 叠加底更亮，小胶囊才浮得起来；
-     原来的 --surface-3 在深色下比侧栏亮出一大截，会把视线从导航文字上抢走。 */
+  border: 1px solid var(--sidebar-border);
   background: var(--surface);
-  color: var(--text-2);
+  color: var(--sidebar-fg);
   font-size: 10.5px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   text-align: center;
 }
 
-.nav-item.active .count { background: var(--surface); border-color: var(--primary-bd); color: var(--primary-fg); }
+.nav-item.active .count { background: var(--nav-count-bg); border-color: var(--nav-selected-border); color: var(--nav-selected-fg); }
 
 .nav-item .count:not(.muted) { border-color: var(--danger-bd); background: var(--danger-soft); color: var(--danger); }
 .nav-item.active .count:not(.muted) { background: var(--surface); }
@@ -202,24 +178,34 @@
   flex-direction: column;
   gap: 8px;
   padding-top: 10px;
-  border-top: 1px solid var(--hairline);
+  border-top: 1px solid var(--sidebar-border);
 }
 
-/* ─── 网关运行状态 ───
+/* ─── 网关状态 ───
    常驻在侧栏底部：网关是否在监听是本工具最基础的状态，
-   不该只有切到「网关」页才能看到。 */
+   不该只有切到「网关」页才能看到。
+
+   两条独立状态（进程 / 账号）：判据不同、可以任意组合，
+   拆开显示才不会出现「没登录」被说成「网关未就绪」这种误导。 */
 .sidebar-status {
   display: flex;
-  align-items: center;
-  gap: 7px;
+  flex-direction: column;
+  gap: 5px;
   padding: 7px 10px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--sidebar-border);
   border-radius: var(--r-sm);
   /* 侧栏整体是「陷入」的底色，状态卡用 --surface 抬起来，两种主题下都是凸起的一层 */
   background: var(--surface);
-  color: var(--text-2);
+  color: var(--sidebar-fg);
   font-size: 11.5px;
   line-height: 1.4;
+}
+
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
 }
 
 .sidebar-status .txt {
@@ -228,6 +214,21 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+
+/* 异常时的出口按钮：只在端口冲突且能靠结束进程解决时露出（见 app.js）。
+   侧栏只有 216px，两个按钮并排会挤成两行，所以允许换行、各自尽量占满宽度。 */
+.status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 3px;
+}
+
+.status-actions button {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
 }
 
 /* 状态灯：绿=在监听 / 红=未就绪 / 灰=未知或已停止 */
@@ -249,10 +250,12 @@
   50% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--ok) 6%, transparent); }
 }
 
-/* 窄侧栏只留状态灯 */
+/* 窄侧栏只留状态灯；按钮文字太长，一并收起（此时状态灯的颜色仍能提示异常） */
 @media (max-width: 900px) {
-  .sidebar-status { justify-content: center; padding: 8px 0; }
+  .sidebar-status { padding: 8px 6px; align-items: center; }
+  .status-line { justify-content: center; }
   .sidebar-status .txt { display: none; }
+  .status-actions { display: none; }
 }
 
 .theme-switch {
@@ -260,11 +263,8 @@
   gap: 2px;
   padding: 3px;
   border-radius: var(--r-sm);
-  border: 1px solid var(--border);
-  /* 槽取 --surface-inset（两套主题里都比 --surface 低一档）、选中段取 --surface，
-     于是浅色深色都是「亮块浮在凹槽上」。这里不能用 --surface-3 做槽：
-     深色下它比 --surface 更亮，选中块会反过来显得是凹进去的。 */
-  background: var(--surface-inset);
+  border: 1px solid var(--sidebar-border);
+  background: var(--control-bg);
 }
 
 .theme-switch button {
@@ -275,7 +275,7 @@
   background: transparent;
   /* 同样要清掉通用 button 的投影：只有选中的那一档才该浮起来 */
   box-shadow: none;
-  color: var(--text-3);
+  color: var(--sidebar-muted);
   font-size: 11px;
   white-space: nowrap;
   transition: background .15s ease, color .15s ease;
@@ -283,7 +283,7 @@
 
 /* 同样是给通用 button:hover 让路的问题：这里补 :not(:disabled) 提高特异性，
    再排除 .active，让悬停已选中的档位时保持不变（否则会被盖成灰底）。 */
-.theme-switch button:hover:not(:disabled):not(.active) { background: color-mix(in oklab, var(--text) 6%, transparent); color: var(--text); }
+.theme-switch button:hover:not(:disabled):not(.active) { background: var(--nav-hover); color: var(--text); }
 
 .theme-switch button.active,
 .theme-switch button.active:hover {
@@ -504,6 +504,36 @@
      这段留白从列表可视高度里让出（面板 flex:1 自适应），锁高结构不受影响。 */
   padding-bottom: var(--pad);
 }
+
+/* 定时任务页：同一套范式。任务是若干张卡片，条数随功能增加而变多
+   （现在已是六条 + 自动签到），整页滚动会让页头的「刷新」与面板头的徽标
+   一起滚出视野 —— 滚动只留在任务列表里，页头与页脚条常驻。 */
+.page.active[data-page="tasks"] {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  /* 同日志页：给底部留出呼吸空间，这段留白从列表可视高度里让出 */
+  padding-bottom: var(--pad);
+}
+
+.page[data-page="tasks"] .page-head { flex: none; }
+
+.page[data-page="tasks"] .panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+.page[data-page="tasks"] .panel-head,
+.page[data-page="tasks"] .panel-foot { flex: none; }
+
+/* 面板体只是包裹层，真正滚动的是里面的 .task-list（与日志页把滚动放在 .log-list
+   上同一套做法）：面板内边距因此留在滚动区之外，卡片滚到底不会贴着面板边框。 */
+.page[data-page="tasks"] .panel-body { flex: 1; min-height: 0; }
 
 .page[data-page="logs"] .page-head,
 .page[data-page="requests"] .page-head { flex: none; }

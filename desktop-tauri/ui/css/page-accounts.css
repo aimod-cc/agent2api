@@ -9,10 +9,10 @@
    现已没有引用**，包括：
      .acct-grid
      .acct-group-title（含 page-accounts-providers.css 里的 .pgroup-*）
-     .acct-card（含 .selected / .disabled / .is-first 与窄卡片容器查询）
+     .acct-card（含 .selected / .disabled 与窄卡片容器查询）
      .card-head / .pick / .who / .who-name / .who-meta / .card-state / .card-note
      .card-foot / .rank / .card-actions / .order-btns / .row-panels
-   这些**一条都没有删**，理由有两条：
+   这些骨架规则继续保留，理由有两条：
      1. `.order-btns`、`.more-menu`、`.row-panel` 的形制仍被表格直接复用或
         在 page-accounts-table.css 里按同等形制重写了一份，逐条甄别「哪条还活着」
         的成本（以及删错一条就得回滚的风险）高于留着它们的成本；
@@ -49,27 +49,11 @@
   overflow-x: auto;
   /* 常驻预留滚动条槽：有无滚动条时列表区宽度一致，列数不会跳变 */
   scrollbar-gutter: stable;
-  /* 列表区铺 --surface-well 做一层「浅凹」槽底，卡片浮在它上面。
-     这里不能用 --bg：面板外的页面画布就是 --bg，两者同色会让面板内外连成一整片、
-     面板边界只剩 1px 边框在划界 —— 也就是「看不到面板在哪」的观感。
-     也不能用 --surface-inset：那个是「内嵌块的深凹槽」（浅色 0.93 / 深色 0.19），
-     压得太深，一片大面积的列表铺上去会显得整块发暗（用户反馈「有点深了」）；
-     列表区要的是「几乎贴着白、只压一点点」的浅凹，故改用列表区专用的 --surface-well。
-     两个令牌在深色下同值（0.19）、浅色下差 0.04（0.97 vs 0.93），语义与取值都各自独立。
-     深浅两套取值的方向是相反的，但「比卡片暗、卡片浮起」的关系两边都成立：
-       浅色：画布 0.96 → 列表 0.97（比画布略亮）→ 卡片 1.0（最亮）
-       深色：画布 0.21 → 列表 0.19（比画布更深，没有更亮的余量可走）→ 卡片 0.285
-     注意面板底与卡片同是 --surface（浅色 1.0 / 深色 0.285），这两层本来就分不出明度差 ——
-     卡片能浮起来靠的是「坐落在列表底（0.97 / 0.19）之上」这一步，以及 1px 描边与 --shadow-1；
-     列表区正是把这层底垫出来的那一层，所以它必须与卡片有色差，而不是与画布比谁亮。
-     若这里不写背景，会透出 .panel 的 --surface —— 与卡片完全同色，卡片边界就没了。
-     工具条仍在面板白底（--surface）上；批量栏与表脚是 --surface-2 的浅灰条
-     （浅色 0.97 / 深色 0.305）。浅色下这两条与列表区**同值**（都是 0.97）——
-     这是「列表底要 #F5F5F5」的直接结果：#F5F5F5 换算成 oklch 正好是 --surface-2 的 0.97。
-     它们之间还剩 --hairline 那条 1px 分界线，以及卡片网格上下的 16/18px 内边距，
-     边界仍在，只是不再靠色差；深色下列表区 0.19 vs 浅灰条 0.305 差 0.115，分层照旧。
-     背景不会引起滚动条跳动：滚动条槽由上面的 scrollbar-gutter 常驻预留。 */
-  background: var(--surface-well);
+  /* 列表区与所在卡片同色（--table-bg）：表格不再自成一层暗底。
+     区分行与行交给每行的 1px 分隔线（.acct-table td 的 --hairline），
+     而不是靠列表底比承载面更深 —— 那会让内容区在深浅两套主题里都突然「掉下去」一截。
+     横向滚动条槽仍由 scrollbar-gutter 常驻预留，背景不引起列宽跳动。 */
+  background: var(--table-bg);
 }
 
 /* ─── 卡片网格 ───
@@ -123,17 +107,6 @@
   /* 命名容器：底部操作按钮的显隐按卡片自身宽度判断，而不是窗口宽度 */
   container-type: inline-size;
   container-name: card;
-  /* 横向 12px 的来历（封顶口径：轨道 340–353px）：队首卡底部那排最宽 ——
-     P 值带 ★ 41px + 间距 7px + 按钮组 280px = 328px；353px 轨道的内容盒 329px
-     （353 − 12×2）刚好容下，13px 内边距只剩 327px 就不够，于是取 12px。
-     口径与文末 @container 小节一致：内容盒按「轨道宽 − 左右内边距」估。
-     文案缩短成「首选」后这枚按钮从 64px（4 字 46 + 内边距 16 + 描边 2）降到 41px
-     （2 字 23 + 16 + 2），按钮组 280 → 257px、那排 328 → 305px：353px 轨道余 24px，
-     最窄的 340px 轨道（内容盒 316px）余 11px —— 当初的紧约束由此松开，横向内边距
-     要放宽到约 17.5px（340 − 2×17.5 = 305）才会重新吃紧。12px 如今只剩「卡片紧凑」
-     这层观感理由，值维持不动。非队首卡那排是 314px（不带 ★ 少 14px，但换回四字的
-     「设为首选」），也不会被挤到：内容盒 ≤325px 时文末 @container 已把它收起，
-     >325px 时本身就进得去。 */
   padding: 12px 12px 11px;
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
@@ -147,29 +120,10 @@
 .acct-card.selected { border-color: var(--primary-bd); background: var(--primary-soft); }
 .acct-card.selected:hover { border-color: var(--primary); }
 
-/* 队首（该模型实际选中的账号）：左侧一道品牌色竖条，扫一片卡片时一眼能找到 */
-.acct-card.is-first { border-color: var(--primary-bd); }
-
-/* 竖条上下留出卡片圆角的量，否则两端会压在弧线上显得毛糙 */
-.acct-card.is-first::before {
-  content: "";
-  position: absolute;
-  left: -1px;
-  top: calc(var(--r-lg) - 2px);
-  bottom: calc(var(--r-lg) - 2px);
-  width: 3px;
-  border-radius: 0 var(--r-pill) var(--r-pill) 0;
-  background: var(--primary);
-}
-
 /* 已禁用：整卡压暗，和可用账号区分开。
-   底色仍用 --surface，不能用 --surface-2，两套主题下都不成立：
-     浅色：--surface-2 是 0.97，与列表底 --surface-well（0.97）**完全同值** ——
-       禁用卡会与列表底融成一片、只剩 1px 描边在划界，比正常卡（1.0）更看不出边界，
-       与「禁用卡只是退后一档、仍是一张卡」的意图相反；
-     深色：--surface-2 是 0.305，比正常卡（0.285）更亮 —— 方向反了，禁用卡反而更「凸」。
-   保持与正常卡同为 --surface（1.0）后，卡片与列表底（0.97）的浅凹差仍然托得住它；
-   禁用的弱化交给文字压灰（见下面两条 --text-3）与既有描边表达。 */
+   底色仍是 --surface，不用 --surface-2：禁用卡只是「退后一档、仍是一张卡」，
+   换底色会让它和正常卡变成两种材质；弱化交给文字压灰（见下面两条 --text-3）
+   与既有描边表达。 */
 .acct-card.disabled { background: var(--surface); }
 .acct-card.disabled .who-name .name { color: var(--text-3); }
 .acct-card.disabled .rank { color: var(--text-3); }
@@ -454,9 +408,6 @@
 }
 
 .rank .p { color: var(--text-3); font-weight: 500; }
-.rank.is-first { color: var(--primary-fg); }
-.rank.is-first .p { color: var(--primary-fg); opacity: .7; }
-.rank .star { margin-right: 4px; font-size: 10px; line-height: 1; }
 
 .card-actions {
   margin-left: auto;
@@ -481,28 +432,6 @@
   background: var(--primary-soft);
   color: var(--primary-fg);
 }
-
-/* ─── 「首选」：品牌色实心块 ───
-   它不是可点的操作，而是「这支账号就是队首」的状态声明；
-   disabled 只用于阻止重复点击，视觉上不能按禁用态处理。
-   卡片一多就需要一眼扫到首选在哪张，所以做成整排按钮里唯一的实心块。
-
-   底色用 --primary 而非正文色，让队首选中态与全站品牌色统一：
-   该令牌浅色即品牌蓝（与亮蓝观感一致），深色自动调亮，两套主题都协调。
-   前景取「表面色向白提亮」的近白派生，而不是直接用 --surface ——
-   后者在深色主题下是近黑，会变成蓝底黑字、读不清。
-   这也是 components.css 里主按钮 button.primary 的既有手法，保持一致。 */
-.card-actions button.is-current {
-  background: var(--primary);
-  border-color: var(--primary);
-  color: color-mix(in srgb, var(--surface) 8%, white);
-  font-weight: 600;
-  box-shadow: var(--shadow-1);
-}
-
-/* 压过 .btn:disabled 的透明度 —— 否则实心块被冲淡成灰色，
-   在浅色主题下又和普通按钮分不出来了 */
-.card-actions button.is-current:disabled { opacity: 1; }
 
 /* ↑/↓ 拼成一组 */
 .order-btns { display: inline-flex; flex: 0 0 auto; }
@@ -545,7 +474,7 @@
   padding: 5px;
   border: 1px solid var(--border-strong);
   border-radius: var(--r-lg);
-  background: var(--surface);
+  background: var(--surface-raised);
   box-shadow: var(--shadow-3);
 }
 
@@ -635,9 +564,9 @@
 .acct-card .row-panel .row { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
 
 /* ─── 批量栏 ───
-   夹在工具条与卡片区之间的一条状态带：通栏铺满面板，四角交给面板自身的圆角裁切。
-   分隔线用 --hairline —— 这一带自带 --surface-2 底色，已经和卡片区分开，
-   再压一道深边框会平白多出一条重线。 */
+   夹在工具条与列表之间的一条状态带：通栏铺满面板，四角交给面板自身的圆角裁切。
+   底色与面板同色（--surface），只用一条 --hairline 与上下分开 ——
+   这一带不需要靠明度差自证存在，多一层色带反而会再把内容区切成几段。 */
 .batch-bar {
   display: flex;
   align-items: center;
@@ -645,7 +574,7 @@
   flex-wrap: wrap;
   padding: 10px 16px;
   border-bottom: 1px solid var(--hairline);
-  background: var(--surface-2);
+  background: var(--surface);
   color: var(--text-2);
   font-size: 11.5px;
 }
@@ -670,14 +599,15 @@
   font-size: 11.5px;
 }
 
-/* ─── 页脚 ─── */
+/* ─── 页脚 ───
+   与批量栏同一处理：同底色 + 一条 --hairline 分隔线，不再自成一条灰带。 */
 .table-foot {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 10px 16px;
   border-top: 1px solid var(--hairline);
-  background: var(--surface-2);
+  background: var(--surface);
   color: var(--text-3);
   font-size: 11px;
   flex-wrap: wrap;

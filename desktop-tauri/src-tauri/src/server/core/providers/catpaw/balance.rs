@@ -1,43 +1,49 @@
-//! CatPaw 的余额查询（移植来源 `account-balance.mjs` 的 `queryBalance`）。
+//! CatPaw 的余额 / 积分查询（**改走客户端自己的网关 API**）。
 //!
-//! ── 上游长什么样（逐条对照源实现）─────────────────────────────
-//!   `GET https://credit.catpaw.meituan.com/api/credit/balance`
-//!   响应 `{code, message?, data: {userId, totalCredits, availableCredits,
-//!   frozenCredits, expiredCredits}}`，HTTP 401 或 `code === 401` 都表示凭证失效。
+//! ── 上游长什么样 ─────────────────────────────────────────────
+//! ```text
+//!   GET https://catx.nocode.cn/api/gateway/credit/balance
+//!   X-Auth-Token: <auth.json 的 auth.accessToken>
+//!   响应 {code, message, data: {availableCredits, userPlan{…}}, errorCode}
+//! ```
+//! `availableCredits` 是**数字字符串**（如 `"0.00"`），`userPlan` 带套餐名 /
+//! 是否专业版 / 到期时间。没有 `totalCredits`／`frozenCredits`／`expiredCredits`
+//! —— 那是下面那个网页接口才有的口径。
 //!
-//! ── ⚠️ 为什么需要 token2，而不是转发用的登录态（本次移植的关键约束）──
-//! 这个接口要的是**网页会话凭证**：源实现注释写明「要求 passport 会话 token
-//! 同时出现在多个 cookie 名下（`token2` / `mt_c_token` / `isid` / `oops`，
-//! 值相同），只发 `token2` 会 401」。而网关转发用的是 `X-Passport-Token`
-//! （见 `conversation::CatPawCredentials`），那是**同一个登录态的另一份投影**
-//! —— 名字像、来源像，但在这个接口上不认。原项目因此把它做成**单独配置的一项**
-//! （账号文件顶层的 `balanceCookies[id].token2`，带 `token2Tail` / `savedAt`）。
+//! ── ⚠️ 为什么从 `credit.catpaw.meituan.com` 换到这里（本次修正）──
+//! 原实现（移植自 `catpaw-local-proxy/account-balance.mjs`）打的是网页积分中心
+//! `credit.catpaw.meituan.com/api/credit/balance`，并据此要求用户**手填**
+//! 一份 `token2` 网页会话凭证。本地实测（2026-09，逐条复现）表明这套归因是错的：
 //!
-//! 所以本模块的凭证来源有两个，按优先级：
-//!   1. 账号记录里的 `balanceToken`（用户在账号设置里填的，见
-//!      `account_store::catpaw_accounts`）；
-//!   2. 旧数据导入留下的 `balanceCookie.token2`（`catpaw_import.rs` 从原项目的
-//!      `balanceCookies` 搬过来的字段）—— 那份数据本来就是为这个功能存的，
-//!      现在余额功能接回来了，正好把它用上，导入过旧数据的用户零配置可用。
-//! 两者都没有时返回**可识别的「未配置」错误**（见下），而不是「失败」。
+//!   1. **真正生效的 cookie 是 `mt_c_token`，不是 `token2`** —— 单发
+//!      `Cookie: mt_c_token=<凭证>` 就 200；单发 `token2=<同一个值>` 反而 401。
+//!      原注释「必须四个 cookie 名同时出现」不成立（四个同值时当然也 200，
+//!      所以原实现能用，只是把结论归错了因）。
+//!   2. **`token2` 的值就是转发用的那个 `accessToken`** —— 客户端登录后把同一个
+//!      token 批量写进 `.meituan.com` / `.sankuai.com` 域的多个 cookie 名
+//!      （`mt_c_token` / `pay_param_token` / `token2` / `oops`），那是客户端自己的
+//!      行为，不是服务端要求。所以「另配一份凭证」这个前提本身就不存在。
+//!   3. `catx.nocode.cn` 这个网关 API 只认 **`X-Auth-Token`** 头（`X-Passport-Token` /
+//!      `Cookie` / `Authorization` 全部 401），且它的凭证同样是那个 `accessToken`。
 //!
-//! ── 为什么「未配置」是中性的提示而不是红色错误 ─────────────────
-//! 「没填 token2」不是故障：用户什么都没做错，账号本身也完全正常（转发照跑），
-//! 只是他没告诉网关「这台机器的网页登录态长什么样」。把它渲染成红色的
-//! 「查询失败」会让用户以为账号坏了、去排查一个不存在的故障。因此错误文案由
-//! `adapter::usage_not_configured` 统一给出（400 + `usage_not_configured` 标记），
-//! 前端据此显示成类似「未配置查询」的中性提示。
+//! 于是本模块现在**不需要任何额外配置**：凭证直接复用转发那条链的
+//! [`catpaw::credentials::snapshot_for`]（账号记录 / 桌面端实时登录态 / 环境变量
+//! 三处来源一次覆盖），用户填不填 `token2` 都能查。旧字段仍然保留兼容
+//! （见下），但不再是查询的前提。
 //!
-//! ── 出网代理（核对结论）──────────────────────────────────────
-//! 源实现的 `queryBalance` 是**裸 fetch**（没有任何代理参数、没有 client 注入），
-//! 对应本项目的直连：`send_raw(..., proxy = None, ...)`。**不挂账号代理** ——
-//! credit 域与 LLM 域是两个站点，账号代理是给转发那条流式长请求准备的出口
-//! （与小浣熊余额、两家刷新接口同一取舍）。
+//! ── 兼容旧的 `balanceToken` / `balanceCookie.token2` ──────────
+//! 老用户可能已经填过 `balanceToken`，原项目导入的数据里也可能有
+//! `balanceCookie.token2`。两者现在都只当作**凭证来源的一个补充**：转发凭证
+//! 拿不到时（例如账号记录里没有 token）才回退到它们，而不是作为前置要求。
+//! 这样「填过的人不受影响、没填的人也不用再填」。
+//!
+//! ── 出网代理 ────────────────────────────────────────────────
+//! 直连（`proxy = None`）：credit 域与 LLM 域是两个站点，账号代理是给转发那条
+//! 流式长请求准备的出口（与小浣熊余额、两家刷新接口同一取舍）。
 //!
 //! ── 超时 ────────────────────────────────────────────────────
-//! 15 秒（源实现 `REQUEST_TIMEOUT_MS = 15000`）。必须显式设：`egress` 的默认
-//! read_timeout 是 600 秒（给 SSE 留的），不设总超时会让挂住的请求把批量查询
-//! 拖到前端一直转圈。
+//! 15 秒。必须显式设：`egress` 的默认 read_timeout 是 600 秒（给 SSE 留的），
+//! 不设总超时会让挂住的请求把批量查询拖到前端一直转圈。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：零 unwrap/expect/panic。
@@ -49,82 +55,41 @@ use crate::server::core::auth_http::send_raw;
 use crate::server::core::providers::adapter::usage_not_configured;
 use crate::server::errors::GatewayError;
 
-/// 余额接口（源实现 `BALANCE_URL`）
-const BALANCE_URL: &str = "https://credit.catpaw.meituan.com/api/credit/balance";
+/// 积分查询接口（客户端自己的网关 API，凭证与转发同一个 `accessToken`）
+const BALANCE_URL: &str = "https://catx.nocode.cn/api/gateway/credit/balance";
 
-/// 请求超时（源实现 `REQUEST_TIMEOUT_MS`）
+/// 请求超时
 const REQUEST_TIMEOUT_MS: u64 = 15_000;
 
-/// 余额接口要求的 cookie 名（源实现 `PASSPORT_COOKIE_NAMES`）。
-///
-/// **值相同、名字四个都要发**：源实现实测只发 `token2` 会 401。这不是猜测出来的
-/// 兼容写法，是原项目踩过坑之后写进注释的结论，照抄。
-const PASSPORT_COOKIE_NAMES: &[&str] = &["token2", "mt_c_token", "isid", "oops"];
+/// 鉴权头名。**只认这一个**：实测 `X-Passport-Token` / `Cookie` / `Authorization`
+/// 在这个域名下全部 401（见模块头）。
+const AUTH_HEADER: &str = "X-Auth-Token";
 
-/// 浏览器 UA（源实现 `BROWSER_UA`）。
+/// 客户端自己会带的标记头（`gray-set: new-agent-sdk`）。
 ///
-/// 必须显式带：`egress` 的默认 UA 是 `undici`（给计费接口用的），而 credit 域
-/// 是网页接口，非浏览器 UA 会被判为非法请求。
-const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                          (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+/// 实测**非必需**（只带 `X-Auth-Token` 就 200），这里仍然带上：它是客户端请求的
+/// 真实形态，上游若哪天按灰度分组收紧策略，带上它更接近官方调用。
+const GRAY_SET: (&str, &str) = ("gray-set", "new-agent-sdk");
 
-/// 账号记录里的余额凭证字段（用户可在账号设置里填）。
+/// 账号记录里的旧余额凭证字段（用户可在账号设置里填）。
+///
+/// 保留为**回退来源**（见模块头）：新装用户不必填，已填的用户也不用清理。
 pub const BALANCE_TOKEN_FIELD: &str = "balanceToken";
 
-/// 查询某账号的余额（归一化形状见 `ProviderAdapter::query_usage` 的文档）。
+/// 查询某账号的余额 / 积分（归一化形状见 `ProviderAdapter::query_usage` 的文档）。
 pub(super) async fn query_usage(
     store: &AccountStore,
     account_id: &str,
 ) -> Result<Value, GatewayError> {
-    let record = store
-        .catpaw_account_record(account_id)
-        .ok_or_else(|| GatewayError::with_status(404, "账号不存在或不属于 CatPaw"))?;
-    let Some(token2) = balance_token_of(&record) else {
-        return Err(usage_not_configured(
-            "CatPaw",
-            "余额查询凭证（token2）",
-        ));
-    };
-    // uid 用于 cookie 里的 `u` / `userId`（源实现：`cookie.uid || account.uid`）
-    let uid = record
-        .get("uid")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            record
-                .get("balanceCookie")
-                .and_then(|cookie| cookie.get("uid"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        })
-        .unwrap_or("")
-        .to_string();
+    let record = store.catpaw_account_record(account_id);
+    let token = resolve_token(store, account_id, record.as_ref())?;
 
-    let mut cookie_parts: Vec<String> = PASSPORT_COOKIE_NAMES
-        .iter()
-        .map(|name| format!("{name}={token2}"))
-        .collect();
-    if !uid.is_empty() {
-        cookie_parts.push(format!("u={uid}"));
-        cookie_parts.push(format!("userId={uid}"));
-    }
     let headers: Vec<(String, String)> = vec![
-        (
-            "Accept".to_string(),
-            "application/json, text/plain, */*".to_string(),
-        ),
-        ("Cookie".to_string(), cookie_parts.join("; ")),
-        // Referer 不是可选项：源实现带上它（credit 域的同源页面）
-        (
-            "Referer".to_string(),
-            "https://credit.catpaw.meituan.com/".to_string(),
-        ),
-        ("User-Agent".to_string(), BROWSER_UA.to_string()),
+        ("Accept".to_string(), "application/json".to_string()),
+        (AUTH_HEADER.to_string(), token),
+        (GRAY_SET.0.to_string(), GRAY_SET.1.to_string()),
     ];
 
-    // 直连（源实现是裸 fetch，见模块头）
     let response = send_raw(
         "GET",
         BALANCE_URL,
@@ -136,76 +101,88 @@ pub(super) async fn query_usage(
     .await
     .map_err(|error| {
         if error.is_timeout() {
-            GatewayError::with_status(504, "余额查询超时")
+            GatewayError::with_status(504, "积分查询超时")
         } else {
-            GatewayError::with_status(502, format!("余额查询请求失败: {error}"))
+            GatewayError::with_status(502, format!("积分查询请求失败: {error}"))
         }
     })?;
 
     let payload = response.payload.unwrap_or(Value::Null);
     let code = payload.get("code").and_then(Value::as_i64);
-    // HTTP 401 与业务码 401 是两条路径（源实现两个都判）
-    if response.status == 401 || code == Some(401) {
+    // 这个接口的两条凭证失效路径（实测）：4010 = 没带 token，4011 = token 无效。
+    // HTTP 401 也同样处理（两条路径都要判，源实现同此口径）。
+    let unauthorized = response.status == 401 || matches!(code, Some(4010) | Some(4011));
+    if unauthorized {
         return Err(GatewayError::with_status(
             401,
-            "余额查询凭证已过期，请在账号设置里更新 token2",
+            "积分查询凭证已失效，请在客户端重新登录后重新导入登录态",
         ));
     }
     if !response.ok {
         return Err(GatewayError::with_status(
             502,
-            format!("余额查询返回 HTTP {}", response.status),
+            format!("积分查询返回 HTTP {}", response.status),
         ));
     }
     let data = payload.get("data").cloned().unwrap_or(Value::Null);
     if code != Some(0) || data.is_null() {
-        let message = payload
-            .get("message")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                format!(
-                    "余额查询返回异常{}",
-                    code.map(|value| format!(" code={value}")).unwrap_or_default()
-                )
-            });
-        return Err(GatewayError::with_status(502, message));
+        return Err(GatewayError::with_status(502, error_message(&payload)));
     }
 
-    // 明细按「额度状态」列出（这是 CatPaw 侧唯一能拿到的拆分口径：
-    // 上游只给总额 / 可用 / 冻结 / 已过期四个数，没有钱包概念）
-    let wallets: Vec<Value> = [
-        ("total", "总额度", data.get("totalCredits")),
-        ("available", "可用", data.get("availableCredits")),
-        ("frozen", "冻结", data.get("frozenCredits")),
-        ("expired", "已过期", data.get("expiredCredits")),
-    ]
-    .into_iter()
-    .filter_map(|(kind, display_name, value)| {
-        let balance = number_or_null(value)?;
-        Some(json!({ "type": kind, "displayName": display_name, "balance": balance }))
-    })
-    .collect();
+    let user_plan = data.get("userPlan").cloned().unwrap_or(Value::Null);
+    // 只有「可用」一个数：没有钱包概念，因此不给 total/frozen/expired 造零值
+    // （缺失就是缺失，前端显示成「—」，见 number_or_null 的说明）。
+    let wallets: Vec<Value> = [("available", "可用积分", data.get("availableCredits"))]
+        .into_iter()
+        .filter_map(|(kind, display_name, value)| {
+            let balance = number_or_null(value)?;
+            Some(json!({ "type": kind, "displayName": display_name, "balance": balance }))
+        })
+        .collect();
 
     let mut raw = Map::new();
     raw.insert("balance".to_string(), data.clone());
     Ok(json!({
         "available": number_or_null(data.get("availableCredits")),
-        // 美团侧的额度单位就是它自己的 credits（源实现所有文案都叫 credits）
+        // 美团侧的额度单位就是它自己的 credits
         "unit": "credits",
         "wallets": wallets,
-        // 这个接口不含订阅信息（源实现只有余额那一路），字段按契约给 null
-        "subscription": Value::Null,
+        // 这个接口没有订阅对象，但套餐信息在 `userPlan` 里 —— 打包成前端已认得的
+        // 订阅形状（`planName` / `expireTime`），免得为一家新造一个展示分支。
+        "subscription": subscription_of(&user_plan),
         "raw": Value::Object(raw),
     }))
 }
 
-/// 取账号记录里的余额凭证：优先用户填的 `balanceToken`，其次旧数据导入留下的
-/// `balanceCookie.token2`（字段来源见模块头）。
+/// 解析这次查询要用的 token。
 ///
-/// 取不到时返回 None（调用方给「未配置」错误，不是失败）。
-fn balance_token_of(record: &Value) -> Option<String> {
+/// 顺序：
+///   1. **转发链路的凭证**（`snapshot_for`：账号记录 / 桌面端实时登录态 /
+///      环境变量旁路都覆盖）—— 新装与旧装用户都能直接命中，无需任何配置；
+///   2. 旧字段回退：账号记录里的 `balanceToken`，
+///      或原项目导入留下的 `balanceCookie.token2`（见模块头）。
+///
+/// 两处都没有才报「未配置」——那时账号本身多半也是没有凭证的。
+fn resolve_token(
+    store: &AccountStore,
+    account_id: &str,
+    record: Option<&Value>,
+) -> Result<String, GatewayError> {
+    if let Ok(credentials) = super::credentials::snapshot_for(store, account_id) {
+        if !credentials.token.is_empty() {
+            return Ok(credentials.token);
+        }
+    }
+    if let Some(record) = record {
+        if let Some(token) = legacy_balance_token(record) {
+            return Ok(token);
+        }
+    }
+    Err(usage_not_configured("CatPaw", "登录凭证"))
+}
+
+/// 旧数据里的余额凭证：`balanceToken`，或原项目导入留下的 `balanceCookie.token2`。
+fn legacy_balance_token(record: &Value) -> Option<String> {
     let direct = record
         .get(BALANCE_TOKEN_FIELD)
         .and_then(Value::as_str)
@@ -223,10 +200,47 @@ fn balance_token_of(record: &Value) -> Option<String> {
     })
 }
 
+/// `userPlan` → 前端已认得的订阅形状（`null` 表示这个账号没有套餐信息）。
+fn subscription_of(user_plan: &Value) -> Value {
+    if !user_plan.is_object() {
+        return Value::Null;
+    }
+    let name = ["planName", "planId"]
+        .iter()
+        .find_map(|key| user_plan.get(*key).and_then(Value::as_str))
+        .unwrap_or("");
+    json!({
+        "name": name,
+        "expireAt": user_plan.get("expireTime").cloned().unwrap_or(Value::Null),
+        // 上游字段名照实带上：前端若要区分「专业版」都够用，不必在这里改名
+        "autoRenew": user_plan.get("autoRenew").cloned().unwrap_or(Value::Null),
+        "pro": user_plan.get("pro").cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// 上游的业务错误文案（`message` 为空时给一个带 code 的兜底）。
+fn error_message(payload: &Value) -> String {
+    payload
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "积分查询返回异常{}",
+                payload
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .map(|value| format!(" code={value}"))
+                    .unwrap_or_default()
+            )
+        })
+}
+
 /// 数值字段透传（缺失/非数字给 None —— 前端把它显示成「—」而不是 0）。
 ///
-/// 为什么不用 0 兜底：`frozenCredits` 缺失与「冻结额度是 0」是两件事，
-/// 前者是上游没给，后者是明确的零；都显示成 0 会让人以为冻结额度被清空了。
+/// 上游把 `availableCredits` 给成**字符串**（`"0.00"`），因此这里必须同时接受
+/// 字符串与数字两种形态。
 fn number_or_null(value: Option<&Value>) -> Option<f64> {
     match value? {
         Value::Number(number) => number.as_f64().filter(|item| item.is_finite()),

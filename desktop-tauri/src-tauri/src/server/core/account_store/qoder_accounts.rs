@@ -1,0 +1,171 @@
+//! Qoder 账号以地区 + userId 识别；凭证与其它提供商共享存储键名。
+
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+
+use crate::server::core::providers::qoder::credentials::Credentials;
+use crate::server::core::providers::qoder::endpoints::Region;
+use crate::server::core::providers::{kind_id, ProviderKind};
+use crate::server::logging;
+
+use super::priority::next_free_priority;
+use super::state::StoredAccount;
+use super::store::{AccountStore, AccountStoreError};
+use super::store_util::{token_tail_of, truncate_chars};
+use super::{CredentialWrite, MAX_ACCOUNTS};
+
+const PROVIDER: &str = kind_id(ProviderKind::Qoder);
+
+impl AccountStore {
+    pub fn qoder_account_record(&self, account_id: &str) -> Option<Value> {
+        let guard = self.guard();
+        let state = self.load(&guard);
+        state.accounts.iter()
+            .filter(|record| record.provider() == PROVIDER)
+            .filter(|record| {
+                if account_id.is_empty() { record.enabled() && record.has_token() }
+                else { record.id() == account_id }
+            })
+            .min_by_key(|record| record.order_key())
+            .map(StoredAccount::to_value)
+    }
+
+    pub fn add_qoder_account(
+        &self,
+        credentials: &Credentials,
+        name: Option<&str>,
+        source: &str,
+    ) -> Result<Value, AccountStoreError> {
+        let mut credentials = credentials.clone();
+        credentials.complete_identity()
+            .map_err(|error| AccountStoreError::new(error.message, error.status_code))?;
+        let guard = self.guard();
+        let mut state = self.load(&guard);
+        let existing = state.accounts.iter().find(|record| {
+            record.provider() == PROVIDER && record.user_id() == credentials.user_id
+                && Region::from_payload(&record.to_value()).ok() == Some(credentials.region)
+        }).cloned();
+        if existing.is_none() && state.accounts.len() >= MAX_ACCOUNTS {
+            return Err(AccountStoreError::bad_request(format!("最多保存 {MAX_ACCOUNTS} 个账号")));
+        }
+        let id = existing.as_ref().map(|record| record.id().to_string()).unwrap_or_else(|| {
+            format!("qoder-{}-{:x}", credentials.region.id(), Sha256::digest(credentials.user_id.as_bytes()))
+        });
+        if existing.is_none() && state.accounts.iter().any(|record| record.id() == id) {
+            return Err(AccountStoreError::new("Qoder 账号 ID 已被其它账号占用，请先核对账号记录", 409));
+        }
+        let record_name = name.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
+            .or_else(|| existing.as_ref().map(StoredAccount::name).filter(|value| !value.is_empty()))
+            .unwrap_or_else(|| {
+                if !credentials.name.is_empty() { credentials.name.clone() }
+                else if !credentials.email.is_empty() { credentials.email.clone() }
+                else { format!("Qoder {}", credentials.user_id) }
+            });
+        let mut fields = existing.as_ref().map(|record| record.fields().clone()).unwrap_or_default();
+        if let Value::Object(values) = credentials.to_value() {
+            for (key, value) in values {
+                // 空值不覆盖既有内容：重新添加时只给了一个 access token（或过期
+                // 时间缺失）不该把上次的 refreshToken / expiresAt 洗掉 —— 那会让
+                // 一个本来能自动续期的账号在下次导入后变成只能等过期。
+                if value.is_null() {
+                    continue;
+                }
+                if matches!(&value, Value::String(text) if text.is_empty()) {
+                    continue;
+                }
+                fields.insert(key, value);
+            }
+        }
+        let priority = existing.as_ref().map(StoredAccount::priority).unwrap_or_else(|| {
+            next_free_priority(&state.accounts.iter().map(StoredAccount::priority).collect::<Vec<_>>())
+        });
+        fields.insert("id".to_string(), Value::String(id.clone()));
+        fields.insert("provider".to_string(), Value::String(PROVIDER.to_string()));
+        fields.insert("name".to_string(), Value::String(truncate_chars(&record_name, 100)));
+        fields.insert("tokenTail".to_string(), Value::String(token_tail_of(&credentials.access_token)));
+        fields.insert("priority".to_string(), Value::from(priority));
+        fields.insert("enabled".to_string(), Value::Bool(existing.as_ref().map(StoredAccount::enabled).unwrap_or(true)));
+        fields.insert("desktop".to_string(), Value::Bool(false));
+        fields.insert("source".to_string(), Value::String(source.to_string()));
+        fields.insert("addedAt".to_string(), Value::from(existing.as_ref().map(StoredAccount::added_at).unwrap_or_else(logging::now_ms)));
+        fields.insert("updatedAt".to_string(), Value::from(logging::now_ms()));
+        fields.insert("rateLimits".to_string(), json!({}));
+        for key in ["edition", "endpoint", "prefixPath", "platform", "access", "refresh", "expires", "pat"] {
+            fields.remove(key);
+        }
+        let record = StoredAccount::from_map(fields);
+        if let Some(index) = state.accounts.iter().position(|item| item.id() == id) {
+            state.accounts[index] = record.clone();
+        } else {
+            state.accounts.push(record.clone());
+        }
+        self.save(&state, &guard)?;
+        logging::log("[Accounts]", &format!("✅ Qoder {}账号已保存（优先级 {priority}）", credentials.region.label()));
+        Ok(self.public_account(&record))
+    }
+
+    pub fn update_qoder_credentials_if_current(
+        &self,
+        expected: &Value,
+        credentials: &Credentials,
+    ) -> Result<CredentialWrite, AccountStoreError> {
+        let id = expected.get("id").and_then(Value::as_str).unwrap_or("");
+        let guard = self.guard();
+        let mut state = self.load(&guard);
+        let Some(record) = state.accounts.iter_mut().find(|record| record.id() == id && record.provider() == PROVIDER) else {
+            return Ok(CredentialWrite::Stale);
+        };
+        for key in ["accessToken", "refreshToken", "mode", "userId", "machineId", "addedAt"] {
+            if record.get(key) != expected.get(key) {
+                return Ok(CredentialWrite::Stale);
+            }
+        }
+        if record.user_id() != credentials.user_id
+            || Region::from_payload(&record.to_value()).ok() != Some(credentials.region)
+        {
+            return Err(AccountStoreError::bad_request("Qoder 刷新结果与原账号身份不一致"));
+        }
+        if let Value::Object(values) = credentials.to_value() {
+            for (key, value) in values {
+                // 空值不覆盖既有内容：刷新结果里缺某一项（上游没回过期时间）时
+                // 不该把记录里仍然有效的值洗成空。
+                if value.is_null() || matches!(&value, Value::String(text) if text.is_empty()) {
+                    continue;
+                }
+                record.fields_mut().insert(key, value);
+            }
+        }
+        record.set("tokenTail", Value::String(token_tail_of(&credentials.access_token)));
+        record.set_updated_at(logging::now_ms());
+        self.save(&state, &guard)?;
+        Ok(CredentialWrite::Written)
+    }
+
+    pub fn to_qoder_public_account(&self, record: &StoredAccount) -> Value {
+        let region = Region::from_payload(&record.to_value()).ok();
+        let available = record.has_token() && region.is_some();
+        let can_refresh = Credentials::from_payload(&record.to_value())
+            .map(|credentials| credentials.can_refresh()).unwrap_or(false);
+        let mut public = Map::new();
+        for key in ["id", "provider", "name", "userId", "email", "nickname", "mode", "source", "tokenTail", "expiresAt"] {
+            public.insert(key.to_string(), record.get(key).cloned().unwrap_or(Value::Null));
+        }
+        public.insert("edition".to_string(), region.map(|value| Value::String(value.edition().to_string())).unwrap_or(Value::Null));
+        public.insert("editionLabel".to_string(), region.map(|value| Value::String(value.label().to_string())).unwrap_or(Value::Null));
+        public.insert("hasRefreshToken".to_string(), Value::Bool(can_refresh));
+        public.insert("priority".to_string(), Value::from(record.priority()));
+        public.insert("enabled".to_string(), Value::Bool(record.enabled()));
+        public.insert("addedAt".to_string(), Value::from(record.added_at()));
+        public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
+        public.insert("proxy".to_string(), crate::server::core::proxies::describe_account_proxy(Some(&record.proxy())));
+        public.insert("rateLimits".to_string(), record.get("rateLimits").cloned().unwrap_or_else(|| json!({})));
+        public.insert("desktop".to_string(), Value::Bool(false));
+        public.insert("available".to_string(), Value::Bool(available));
+        // `chatSupported` **刻意不在这里写**：它是跨家的统一事实，由
+        // `store.rs::public_account` 在分派点按适配器的 `supports_chat()` 注入。
+        // 本函数早先硬编码过 `false`（Qoder 只有账号管理能力那会儿），
+        // 而那个值会被分派点的注入覆盖 —— 留着它只会在下一次读这段代码时
+        // 误导「这家不能转发」，且一旦注入被挪走就会静默失真。
+        Value::Object(public)
+    }
+}

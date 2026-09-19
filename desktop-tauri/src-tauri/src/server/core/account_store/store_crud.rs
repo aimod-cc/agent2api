@@ -369,18 +369,11 @@ impl AccountStore {
         Ok(())
     }
 
-    /// 置顶账号：把它变成转发顺序第一位，也就是「当前账号」。
+    /// 把账号移到全局队列第一位，其余账号的相对顺序保持不变。
     ///
-    /// 这是「设为当前」的实际动作 —— 优先级唯一的前提下，与其让用户手工去猜
-    /// 一个比所有人都小的数，不如直接把目标移到队首再整队连续编号，其余账号
-    /// 相对顺序保持不变。目标若处于禁用状态会一并启用：这个动作的语义是
-    /// 「现在开始用它」，只置顶不启用只会让人以为没生效。
-    ///
-    /// ── 队首是**全局**队首 ────────────────────────────────────
-    /// 四家账号共用一条队列，置顶就是把它排到所有账号之前，整队连续编号。
-    ///
-    /// ── 响应里的 `currentAccountId` ───────────────────────────
-    /// 与 `/api/session` 的 `session.currentAccountId` 同源（全局队首）。
+    /// 置顶只调整优先级，不改变启用状态；禁用账号仍不参与转发。
+    /// `currentAccountId` 保留「首个启用且有可用凭证的账号」的语义，
+    /// 不一定指向本次置顶的账号。
     pub fn promote_to_front(&self, id: &str) -> Result<Value, AccountStoreError> {
         let _guard = self.guard();
         let mut state = self.load(&_guard);
@@ -391,13 +384,6 @@ impl AccountStore {
         let mut ordered = state.accounts.clone();
         ordered.sort_by_key(StoredAccount::order_key);
         let mut changes: Vec<String> = Vec::new();
-
-        if let Some(record) = ordered.iter_mut().find(|item| item.id() == id) {
-            if !record.enabled() {
-                record.set_enabled(true);
-                changes.push("已启用".to_string());
-            }
-        }
 
         let position = ordered.iter().position(|item| item.id() == id).unwrap_or(0);
         if position > 0 {
@@ -422,12 +408,10 @@ impl AccountStore {
             ));
         }
         if changes.is_empty() {
-            // 「已是当前账号，无需切换」：Node 版的路由会把 list 补进这个结果，
-            // 所以这里也带上 —— 前端拿到响应后可以直接用同一份快照刷新列表
             return Ok(json!({
                 "id": id,
                 "changed": false,
-                "reason": "已是当前账号",
+                "reason": "已在全局队列第一位",
                 "currentAccountId": Self::pick_current(&state.accounts)
                     .map(|record| Value::String(record.id().to_string()))
                     .unwrap_or(Value::Null),

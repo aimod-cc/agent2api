@@ -7,7 +7,9 @@
 /* ─── 按钮 ───
    基础 button 保留一层默认外观：账号行、代理表单等处由 JS 动态生成按钮，
    出厂样式能保证它们不会变成没有边框的裸文字。
-   .btn 用于静态结构，样式更精细。 */
+   .btn 用于静态结构，样式更精细。
+   填充与描边取 --control-* 一组：它们与承载面（--surface / --surface-2）分开，
+   于是按钮在内容表面提亮之后依然立得住，不再需要靠压暗整块内容来衬托。 */
 button {
   display: inline-flex;
   align-items: center;
@@ -15,9 +17,9 @@ button {
   gap: 6px;
   height: 30px;
   padding: 0 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--r-md);
-  background: var(--surface);
+  background: var(--control-bg);
   color: var(--text);
   font-size: 12.5px;
   font-weight: 500;
@@ -26,7 +28,7 @@ button {
   transition: background .15s ease, border-color .15s ease, color .15s ease, transform .08s ease;
 }
 
-button:hover:not(:disabled) { background: var(--surface-3); border-color: var(--border-strong); }
+button:hover:not(:disabled) { background: var(--control-hover); border-color: var(--control-border-hover); }
 button:active:not(:disabled) { transform: translateY(.5px); }
 button:disabled { opacity: .45; box-shadow: none; cursor: not-allowed; }
 
@@ -53,7 +55,7 @@ button.danger:hover:not(:disabled) {
 }
 
 button.ghost { background: transparent; border-color: transparent; box-shadow: none; color: var(--text-2); }
-button.ghost:hover:not(:disabled) { background: var(--surface-3); color: var(--text); border-color: transparent; }
+button.ghost:hover:not(:disabled) { background: var(--control-hover); color: var(--text); border-color: transparent; }
 
 /* 小号按钮按比例收一号圆角：26px 高配 12.8px 圆角会显得过圆。
    行内控件档（分页、卡片内操作）都落在这一档 */
@@ -68,9 +70,9 @@ button.icon.sm { width: 26px; }
   gap: 5px;
   min-height: 21px;
   padding: 1px 9px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--r-pill);
-  background: var(--surface-3);
+  background: var(--control-bg);
   color: var(--text-2);
   font-size: 11.5px;
   font-weight: 600;
@@ -241,9 +243,9 @@ textarea {
   min-width: 0;
   height: 30px;
   padding: 0 10px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--r-md);
-  background: var(--surface);
+  background: var(--control-bg);
   color: var(--text);
   font-size: 12.5px;
   outline: none;
@@ -263,7 +265,7 @@ textarea {
 }
 
 input::placeholder, textarea::placeholder { color: var(--text-3); }
-input:hover:not(:disabled), select:hover:not(:disabled), textarea:hover:not(:disabled) { border-color: var(--border-strong); }
+input:hover:not(:disabled), select:hover:not(:disabled), textarea:hover:not(:disabled) { border-color: var(--control-border-hover); }
 
 input:focus, select:focus, textarea:focus {
   border-color: var(--primary);
@@ -302,7 +304,7 @@ input[type="number"] { max-width: 130px; }
 .input-affix .affix { position: absolute; left: 10px; color: var(--text-3); font-size: 12px; pointer-events: none; }
 .input-affix input { padding-left: 28px; }
 
-/* ─── 单选卡片（登录方式 / 账号版本 / 代理模式） ─── */
+/* ─── 单选卡片（账号版本 / 代理模式） ─── */
 .edition-option {
   display: inline-flex;
   align-items: center;
@@ -410,14 +412,15 @@ input[type="number"] { max-width: 130px; }
   pointer-events: auto;
 }
 
-/* ─── 分段控件（账号页筛选） ─── */
+/* 分段控件（账号页筛选）：槽取 --control-* 一组，与按钮同源 ——
+   它现在坐在内容表面上，需要靠自身填充而不是反衬底色来立住。 */
 .seg {
   display: inline-flex;
   gap: 2px;
   padding: 2px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--r-md);
-  background: var(--surface-3);
+  background: var(--control-bg);
 }
 
 /* 分段项嵌在 .seg 里，圆角要按「外圆角 - 内边距」收一号，
@@ -440,7 +443,7 @@ input[type="number"] { max-width: 130px; }
 }
 
 /* 未选中项用中性叠加：深色叠白、浅色叠黑，同一行声明两边都成立 */
-.seg-item:hover:not(:disabled) { background: color-mix(in oklab, var(--text) 6%, transparent); color: var(--text); }
+.seg-item:hover:not(:disabled) { background: var(--nav-hover); color: var(--text); }
 
 /* 选中项走品牌浅底，与导航选中态、单选卡片保持一致 */
 .seg-item.active {
@@ -489,7 +492,7 @@ input[type="number"] { max-width: 130px; }
   .toolbar .actions { flex-basis: 100%; margin-left: 0; }
 }
 
-/* 模型筛选下拉：选中的模型决定「限额」口径与列表里的首选账号，
+/* 提供商筛选下拉：它决定列表里显示哪些家的账号，
    比同排普通下拉重一档，边框取强调色而不是用字重硬顶 */
 .model-select {
   max-width: 200px;

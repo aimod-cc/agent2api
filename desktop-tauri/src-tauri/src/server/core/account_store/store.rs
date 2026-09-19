@@ -222,10 +222,19 @@ impl AccountStore {
     /// 凭证」的账号。这是账号页 ★ / 「首选」与 `/api/session` 的 `currentAccountId`
     /// 的数据源。对某个具体模型实际先用谁还要看它是否支持该模型、是否限流中，
     /// 那是转发层按请求逐次判定的（`routing::pick_account_by_priority`）。
+    ///
+    /// ── 为什么排除**没有转发能力**的家（历史用法，五家现已都能转发）──
+    /// 这个值的消费方都把它当「会承接请求的那个账号」用：`/api/session` 的
+    /// `currentAccountId` 决定顶栏显示的昵称/过期时间，`clear_session`（退出登录）
+    /// 按它**删除账号**，界面的 ★ / 「设为首选」也按它渲染。Qoder 只有账号管理
+    /// 能力那会儿（转发返回 501）必须排除：排进队首会让顶栏把它显示成当前登录态，
+    /// 而「退出登录」会把它删掉。它接上推理协议后，这条过滤对它就自然失效了 ——
+    /// 判据取自适配器的**恒定能力声明**（`supports_chat`），不写死 provider id，
+    /// 因此两家各自的接线时点都不需要改这里。
     pub(crate) fn pick_current(accounts: &[StoredAccount]) -> Option<StoredAccount> {
         let mut candidates: Vec<StoredAccount> = accounts
             .iter()
-            .filter(|item| item.enabled() && item.has_credentials())
+            .filter(|item| item.enabled() && item.has_credentials() && forwards_requests(item))
             .cloned()
             .collect();
         candidates.sort_by_key(StoredAccount::order_key);
@@ -572,13 +581,13 @@ impl AccountStore {
     /// 波次里补一个分支即可 —— 那条分支落地前，万一有手改的账号记录落进这里，
     /// 走 workbuddy 形状总比整条列表报错好。
     ///
-    /// ── `hasCredentials`：四家统一的「有可用凭证」事实（口径修复）──
-    /// 在这里**统一注入**而不是改四家的公开形态函数：判据只有一条
-    /// （`StoredAccount::has_credentials`，桌面端实时账号也算有凭证），
-    /// 而「谁有凭证」正是转发选路与「当前账号」派生共用的那道闸门。前端要按模型
+    /// ── `hasCredentials` / `chatSupported`：统一注入的**跨家事实** ──────
+    /// 在这里**统一注入**而不是改各家的公开形态函数：判据只有一条
+    /// （`has_credentials` / 适配器的 `supports_chat`），而「谁有凭证」「谁能转发」
+    /// 正是转发选路与「当前账号」派生共用的那两道闸门。前端要按模型
     /// 自行推算「这一家此刻会走谁」时（后端只给不限模型的队首），必须拿得到同一
     /// 事实，否则会出现「界面标 ★ 的账号其实转发时会因无凭证被跳过」的分歧。
-    /// 放在分派点让四家形状**同字段名、同语义**，前端不必按 provider 查表。
+    /// 放在分派点让各家形状**同字段名、同语义**，前端不必按 provider 查表。
     ///
     /// 纯新增字段：各家的既有字段一个不动，旧客户端忽略它即可。
     pub(crate) fn public_account(&self, record: &StoredAccount) -> Value {
@@ -588,6 +597,8 @@ impl AccountStore {
             self.to_catpaw_public_account(record)
         } else if record.provider() == super::AUTOCLAW_PROVIDER_ID {
             self.to_autoclaw_public_account(record)
+        } else if record.provider() == super::QODER_PROVIDER_ID {
+            self.to_qoder_public_account(record)
         } else {
             self.to_public_account(record)
         };
@@ -596,6 +607,15 @@ impl AccountStore {
                 fields.insert(
                     "hasCredentials".to_string(),
                     Value::Bool(record.has_credentials()),
+                );
+                // 没有转发能力的家：界面据此说明「启用了也不会被转发」，
+                // 而不是把一个失效的启用开关当成正常账号展示。
+                // 五家现在都能转发，所以正常配置下这里恒为 true ——
+                // 保留这个字段是因为「能用账号管理、但转发还没接上」这种过渡期
+                // 状态将来还会出现，而界面需要有办法如实说出来。
+                fields.insert(
+                    "chatSupported".to_string(),
+                    Value::Bool(forwards_requests(record)),
                 );
                 Value::Object(fields)
             }
@@ -706,6 +726,19 @@ pub(crate) fn live_desktop_credentials(record: &StoredAccount) -> Option<(String
         credentials.refresh_token,
         credentials.expires_at.unwrap_or(0.0),
     ))
+}
+
+/// 这条账号记录所属的 provider **是否能承接推理转发**（`ProviderAdapter::supports_chat`）。
+///
+/// 全局队首要排除「只有账号管理能力」的家（Qoder 在接上推理协议之前就是）：
+/// 它会被顶栏当成当前登录态显示，而「退出登录」按队首**删除账号**。
+/// 判据问适配器，不写死 id —— 于是某家从「只有账号管理」走到「也能转发」时，
+/// 这里一行都不用改；未知 provider id（手改文件塞进来的）按「能转发」处理 ——
+/// 与 `public_account` 的兜底口径一致，不让一条陌生记录把队首派生整个清空。
+pub(crate) fn forwards_requests(record: &StoredAccount) -> bool {
+    crate::server::core::providers::kind_from_id(&record.provider())
+        .map(|kind| crate::server::core::providers::adapter::adapter_for(kind).supports_chat())
+        .unwrap_or(true)
 }
 
 /// 把解析结果拆成 `(proxy, proxyError)`：失败时 proxy 为 null、

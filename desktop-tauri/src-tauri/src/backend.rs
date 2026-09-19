@@ -57,6 +57,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::gateway::proxy_port;
+use crate::port_conflict::{ConflictKind, Occupant, PortConflict, StartupFailure};
 use crate::server;
 use crate::state::AppState;
 
@@ -84,29 +85,40 @@ pub async fn is_ready(port: u16) -> bool {
 
 /// 确保后端可用：构造服务状态 → 绑定端口 → 异步 accept 循环 → 本地自检。
 ///
-/// 失败一律返回可读的中文说明（调用方把错误原样透给 UI 的
-/// `backend:error` 事件），不 panic —— release profile 是 panic=abort。
-pub async fn ensure_ready(app: &AppHandle) -> Result<(), String> {
+/// 失败返回 [`StartupFailure`]（调用方把它原样透给 UI 的 `backend:error` 事件
+/// 与 `backend_status` 命令），不 panic —— release profile 是 panic=abort。
+///
+/// 为什么要带结构而不只是一句话：端口冲突有两种性质相反的原因（被别的进程占用
+/// vs 落在系统保留段里），界面据此给的出路完全不同，而分类所需的 OS 错误码
+/// 只有在 bind 失败的那一刻才拿得到。详见 `crate::port_conflict`。
+pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     let port = proxy_port();
 
     // 起服务：日志库与配置在这里初始化（bootstrap 内部完成）。
     // 失败一律原样返回：`bootstrap` 只在「本该执行的目录迁移没有执行」时返回
     // Err（防御性校验，见那边的注释）—— 继续下去会把新配置目录建出来，
     // 让迁移永远无法重试，所以这里必须中断而不是带着错误往下走。
-    let state = server::ServerState::bootstrap(port)?;
+    let state = server::ServerState::bootstrap(port).map_err(StartupFailure::other)?;
 
     // 端口已被占用：唯一合法的占用者是「本产品的旧版 node 网关」（升级场景），
     // 先尝试自动接管；接管不了（别的程序 / 用户手工起的服务）才走报错。
     // 这里不静默复用（见模块头部说明）—— 复用别人的端口等于把管理 API
     // 交给一个不受控的旧版本进程。
     if is_ready(port).await && !reclaim_port_from_legacy(port).await {
-        return Err(format!(
-            "{port} 端口上已有服务在响应：可能是旧版网关（node server.mjs）尚未退出。\
-             请先结束它再启动本程序，或用环境变量 AGENT2API_PROXY_PORT 指定其它端口\
-             （旧名 WORKBUDDY_PROXY_PORT 仍有效）。"
-        ));
+        // 端口上有服务应答但接管失败：属于「被占用」这一类，查出监听进程
+        // 一并交给界面（能查出进程时用户就不必自己去翻 netstat）
+        let occupant = occupant_of(port);
+        return Err(StartupFailure::port(PortConflict::new(
+            ConflictKind::Occupied,
+            port,
+            occupant,
+            "端口上已有服务在响应",
+        )));
     }
-    let shutdown_tx = server::start(&state)?;
+    let shutdown_tx = server::start(&state).map_err(|conflict| {
+        // bind 失败：补上「谁占着」再交给界面（查进程是平台细节，见 backend 模块头）
+        StartupFailure::port(conflict.with_occupant(occupant_of(port)))
+    })?;
 
     // 句柄先入 state：即使后面的自检失败，退出路径也能正常发停机信号，
     // 不会留下一个「已经起来但没人管」的监听端口
@@ -115,7 +127,7 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), String> {
         let mut guard = app_state
             .backend
             .lock()
-            .map_err(|_| "服务器状态锁不可用".to_string())?;
+            .map_err(|_| StartupFailure::other("服务器状态锁不可用"))?;
         guard.shutdown_tx = Some(shutdown_tx);
         guard.port = port;
     }
@@ -126,6 +138,12 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), String> {
     while std::time::Instant::now() < deadline {
         if is_ready(port).await {
             server::logging::log("[Server]", &format!("服务已就绪（127.0.0.1:{port}）"));
+            // 起来了就清掉上一次的失败记录：那条记录描述的是「之前起不来」，
+            // 留着会让界面在网关正常运行时仍显示「端口被占用」——
+            // 用户刚结束完进程重启，看到这个只会以为没生效。
+            if let Ok(mut guard) = app.state::<AppState>().backend.lock() {
+                guard.failure = None;
+            }
             // 升级迁移收尾：清掉旧版安装目录残留的 node.exe / server.cjs。
             // 放在就绪之后 —— 网关可用是本程序存在的意义，先保主链路再清磁盘。
             cleanup_legacy_resources();
@@ -133,9 +151,101 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), String> {
         }
         tokio::time::sleep(HEALTH_INTERVAL).await;
     }
-    Err(format!(
+    Err(StartupFailure::other(format!(
         "服务启动超时（{port} 端口未就绪）：端口已绑定但健康检查未通过，请查看运行日志"
-    ))
+    )))
+}
+
+/// 查端口上的监听进程（PID、镜像名、路径，以及两个身份标记）。
+///
+/// 查不到返回 None —— 这可能是因为权限不足（别人的进程），也可能因为端口
+/// 根本没被进程占着（系统保留段就是这种：`netstat` 里空无一物）。两种情况
+/// 都不该编造一个「占用者」出来。
+pub fn occupant_of(port: u16) -> Option<Occupant> {
+    let (pid, path) = listener_process(port)?;
+    let name = Path::new(&path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    let self_pid = std::process::id();
+    Some(Occupant {
+        pid,
+        name,
+        path: path.clone(),
+        is_self: pid == self_pid,
+        system: inside_system_dir(&path),
+    })
+}
+
+/// 结束占用端口的进程（含其子树），并在宽限期内确认端口真的释放。
+///
+/// **只结束 `occupant` 里那个 PID**，不做「按端口号无差别清理」：端口在两次
+/// 查询之间易主时，无差别清理会杀掉一个无辜的进程。结束前由调用方（界面）
+/// 把进程名与路径显示给用户确认 —— 这个函数本身不做询问，它是个动作。
+///
+/// 返回结束后的端口状态：`Ok(())` 表示端口已可 bind（可以重试启动了）；
+/// Err 是仍然存在的冲突（例如系统保留段 —— 那里根本没有进程可杀）。
+pub fn end_occupant(port: u16, occupant: &Occupant) -> Result<(), PortConflict> {
+    // 本进程自己：结束它等于让界面所在的程序退出，这是用户无法预期的行为，
+    // 一律拒绝（界面在这种情况下也不该给出这个按钮，这里是第二道闸）。
+    if occupant.is_self {
+        return Err(PortConflict::new(
+            ConflictKind::Other,
+            port,
+            None,
+            "该进程就是本程序自己，不能结束",
+        ));
+    }
+    if occupant.system {
+        return Err(PortConflict::new(
+            ConflictKind::Other,
+            port,
+            None,
+            "该进程属于系统组件，不应由本程序结束",
+        ));
+    }
+
+    if !kill_process_tree(occupant.pid) {
+        return Err(PortConflict::new(
+            ConflictKind::Other,
+            port,
+            None,
+            &format!(
+                "结束进程失败（PID {}，{}）：可能权限不足，请以管理员身份重试",
+                occupant.pid, occupant.name
+            ),
+        ));
+    }
+
+    server::logging::log(
+        "[Server]",
+        &format!(
+            "已结束占用端口的进程（PID {}，{}）",
+            occupant.pid, occupant.name
+        ),
+    );
+    Ok(())
+}
+
+/// 结束进程后等端口释放：强杀后监听句柄立即关闭，但给安全软件拦截、
+/// 进程退出钩子这类抖动留一个窗口。
+///
+/// 返回 Ok(()) 表示端口已可 bind；Err 是仍存在的冲突（附当前占用者）。
+pub fn wait_port_released(port: u16) -> Result<(), PortConflict> {
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + RELEASE_TIMEOUT;
+    loop {
+        match server::probe_port(port) {
+            Ok(()) => return Ok(()),
+            Err(conflict) => {
+                if std::time::Instant::now() >= deadline {
+                    // 超时：把当时查到的占用者带上，好让界面能如实说明现状
+                    return Err(conflict.with_occupant(occupant_of(port)));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// 升级迁移：把端口从「本产品的旧版 node 网关」手里收回来。
@@ -433,6 +543,24 @@ fn inside_install_dir(candidate: &str) -> bool {
         return false;
     };
     target.starts_with(install_dir)
+}
+
+/// 进程的可执行文件是否位于系统目录（`%SystemRoot%`）之内。
+///
+/// 用来拦下「结束进程」按钮：svchost 这类系统组件既可能承载别的服务，
+/// 也不该由本程序去结束。拿不到系统目录时保守返回 true（宁可少杀一个，
+/// 也不要误杀系统进程 —— 这条判据的误判代价是不对称的）。
+fn inside_system_dir(candidate: &str) -> bool {
+    let Ok(root) = std::env::var("SystemRoot") else {
+        return true;
+    };
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return true;
+    };
+    let Ok(target) = std::fs::canonicalize(candidate) else {
+        return false;
+    };
+    target.starts_with(root)
 }
 
 /// 清理旧版安装目录里残留的 Node 运行时。

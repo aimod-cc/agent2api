@@ -47,24 +47,48 @@ pub const TICK_MS: u64 = 30_000;
 /// 默认触发时刻：零点一分（Node 版 DEFAULT_TIME）
 pub const DEFAULT_TIME: &str = "00:01";
 
-/// 可勾选的签到提供商（界面上的两个复选框）。默认全选。
+/// 可勾选的签到提供商（界面上的复选框）。默认全选。
 ///
-/// WorkBuddy 走腾讯的每日签到接口；小浣熊走「桌面登录积分」链路
-/// （`providers::raccoon` 的每日积分发放，见该模块的说明）。
-pub const CHECKIN_PROVIDERS: [&str; 2] = ["workbuddy", "raccoon"];
+///   - **WorkBuddy**：腾讯的每日签到接口；
+///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
+///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
+///     （`providers::autoclaw::checkin`）。
+///
+/// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw / Qoder 有积分
+/// 查询但没有签到，因此不在此列 —— 它们的账号在批量签到里被算作 `skipped`。
+/// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
+pub const CHECKIN_PROVIDERS: [&str; 3] = ["workbuddy", "raccoon", "autoclaw"];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {
     CHECKIN_PROVIDERS.iter().map(|id| id.to_string()).collect()
 }
 
-/// 提供商的展示名（从注册表查，查不到就原样回显 id）
+/// 提供商的展示名（从注册表查，查不到就原样回显 id）。
+///
+/// ── 为什么 WorkBuddy 要带上「国内版」────────────────────────
+/// 这个标签只出现在**签到语境**（提供商复选框、配置错误提示、签到范围变更日志），
+/// 而签到对 WorkBuddy 是**有版本限定**的：只有国内版有签到活动，国际版账号
+/// 一律被 `billing::checkin::supports_checkin` 排除（上游事实：腾讯的每日签到
+/// 接口只有国内站有）。注册表里的 `label` 是这家在**所有语境**下的通用展示名
+/// （账号卡片、筛选、模型清单都用它），改成「WorkBuddy 国内版」会让那些地方
+/// 出现一个没头没尾的版本后缀。
+///
+/// 因此在这里覆盖而不是改注册表：分叉的原因不是「名字不一样」，而是
+/// 「签到这条链路只有国内版能走」—— 标签替用户把这件事讲清楚，
+/// 他勾上它时就知道国际版账号不会参与，而不是签完发现被跳过了才回来查。
+///
+/// 另外两家没有这个后缀：小浣熊没有版本区分（`edition` 概念不适用于它），
+/// AutoClaw 的签到链路也没有国际版分支。
 fn provider_label(id: &str) -> &str {
-    crate::server::core::providers::PROVIDERS
-        .iter()
-        .find(|meta| meta.id == id)
-        .map(|meta| meta.label)
-        .unwrap_or(id)
+    match id {
+        "workbuddy" => "WorkBuddy 国内版",
+        other => crate::server::core::providers::PROVIDERS
+            .iter()
+            .find(|meta| meta.id == other)
+            .map(|meta| meta.label)
+            .unwrap_or(other),
+    }
 }
 
 /// 归一化配置里的提供商清单：只认 CHECKIN_PROVIDERS 里的 id（去重、保持顺序），

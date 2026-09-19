@@ -38,12 +38,193 @@ pub async fn api_request_text(method: String, path: String) -> Result<String, St
     gateway::call_text(&method, &path).await
 }
 
-/// 后端就绪状态：渲染层可在启动阶段据此显示提示
+/// 后端就绪状态：渲染层可在启动阶段据此显示提示。
+///
+/// 返回的不只是「就绪与否」，还有**为什么没就绪** —— 端口冲突的详情
+/// （性质、占用者、能否靠结束进程解决）都在 `failure` 里。界面据此决定
+/// 是显示「网关启动中」还是给出「结束占用进程 / 更换端口」两个出口。
+///
+/// 之所以做成可反复查询而不是只发一次事件：事件可能在界面订阅之前就发出去了
+/// （窗口还在加载），那时用户只能看到一个灰着的状态灯，不知道发生了什么。
 #[tauri::command]
-pub async fn backend_status() -> Result<Value, String> {
+pub async fn backend_status(app: AppHandle) -> Result<Value, String> {
     let port = gateway::proxy_port();
     let ready = backend::is_ready(port).await;
-    Ok(json!({ "ready": ready, "port": port }))
+    // 失败详情存在 AppState 里（由 ensure_ready 的失败分支写入）；
+    // 端口已被显式指定过（环境变量）时，界面不该再提供「更换端口」——
+    // 改设置也不会生效，只会让用户白忙一场
+    let failure = app
+        .state::<AppState>()
+        .backend
+        .lock()
+        .ok()
+        .and_then(|guard| guard.failure.clone());
+    Ok(json!({
+        "ready": ready,
+        "port": port,
+        "portFromEnv": gateway::port_from_env().is_some(),
+        "failure": failure,
+    }))
+}
+
+/// 重启整个应用。
+///
+/// ── 为什么是整进程重启，而不是「进程内重建后端」 ──────────────
+/// 服务端有一批**进程级单例**（模型目录、定时签到调度、更新管理器），它们用
+/// `OnceLock` 装载：第二次 `ServerState::bootstrap` 装不进全局，于是新的
+/// ServerState 会拿着一份与全局不同的句柄 —— 停机时 `stop_global()` 停的是
+/// 旧那份，新起的调度循环没人管。整进程重启让所有单例从头初始化，不存在这种
+/// 分叉；代价是窗口会重新打开（约一秒），换来的是「重启后状态一定是对的」。
+///
+/// ── 顺序上的两个要点 ────────────────────────────────────────
+///   1. **必须先 `begin_exit()`**：否则 `RunEvent::ExitRequested` 会被
+///      「关闭到托盘」那条规则拦下（`api.prevent_exit()`），重启请求落空；
+///   2. **延迟再退**：让本命令的返回值先回到前端，界面才能提示「正在重启」
+///      而不是无声消失。
+pub fn schedule_app_restart(app: &AppHandle) {
+    app.state::<AppState>().begin_exit();
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        // `restart()` 触发 ExitRequested → Exit（插件在此释放单实例互斥体）
+        // → 拉起新进程 → 本进程退出。不返回。
+        handle.restart();
+    });
+}
+
+/// 重启应用（供界面在「结束占用进程」后重试启动，或用户手动触发）。
+#[tauri::command]
+pub async fn restart_app(app: AppHandle) -> Result<Value, String> {
+    let port = gateway::proxy_port();
+    schedule_app_restart(&app);
+    Ok(json!({ "restarting": true, "port": port }))
+}
+
+/// 查占用网关端口的进程。
+///
+/// 端口没被占用（或查不到，例如系统保留段）时 `occupant` 为 null ——
+/// 界面据此只给「更换端口」，不显示一个点了必然失败的「结束进程」。
+#[tauri::command]
+pub async fn port_occupant() -> Result<Value, String> {
+    let port = gateway::proxy_port();
+    let occupant = backend::occupant_of(port);
+    Ok(json!({ "port": port, "occupant": occupant }))
+}
+
+/// 结束占用网关端口的进程，并在宽限期内确认端口真的释放。
+///
+/// 只结束 `port_occupant` 查到的那个 PID（不做按端口号的无差别清理：
+/// 端口在两次查询之间易主时，无差别清理会杀掉无辜进程）。
+/// 结束前由界面把进程名与路径显示给用户确认。
+///
+/// 成功后**不自动重启**：调用方（界面）需要先看到结果，再决定是否重启
+/// 让网关重新启动（`restart_app`）。
+#[tauri::command]
+pub async fn end_port_occupant(app: AppHandle) -> Result<Value, String> {
+    let port = gateway::proxy_port();
+    let Some(occupant) = backend::occupant_of(port) else {
+        return Err(format!(
+            "端口 {port} 上没有查到监听进程，无法结束。\
+             若该端口属于系统保留段，请改用「更换端口」。"
+        ));
+    };
+    // 结束是阻塞的（OpenProcess + TerminateProcess + 等端口释放），
+    // 放到阻塞线程池，别占着异步运行时的 worker
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let killed = backend::end_occupant(port, &occupant);
+        // 无论结束是否成功都探一次端口现状：成功了要确认释放，
+        // 失败了要告诉用户「现在端口上是什么情况」
+        let release = backend::wait_port_released(port);
+        (killed, release)
+    })
+    .await
+    .map_err(|error| format!("结束进程任务失败: {error}"))?;
+
+    let (killed, release) = result;
+    // 结束失败（权限不足 / 是系统进程 / 是本程序自己）原样把说明透给界面
+    killed.map_err(|conflict| conflict.message)?;
+    let released = release.is_ok();
+    if released {
+        // 端口已释放：**清掉启动失败记录**。那条记录描述的是「启动时端口被占」，
+        // 现在占用者已经不在了，留着会让界面一直显示「端口被占用」——
+        // 而用户刚结束完进程，看到这个只会以为没生效。
+        // 清掉后界面回到「网关启动中…」，如实反映「端口空着、网关还没起来」。
+        if let Ok(mut guard) = app.state::<AppState>().backend.lock() {
+            guard.failure = None;
+        }
+    }
+    Ok(json!({ "port": port, "released": released }))
+}
+
+/// 校验一个端口能否用于监听（「更换端口」在保存前先试）。
+///
+/// 用真实的 bind 探测，而不是查 netsh 保留段：实测保留段列表里有些端口
+/// 照样能绑上，列表既不充分也不必要（详见 port_conflict 模块头）。
+/// 返回 `{ ok, message, conflict }` —— 不抛错，因为「端口不可用」是
+/// 一种正常结果而非调用失败，界面要拿它的文案直接显示在输入框旁。
+#[tauri::command]
+pub async fn check_port(port: u16) -> Result<Value, String> {
+    if port == 0 {
+        return Ok(json!({ "ok": false, "message": "端口号必须在 1-65535 之间" }));
+    }
+    // 1024 以下的端口在 Windows 上通常需要管理员权限，直接拒绝能省掉
+    // 一次「保存成功但重启后起不来」的往返
+    if port < 1024 {
+        return Ok(json!({
+            "ok": false,
+            "message": "端口 1-1023 是系统保留范围，普通程序无法监听，请用 1024 以上的端口",
+        }));
+    }
+    let current = gateway::proxy_port();
+    if port == current {
+        return Ok(json!({ "ok": true, "message": "与当前端口相同，无需重启", "same": true }));
+    }
+    match crate::server::probe_port(port) {
+        Ok(()) => Ok(json!({ "ok": true, "message": format!("端口 {port} 可用") })),
+        Err(conflict) => Ok(json!({
+            "ok": false,
+            "message": conflict.message.clone(),
+            "conflict": conflict,
+        })),
+    }
+}
+
+/// 更换网关端口：校验 → 写设置 → 重启应用。
+///
+/// 校验放在写盘之前，是为了让「端口不可用」被拦在设置文件之外 —— 否则文件里
+/// 会留下一个起不来的端口，下次开机照样起不来。
+///
+/// 端口在服务端 bind 之后就改不了，所以必须重启（见 `schedule_app_restart`）。
+#[tauri::command]
+pub async fn change_port(app: AppHandle, port: u16) -> Result<Value, String> {
+    if port < 1024 {
+        return Err("端口 1-1023 是系统保留范围，请用 1024 以上的端口".to_string());
+    }
+    // 环境变量显式指定端口时，设置文件里的值不会生效 —— 与其静默失败，
+    // 不如明确告诉用户该改哪里
+    if gateway::port_from_env().is_some() {
+        return Err(
+            "当前端口由环境变量 AGENT2API_PROXY_PORT 指定，设置里的端口不会生效。\
+             请修改该环境变量后重启程序。"
+                .to_string(),
+        );
+    }
+    if port == gateway::proxy_port() {
+        return Ok(json!({ "changed": false, "port": port }));
+    }
+    // 真实 bind 探测：不可用就别写盘（详见 check_port 的说明）
+    if let Err(conflict) = crate::server::probe_port(port) {
+        return Err(conflict.message);
+    }
+
+    let mut current = settings::load();
+    current.proxy_port = port;
+    settings::save(&current)?;
+
+    // 重启后新端口生效。不在这里等结果：重启会带走本进程，
+    // 界面靠重连（页面重载）确认新端口是否可用。
+    schedule_app_restart(&app);
+    Ok(json!({ "changed": true, "port": port, "restarting": true }))
 }
 
 /// 发起登录；阻塞到完成/失败/取消/超时。
@@ -129,9 +310,18 @@ pub fn get_app_settings(app: AppHandle) -> AppSettings {
 ///
 /// `autostart` 变化时同步系统自启动登记；返回值里的 `autostart` 取插件
 /// 反馈的实际结果，避免出现「界面显示已开启但注册表没写进去」。
+///
+/// ── 为什么 `proxyPort` 要从磁盘上带过来 ──────────────────────
+/// 本命令的调用方（设置页）只管「关闭到托盘」与「开机自启」两个开关，
+/// 它发来的 patch 里没有端口字段 —— 而本命令是**全量覆盖**写入。
+/// 若直接落盘，`proxyPort` 会被反序列化成 0（= 未设置），把用户通过
+/// 「更换端口」设过的端口悄悄抹掉，下次开机又回到 3065 上撞冲突。
+/// 端口不归这个命令管，就原样保留磁盘上的值。
 #[tauri::command]
 pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettings, String> {
     let mut saved = patch;
+    // 端口由 change_port 专门负责，这里保持磁盘现值不被覆盖
+    saved.proxy_port = settings::load().proxy_port;
 
     let autolaunch = app.autolaunch();
     let currently_enabled = autolaunch.is_enabled().unwrap_or(false);
@@ -375,8 +565,23 @@ fn timestamp_for_filename() -> String {
     format!("{year:04}-{month:02}-{day:02}-{hour:02}-{minute:02}-{second:02}")
 }
 
-/// 启动维护：让网关刷新一遍临期凭证，再批量查询余额，结果推给渲染层。
+/// 启动维护：让网关刷新一遍临期凭证，结果推给渲染层。
 /// 任一环节失败只记日志，不影响窗口使用（与原 Electron 版行为一致）。
+///
+/// ── 余额查询为什么从这里移走了 ──────────────────────────────
+/// 原先这里还会调一次 `GET /api/accounts/usage`。现在余额查询归「定时查询积分」
+/// 这条定时任务（`scheduled_tasks` 的 backend 任务，默认每 10 分钟一次），
+/// 而它的**首轮在网关 bootstrap 后就立即跑一次**（`seed_schedule` 把首次排到
+/// 「现在」）—— 于是启动时该做的这一次查询依旧会发生，只是执行者换成了定时任务。
+///
+/// 两处各查一遍的代价是每个账号在启动瞬间被打两次上游积分接口：既无收益
+/// （同一份数据），又平白多担一次风控风险。更关键的是「关掉定时查询积分 =
+/// 启动也不查」这条一致性 —— 与其它定时任务（「关掉任务 = 启动也不刷」）同款，
+/// 留着这里这一份会让那条开关变得半失效。
+///
+/// 界面因此改为读定时任务的结果快照（`/api/accounts/usage/snapshot`），
+/// 由 `usage-actions.js` 的 `syncSnapshot` 应用 —— 手动点「查询积分」那条路径
+/// 不受影响，它仍走 `GET /api/accounts/usage` 当场取。
 pub async fn startup_maintenance(app: AppHandle) {
     // 临期凭证的刷新**交给网关自己**（POST /api/accounts/refresh-expiring）：
     // 「哪个账号该刷」是各家 provider 的知识（过期时间字段名、临期窗口四家
@@ -405,15 +610,7 @@ pub async fn startup_maintenance(app: AppHandle) {
         }
     };
 
-    let balances = match gateway::call("GET", "/api/accounts/usage", None).await {
-        Ok(value) => Some(value),
-        Err(error) => {
-            eprintln!("[startup] 自动查询余额失败: {error}");
-            None
-        }
-    };
-
-    let _ = app.emit("accounts:auto-maintained", json!({ "refreshed": refreshed, "balances": balances }));
+    let _ = app.emit("accounts:auto-maintained", json!({ "refreshed": refreshed }));
     if !refreshed.is_empty() {
         eprintln!("[startup] 已自动刷新 {} 个临期账号的 Token", refreshed.len());
     }

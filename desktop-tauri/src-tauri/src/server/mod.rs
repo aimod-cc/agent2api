@@ -126,6 +126,7 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 
+use crate::port_conflict::{ConflictKind, PortConflict};
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::AuthService;
 use crate::server::core::auto_checkin::AutoCheckin;
@@ -571,17 +572,27 @@ fn read_legacy_session() -> Option<serde_json::Value> {
 ///      且端口占用这个最常见的失败能立刻拿到 OS 错误码返回给调用方；
 ///   2. 需要运行时的 from_std 与 serve 都放进 `tauri::async_runtime::spawn`，
 ///      任务体一定跑在运行时的工作线程上，reactor 必然可用。
-pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, String> {
+///
+/// ── 失败为什么返回 PortConflict 而不是裸字符串 ──
+/// bind 失败的原因决定了界面该给什么出路：被别的进程占用可以「结束进程」，
+/// 落在系统保留段里则只能「更换端口」。分类判据（`std::io::ErrorKind`）
+/// 只有在这里才拿得到，所以在这里分好类往上带，别让界面去猜错误文案。
+pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
     let router = http::router(state.clone());
     let addr = SocketAddr::from(([127, 0, 0, 1], state.port));
 
     let listener = std::net::TcpListener::bind(addr)
-        .map_err(|error| describe_bind_error(state.port, &error))?;
+        .map_err(|error| PortConflict::from_bind_error(state.port, &error, None))?;
     // 立刻转成非阻塞：从这一刻起到 serve 接手之间，若有连接进来，
     // 阻塞式 accept 会把工作线程卡住。转非阻塞放在同步段更安全。
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("设置监听为非阻塞失败: {error}"))?;
+    listener.set_nonblocking(true).map_err(|error| {
+        PortConflict::new(
+            ConflictKind::Other,
+            state.port,
+            None,
+            &format!("设置监听为非阻塞失败: {error}"),
+        )
+    })?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     // 停机收尾要用的统计句柄：先克隆出来再移进任务（`state` 是借用，不能
@@ -616,20 +627,20 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, String> {
     Ok(shutdown_tx)
 }
 
-/// 端口占用时的中文说明。
+/// 启动前的端口自检：能不能真的 bind 上这个端口。
 ///
-/// 旧版桌面端会「探测到 3065 已在跑就复用」，所以机器上很可能还留着
-/// 一个 node server.mjs 或旧版桌面端；升级后进程内服务器必须自己 bind，
-/// 这时把原因讲清楚，比抛一个裸的 "os error 10048" 有用得多。
-fn describe_bind_error(port: u16, error: &std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::AddrInUse {
-        return format!(
-            "{port} 端口被占用：可能有旧版本网关仍在运行\
-             （如 node server.mjs 或旧版桌面端），请先结束它再启动。\
-             也可用环境变量 AGENT2API_PROXY_PORT 换一个端口\
-             （旧名 WORKBUDDY_PROXY_PORT 仍有效）。\
-             （系统错误: {error}）"
-        );
+/// 与 `start()` 里的 bind 是同一个判据（都走 `std::net::TcpListener::bind`），
+/// 但**不改动任何状态**：探测完立刻释放。界面在「更换端口」时用它校验用户
+/// 填的端口，好在保存之前就给出「这个端口也被占了」而不是等到重启后才发现。
+///
+/// 返回 Ok(()) 表示可用；Err 是分类好的冲突描述（文案与启动失败共用一套）。
+pub fn probe_port(port: u16) -> Result<(), PortConflict> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    match std::net::TcpListener::bind(addr) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(error) => Err(PortConflict::from_bind_error(port, &error, None)),
     }
-    format!("监听 127.0.0.1:{port} 失败: {error}")
 }

@@ -136,9 +136,15 @@ pub fn resolve_checkin_targets(
 /// 单个账号签到。已签到（上游非 0 code）不算错误，原样返回结果 ——
 /// 前端把「今天已签到」显示成一条 warn 提示。
 ///
-/// 按提供商分派：WorkBuddy 走计费服务的每日签到；小浣熊走桌面登录积分链路
-/// （`providers::raccoon::balance::claim_daily_grant`，claim 形状已对齐成
-/// `{success, msg}`，汇总口径两家具余一致）。
+/// ── 按提供商分派（三家的接口互不相通）────────────────────────
+///   - **WorkBuddy**：计费服务的每日签到（`billing.claim_daily_checkin`）；
+///   - **小浣熊**：桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）；
+///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
+///     （`providers::autoclaw::checkin::claim_daily_signin`）。
+///
+/// 拿一家的 token 去打另一家的签到接口只会稳定报错，所以这条分派是必需的而不是
+/// 优化。三个分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
+/// 各家的 claim 都由各自的实现对齐成 `{success, msg}` 形状。
 pub async fn checkin_for(
     store: &AccountStore,
     billing: &BillingService,
@@ -147,52 +153,75 @@ pub async fn checkin_for(
     let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
     let display = name.as_str().unwrap_or(&id).to_string();
-    if provider_of(account) == "raccoon" {
-        return match crate::server::core::providers::raccoon::balance::claim_daily_grant(store, &id)
-            .await
-        {
-            Ok(claim) => {
-                let success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
-                let msg = claim.get("msg").and_then(Value::as_str).unwrap_or("");
-                if success {
-                    logging::log("[Accounts]", &format!("账号 {display}: 签到成功（{msg}）"));
-                } else {
-                    logging::log("[Accounts]", &format!("账号 {display}: 签到未领取（{msg}）"));
-                }
-                json!({ "id": id, "name": name, "claim": claim, "error": Value::Null })
-            }
-            Err(error) => {
-                logging::verbose("[Accounts]", &format!("账号 {id} 签到失败: {}", error.message));
-                json!({
+    match provider_of(account) {
+        "raccoon" => {
+            let claim =
+                crate::server::core::providers::raccoon::balance::claim_daily_grant(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "autoclaw" => {
+            let claim =
+                crate::server::core::providers::autoclaw::checkin::claim_daily_signin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        _ => {
+            let Some(entry) = store.get_session_by_id(&id) else {
+                return json!({
                     "id": id,
                     "name": name,
                     "claim": Value::Null,
-                    "error": error.message,
-                })
-            }
-        };
+                    "error": "没有可用凭证",
+                });
+            };
+            let claim = billing
+                .claim_daily_checkin(Some(&entry.session))
+                .await
+                .map_err(|error| error.message);
+            claim_result(id, name, &display, false, claim)
+        }
     }
-    let Some(entry) = store.get_session_by_id(&id) else {
-        return json!({ "id": id, "name": name, "claim": Value::Null, "error": "没有可用凭证" });
-    };
-    match billing.claim_daily_checkin(Some(&entry.session)).await {
+}
+
+/// 把一次签到调用翻成统一的结果行（`{id, name, claim, error}`）。
+///
+/// ── `log_success_msg` 为什么是一个参数而不是统一口径 ─────────
+/// 小浣熊与 AutoClaw 的 claim `msg` 带**具体收益**（「今日积分 +100」
+/// 「签到成功，获得 100 积分」），拼进日志才有排查价值；WorkBuddy 保持原样
+/// （照抄 Node 版，不在这里做「顺手统一」—— 那会改变它既有的日志文案，
+/// 而日志是用户已经在看的输出）。失败分支三家一致。
+fn claim_result(
+    id: String,
+    name: Value,
+    display: &str,
+    log_success_msg: bool,
+    result: Result<Value, String>,
+) -> Value {
+    match result {
         Ok(claim) => {
             let success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let msg = claim.get("msg").and_then(Value::as_str).unwrap_or("");
             if success {
-                logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
+                if log_success_msg && !msg.is_empty() {
+                    logging::log("[Accounts]", &format!("账号 {display}: 签到成功（{msg}）"));
+                } else {
+                    logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
+                }
             } else {
-                let msg = claim.get("msg").and_then(Value::as_str).unwrap_or("");
                 logging::log("[Accounts]", &format!("账号 {display}: 签到未领取（{msg}）"));
             }
             json!({ "id": id, "name": name, "claim": claim, "error": Value::Null })
         }
-        Err(error) => {
-            logging::verbose("[Accounts]", &format!("账号 {id} 签到失败: {}", error.message));
+        Err(message) => {
+            logging::verbose("[Accounts]", &format!("账号 {id} 签到失败: {message}"));
             json!({
                 "id": id,
                 "name": name,
                 "claim": Value::Null,
-                "error": error.message,
+                "error": message,
             })
         }
     }

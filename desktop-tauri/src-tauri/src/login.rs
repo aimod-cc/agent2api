@@ -3,7 +3,7 @@
 //! 后端把登录拆成三步：start 拿 state+authUrl → 用户在页面上完成 →
 //! 轮询 wait 拿结果。桌面端只负责托管页面与轮询，不接触任何凭证。
 //!
-//! ── 两家 provider 的两条链（为什么这里要分流）────────────────
+//! ── 三家 provider 的三条链（为什么这里要分流）────────────────
 //!   - **workbuddy**：后端向自己上游要 state/authUrl，凭证由后端轮询上游拿回，
 //!     桌面端**完全没有回调要处理**。系统浏览器模式（external）也能用，
 //!     因为用户在哪登录都行 —— 判定归后端。
@@ -19,6 +19,17 @@
 //!     也正因如此，小浣熊**只提供内嵌窗口**：系统浏览器模式下那个深链要靠
 //!     系统注册 `office-raccoon://` 才回得来（那是官方客户端注册的，装了才有），
 //!     给用户一个「大概率永远收不到回调」的选项只会制造难查的卡死。
+//!   - **Qoder**：设备授权（PKCE）——授权页只负责把设备码交给用户点的那个账号，
+//!     凭证由网关轮询设备令牌接口取回（`providers::qoder::oauth`），桌面端同样
+//!     没有回调。内嵌与系统浏览器两种方式都可选（前者用全新的临时数据目录，
+//!     所以能连着添加多个互不影响的账号）。
+//!
+//! ── 凭什么三个 provider 共用同一段轮询 ────────────────────
+//! 三家的差别只有「授权地址怎么来」与「谁算登录成功」，两者都被后端收进了
+//! `LoginTask`：壳只做「打开 URL → 每 2 秒问一次 `/wait` → 按结果收尾」。
+//! 唯一的壳侧差异是回调拦截（只有小浣熊需要），因此 workbuddy 与 Qoder 走同一条
+//! 内嵌窗口路径；内嵌窗口本身对三家一视同仁地**每次新建临时数据目录**（见
+//! `login_profile.rs`：这是「添加第二个账号时不复用上一个账号登录态」的关键）。
 //!
 //! ── User-Agent 为什么**不需要**清洗（与原 Electron 版的差别）─────
 //! Electron 版的登录窗口带 `Electron/xx` 段，源实现特意把它抹掉（有些登录页会
@@ -37,11 +48,11 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::gateway;
+use crate::login_profile::LoginProfile;
 use crate::state::ActiveLogin;
 
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-const LOGIN_WINDOW_LABEL: &str = "login";
 
 /// workbuddy 登录窗口允许导航的域名，取自两版 cli/product.json 的
 /// internalDomain / externalDomain / iOADomain，外加扫码登录所需的微信/QQ 域名。
@@ -89,11 +100,36 @@ const RACCOON_CALLBACK_SCHEME: &str = "office-raccoon";
 const RACCOON_CALLBACK_HOST: &str = "auth";
 const RACCOON_CALLBACK_PATH: &str = "/callback";
 
-fn allowed_hosts(provider: &str) -> &'static [&'static str] {
-    if provider == "raccoon" {
-        RACCOON_ALLOWED_HOSTS
-    } else {
-        WORKBUDDY_ALLOWED_HOSTS
+/// Qoder 与 CatPaw 登录窗口允许导航的域名：**不限制**。
+///
+/// ── 为什么这两家不设域名白名单 ───────────────────────────────
+/// 两家都会跳出自己的域，且跳转主机不可穷举：
+///   - Qoder 的登录入口按用户选择跳到第三方身份提供方（Google / GitHub），
+///     授权页本身在 `qoder.com`，完整 SSO 链路的跳转主机列不全；
+///   - CatPaw 走美团 passport（`passport.meituan.com` → `settoken` →
+///     `catpaw.meituan.com` 的 `login-callback`），沿途还会跳微信 / 支付宝
+///     这类扫码登录，第三方名单同样没有尽头。
+///
+/// 而 `on_navigation` 返回 false 是**静默拦下**：漏一个主机就表现为「窗口打开
+/// 但一片空白」或「点了登录没反应」这种极难排查的故障 —— CatPaw 首次接入时
+/// 正是因为漏了这一分支、落进默认分支拿到 WorkBuddy 的白名单而白屏。
+///
+/// 放行的代价在这两家可以接受：两者的凭证都换不出「别人手里的东西」——
+/// Qoder 的授权码要靠只在网关进程内的 PKCE verifier 才能兑换（见
+/// `providers::qoder::oauth`）；CatPaw 的 token 由上游直接 POST 到本机网关的
+/// loopback 端口，且回调要过一次性 state 逐字校验（见 `core::login::catpaw`）。
+/// 且窗口用的是独立临时数据目录（`login_profile`），不携带本机任何登录态。
+///
+/// ── 为什么 workbuddy / 小浣熊仍然白名单 ─────────────────────
+/// 那两家的登录链路是固定的几个站点（腾讯系 / 商汤系 + 各自的验证码托管方），
+/// 能列全；白名单在这里是免费的额外一层约束，就不放弃。
+fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
+    match provider {
+        "raccoon" => Some(RACCOON_ALLOWED_HOSTS),
+        // CatPaw 与 Qoder 都不设限（理由见上）；**新加 provider 时不要让它落到
+        // 默认分支** —— 那会静默沿用 WorkBuddy 的白名单，症状是登录窗口白屏。
+        "catpaw" | "qoder" => None,
+        _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
 
@@ -107,14 +143,20 @@ fn host_allowed(url: &url::Url, provider: &str) -> bool {
     match url.scheme() {
         "about" | "data" => true,
         "https" | "http" => {
+            let Some(allowed) = allowed_hosts(provider) else {
+                // 不限制主机（Qoder：身份提供方不可穷举，理由见 allowed_hosts）
+                return true;
+            };
             let Some(host) = url.host_str() else {
                 return false;
             };
             let host = host.to_lowercase();
-            allowed_hosts(provider)
+            allowed
                 .iter()
-                .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
+                .any(|item| host == *item || host.ends_with(&format!(".{item}")))
         }
+        // 非 http(s) 的其它协议一律拒绝（除了上面的 about / data）：
+        // 白名单之外的自定义协议在 WebView2 里会被交给系统处理，不该由登录页触发
         _ => false,
     }
 }
@@ -125,10 +167,12 @@ fn host_allowed(url: &url::Url, provider: &str) -> bool {
 /// http(s) 那样被规范化成小写，`office-raccoon://AUTH/callback` 会原样保留。
 /// 这里只是**识别**（后端 `raccoon::oauth::parse_callback_code` 才是最终校验，
 /// 它有一模一样的口径）；两边都宽一点，避免同一个 URL 在壳与后端得到不同结论。
+///
+/// **只有小浣熊走回调**：workbuddy 的凭证由后端轮询上游取回，Qoder 走设备授权
+/// 轮询（见 `providers::qoder::oauth`），两家都没有自定义协议回调 ——
+/// 别把「没有回调」误写成「什么都算回调」。
 fn is_login_callback(url: &url::Url, provider: &str) -> bool {
     if provider != "raccoon" {
-        // workbuddy 的登录没有自定义协议回调（凭证由后端轮询上游取回），
-        // 所以它这里恒为 false —— 别把「没有回调」误写成「什么都算回调」。
         return false;
     }
     let host_matches = url
@@ -138,11 +182,13 @@ fn is_login_callback(url: &url::Url, provider: &str) -> bool {
     url.scheme() == RACCOON_CALLBACK_SCHEME && host_matches && url.path() == RACCOON_CALLBACK_PATH
 }
 
-/// 归一化前端传来的 provider id（缺省 workbuddy，只认这两家）。
+/// 归一化前端传来的 provider id（缺省 workbuddy，只认这四家）。
 fn normalize_provider(provider: &str) -> Result<&'static str, String> {
     match provider.trim() {
         "" | "workbuddy" => Ok("workbuddy"),
         "raccoon" => Ok("raccoon"),
+        "qoder" => Ok("qoder"),
+        "catpaw" => Ok("catpaw"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -219,12 +265,12 @@ fn task_gone(message: &str) -> bool {
 
 /// 通知后端中止轮询；用于用户关窗/点取消
 pub async fn cancel(app: &AppHandle) -> Result<(), String> {
-    let active = {
-        let state = app.state::<crate::state::AppState>();
-        let mut guard = state.login.lock().map_err(|_| "登录状态锁不可用")?;
-        guard.take()
-    };
+    let active = current_login(app);
     if let Some(active) = active {
+        if let Some(window) = app.get_webview_window(&login_window_label(&active.state)) {
+            let _ = window.destroy();
+        }
+        clear_active_login(app, &active.state);
         let _ = gateway::call(
             "POST",
             "/api/session/login/cancel",
@@ -232,7 +278,6 @@ pub async fn cancel(app: &AppHandle) -> Result<(), String> {
         )
         .await;
     }
-    emit_login_state(app, LoginState { active: false, mode: None, edition: None, provider: None });
     Ok(())
 }
 
@@ -256,10 +301,23 @@ pub async fn start(
     if provider == "raccoon" {
         return start_raccoon(app).await;
     }
+    // CatPaw：授权地址要问一次上游 `login-config`，且 token 由上游**推**到本网关
+    // 的 loopback 回调上（见 core::login::catpaw）。同样没有 edition 维度。
+    if provider == "catpaw" {
+        return start_catpaw(app, &mode).await;
+    }
 
-    let edition_id = if edition == "intl" { "intl" } else { "cn" };
+    // Qoder 的设备授权两站同构（见 core::login::qoder），`cn` 原样透传给后端 ——
+    // 由它决定授权页与轮询地址打哪一站。这里不再拦截国内版。
+    let edition_id = if provider == "qoder" {
+        if edition == "intl" || edition == "global" { "intl" } else { "cn" }
+    } else if edition == "intl" { "intl" } else { "cn" };
     let edition_label = if edition_id == "intl" { "国际版" } else { "国内版" };
-    let use_external = mode == "external";
+    // 系统浏览器模式只对 workbuddy 与 qoder 开放：两家的判定都在后端（前者轮询
+    // 上游 auth/token，后者轮询设备令牌），浏览器在哪登录都行。小浣熊**只有内嵌
+    // 窗口**能收回调（自定义协议深链要靠系统注册，见模块头），给它这个选项只会
+    // 制造一个永远等不到回调的卡死。
+    let use_external = mode == "external" && provider != "raccoon";
 
     let started = gateway::call(
         "POST",
@@ -298,14 +356,18 @@ pub async fn start(
         },
     );
 
-    let title = format!("登录 WorkBuddy {edition_label}账号");
+    let provider_label = if provider == "qoder" { "Qoder" } else { "WorkBuddy" };
+    let title = format!("登录 {provider_label} {edition_label}账号");
     let result = if use_external {
-        open_external(app, &auth_url, edition_label).await
+        open_external(app, &auth_url, edition_label, &login_state).await
     } else {
         run_embedded(app, provider, &auth_url, &title, &login_state).await
     };
 
-    clear_active_login(app);
+    if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
+        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
+    }
+    clear_active_login(app, &login_state);
     result
 }
 
@@ -352,19 +414,98 @@ async fn start_raccoon(app: &AppHandle) -> Result<serde_json::Value, String> {
     );
 
     let result = run_embedded(app, "raccoon", &auth_url, "登录小浣熊账号", &login_state).await;
-    clear_active_login(app);
+    if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
+        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
+    }
+    clear_active_login(app, &login_state);
     result
 }
 
-/// 清掉进行中的登录并推状态（成功/失败/取消三条出口共用）
-fn clear_active_login(app: &AppHandle) {
+/// CatPaw 网页登录：**passport 登录页 + 上游回调打到网关自己的 loopback 端口**。
+///
+/// 与另两家的差别（见 `core::login::catpaw` 的模块头）：token 是**上游推给
+/// 我们**的 —— 美团 passport 的 `login-callback` 页面把 `{token, state}` 表单
+/// POST 到授权 URL 里给的 `redirect`，而那个地址就是本网关的
+/// `127.0.0.1:<port>/api/session/login/catpaw-callback`。因此这里只需要
+/// 「开窗口 → 轮询 /wait」，不需要壳侧做任何回调识别或转交。
+///
+/// `mode`：内嵌窗口与系统浏览器都支持（回调打回本机网关，与浏览器在哪无关），
+/// 与 Qoder 同理；小浣熊那种「只有内嵌能收回调」的约束在这家不成立。
+async fn start_catpaw(
+    app: &AppHandle,
+    mode: &str,
+) -> Result<serde_json::Value, String> {
+    let started = gateway::call(
+        "POST",
+        "/api/session/login/start",
+        Some(&json!({ "provider": "catpaw" })),
+    )
+    .await?;
+    let login_state = started
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("后端未返回登录状态")?
+        .to_string();
+    let auth_url = started
+        .get("authUrl")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("后端未返回登录链接，请检查网络")?
+        .to_string();
+
+    let use_external = mode == "external";
+    let mode_id = if use_external { "external" } else { "embedded" };
     {
         let state = app.state::<crate::state::AppState>();
-        if let Ok(mut guard) = state.login.lock() {
-            *guard = None;
-        };
+        let mut guard = state.login.lock().map_err(|_| "登录状态锁不可用")?;
+        *guard = Some(ActiveLogin {
+            state: login_state.clone(),
+            edition: String::new(),
+            mode: mode_id.into(),
+            provider: "catpaw".to_string(),
+        });
     }
-    emit_login_state(app, LoginState { active: false, mode: None, edition: None, provider: None });
+    emit_login_state(
+        app,
+        LoginState {
+            active: true,
+            mode: Some(mode_id.into()),
+            edition: None,
+            provider: Some("catpaw".to_string()),
+        },
+    );
+
+    let result = if use_external {
+        // "CatPaw 官方登录页" 是给超时文案用的：这家没有「国际版 / 国内版」这一级，
+        // 传空串会得到「已完成登录，但等待超时」这种缺主语的句子。
+        open_external(app, &auth_url, "CatPaw 官方登录页", &login_state).await
+    } else {
+        run_embedded(app, "catpaw", &auth_url, "登录 CatPaw 账号", &login_state).await
+    };
+    if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
+        let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
+    }
+    clear_active_login(app, &login_state);
+    result
+}
+
+/// 只结束本次登录，旧窗口的关闭事件不能清掉后来发起的登录。
+fn clear_active_login(app: &AppHandle, expected_state: &str) {
+    let state = app.state::<crate::state::AppState>();
+    if let Ok(mut guard) = state.login.lock() {
+        if guard.as_ref().is_some_and(|active| active.state == expected_state) {
+            *guard = None;
+            emit_login_state(app, LoginState { active: false, mode: None, edition: None, provider: None });
+        }
+    };
+}
+
+fn login_is_current(app: &AppHandle, expected_state: &str) -> bool {
+    current_login(app).is_some_and(|active| active.state == expected_state)
+}
+
+fn login_window_label(login_state: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("login-{:x}", Sha256::digest(login_state.as_bytes()))
 }
 
 /// 系统浏览器模式：浏览器与登录页共享登录态，完成后仍由后端轮询判定。
@@ -373,6 +514,7 @@ async fn open_external(
     app: &AppHandle,
     auth_url: &str,
     edition_label: &str,
+    login_state: &str,
 ) -> Result<serde_json::Value, String> {
     if std::env::var("WORKBUDDY_SKIP_OPEN_BROWSER").as_deref() != Ok("1") {
         open_in_browser(auth_url)?;
@@ -381,10 +523,10 @@ async fn open_external(
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(POLL_INTERVAL).await;
         // 已被取消（关弹窗/点取消）：停止轮询，不当作错误
-        if current_login(app).is_none() {
+        if !login_is_current(app, login_state) {
             return Ok(json!({ "ok": false, "canceled": true }));
         }
-        match poll_once(&login_state_of(app)?.as_str()).await {
+        match poll_once(login_state).await {
             PollOutcome::Pending => continue,
             PollOutcome::Done => return Ok(json!({ "ok": true, "external": true })),
             PollOutcome::Failed(error) => {
@@ -407,12 +549,6 @@ async fn open_external(
     Err(format!("已打开系统浏览器完成{edition_label}登录，但等待超时（5 分钟），请重试"))
 }
 
-fn login_state_of(app: &AppHandle) -> Result<String, String> {
-    current_login(app)
-        .map(|active| active.state)
-        .ok_or_else(|| "登录已取消".to_string())
-}
-
 /// 内嵌 WebView 模式：建独立窗口加载登录页，同时轮询后端。
 ///
 /// `provider` 决定白名单与回调识别（小浣熊要捕获 `office-raccoon://` 深链）；
@@ -424,9 +560,18 @@ async fn run_embedded(
     title: &str,
     login_state: &str,
 ) -> Result<serde_json::Value, String> {
-    if let Some(existing) = app.get_webview_window(LOGIN_WINDOW_LABEL) {
-        let _ = existing.close();
-    }
+    let window_label = login_window_label(login_state);
+    // ── 每次登录一个独立环境（修复：第二次添加账号会看到上一个账号的登录态）──
+    // 每次登录用**全新**的临时数据目录：WebView2 的 Cookie / localStorage / 缓存
+    // 都按数据目录存放，共用默认目录就等于共用登录态 —— 添加第二个账号时官方
+    // 登录页会把上一个账号直接放行过去，用户根本没有机会换成另一个账号。
+    // 目录在窗口关闭后删除（见 login_profile.rs）。
+    //
+    // **刻意不开隐私模式**（`incognito(true)`）：那个开关会让 Google / GitHub 之类
+    // 的身份提供方判为「不支持登录的浏览器」而拒绝登录（多次看到点登录没反应），
+    // 而独立数据目录已经提供了本功能真正需要的隔离 —— 每个账号一份干净的
+    // Cookie 存储，与前一个账号互不影响。
+    let profile = LoginProfile::new()?;
     let url = url::Url::parse(auth_url).map_err(|error| format!("登录链接无效: {error}"))?;
 
     // ── 回调只处理一次 ────────────────────────────────────────
@@ -446,7 +591,11 @@ async fn run_embedded(
     let seen_for_window = callback_seen.clone();
     let state_for_window = login_state_owned.clone();
 
-    let window = WebviewWindowBuilder::new(app, LOGIN_WINDOW_LABEL, WebviewUrl::External(url))
+    let window = WebviewWindowBuilder::new(app, &window_label, WebviewUrl::External(url))
+        .data_directory(profile.path().to_path_buf())
+        // 免去密码/地址的自动填充建议：这个窗口只用来过一次登录，填充弹层会
+        // 盖住授权码。老运行时上没有 Settings4 接口，wry 会跳过它。
+        .general_autofill_enabled(false)
         .title(title.to_string())
         .inner_size(1100.0, 820.0)
         .min_inner_size(760.0, 560.0)
@@ -497,25 +646,16 @@ async fn run_embedded(
 
     // 关窗即视为放弃登录：通知后端中止轮询，并让等待循环退出
     let handle = app.clone();
-    let window_for_event = window.clone();
-    // Tauri 的关闭事件无法直接 await 异步逻辑，用阻塞式的取消请求；
-    // 这里只是一次本地 HTTP 调用，开销极小。
+    let state_for_close = login_state.to_string();
     window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { .. } = event {
-            let app = handle.clone();
-            let state_handle = app.state::<crate::state::AppState>();
-            let taken = state_handle
-                .login
-                .lock()
-                .ok()
-                .and_then(|mut guard| guard.take());
-            if let Some(active) = taken {
-                let payload = json!({ "state": active.state });
+            if login_is_current(&handle, &state_for_close) {
+                clear_active_login(&handle, &state_for_close);
+                let payload = json!({ "state": state_for_close });
                 tauri::async_runtime::spawn(async move {
                     let _ = gateway::call("POST", "/api/session/login/cancel", Some(&payload)).await;
                 });
             }
-            let _ = window_for_event.close();
         }
     });
 
@@ -527,7 +667,7 @@ async fn run_embedded(
         tokio::time::sleep(POLL_INTERVAL).await;
 
         // 窗口被关掉（或已取消）：结束等待
-        if app.get_webview_window(LOGIN_WINDOW_LABEL).is_none() || current_login(app).is_none() {
+        if app.get_webview_window(&window_label).is_none() || !login_is_current(app, login_state) {
             break Ok(json!({ "ok": false, "canceled": true }));
         }
         match poll_once(login_state).await {
@@ -548,9 +688,9 @@ async fn run_embedded(
         }
     };
 
-    if let Some(window) = app.get_webview_window(LOGIN_WINDOW_LABEL) {
-        let _ = window.close();
-    }
+    let _ = window.destroy();
+    drop(window);
+    drop(profile);
     outcome
 }
 

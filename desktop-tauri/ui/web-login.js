@@ -27,7 +27,7 @@
   /** 等待中的那家 provider；主进程状态里没带 provider 时按 workbuddy 兜底 */
   let loginProvider = '';
   /** 一次 start() 正在收尾：此时主进程状态可能还没回到「空闲」，
-   *  期间任何「顺手取消」（关弹窗、切登录方式）都必须让路 —— 否则会把一次
+   *  期间任何「顺手取消」（关弹窗时）都必须让路 —— 否则会把一次
    *  刚成功的登录取消掉，界面上表现为「登录成功却提示已取消」。 */
   let flowSettling = false;
 
@@ -173,11 +173,7 @@
     isActive: () => loginActive,
     activeProvider: () => loginProvider,
     /**
-     * 放弃等待中的登录（关弹窗、切走网页登录方式时调用）。
-     *
-     * `provider` 给定时只在「等待中的正是这家」时才取消：WorkBuddy 的「登录方式」
-     * 分段切到「粘贴 JSON」会调用它，而那个分段在别的家的登录等待期间不该有
-     * 取消别人登录的副作用（它只是收起自己那段 UI）。
+     * 放弃等待中的登录。给定 provider 时只取消该家的流程，避免干扰其它提供商。
      * 返回是否真的发了取消请求。
      */
     async cancelIfActive(provider) {

@@ -106,6 +106,18 @@ fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             crate::server::core::providers::raccoon::models::remote_refreshed(),
             crate::server::core::providers::raccoon::models::last_refreshed_at(),
         ),
+        // Qoder 也有远程目录（`algo/api/v2/model/list`，按地区各缓存一份）：
+        // 两个地区只要有一边成功拉到过，就算「远程」。
+        ProviderKind::Qoder => (
+            crate::server::core::providers::qoder::models::remote_refreshed(
+                crate::server::core::providers::qoder::endpoints::Region::Global,
+            ) || crate::server::core::providers::qoder::models::remote_refreshed(
+                crate::server::core::providers::qoder::endpoints::Region::Cn,
+            ),
+            crate::server::core::providers::qoder::models::last_refreshed_at(),
+        ),
+        // CatPaw / AutoClaw 都是**内置清单**语义（CatPaw 的模型表是静态的，
+        // 上游没有目录接口；AutoClaw 是静态路由表 + `zai_auto` 回退）。
         ProviderKind::CatPaw | ProviderKind::AutoClaw => (false, 0),
     }
 }

@@ -122,15 +122,16 @@
    * index.html 里（写死的话每家账号打开设置都会看到一个与自己无关的输入框，
    * 而 index.html 同时被其它任务维护，这里不重排/新增它的既有节点）。
    *
-   * ── 为什么这个值是单独一项，不能复用 token ──────────────────────
-   * CatPaw 转发用的是 `X-Passport-Token`，而余额接口（美团 credit 域）要的是
-   * **网页会话 cookie 里的 token2**（原项目单独存的一项，见
-   * `providers/catpaw/balance.rs` 模块头）。两者名字像但不是一回事，
-   * 所以这里必须让用户能单独填。
+   * ── 现在它是**可选的回退项**，不再是查询的前提 ──────────────────
+   * 积分查询已改走客户端自己的网关 API（`catx.nocode.cn/api/gateway/credit/balance`），
+   * 凭证就是转发用的那个 token —— 不需要用户额外配置（见
+   * `providers/catpaw/balance.rs` 模块头）。这一栏留给两种旧数据：
+   * 已经填过的用户（值仍在），以及从原项目导入的 `balanceCookie.token2`。
+   * 空着完全不影响查询。
    *
    * `hasBalanceToken` 由后端公开形态给出（**只给真假，不给值** —— 它是完整凭证，
    * 不进账号列表这种会被截图/贴出来排障的界面）：已配置时占位提示「留空则不修改」，
-   * 并给一个显式的「清除」按钮（凭证轮换后可能要清掉再填新的）。
+   * 并给一个显式的「清除」按钮。
    */
   const BALANCE_TOKEN_ROW_ID = 'account-balance-token-row';
 
@@ -146,8 +147,8 @@
     row.style.marginTop = '9px';
     row.innerHTML = `<label for="account-balance-token-input">余额查询凭证</label>`
       + `<input id="account-balance-token-input" type="text" `
-      + `placeholder="${configured ? '已配置，留空则不修改' : '可选：网页登录态的 token2'}" `
-      + `title="CatPaw 的余额接口要的是网页会话凭证（token2），与转发用的 X-Passport-Token 不是同一个值；不填也能正常转发，只是查不了余额">`
+      + `placeholder="${configured ? '已配置，留空则不修改' : '一般不用填'}" `
+      + `title="积分查询已复用转发用的登录凭证，这里通常留空即可。只有旧版本填过、或从旧代理导入过凭证时才有值">`
       // 清除是**显式动作**（保存时的空值一律理解为「不修改」，见 readBalanceTokenPatch）
       + (configured
         ? `<button id="account-balance-token-clear" title="清除已配置的余额查询凭证">清除</button>`
@@ -318,8 +319,7 @@
     }
     if (action === 'remove' && !confirmBatchRemove(batchIds.length)) return;
 
-    // 批量禁用/删除可能把首选账号一起停掉（首选是优先级的派生值，
-    // 被禁用后会自动落到下一个账号），提醒一下更稳妥。
+    // 批量禁用/删除可能把所有启用中的账号一起停掉，转发将无账号可用，提醒一下更稳妥。
     // 判据是「选中的账号是否已覆盖全部启用中的账号」，而不是数量对比 ——
     // 否则勾了已禁用账号凑够数量也会误报。
     if (action === 'disable' || action === 'remove') {

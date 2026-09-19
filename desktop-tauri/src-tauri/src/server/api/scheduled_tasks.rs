@@ -1,6 +1,6 @@
 //! 定时任务路由（设置页「定时任务」页的数据源）。
 //!
-//!   GET   /api/scheduled-tasks             读取四条间隔型任务的开关、间隔与运行状态
+//!   GET   /api/scheduled-tasks             读取间隔型任务的开关、间隔与运行状态
 //!   PATCH /api/scheduled-tasks/{id}        改一条任务（`{enabled?, interval?}`）
 //!   POST  /api/scheduled-tasks/{id}/run    立即执行一条**后端**任务
 //!

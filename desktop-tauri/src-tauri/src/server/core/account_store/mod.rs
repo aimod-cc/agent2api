@@ -66,6 +66,7 @@ pub mod autoclaw_import;
 pub mod catpaw_accounts;
 pub mod catpaw_import;
 pub mod priority;
+pub mod qoder_accounts;
 pub mod raccoon_accounts;
 pub mod raccoon_import;
 pub mod state;
@@ -107,6 +108,13 @@ pub(crate) const CATPAW_PROVIDER_ID: &str = crate::server::core::providers::kind
 /// [`RACCOON_PROVIDER_ID`] 的口径）。
 pub(crate) const AUTOCLAW_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::AutoClaw,
+);
+
+/// Qoder provider id（账号存储内部多处要用；**从注册表推导**，同
+/// [`RACCOON_PROVIDER_ID`] 的口径）。Qoder 的账号形态与推理转发见
+/// `qoder_accounts.rs` 与 `providers::qoder` 的模块头。
+pub(crate) const QODER_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::Qoder,
 );
 
 /// 小浣熊 provider id（账号存储内部多处要用）。

@@ -27,6 +27,9 @@
 //! 任务完成后保留 10 分钟，清理在「取任务时顺手做过期检查」里完成，
 //! 不额外起后台定时器。
 
+mod catpaw;
+mod qoder;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -194,19 +197,16 @@ impl LoginTasks {
         let Some(handle) = self.get(state) else {
             return false;
         };
-        let should_cancel = {
-            let guard = handle.lock();
-            !guard.done
-        };
-        if !should_cancel {
-            return false;
-        }
-        handle.update(|task| {
+        {
+            let mut task = handle.lock();
+            if task.done {
+                return false;
+            }
             task.canceled = true;
             task.done = true;
             task.error = Some("登录已取消".to_string());
             task.finished_at = Some(logging::now_ms());
-        });
+        }
         {
             let mut table = self.lock();
             // 按 state 或按句柄（state 未入表时用 ticket 兜底，两者必居其一）
@@ -456,6 +456,9 @@ impl LoginService {
                 format!("登录任务记录的提供商「{}」无法识别", task.provider),
             ));
         };
+        if kind != ProviderKind::Raccoon {
+            return Err(GatewayError::with_status(400, "该登录任务不接收授权码回调"));
+        }
         let code = match oauth::parse_callback_code(callback_url, state) {
             Ok(code) => code,
             Err(error) => {

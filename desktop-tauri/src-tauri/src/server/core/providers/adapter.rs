@@ -100,6 +100,7 @@ use serde_json::{json, Value};
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
+use super::qoder;
 use super::raccoon;
 use super::{kind_id, meta, ProviderKind};
 
@@ -258,6 +259,29 @@ pub trait ProviderAdapter: Send + Sync {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     >;
+
+    /// 本 provider 是否有**已接入的推理转发能力**（五家现在都是 true）。
+    ///
+    /// ── 这条声明曾经区分过什么（历史，别误会成现在还有 false）─────
+    /// Qoder 在接入推理协议之前返回 false（它当时只有账号管理能力），
+    /// 判据的用途正是下面这条「与 `list_models` 的分工」。那家接上转发后本方法
+    /// 在生产代码里已无 false 分支；保留这个入口是因为它编码的**语义**仍然成立 ——
+    /// 「清单这次是空的」与「这家根本没有转发能力」是两件事，将来再有新 provider
+    /// 的过渡期（先上账号管理、后接转发）仍需要它。
+    ///
+    /// ── 与 `list_models` 的分工（为什么不看清单是否为空）──────────
+    /// workbuddy 与 raccoon 的清单来自远程目录，拉取失败或没登录时**本来就可能
+    /// 为空**，但它们能转发。拿清单当判据会把这两家在那种时刻误判成「不能转发」。
+    /// 因此本方法是一个**恒定能力声明**（编译期常量），与 `supports_usage` /
+    /// `supports_refresh` 同一性质；也正因为它是常量，调用点（账号存储派生全局
+    /// 队首）可以逐账号调用而不必付 `list_models` 的克隆开销。
+    ///
+    /// 消费方：`account_store::pick_current`（全局队首 = `/api/session` 的
+    /// `currentAccountId`、退出登录的删除目标、界面 ★）。没有转发能力却排进队首，
+    /// 会让顶栏把它显示成「当前登录态」、并让「退出登录」把它删掉。
+    fn supports_chat(&self) -> bool {
+        true
+    }
 
     /// 本 provider 是否有**可拉取的远程模型目录**（模块头扩展 9）。
     ///
@@ -605,6 +629,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::Raccoon => &super::raccoon::RACCOON_ADAPTER,
         ProviderKind::CatPaw => &super::catpaw::adapter::CATPAW_ADAPTER,
         ProviderKind::AutoClaw => &super::autoclaw::adapter::AUTOCLAW_ADAPTER,
+        ProviderKind::Qoder => &super::qoder::QODER_ADAPTER,
     }
 }
 
@@ -614,8 +639,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 /// 这是「已完整实现」而不是「已注册」：AutoClaw 曾在 W4a–W4b 之间处于「身份与
 /// 注册表项都在、但适配器是占位」的中间态，那时它**不在本列表里**；
 /// W4b-T-c2 接上真身（`autoclaw::adapter::AUTOCLAW_ADAPTER`）后列入本表 ——
-/// 与 CatPaw 在 W5-T-d4 走过的路径相同。四家现在全部在列表里，与 `PROVIDERS`
-/// 的 id 集合一一对应（过渡期的占位实现已在 W6 随 `pending.rs` 删除）。
+/// 与 CatPaw 在 W5-T-d4 走过的路径相同。Qoder 也走过同一条路：接入推理转发
+/// 之前它只有账号管理能力，本波次接上真身后列入。**五家现在全部在列表里**，
+/// 与 `PROVIDERS` 的 id 集合一一对应（过渡期的占位实现已在 W6 随
+/// `pending.rs` 删除）。
 ///
 /// 为什么这份列表必须排除占位实现（当时的口径）：它的消费方是后台目录刷新
 /// （`refresh_implemented` ← `api::chat::spawn_catalog_refresh` 与
@@ -633,6 +660,7 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::Raccoon,
         ProviderKind::CatPaw,
         ProviderKind::AutoClaw,
+        ProviderKind::Qoder,
     ]
 }
 
@@ -716,6 +744,17 @@ fn seed_current_workbuddy_defaults() {
     }
 }
 
+/// 对**当前缓存清单**里的 Qoder 模型补一次默认规则种子（默认只启用白名单内的
+/// 模型，见 `model_rules::seed_qoder_defaults`）。
+///
+/// 委托给 `qoder::models::seed_default_rules` —— 那边取的是两个地区的**并集**，
+/// 与刷新落地时种的是同一份口径。要这一手补种的理由与 WorkBuddy 相同：Qoder
+/// 在没有账号 / 远程刷新失败时手里只剩静态兜底清单，而**升级用户**的并集正是
+/// 那份兜底 —— 不补种的话，他们打开管理页看到的仍是旧的全开状态。
+fn seed_current_qoder_defaults() {
+    qoder::models::seed_default_rules();
+}
+
 /// 让所有**已实现**的 provider 各刷新一次模型目录（后台任务入口）。
 ///
 /// 调用点：`api::chat::spawn_catalog_refresh`（GET /v1/models 的异步刷新）
@@ -729,6 +768,7 @@ fn seed_current_workbuddy_defaults() {
 pub async fn refresh_implemented(store: &AccountStore) {
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
+    seed_current_qoder_defaults();
     for kind in implemented_kinds() {
         let adapter = adapter_for(kind);
         // 注册表与适配器自报的 kind 必须一致（不一致说明 `adapter_for`
@@ -782,6 +822,7 @@ pub async fn refresh_implemented_forced(store: &AccountStore) -> Vec<Value> {
     // 内部还会再种一次）
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
+    seed_current_qoder_defaults();
     for kind in implemented_kinds() {
         let adapter = adapter_for(kind);
         debug_assert_eq!(adapter.kind(), kind);

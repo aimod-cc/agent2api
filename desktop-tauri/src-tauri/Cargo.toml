@@ -1,6 +1,6 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "2.0.2"
+version = "2.2.0"
 description = "Agent2API 桌面端 — 多提供商本地网关与会话管理"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -67,6 +67,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # data URL 的 base64 解/编码。base64 0.22.1 已经是 reqwest 的非可选依赖
 # （同样走特性合并，不新增 crate、不新增编译产物）。
 base64 = "0.22"
+# Qoder 网页登录的 PKCE verifier / nonce 与机器标识需要**不可预测**的随机串
+# （verifier 是「授权码只能换给本进程」这条保证的全部依据），因此要真正的
+# 密码学随机源，不能沿用 raccoon::oauth 那套「RandomState + 时间戳」的廉价串
+# （那套只够做 CSRF 口径的 state）。getrandom 0.2 本来就在依赖树里
+# （ring / aes-gcm 拉的），这里只是把它提升为直接依赖，不新增编译产物。
+getrandom = "0.2"
 # AutoClaw 适配器的 encryption 侧（providers/autoclaw/crypto.rs）：Electron
 # safeStorage 的 os_crypt 密文是 AES-256-GCM，密钥由 DPAPI 解出。
 # 刻意 **关掉 default**：默认特性里的 getrandom/rand_core 是给「生成密钥」用的，
@@ -74,11 +80,25 @@ base64 = "0.22"
 # 留下 aes（AES-256 分组密码本体）与 alloc（Aead::decrypt 返回 Vec 必需）——
 # 两者都是纯 Rust（aes / ghash / polyval），无 C 编译依赖、也不要求 nasm。
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+# AES-128-CBC 分组加密：Qoder COSY 签名要用它加密一次性的身份 JSON
+# （providers/qoder/cosy.rs）。**不是新增编译产物** —— `aes` 0.9 本来就是
+# aes-gcm 的非可选依赖（上面那行的 `aes` 特性就是它），这里只是把它提升为
+# 直接依赖，好在自己的代码里 `use aes::Aes128`。CBC 的链式异或与 PKCS#7 补位
+# 是十几行确定性代码，因此不额外引入 `cbc` + `block-padding` 两个 crate。
+aes = "0.9"
 # AutoClaw 鉴权接口的请求签名：X-Auth-Sign = MD5(appId&timestamp&appKey)
 # （providers/autoclaw/credentials.rs 的刷新调用，见 autoclaw-upstream-client.mjs）。
 # 只加它自己：digest 0.10.7 与 cfg-if 都已被 sha2 拉进依赖树（特性合并，不新增）。
 # MD5 在这里**不是**安全边界，只是复刻桌面端客户端的固定指纹，不要换成别的摘要。
 md-5 = "0.10"
+# Qoder COSY 签名（providers/qoder/cosy.rs）要用 RSA 公钥加密一把一次性 AES 密钥，
+# 而那条链路上只用到「PKCS#1 v1.5 打包 + 一次模幂」这一步。因此不引入完整的
+# rsa crate（它会拖进 num-bigint-dig / pkcs1 / pkcs8 / der / signature 一长串依赖），
+# num-bigint 就够：大整数 + modpow，打包与随机填充十几行。
+# num-integer 是它的既有依赖（已在依赖树里），不新增编译产物。
+# 正确性已与 Node 的 crypto 对拍（Rust 加密 → Node 私钥解密往返成功，
+# 且 AES-CBC / MD5 / 请求体编码的密文与 Node 逐字节一致）。
+num-bigint = "0.4"
 
 # 查端口监听者与结束进程树改用纯 Win32 API（iphlpapi 的 GetExtendedTcpTable、
 # Toolhelp 进程快照 + OpenProcess/TerminateProcess）。原先靠 spawn taskkill /

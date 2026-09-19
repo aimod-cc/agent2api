@@ -8,6 +8,7 @@
 //! 只访问 127.0.0.1 上的明文 HTTP，不需要 TLS。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -16,13 +17,57 @@ use serde_json::Value;
 pub const DEFAULT_PORT: u16 = 3065;
 pub const REQUEST_TIMEOUT_MS: u64 = 60_000;
 
-/// 实际使用端口：允许用 AGENT2API_PROXY_PORT 覆盖
-/// （旧名 WORKBUDDY_PROXY_PORT 仍可读，新名优先）。
-/// 默认 3065；端口被别的程序占用时可用它改端口并行运行。
+/// 本次运行实际使用的端口。
+///
+/// 端口在进程启动时定死（服务端 bind 之后就改不了），但「用户改了设置」这件事
+/// 发生在运行期 —— 保存新端口后要重启进程才生效。这个原子量让**重启之前**的
+/// 读取（界面查状态、管理 API 客户端拼 URL）拿到的仍是当前真正在监听的端口，
+/// 不会因为设置里已经写上新值就指向一个没人监听的端口。
+static ACTIVE_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// 端口选择优先级：环境变量 > 配置文件 > 默认值。
+///
+/// 环境变量优先是历史行为（1.x 起就支持用它并行跑第二实例做测试），
+/// 且它只影响本次运行、不写盘，语义清晰。
+///
+/// **配置文件里的端口**（`desktop-settings.json` 的 `proxyPort`）是 2.0.4 新增的：
+/// 端口被系统保留段挡住时，改环境变量对普通用户来说门槛太高（要改启动方式），
+/// 而这条故障又只能靠换端口解决 —— 界面上的「更换端口」写的就是这个字段。
 pub fn proxy_port() -> u16 {
-    env_port("AGENT2API_PROXY_PORT")
+    let cached = ACTIVE_PORT.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    resolve_port()
+}
+
+/// 按优先级解析端口并缓存进 `ACTIVE_PORT`（只在首次调用时真正解析）。
+fn resolve_port() -> u16 {
+    let port = env_port("AGENT2API_PROXY_PORT")
         .or_else(|| env_port("WORKBUDDY_PROXY_PORT")) // 旧名兼容读（1.x 起沿用）
-        .unwrap_or(DEFAULT_PORT)
+        .or_else(|| configured_port())
+        .unwrap_or(DEFAULT_PORT);
+    ACTIVE_PORT.store(port, Ordering::Relaxed);
+    port
+}
+
+/// 读设置文件里的端口；未设置 / 非法一律当未设置（回落到下一级）。
+///
+/// 用 `settings::load()` 而不是自己读文件：设置文件的路径与容错口径
+/// （缺失、损坏、权限不足都回落默认值）只该有一处实现。
+fn configured_port() -> Option<u16> {
+    let port = crate::settings::load().proxy_port;
+    if port > 0 {
+        Some(port)
+    } else {
+        None
+    }
+}
+
+/// 环境变量是否显式指定了端口（显式指定时界面不该再提供「更换端口」——
+/// 改了设置也不会生效，只会让用户白忙一场）
+pub fn port_from_env() -> Option<u16> {
+    env_port("AGENT2API_PROXY_PORT").or_else(|| env_port("WORKBUDDY_PROXY_PORT"))
 }
 
 /// 读环境变量里的端口：未设置 / 非数字 / 0 一律当未设置（回落到下一级）

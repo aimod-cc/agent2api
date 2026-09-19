@@ -5,11 +5,12 @@
 //!   POST   /api/accounts                手动添加账号（accessToken/refreshToken JSON）
 //!   GET    /api/accounts/export         导出全部账号（含 token，换机器后导入继续用）
 //!   POST   /api/accounts/import         导入账号（merge：按 uid 匹配，命中更新、未命中追加）
-//!   POST   /api/accounts/current        把账号置顶（即切换当前账号）{ id }
+//!   POST   /api/accounts/current        把账号置顶（仅调整全局优先级）{ id }
 //!   POST   /api/accounts/batch          批量操作 { action, ids, proxy? }
 //!   POST   /api/accounts/refresh        刷新指定（或当前）账号的 token { id? }
 //!   POST   /api/accounts/refresh-expiring 刷新**全部**已过期/临期的账号凭证（批量）
 //!   GET    /api/accounts/usage          逐账号查询积分/额度（并发，单账号失败不拖垮整批）
+//!   GET    /api/accounts/usage/snapshot 最近一次**定时查询**的结果快照（形状同 usage）
 //!   POST   /api/accounts/checkin        签到（串行，跳过已禁用与国际版账号）{ id? }
 //!   PATCH  /api/accounts/{id}           修改账号属性 { name?, priority?, enabled?, proxy? }
 //!   POST   /api/accounts/{id}/move      与相邻账号交换优先级 { direction: 'up' | 'down' }
@@ -59,7 +60,12 @@ use crate::server::http::{ok_json, parse_body};
 use crate::server::logging;
 use crate::server::ServerState;
 
-fn store_error(error: AccountStoreError) -> Response {
+/// 账号存储错误 → 管理信封（打日志 + 原状态码）。
+///
+/// 可见性是 `pub(super)`：`api::session` 的 AutoClaw 验证码登录要落账号
+/// （`add_autoclaw_account`），失败时必须是同一个响应形状与同一条日志格式 ——
+/// 让那边各写一份会让「登录失败」与「添加失败」在界面上长得不一样。
+pub(super) fn store_error(error: AccountStoreError) -> Response {
     logging::log("[Accounts]", &format!("❌ {}", error.message));
     management_error(error.status_code, error.message)
 }
@@ -205,6 +211,10 @@ pub async fn dispatch(
         ("POST", "refresh-expiring") => return refresh_expiring_accounts(&state).await,
         // 余额 / 积分查询（四家混查）实现在 `api::accounts_usage`（拆分见那里的模块头）
         ("GET", "usage") => return super::accounts_usage::accounts_usage(&state).await,
+        // 定时查询那一轮的结果快照（形状同 usage，多一个 `at`）
+        ("GET", "usage/snapshot") => {
+            return super::accounts_usage::accounts_usage_snapshot().await
+        }
         ("POST", "checkin") => return accounts_checkin(&state, body).await,
         _ => {}
     }
@@ -313,6 +323,12 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 store.add_autoclaw_account(&payload, import_name)
             }
         }
+        Some(crate::server::core::providers::ProviderKind::Qoder) => {
+            match crate::server::core::providers::qoder::auth::prepare_account(&payload).await {
+                Ok(credentials) => store.add_qoder_account(&credentials, import_name, "manual"),
+                Err(error) => Err(AccountStoreError::new(error.message, error.status_code)),
+            }
+        }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
             store.add_account(&payload, None)
         }
@@ -366,7 +382,7 @@ pub async fn set_current(state: &ServerState, body: &Bytes) -> Response {
     match state.store().promote_to_front(id) {
         Ok(result) => {
             if result.get("changed").and_then(Value::as_bool) == Some(false) {
-                logging::log("[Accounts]", &format!("已是当前账号，无需切换: {id}"));
+                logging::log("[Accounts]", &format!("已在全局队列第一位，无需置顶: {id}"));
             }
             ok_json(result)
         }
@@ -473,6 +489,9 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
         },
     };
     logging::verbose("[Accounts]", &format!("刷新账号 token: {id}"));
+    if state.store().qoder_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Qoder).await;
+    }
     // 小浣熊账号：走它自己的刷新（结果由 `credentials::refresh` 回写）
     if state.store().raccoon_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Raccoon).await;
@@ -544,76 +563,12 @@ pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
 
 // ─── GET /api/accounts/usage 与 POST /api/accounts/checkin ──
 
-/// 批量操作（usage/checkin）的目标集合：默认跳过已禁用账号（避免无谓地打上游）。
-/// 对照 Node 版 `resolveBatchTargets`：给了 id 就只取该账号且**不看 enabled**
-/// （用户显式指定就该执行）；没给 id 时取全部启用账号，并统计被跳过的数量。
-///
-/// `provider`：`Some(id)` 只取该家（**签到**必须这样——它是 workbuddy 独有的
-/// 概念，拿别家账号打腾讯的签到接口只会稳定报错）；`None` 跨四家取
-/// （**余额查询**用它：四家的余额接口各不相同、由各自适配器负责）。
-/// 显式指定 id 时**不做过滤**（与「显式指定就执行」的既有语义一致）。
-///
-/// 返回 `Box<Response>` 是为了压住 clippy 的 result_large_err（axum 的 Response
-/// 有 128 字节）：Box 只在这条**错误**分支上多一次分配，正常路径零开销。
-///
-/// `pub(super)`：余额查询（`api::accounts_usage`）也要用同一条目标集合解析 ——
-/// 两条接口的 `skipped` 口径与「显式指定 id 不过滤」的语义必须同源，
-/// 各写一份必然分叉。
-pub(super) fn resolve_batch_targets(
-    state: &ServerState,
-    provider: Option<&str>,
-    id: Option<&str>,
-) -> Result<(Vec<Value>, usize), Box<Response>> {
-    let snapshot = state.store().list_accounts();
-    let accounts: Vec<Value> = snapshot
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    // provider 缺失的账号按 workbuddy 归属（与 store 的 `provider()` 兜底口径
-    // 一致：旧记录没有这个字段），否则它们会在两种过滤下都被漏掉
-    let in_scope = |account: &Value| match provider {
-        None => true,
-        Some(provider) => account
-            .get("provider")
-            .and_then(Value::as_str)
-            .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID)
-            == provider,
-    };
-    let is_available = |account: &Value| {
-        account.get("available").and_then(Value::as_bool).unwrap_or(true)
-    };
-    let is_enabled = |account: &Value| {
-        account.get("enabled").and_then(Value::as_bool).unwrap_or(true)
-    };
-    if let Some(id) = id.filter(|value| !value.is_empty()) {
-        let found: Vec<Value> = accounts
-            .iter()
-            .filter(|account| account.get("id").and_then(Value::as_str) == Some(id))
-            .cloned()
-            .collect();
-        if found.is_empty() {
-            return Err(Box::new(management_error(404, "账号不存在")));
-        }
-        return Ok((found, 0));
-    }
-    let available: Vec<Value> = accounts
-        .into_iter()
-        .filter(in_scope)
-        .filter(is_available)
-        .collect();
-    let skipped = available.len();
-    let targets: Vec<Value> = available.into_iter().filter(is_enabled).collect();
-    let skipped = skipped - targets.len();
-    Ok((targets, skipped))
-}
-
-/// ── 签到目标解析搬去了 `core::billing::checkin` ─────────────
-/// `resolve_checkin_targets` / `checkin_for` / `runCheckin` 三段整体下沉到 core：
-/// 定时签到（core::auto_checkin）与 `POST /api/accounts/checkin` 必须共用同一段
-/// 逻辑。这里只剩 `accounts_checkin` 一个转发壳，规则见
-/// `core::billing::checkin::resolve_checkin_targets`。`resolve_batch_targets`
-/// 仍留在这里（`/api/accounts/usage` 的并发查询要用它，`skipped` 口径不同）。
+/// ── 两条路径的目标解析都不在本文件了 ─────────────────────
+/// · 余额查询的目标集合：`core::usage_query::resolve_batch_targets`
+///   （它跟着查询逻辑一起下沉 —— 「定时查询积分」要用同一份口径）；
+/// · 签到的目标集合：`core::billing::checkin::resolve_checkin_targets`
+///   （定时签到与手动签到必须共用同一段逻辑）。
+/// 本文件只剩 `accounts_checkin` 一个转发壳。
 
 
 /// POST /api/accounts/checkin

@@ -69,6 +69,15 @@ const SUBSCRIBE_INFO_PATH: &str = "/agentpay/v1/assistant/subscribe-info";
 /// 把一次登录态过期当成「积分查询返回异常」报给用户（他不会知道要去重新登录）。
 const AUTH_EXPIRED_CODES: &[i64] = &[410_000, 400_000];
 
+/// 业务码是否表示「登录态失效」。
+///
+/// 签到（`checkin.rs`）也走 userapi 域，用的是同一组判定 —— 提成函数而不是让
+/// 那边复制一份码表：两处一旦分叉，签到链路会把一次登录态过期当成「签到失败」
+/// 报给用户，他不会知道要去重新登录。可见性是 `pub(super)`（只给同目录用）。
+pub(super) fn is_auth_expired_code(code: i64) -> bool {
+    AUTH_EXPIRED_CODES.contains(&code)
+}
+
 /// v1 钱包实例的 scope → 展示名（源实现 `WALLET_SCOPE_LABELS`，逐字照抄）。
 const WALLET_SCOPE_LABELS: &[(&str, &str)] = &[
     ("daily", "赠送积分"),
@@ -138,7 +147,7 @@ pub(super) async fn query_usage(
 ///
 /// 返回 `{totalBalance, wallets, expiring, raw}`。
 async fn query_points(credentials: &AutoClawCredentials) -> Result<Value, GatewayError> {
-    let wallet_payload = userapi_get(credentials, POINTS_WALLET_PATH).await?;
+    let wallet_payload = userapi_get(credentials, POINTS_WALLET_PATH, "积分查询").await?;
     if let Some(code) = wallet_payload.get("code").and_then(Value::as_i64) {
         if AUTH_EXPIRED_CODES.contains(&code) {
             return Err(GatewayError::with_status(
@@ -213,7 +222,7 @@ async fn query_points(credentials: &AutoClawCredentials) -> Result<Value, Gatewa
         )
     } else {
         // v2 拿不到（code 非 0 或没有 wallets 数组）→ v1 兜底
-        let legacy = userapi_get(credentials, POINTS_WALLET_LEGACY_PATH).await?;
+        let legacy = userapi_get(credentials, POINTS_WALLET_LEGACY_PATH, "积分查询").await?;
         if let Some(code) = legacy.get("code").and_then(Value::as_i64) {
             if AUTH_EXPIRED_CODES.contains(&code) {
                 return Err(GatewayError::with_status(
@@ -256,7 +265,7 @@ async fn query_points(credentials: &AutoClawCredentials) -> Result<Value, Gatewa
 
     // 「即将过期」是附加信息：失败不阻塞余额展示（源实现把这条调用包在
     // 自己的 try/catch 里，注释写明「即将过期查询失败不阻塞余额展示」）
-    let expiring = match userapi_get(credentials, POINTS_EXPIRING_PATH).await {
+    let expiring = match userapi_get(credentials, POINTS_EXPIRING_PATH, "积分查询").await {
         Ok(payload) => {
             let data = payload.get("data").cloned().unwrap_or(Value::Null);
             if payload.get("code").and_then(Value::as_i64) == Some(0) && !data.is_null() {
@@ -340,7 +349,7 @@ async fn query_subscription(credentials: &AutoClawCredentials) -> Result<Value, 
             );
         }
     }
-    let payload = userapi_post(credentials, SUBSCRIBE_INFO_PATH, &body).await?;
+    let payload = userapi_post(credentials, SUBSCRIBE_INFO_PATH, &body, "订阅查询").await?;
     if let Some(code) = payload.get("code").and_then(Value::as_i64) {
         if AUTH_EXPIRED_CODES.contains(&code) {
             return Err(GatewayError::with_status(
@@ -445,35 +454,35 @@ fn normalize_subscription(data: &Value) -> Value {
 }
 
 /// 发一次带签名的 userapi GET（源实现 `userapiGetFor` 的对等物）。
-async fn userapi_get(
+///
+/// 可见性是 `pub(super)`：签到（`checkin.rs`）在同一个 userapi 域上取任务列表，
+/// 复用的是同一套签名头与超时口径。复制一份到那边会让 appId/appKey、时间戳单位
+/// 与品牌头各自演进，而签名一旦分叉就是稳定 400002。
+///
+/// `what` 是**出错文案里的动作名**（「积分查询」「任务列表查询」）。它是参数而不是
+/// 写死常量：这条函数被三条链路共用，写死「积分查询」会让签到失败时告诉用户
+/// 「积分查询失败」—— 一条指向错误功能的提示比没有提示更难排查。
+pub(super) async fn userapi_get(
     credentials: &AutoClawCredentials,
     path: &str,
+    what: &str,
 ) -> Result<Value, GatewayError> {
     let url = format!("{}{path}", credentials::userapi_base_url());
     let headers = signed_auth_headers(&credentials.token);
     let response = send_raw("GET", &url, None, &headers, None, Some(REQUEST_TIMEOUT_MS))
         .await
-        .map_err(|error| describe_transport("积分查询", &error))?;
-    if response.status == 401 {
-        return Err(GatewayError::with_status(
-            401,
-            "登录态已过期，无法查询积分",
-        ));
-    }
-    if !response.ok {
-        return Err(GatewayError::with_status(
-            response.status as i32,
-            format!("积分查询返回 HTTP {}", response.status),
-        ));
-    }
-    Ok(response.payload.unwrap_or(Value::Null))
+        .map_err(|error| describe_transport(what, &error))?;
+    check_userapi_response(&response, what)
 }
 
 /// 发一次带签名的 userapi POST（源实现 `userapiPostFor` 的对等物）。
-async fn userapi_post(
+///
+/// `what` 的含义与 [`userapi_get`] 相同（「订阅查询」「签到」）。
+pub(super) async fn userapi_post(
     credentials: &AutoClawCredentials,
     path: &str,
     body: &Value,
+    what: &str,
 ) -> Result<Value, GatewayError> {
     let url = format!("{}{path}", credentials::userapi_base_url());
     let headers = signed_auth_headers(&credentials.token);
@@ -486,20 +495,28 @@ async fn userapi_post(
         Some(REQUEST_TIMEOUT_MS),
     )
     .await
-    .map_err(|error| describe_transport("订阅查询", &error))?;
+    .map_err(|error| describe_transport(what, &error))?;
+    check_userapi_response(&response, what)
+}
+
+/// HTTP 层结果的统一判定（GET / POST 共用，两者只差方法名）。
+fn check_userapi_response(
+    response: &crate::server::core::auth_http::ApiResponse,
+    what: &str,
+) -> Result<Value, GatewayError> {
     if response.status == 401 {
         return Err(GatewayError::with_status(
             401,
-            "登录态已过期，无法查询订阅",
+            format!("登录态已过期，无法{what}"),
         ));
     }
     if !response.ok {
         return Err(GatewayError::with_status(
             response.status as i32,
-            format!("订阅查询返回 HTTP {}", response.status),
+            format!("{what}返回 HTTP {}", response.status),
         ));
     }
-    Ok(response.payload.unwrap_or(Value::Null))
+    Ok(response.payload.clone().unwrap_or(Value::Null))
 }
 
 /// 传输错误 → 可读的网关错误（超时给 504，与既有计费接口的分档口径一致）。

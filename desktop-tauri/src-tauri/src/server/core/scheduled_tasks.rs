@@ -9,8 +9,8 @@
 //! 由 `/api/scheduled-tasks*` 三条路由读改，循环只负责按清单干活。
 //!
 //! ── 两类任务（区别是**谁来执行**，不是可配性）─────────────────
-//!   - `Runner::Backend`：凭证自动维护、模型目录刷新。后端循环执行，
-//!     因此有「上次执行 / 下次执行 / 立即执行」这些运行状态。
+//!   - `Runner::Backend`：凭证自动维护、定时查询积分、模型目录刷新、软件版本检查。
+//!     后端循环执行，因此有「上次执行 / 下次执行 / 立即执行」这些运行状态。
 //!   - `Runner::Frontend`：日志页与请求明细页的自动刷新。定时器天然长在页面上
 //!     （只在页面可见时该走），后端只存开关与间隔，界面自己读；
 //!     因此它们没有运行状态，也不提供「立即执行」。
@@ -92,13 +92,15 @@ pub const TASK_CREDENTIAL_MAINTENANCE: &str = config::KEY_CREDENTIAL_MAINTENANCE
 pub const TASK_MODEL_REFRESH: &str = config::KEY_MODEL_REFRESH;
 /// 软件版本定时检查
 pub const TASK_UPDATE_CHECK: &str = config::KEY_UPDATE_CHECK;
+/// 定时查询积分
+pub const TASK_USAGE_QUERY: &str = config::KEY_USAGE_QUERY;
 /// 日志页自动刷新（前端定时器）
 pub const TASK_LOGS_AUTO_REFRESH: &str = config::KEY_LOGS_AUTO_REFRESH;
 /// 请求明细页自动刷新（前端定时器）
 pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 
 /// 任务清单（顺序 = 界面上的显示顺序：先后端、后前端，同类按重要性）
-pub const TASKS: [TaskDef; 5] = [
+pub const TASKS: [TaskDef; 6] = [
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
         label: "凭证自动维护",
@@ -109,6 +111,18 @@ pub const TASKS: [TaskDef; 5] = [
         min: config::INTERVAL_MIN_MINUTES,
         max: config::INTERVAL_MAX_MINUTES,
         default_interval: config::DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES,
+    },
+    TaskDef {
+        id: TASK_USAGE_QUERY,
+        label: "定时查询积分",
+        description: "定期查询全部已启用账号的余额 / 积分（四家的接口各不相同，由各自的适配器负责），\
+                      结果自动更新到账号页；查询失败的账号会明显标成「查询失败」并给出原因，不会静默留旧值。\
+                      一条查询就是逐账号打一次上游的积分接口，间隔设得过密可能触发上游风控。",
+        unit: "minutes",
+        runner: Runner::Backend,
+        min: config::INTERVAL_MIN_MINUTES,
+        max: config::INTERVAL_MAX_MINUTES,
+        default_interval: config::DEFAULT_USAGE_QUERY_MINUTES,
     },
     TaskDef {
         id: TASK_MODEL_REFRESH,
@@ -296,6 +310,8 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         settings.model_refresh
     } else if id == TASK_UPDATE_CHECK {
         settings.update_check
+    } else if id == TASK_USAGE_QUERY {
+        settings.usage_query
     } else if id == TASK_LOGS_AUTO_REFRESH {
         settings.logs_auto_refresh
     } else if id == TASK_REQUESTS_AUTO_REFRESH {
@@ -547,6 +563,32 @@ async fn run_backend(
                 Err(error) => format!("检查失败：{}", error.message),
             }
         }
+        TASK_USAGE_QUERY => {
+            // 定时查询积分：查全部启用账号的余额，结果存进快照
+            // （界面读 `/api/accounts/usage/snapshot` 拿它，不必用户点按钮）。
+            //
+            // 与手动那条（`GET /api/accounts/usage`）**共用 core::usage_query::query_all**：
+            // 「查哪些账号、怎么查、失败怎么收敛」只有一份，两条入口只在「结果去哪」
+            // 上不同 —— 手动是直接回给这一次请求，定时是存快照。
+            //
+            // **失败也进快照**（`store_snapshot` 里不筛）：这条任务的意义就是
+            // 「不点按钮也知道现在好不好」，把失败丢掉会让界面停在旧余额上，
+            // 比显示失败更误导。摘要里同样带上失败数，且失败时写一条日志 ——
+            // 余额全线查不通（凭证过期 / 上游改接口）是用户需要知道的事。
+            match crate::server::core::usage_query::query_all(store).await {
+                Ok(report) => {
+                    let (ok, failed) = crate::server::core::usage_query::store_snapshot(report);
+                    if failed > 0 {
+                        logging::log(
+                            "[Usage]",
+                            &format!("定时查询积分：成功 {ok} 个，失败 {failed} 个"),
+                        );
+                    }
+                    format!("成功 {ok} 个，失败 {failed} 个")
+                }
+                Err(error) => format!("查询失败：{}", error.message),
+            }
+        }
         _ => {
             with_run(task.id, |entry| entry.running = false);
             return None;
@@ -556,18 +598,19 @@ async fn run_backend(
     Some(summary)
 }
 
-/// 调度循环：把两条后端任务按各自配置的间隔重复执行。
+/// 调度循环：把后端任务按各自配置的间隔重复执行。
 ///
 /// 由 `ServerState::bootstrap` 起一次（进程内只有这一个循环，见那边的注释）。
 /// 循环体只做三件事：读配置 → 看谁到点了 → 跑它。所有状态都在
 /// `RUNS` 与 `config` 里，因此重启进程即从头开始（这是有意的，见模块头）。
 ///
-/// **首轮就绪即跑**：spawn 出来的第一次循环不等间隔，直接跑一次两条任务 ——
+/// **首轮就绪即跑**：spawn 出来的第一次循环不等间隔，直接跑一次各条任务 ——
 /// 这替代了改造前 bootstrap 里那两处「启动时刷新一次」（凭证维护与模型目录），
 /// 于是「关掉任务 = 启动也不刷」这条一致性成立；开启时行为与改造前相同。
+/// 定时查询积分也走这条：启动即查一次，界面不用等满一个间隔才见到余额。
 pub fn spawn(store: AccountStore, update: crate::server::core::update::UpdateManager) {
     tauri::async_runtime::spawn(async move {
-        // 首轮：给两条后端任务排上「现在就执行」的期，于是紧接着的第一次循环
+        // 首轮：给各条后端任务排上「现在就执行」的期，于是紧接着的第一次循环
         // 立刻就跑一次。这替代了改造前 bootstrap 里那两处「启动时刷新一次」
         // （凭证维护与模型目录）—— 于是「关掉任务 = 启动也不刷」这条一致性成立，
         // 开启时的行为则与改造前完全相同。

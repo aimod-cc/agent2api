@@ -10,9 +10,8 @@
  * 逐个尝试，跳过禁用 / 不支持该模型 / 该模型限流中的账号（见 priority.rs 与
  * rotate.rs）。所以这张表：
  *   · 行序 = 优先级升序（不再按 provider 分块，也没有组首分隔线）；
- *   · 「首选」= **下一个请求会先用的账号**（后端 `routedAccountId`：按最近一次
- *     请求的模型派生，已剔除对该模型限流的账号）。它可能不是队列第一位 ——
- *     队首正对该模型限流时，那一位显示为「队首」块，见 accounts-table 的 actionsCell；
+ *   · 「设为首选」只调整全局队列顺序，不改变启用状态；
+ *   · 不根据请求模型或选路结果标记账号；
  *   · ↑/↓ 与全局相邻账号交换（对方可能是另一家的账号）；
  *   · 「先用哪一家」由队列里排最前的支持该模型的账号决定，
  *     provider 只再是账号的一个属性（不再有独立的「转发路由」设置）。
@@ -39,8 +38,6 @@
     checkinableAccounts,
     visibleAccounts,
     positionMap,
-    routedId,
-    pickQueueHead,
     moreMenuHtml,
     usagePanelHtml: usagePanelHtmlOf,
     limitPanelHtml: limitPanelHtmlOf,
@@ -110,8 +107,8 @@
   /**
    * 一张表：所有可见账号按**全局优先级升序**排成一条队列（与后端选路同构）。
    *
-   * 每行的 ctx 都是现算的：位置表（序号与 ↑/↓ 边界）、队首（★ / 首选）、
-   * 各自的展开态。明细行紧跟在各自账号行之后（整宽内容，放进单元格会被那一列锁死）。
+   * 每行的 ctx 都是现算的：位置表（序号与 ↑/↓ 边界）、各自的展开态。
+   * 明细行紧跟在各自账号行之后（整宽内容，放进单元格会被那一列锁死）。
    */
   function render() {
     const list = $('account-list');
@@ -139,22 +136,12 @@
       list.innerHTML = '<div class="empty">当前筛选条件下没有账号</div>';
       return;
     }
-    // 队首（★ / 「首选」）：优先用后端按「最近一次请求的模型」派生的
-    // `routedAccountId` —— 它把该模型限流中的账号剔除了，与转发层同一套判据，
-    // 标出来的就是这个请求真正会先试的账号。后端没给（旧版后端 / 模型未知）时
-    // 回落到不限模型的 `currentAccountId`，两者都不可用才由前端按同一判据派生。
-    const currentId = routedId(all, wbApp.getState?.()?.routedAccountId, snap.currentAccountId);
-    // 队列第一位（不看限额）：与 currentId 不同，说明它正被最近那个模型限流、
-    // 本次请求会顺延 —— 操作列据此把「设为首选」换成不可点的「队首」块
-    const queueHeadId = pickQueueHead(all)?.id || null;
     const positions = positionMap(all);
 
     // 逐行渲染（priorityUsage 之类的提示数据不再需要：冲突只有后端一处判）
     const body = visible.slice().sort(byPriorityOrder).map(account => {
       const row = table.rowHtml(account, {
         seat: positions.get(account.id) || { position: 1, total: 1 },
-        isCurrent: account.id === currentId,
-        isQueueHead: account.id === queueHeadId,
         picked: selectedIds.has(account.id),
         usageEntry: usageMap.get(account.id),
         usageOpen: panelOpen(account.id, 'usage'),
@@ -645,6 +632,8 @@
     // 余额 / 签到的动作与缓存都在 usage-actions.js，这里只做转发：
     // app.js 与外部仍按原有的 wbAccountsView 名字调用，引用路径一行不用改
     applyBalances: actions.applyBalances,
+    // 定时查询积分的结果快照轮询（见 usage-actions.js 的 syncSnapshot）
+    syncBalancesSnapshot: actions.syncSnapshot,
     queryUsageFor: actions.queryUsageFor,
     queryAllUsage: actions.queryAllUsage,
     checkinFor: actions.checkinFor,

@@ -18,8 +18,11 @@
   const { esc, toast } = wbApp;
   const $ = id => document.getElementById(id);
 
-  const REFRESH_TITLE = '只刷新支持远程目录的提供商（WorkBuddy、小浣熊）；'
-    + 'CatPaw 与 AutoClaw 使用固定模型清单，刷新不会改变它们';
+  // 提示里不点名哪几家：支持远程目录的家会变（Qoder 接入后也支持刷新），
+  // 硬编码名单每加一家就要改一次，而漏改只会给用户一句过时的说明。
+  // 「谁被跳过」由后端逐家结果里的 `fixed` 标记如实给出（见下方 renderRefreshResult）。
+  const REFRESH_TITLE = '只刷新支持远程目录的提供商；'
+    + '使用固定模型清单的提供商（上游没有目录接口）刷新不会改变它们';
   const GROUP_LIMIT = 8;
 
   /** 当前数据（null = 还没拉到） */

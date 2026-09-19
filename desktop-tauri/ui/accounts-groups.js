@@ -4,7 +4,7 @@
 /**
  * 从 accounts-model.js 按职责拆出的「provider 维度 + 领域判定 + 筛选与队列」层：
  * provider 能力表与摘要归一化、账号可用性 / 限流判定、筛选口径与分段计数、
- * 全局队列的位置表与队首派生。
+ * 全局队列的位置表。
  *
  * 这些都是**纯逻辑**：不读写模块状态、不碰事件、不生成卡片级 HTML
  * （不生成任何卡片或行级 HTML，那些在 accounts-model / accounts-table）。
@@ -43,16 +43,20 @@
    * 前端只回答「这一家有没有这个概念」。CatPaw 的余额接口要单独配置一个网页会话
    * 凭证（token2），没配置时后端返回可识别的「未配置」、面板显示成中性提示
    * （见 usage-panel.js）—— 所以它的按钮照样渲染，用户才有「去配置」的入口。
-   * checkin **只有 workbuddy**（签到的活动确实只有那一家有）；
+   * checkin 是**有签到活动**的家：workbuddy（腾讯每日签到）、raccoon（桌面登录
+   * 积分发放）、autoclaw（通用任务接口的 daily_signin 任务）。CatPaw / Qoder
+   * 有积分但确实没有签到，所以是 false —— 这个字段决定批量签到的目标集合与卡片上
+   * 的签到按钮，报错的家不该出现在这里。
    * edition 决定卡片是否显示国内版 / 国际版徽章与组内二级分组；
    * identifier / expiry 是「账号标识」与「有效期」在记录里的键名
    * （workbuddy 用 uid / expiresAt，小浣熊用 userId / tokenExpiresAt）。
    */
   const PROVIDER_FEATURES = {
     workbuddy: { usage: true, checkin: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
-    raccoon: { usage: true, checkin: false, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
+    raccoon: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
     catpaw: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
-    autoclaw: { usage: true, checkin: false, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
+    autoclaw: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
+    qoder: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt' },
   };
 
   /**
@@ -137,6 +141,18 @@
     return account?.desktop === true;
   }
 
+  /**
+   * 该账号所属的 provider 是否能承接推理转发（后端公开形态的 `chatSupported`）。
+   *
+   * 判据是适配器的 `supports_chat()` 声明（后端在公开形态里统一注入），
+   * 当前五家都能转发，因此正常配置下恒为 true。字段缺失（旧版后端）按
+   * 「能转发」处理：宁可让界面显示一个正常账号，也不要因为少了一个字段
+   * 就把所有账号标成「仅账号管理」。
+   */
+  function supportsChat(account) {
+    return account?.chatSupported !== false;
+  }
+
   // ─── 基础判定 ──────────────────────────────
 
   function typeLabel(type) {
@@ -174,37 +190,25 @@
     return Object.values(limits).some(info => Number(info?.resetAt) > now);
   }
 
-  /** 该账号此刻能否承接指定模型的请求（与后端 accountUsability 同构） */
-  function usableForModel(account, model) {
-    if (!isEnabled(account)) return false;
-    return !isRateLimited(account, model);
-  }
-
-  /**
-   * 账号是否有可用凭证（后端公开形态的 `hasCredentials`，四家同字段名）。
-   *
-   * 与后端 `StoredAccount::has_credentials` 同义：桌面端实时账号（记录里按设计
-   * 不落 token，凭证在客户端登录态文件里）也算「有凭证」。转发选路挑出候选后还要
-   * 取到会话才用，取不到就继续往后找 —— 凭证是转发口径的一部分，前端推算
-   * 「这一家会走谁」时必须一起判，否则会给一个转发时必然被跳过的账号打 ★。
-   * 字段缺失（旧版后端）按「有凭证」处理，不让所有 ★ 凭空消失。
-   */
-  function hasCredentials(account) {
-    return account?.hasCredentials !== false;
-  }
-
   /** 账号所属版本：cn=国内 / intl=国际（缺省视为国内，兼容旧账号记录） */
   function accountEdition(account) {
     return account?.edition === 'intl' ? 'intl' : 'cn';
   }
 
-  /** 只有有签到活动的那一家（workbuddy）的国内版账号才参与签到 */
+  /**
+   * 该账号是否参与签到：所属家**有签到活动**，且不是国际版。
+   *
+   * 版本限定只对 WorkBuddy 实际生效 —— 只有它有 edition 概念、也只有它的签到
+   * 活动分国内 / 国际站（国际站没有签到，上游事实）。判断按「非 intl」写而不是
+   * 逐个 provider 特判：另两家没有 edition 字段，`accountEdition` 会把缺省值
+   * 归一成 cn，因此这个条件对它们是恒真的，正好符合「不按版本排除」的语义。
+   */
   function supportsCheckin(account) {
     if (!providerFeatures(providerOf(account)).checkin) return false;
     return accountEdition(account) !== 'intl';
   }
 
-  /** 可参与签到的账号（一键签到只用这批：workbuddy + 启用 + 国内版） */
+  /** 可参与签到的账号（一键签到只用这批：所属家有签到活动 + 启用 + 非国际版） */
   function checkinableAccounts(list) {
     return (list || []).filter(account => isEnabled(account) && supportsCheckin(account));
   }
@@ -312,65 +316,6 @@
     return map;
   }
 
-  /**
-   * 全局队列的选路结果：优先级升序里第一个「启用 + 对该模型未限流 + 有可用凭证」的账号。
-   *
-   * 与后端 pick_account_by_priority 一致（不含 429 重试的排除列表；转发调用方还有
-   * 「挑出候选后取不到会话就继续往后找」的循环，这里同样把凭证算进判据，少了它界面
-   * 会把一个转发时必然被跳过的账号标成队首）。
-   *
-   * 注意它**不含**「这个模型由哪几家提供」这道收窄（那要读模型目录、且聚合视图是
-   * 跨家去重过的，前端还原不出来），所以只当兜底用：正式的首选来自后端
-   * `routedAccountId`（见 routedId）。`model` 留空 = 不限模型。
-   */
-  function pickForModel(list, model = '') {
-    const candidates = (list || [])
-      .filter(account => usableForModel(account, model) && hasCredentials(account))
-      .sort(byPriorityOrder);
-    return candidates[0] || null;
-  }
-
-  /**
-   * 队列第一位（**不看限额**）：优先级升序里第一个「启用 + 有可用凭证」的账号。
-   *
-   * 与后端 `pick_current`（快照的 `currentAccountId`）逐条同口径 —— 不判 rateLimits
-   * 是刻意的：它回答的是「队列排最前的是谁」，而不是「这次请求会走谁」。
-   * 两者不同（队首正被限流）才会用到这个函数，见 routedId 与操作列的「队首」块。
-   *
-   * 不能拿 `pickForModel(list, '')` 顶替：那个函数在 model 为空时判的是「任一模型
-   * 限流中」（见 isRateLimited 的无模型分支），会把队首跳过，于是「队首」块永远
-   * 不显示、还会给真正的队首错误地渲染出「设为首选」按钮。
-   */
-  function pickQueueHead(list) {
-    const candidates = (list || [])
-      .filter(account => isEnabled(account) && hasCredentials(account))
-      .sort(byPriorityOrder);
-    return candidates[0] || null;
-  }
-
-  /**
-   * 队首账号 id（★ / 「首选」标的就是它）。
-   *
-   * 两个候选按优先级取：
-   *   1. `routedAccountId` —— 后端按**最近一次请求的模型**派生的「下一个请求会先用
-   *      谁」，判据与转发层同一套（候选 = 提供该模型的那些家的账号，再取「启用 +
-   *      有凭证 + 对该模型未限流」里优先级最小的）。这是**正确**的那个答案。
-   *   2. `currentAccountId` —— 不限模型的队首，旧版后端给不出前者时的回落。
-   *
-   * 为什么不能只看 `currentAccountId`：它不看按模型记的限额，队首正在限流时会把 ★
-   * 标在一个本次请求必然被跳过的账号上 —— 用户看到的就是「界面标着首选，请求却走
-   * 了别人」。
-   *
-   * 候选指向的账号可能已被删（两次快照之间），所以还得校验它在不在列表里；
-   * 都不在时按同一判据在前端退化派生，避免整列 ★ 凭空消失。
-   */
-  function routedId(all, routedAccountId = null, currentAccountId = null) {
-    const exists = id => id && (all || []).some(account => account.id === id);
-    if (exists(routedAccountId)) return routedAccountId;
-    if (exists(currentAccountId)) return currentAccountId;
-    return pickQueueHead(all)?.id || null;
-  }
-
   window.wbAccountsGroups = {
     // provider 维度
     DEFAULT_PROVIDER_ID,
@@ -382,14 +327,13 @@
     tokenExpiryOf,
     supportsUsage,
     isDesktopAccount,
+    supportsChat,
     // 基础判定
     byPriorityOrder,
     typeLabel,
     isEnabled,
     isRateLimited,
     activeLimits,
-    usableForModel,
-    hasCredentials,
     accountEdition,
     supportsCheckin,
     checkinableAccounts,
@@ -401,8 +345,5 @@
     visibleAccounts,
     filterCounts,
     positionMap,
-    pickForModel,
-    pickQueueHead,
-    routedId,
   };
 })();

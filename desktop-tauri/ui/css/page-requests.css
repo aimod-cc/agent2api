@@ -31,7 +31,7 @@
   padding-top: 8px;
   padding-bottom: 8px;
   border-bottom: 1px solid var(--border);
-  background: var(--surface-2);
+  background: var(--table-head-bg);
   color: var(--text-3);
   font-size: 11px;
   font-weight: 600;
@@ -40,7 +40,7 @@
 
 .req-row { border-bottom: 1px solid var(--hairline); transition: background .12s ease; }
 .req-row:last-child { border-bottom: none; }
-.req-row:hover { background: var(--surface-2); }
+.req-row:hover { background: var(--row-hover); }
 
 /* 表头里用时一格跟数值同侧对齐（数值列是右对齐的） */
 .req-head .req-dur { text-align: right; }

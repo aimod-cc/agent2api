@@ -26,8 +26,8 @@
 //! `rand`／`uuid`，为一个 state 引进它们不合算）。
 //!
 //! ── 落账号为什么不自己写一份 ────────────────────────────────
-//! 走 `AccountStore::add_raccoon_account` —— 与「填写凭证 / 粘贴 JSON」两条
-//! 路径**同一个入口**：JWT 校验、`user-<userId>` 的 id 生成、撞 id 保护、
+//! 走 `AccountStore::add_raccoon_account` —— 与「填写凭证」那条路径**同一个
+//! 入口**：JWT 校验、`user-<userId>` 的 id 生成、撞 id 保护、
 //! 优先级分配、字段合并都在那里。另写一份落盘逻辑的唯一后果是两条路逐渐分叉
 //! （例如网页登录进来的账号缺 officeIdentity，或者优先级算法不一样）。
 //! `source` 因此沿用该函数的既有取值 `manual`（导入路径才写 `imported`），

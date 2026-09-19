@@ -63,7 +63,7 @@
   border: 1px solid var(--border);
   /* 承载整列日志的容器，跟面板同档的大圆角 */
   border-radius: var(--r-lg);
-  background: var(--surface-inset);
+  background: var(--table-bg);
 }
 
 /* 单条日志：左侧级别圆点 + 竖线，右侧时间 */
@@ -79,7 +79,7 @@
 }
 
 .log-row:last-child { border-bottom: none; }
-.log-row:hover { background: var(--surface-2); }
+.log-row:hover { background: var(--row-hover); }
 
 /* 左侧导轨 */
 .log-rail {
@@ -109,10 +109,10 @@
   border-radius: 50%;
   background: var(--text-3);
   /* 光环取列表底色，圆点才像从轨道上「挖」出来的；悬浮时底色换成行底色 */
-  box-shadow: 0 0 0 3px var(--surface-inset);
+  box-shadow: 0 0 0 3px var(--table-bg);
 }
 
-.log-row:hover .log-dot { box-shadow: 0 0 0 3px var(--surface-2); }
+.log-row:hover .log-dot { box-shadow: 0 0 0 3px var(--row-hover); }
 .log-dot.info { background: var(--info); }
 .log-dot.warn { background: var(--warn); }
 .log-dot.error { background: var(--danger); }
@@ -196,7 +196,7 @@
   padding: 4px 10px;
   border: 1px solid var(--border);
   border-radius: var(--r-sm);
-  background: var(--surface);
+  background: var(--surface-inset);
   color: var(--text-2);
   font-family: var(--font-mono);
   font-size: 11px;

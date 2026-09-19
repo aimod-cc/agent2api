@@ -16,9 +16,8 @@
  * 优先级在后端是**全局唯一**的一条队列：四家账号混排，转发时按优先级从小到大
  * 逐个尝试，跳过禁用 / 不支持该模型 / 该模型限流中的账号（见 priority.rs 与
  * rotate.rs 的模块头）。所以本表按优先级升序排行，第一列给出全局序号 #N；
- * ↑/↓ 与全局相邻账号交换，「首选」是**下一个请求会先用的账号**（后端
- * `routedAccountId`，按最近一次请求的模型派生）；队列第一位若正对该模型限流，
- * 显示为「队首」块而不是「首选」（见 actionsCell）。
+ * ↑/↓ 与全局相邻账号交换，「设为首选」只把账号移到全局队列第一位，
+ * 不改变启用状态，也不表示请求正在使用该账号。
  *
  * 同理，优先级输入框**不做冲突判定**：冲突只有后端一处判（全局唯一，409 带占位者
  * 姓名），前端拦下来只会出现「界面放过、后端拒绝」或反过来的分歧。
@@ -158,7 +157,7 @@
   }
 
   /**
-   * 账号：第一行「★ + 名称」，第二行「桌面端 / 代理」，第三行只在异常时出现
+   * 账号：第一行名称，第二行「桌面端 / 代理」，第三行只在异常时出现
    * （代理不可用原因 / 账号不可用）。
    *
    * 标识（UID / userId）与 Token 尾号**不再上屏**：它们对「这条账号能不能用」没有
@@ -193,7 +192,6 @@
     const sub = desktop + parts.join('<span class="sep">·</span>');
     const note = healthNote(account);
     return `<td class="cell-account"><div class="acct-name"${title ? ` title="${esc(title)}"` : ''}>`
-      + (account.isCurrent ? '<span class="star" title="转发顺序第一位，下一个请求会先试它">★</span>' : '')
       + `<span class="name">${esc(name)}</span></div>`
       + (sub ? `<div class="acct-sub">${sub}</div>` : '')
       + note
@@ -347,32 +345,17 @@
       + `<span class="usage-sum ${summary.kind}" title="${esc(summary.title)}">${esc(summary.text)}</span></td>`;
   }
 
-  /**
-   * 操作：首选 / 队列首位 / 设置 / 签到 / ⋯。
-   *
-   * 三种状态互斥（它们回答的是同一个问题「这一行是不是下一个请求会先用的」）：
-   *   · `isCurrent`（后端 `routedAccountId`，已剔除对该模型限流的账号）→ 实心
-   *     「首选」块：状态声明，不可点；
-   *   · 只是队列第一位、但当前被跳过（队首对该模型限流）→ 描边「队首」块。
-   *     这一格不能放「设为首选」：它本来就在最前，点了什么也不会变（promote_to_front
-   *     返回 changed:false），却弹一句「已设为首选」，反而让人以为标记坏了；
-   *   · 其余 → 「设为首选」按钮（promote_to_front 把目标排到所有账号之前）。
-   *
-   * 签到只对「启用 + 有签到概念 + 国内版」渲染（判定在 accounts-model 的
-   * supportsCheckin）。启用/禁用、刷新 Token、删除仍在 ⋯ 菜单里。
-   */
+  /** 操作：设为首选 / 设置 / 签到 / ⋯。置顶只看全局位置，不按可用性过滤。 */
   function actionsCell(account, ctx) {
     const enabled = isEnabled(account);
     const settings = `<button data-action="settings" data-id="${esc(account.id)}" title="备注名 / 启用 / 代理">设置</button>`;
     const checkin = enabled && supportsCheckin(account)
       ? `<button data-action="checkin" data-id="${esc(account.id)}" title="为该账号签到">签到</button>`
       : '';
-    const head = ctx.isCurrent
-      ? '<span class="is-current" title="下一个请求会先试它（按最近使用的模型推导）">首选</span>'
-      : ctx.isQueueHead
-        ? '<span class="is-head" title="排在转发顺序第一位，但它对最近使用的模型正在限流，请求会顺延到下一位">队首</span>'
-        : `<button data-action="switch" data-id="${esc(account.id)}" title="把该账号移到全局队列的第一位，并启用它">设为首选</button>`;
-    return `<td class="cell-actions"><div class="acct-actions">${head}${settings}${checkin}`
+    const atFront = ctx.seat?.position === 1;
+    const promote = `<button data-action="switch" data-id="${esc(account.id)}"`
+      + ` title="${atFront ? '已在全局队列第一位' : '仅将优先级调整到全局第一位，不改变启用状态'}"${atFront ? ' disabled' : ''}>设为首选</button>`;
+    return `<td class="cell-actions"><div class="acct-actions">${promote}${settings}${checkin}`
       + `<button data-action="more" data-id="${esc(account.id)}" title="更多操作">⋯</button></div></td>`;
   }
 
@@ -383,33 +366,26 @@
    *
    * ctx（由 accounts-view.js 给）：
    *   seat             `{position, total}`：**全局队列**里的位置（序号与 ↑/↓ 边界）
-   *   isCurrent        是否**下一个请求会先用**的那个（★ 与实心「首选」）
-   *   isQueueHead      是否队列第一位（不看限额的队首；两者不同说明队首正被限流）
    *   picked           是否被勾选
    *   usageEntry       余额缓存条目；usageOpen 是否已展开明细
    *   limitsOpen       是否已展开限流明细
    *   draft            正在编辑中的优先级草稿（重绘时保住用户没提交完的输入）
    */
   function rowHtml(account, ctx) {
-    const isCurrent = ctx.isCurrent === true;
     const classes = ['acct-row'];
     if (!isEnabled(account)) classes.push('disabled');
     if (ctx.picked) classes.push('selected');
-    if (isCurrent) classes.push('is-first');
-    // 「当前使用中」的表达在这张表里有两处，各管一种读法：
-    //   行首竖条 + 行底色（.is-first）让它在整列里被扫到，
-    //   账号列的 ★ 与操作列的实心「首选」回答「到底是谁」。
     return `<tr class="${classes.join(' ')}" data-id="${esc(account.id)}"`
       + `${isDesktopAccount(account) ? ' data-desktop="1"' : ''}>`
       + pickCell(account, ctx.picked)
       + priorityCell(account, ctx)
       + providerCell(providerOf(account), account)
-      + accountCell({ ...account, isCurrent })
+      + accountCell(account)
       + statusCell(account)
       + limitsCell(account, ctx)
       + expiryCell(account)
       + usageCell(account, ctx)
-      + actionsCell(account, { isCurrent, isQueueHead: ctx.isQueueHead === true })
+      + actionsCell(account, ctx)
       + '</tr>';
   }
 

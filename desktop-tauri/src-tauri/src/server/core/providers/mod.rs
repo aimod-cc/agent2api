@@ -3,26 +3,27 @@
 //! ── 为什么要有这个模块 ──────────────────────────────────────
 //! 改造前整个网关只有 WorkBuddy 一个上游，provider 概念是隐含的：账号就是
 //! workbuddy 账号、端点常量写在 `endpoints.rs`、鉴权逻辑写在 `auth.rs`。
-//! 多提供商（注册表现有四家：WorkBuddy / 小浣熊 raccoon / CatPaw / AutoClaw，
+//! 多提供商（注册表现有五家：WorkBuddy / 小浣熊 raccoon / CatPaw / AutoClaw /
+//! Qoder，五家都参与推理转发，见各自的 `mod.rs`），
 //! 后两家分别由 W5-T-d4 与 W4b-T-c2 接上各自的适配器）之后，
 //! 「这个账号属于哪家」「这一家叫什么名字」需要一个
 //! 全局唯一的定义点 —— 就是本模块。
 //!
 //! 账号数据里的 `provider` 字段存的是 **provider id 字符串**
-//! （`"workbuddy"` / `"raccoon"` / `"catpaw"` / `"autoclaw"`）：它要落进
+//! （`"workbuddy"` / `"raccoon"` / `"catpaw"` / `"autoclaw"` / `"qoder"`）：它要落进
 //! accounts.json、要出现在 HTTP 响应里、还要被前端当筛选条件用，所以
 //! **字符串本身就是契约**，不能随手改。
 //! 本模块负责 id ↔ `ProviderKind` ↔ `ProviderMeta` 三者互查，避免这些字符串
 //! 散落到 account_store / api 各处各写一遍（写错一处不会报错，只会静默失配）。
 //!
-//! ── 本文件与其它模块的分工（W4a 起四家 provider）─────────────
-//! 本文件只有**身份与元数据**：枚举（四家）、注册表、三个查询函数。
+//! ── 本文件与其它模块的分工（W4a 起多家 provider）─────────────
+//! 本文件只有**身份与元数据**：枚举、注册表、三个查询函数。
 //! 架构文档 §4.2 的 `ProviderAdapter` trait 与适配器注册表在 `adapter.rs`，
-//! 四家的实现分别在 `workbuddy.rs` / `raccoon/` / `catpaw/` / `autoclaw/`
-//! （后两家分别由 W5-T-d4 与 W4b-T-c2 接入）。过渡期用过的占位适配器
-//! （`pending.rs`，W6 删除）已随四家全部接上真身而退场 —— 现在 `adapter_for`
-//! 的 match 是穷举的，加新 kind 时编译器会强制给出分支，「注册了 provider
-//! 却忘了接线」在编译期就被拦住，不再需要运行期的占位实现兜底。
+//! 各家的实现分别在 `workbuddy.rs` / `raccoon/` / `catpaw/` / `autoclaw/` /
+//! `qoder/`。过渡期用过的占位适配器（`pending.rs`，W6 删除）已随四家全部接上
+//! 真身而退场 —— 现在 `adapter_for` 的 match 是穷举的，加新 kind 时编译器会强制
+//! 给出分支，「注册了 provider 却忘了接线」在编译期就被拦住，不再需要运行期的
+//! 占位实现兜底。
 //!
 //! **加新 provider 的最小改动面**：`ProviderKind` 加变体 + 本文件 `PROVIDERS`
 //! 加条目 + `kind_from_id` / `kind_id` 各加一个分支 + `adapter.rs` 的
@@ -30,7 +31,7 @@
 //! 经 `kind_from_id` 判定」自动派生，不需要再改那些文件里的任何 id 清单。
 //!
 //! ── 静态注册表为什么用切片而不是 HashMap ─────────────────────
-//! provider 是**编译期内置**的（内置四家，不是插件），数量个位数；
+//! provider 是**编译期内置**的（内置五家，不是插件），数量个位数；
 //! 用 `&'static [ProviderMeta]` 可以让 `meta()` 直接返回 `&'static` 引用
 //! （没有生命周期纠缠、也没有锁），且列表顺序稳定 —— 前端拿到的 `providers`
 //! 数组顺序稳定，便于比对与展示。
@@ -61,12 +62,26 @@
 //!                                / 账号记录）+ mtime 缓存
 //!                 refresh.rs     刷新（单飞 + 400002 降级；**只读不回写**）
 //!                 models.rs      模型路由表（静态映射 + zai_auto 回退）
+//!   qoder/       Qoder（账号管理 **+ 推理转发**）：
+//!                 endpoints.rs   地区与鉴权端点（含推理网关基址）
+//!                 machine.rs     PKCE 随机串与本机标识（getrandom）
+//!                 oauth.rs       国际版 PKCE 设备授权
+//!                 credentials.rs 凭证格式（兼容 Qoder-Proxy 的 access/refresh）
+//!                 auth.rs        PAT 换取令牌 / 用户资料
+//!                 refresh.rs     续期（单飞 + 比较再写）
+//!                 balance.rs     额度查询（归一成账号页的统一形状）
+//!                 cosy.rs        COSY 请求签名 + 请求体编码（鉴权核心）
+//!                 models.rs      模型目录（两地区缓存 + 静态兜底 + 远程刷新）
+//!                 protocol.rs    OpenAI ↔ Qoder 协议转换
+//!                 stream.rs      上游 SSE 信封解包 + 思考标签拆解
+//!                 chat.rs        转发编排（构造 → 发送 → 翻译）
 //! 本文件仍然只做「身份与元数据」这一件事，不认识磁盘也不认识账号。
 
 pub mod adapter;
 pub mod autoclaw;
 pub mod catalog;
 pub mod catpaw;
+pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
@@ -95,6 +110,12 @@ pub enum ProviderKind {
     /// `autoclaw/adapter.rs`（W4b-T-c2 接线）：**无状态**（OpenAI 兼容 +
     /// `X-Authorization`，与 raccoon 同构），`sse_model_rewrite()` 为 true。
     AutoClaw,
+    /// Qoder。适配实现在 `qoder/`：账号管理（国际版设备授权登录 / PAT /
+    /// 凭证续期 / 额度查询）**加推理转发**。上游鉴权不是 Bearer 而是一套自签名
+    /// 的 COSY 头、请求体要先编码再签名、响应还多包一层信封，因此
+    /// `is_stateful()` 为 true（一次发送由适配器自己完成，见 `qoder/mod.rs`）；
+    /// 它参与全局队列与模型广告，`supports_chat()` 为 true。
+    Qoder,
 }
 
 /// 一个提供商的静态元数据。
@@ -123,6 +144,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "raccoon", label: "小浣熊" },
     ProviderMeta { id: "catpaw", label: "CatPaw" },
     ProviderMeta { id: "autoclaw", label: "AutoClaw" },
+    ProviderMeta { id: "qoder", label: "Qoder" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -187,6 +209,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "raccoon" => Some(ProviderKind::Raccoon),
         "catpaw" => Some(ProviderKind::CatPaw),
         "autoclaw" => Some(ProviderKind::AutoClaw),
+        "qoder" => Some(ProviderKind::Qoder),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -209,6 +232,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Raccoon => "raccoon",
         ProviderKind::CatPaw => "catpaw",
         ProviderKind::AutoClaw => "autoclaw",
+        ProviderKind::Qoder => "qoder",
     }
 }
 

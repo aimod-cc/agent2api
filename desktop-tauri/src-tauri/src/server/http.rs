@@ -65,7 +65,17 @@ pub fn router(state: ServerState) -> Router {
         .route("/health", get(api::health::handle))
         .route("/api/session", get(api::session::get_session))
         .route("/api/endpoints", get(api::endpoints::handle))
-        .route("/v1/models", get(api::chat::list_models));
+        .route("/v1/models", get(api::chat::list_models))
+        // CatPaw 网页登录的 loopback 回调：**上游浏览器直接 POST 到这里**
+        // （redirect 指向本网关自己的 loopback 端口，见 core::login::catpaw），
+        // 所以它必须免鉴权 —— 调用方是美团 passport 页面，它没有我们的 API Key。
+        // 安全性由一次性 `state` 承担（逐字比对，见该处理函数的说明）。
+        // 注意方向：与小浣熊那条 `/api/session/login/callback` 相反，那条是
+        // **我们自己的登录窗口**转交上来的，因此留在 protected 组。
+        .route(
+            "/api/session/login/catpaw-callback",
+            post(api::session::login_catpaw_callback),
+        );
 
     // 需鉴权：Node 版对这些路径都调用了 checkApiKey
     let protected = Router::new()
@@ -154,6 +164,18 @@ pub fn router(state: ServerState) -> Router {
         // 见 api::session::login_callback 的说明）。与其他 login/* 一样在
         // protected 组 —— 它写账号库，必须过 API Key。
         .route("/api/session/login/callback", post(api::session::login_callback))
+        // AutoClaw 的手机号验证码登录（**不是**网页登录，见 api::session 模块头）：
+        // 上游没有授权码 / 回调这条路，登录就是「发码 → 用码换 token」两次请求，
+        // 因此不需要登录窗口与轮询。两条都挂 protected —— 它们都写账号库，
+        // 与上面 callback 同一判据。
+        .route(
+            "/api/session/login/sms/send",
+            post(api::session::login_sms_send),
+        )
+        .route(
+            "/api/session/login/sms/verify",
+            post(api::session::login_sms_verify),
+        )
         .route("/api/session/refresh", post(api::session::session_refresh))
         .route("/api/session/logout", post(api::session::session_logout))
         .route("/auth/login", post(api::session::auth_login))

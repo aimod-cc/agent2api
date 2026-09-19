@@ -69,10 +69,36 @@
       </nav>
 
       <div class="sidebar-foot">
-        <!-- 网关运行状态：常驻显示，不必切到「网关」页也能确认服务是否在监听 -->
+        <!-- 网关状态：常驻显示，不必切到「网关」页也能确认服务是否在监听。
+
+             ── 为什么是两条而不是一条 ──────────────────────────
+             这里原本只有一行「网关运行中 / 网关未就绪」，判据却取自
+             /api/session 的 upstreamConfigured（= 有没有可用账号）。于是
+             「没有账号」被说成了「网关没就绪」—— 而能渲染出这句话本身就
+             证明网关正在监听（否则这个请求根本发不出去）。同一个字段在顶栏
+             又叫「未登录」，用户无从判断到底哪个坏了。
+
+             现在拆成两个互相独立的事实：
+               · 网关进程：进程在不在监听（判据来自壳侧，不依赖 HTTP 能否应答）
+               · 可用账号：转发时有没有账号可用（判据 = 全局队列队首，与转发口径一致）
+             两者可以任意组合：没账号不影响网关监听，端口被占也不影响账号存在。 -->
         <div class="sidebar-status" id="sidebar-status" title="本地网关监听状态">
-          <span class="live" id="sidebar-status-dot"></span>
-          <span class="txt" id="sidebar-status-text">正在检查…</span>
+          <div class="status-line">
+            <span class="live" id="sidebar-status-dot"></span>
+            <span class="txt" id="sidebar-status-text">正在检查…</span>
+          </div>
+          <div class="status-line">
+            <span class="live" id="sidebar-account-dot"></span>
+            <span class="txt" id="sidebar-account-text">正在检查…</span>
+          </div>
+          <!-- 异常时的出口：只在出现端口冲突时露出（见 app.js）。
+               两个按钮的显隐条件不同：「结束占用进程」在端口被别的进程占着时给，
+               被系统保留时只给「更换端口」（那里没有进程可杀）。
+               常驻显示会让这个角落一直有按钮，而它绝大多数时候无事可做。 -->
+          <div class="status-actions" id="sidebar-status-actions" hidden>
+            <button class="sm" id="btn-end-occupant" hidden>结束占用进程</button>
+            <button class="sm" id="btn-change-port">更换端口</button>
+          </div>
         </div>
         <div class="theme-switch" id="theme-switch">
           <button data-mode="system">跟随系统</button>
@@ -118,7 +144,7 @@
             <div class="panel-head">
               <h2>会话状态</h2>
               <span id="session-badge" class="badge">检测中…</span>
-              <span class="panel-sub">当前首选账号</span>
+              <span class="panel-sub">登录态信息</span>
               <div class="head-actions">
                 <button id="btn-refresh-state">刷新状态</button>
                 <button id="btn-refresh-token">刷新 Token</button>
@@ -129,7 +155,7 @@
             <div class="panel-body">
               <div class="field-grid">
                 <div class="field">
-                  <div class="label">首选账号昵称</div>
+                  <div class="label">账号昵称</div>
                   <div class="value" id="session-nickname">—</div>
                 </div>
                 <div class="field">
@@ -151,7 +177,7 @@
               </div>
 
               <p class="hint">
-                「首选」= 下一个请求会先用的账号（按最近一次请求的模型推导，队列里排最前且对该模型未限流的那个）。限额按<strong>模型</strong>记录，所以换个模型走哪个账号可能不同 —— 队列第一位若正对该模型限流，账号页会给它标「队首」而不是「首选」。此处展示与刷新 Token / 退出登录针对的都是首选账号。
+                「设为首选」只调整账号的全局优先级，不改变启用状态。每次请求仍按模型支持情况、账号启用状态与限额选择账号；此处为登录态信息，不代表正在处理请求的账号。
               </p>
             </div>
           </section>
@@ -321,7 +347,7 @@
             <div class="table-foot">
               <span>优先级是<b>全局</b>唯一的一条队列：数值越小越先用，不分提供商；拖动表头右缘可调列宽，双击还原</span>
               <div class="spacer"></div>
-              <span>「★ / 首选」= 队首（当前请求先试它；不支持该模型或该模型限流时自动顺延到下一位）</span>
+              <span>「设为首选」仅将账号移到全局第一位，不改变启用状态</span>
             </div>
           </section>
         </section>
@@ -585,8 +611,9 @@
         </section>
 
         <!-- ─── 定时任务 ───
-             到点自动干活的任务集中在这里：自动签到（每天定点）+ 四条等间隔任务
-             （凭证自动维护 / 模型目录刷新 / 日志页自动刷新 / 请求明细自动刷新）。
+             到点自动干活的任务集中在这里：自动签到（每天定点）+ 六条等间隔任务
+             （凭证自动维护 / 定时查询积分 / 模型目录刷新 / 软件版本检查 /
+             日志页自动刷新 / 请求明细自动刷新）。
              两类走不同的接口（签到是「每天某时刻」，间隔型是「每 N 分钟 / 秒」），
              但同属「定时」这一类，收在一页才好对照着调。
              整个列表由 tasks-panel.js 渲染，这里只留容器。 -->
@@ -864,7 +891,7 @@
     </main>
   </div>
 
-  <!-- ─── 添加账号弹窗：网页登录 / 手动粘贴 auth.json ─── -->
+  <!-- ─── 添加账号弹窗 ─── -->
   <div id="add-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="add-title">
     <div class="modal">
       <div class="modal-head">
@@ -876,7 +903,7 @@
         <div class="modal-section">
           <h3>账号版本</h3>
           <p>国内版走 copilot.tencent.com，国际版走 www.workbuddy.ai，两版账号可同时保存、按账号自动路由。</p>
-          <!-- 分段控件的交互（点击 / 左右方向键 / roving tabindex）由 account-panel.js 的
+          <!-- 分段控件的交互（点击 / 左右方向键 / roving tabindex）由 add-provider-forms.js 的
                bindSeg 统一绑定，切换后派发 wb-seg-change；这里只声明结构与初始选中项。
                aria 用 radiogroup/radio：它表达的是「一组互斥取值里选一个」的表单语义，
                role=tab 那套是切视图页签用的（账号页筛选栏的 tablist 子项并未带 role=tab，
@@ -888,44 +915,20 @@
         </div>
 
         <div class="modal-section">
-          <h3>登录方式</h3>
-          <p>网页登录是最省事的一条路（账号昵称自动取自上游）；环境里打不开登录窗口时，再改用粘贴登录态 JSON。</p>
-          <div class="seg add-seg" id="add-login-method" role="radiogroup" aria-label="登录方式">
-            <button type="button" class="seg-item active" data-value="web" role="radio" aria-checked="true" tabindex="0">网页登录</button>
-            <button type="button" class="seg-item" data-value="json" role="radio" aria-checked="false" tabindex="-1">粘贴登录态 JSON</button>
-          </div>
-
-          <!-- 第二级：只有第一级选了「网页登录」才显示（显隐见 add-account.js 的 syncLoginMethod） -->
-          <div class="add-sub" id="add-web-login-block">
-            <p>打开官方 WorkBuddy 登录页，完成登录后自动加入账号列表（排在转发顺序最后，不会抢占首选账号）。账号昵称取自上游，无需手动填写。</p>
-            <div class="field-row">
-              <span class="add-seg-label">打开方式</span>
-              <div class="seg add-seg" id="add-login-mode" role="radiogroup" aria-label="网页登录的打开方式">
-                <button type="button" class="seg-item active" data-value="embedded" role="radio" aria-checked="true" tabindex="0">内嵌窗口</button>
-                <button type="button" class="seg-item" data-value="external" role="radio" aria-checked="false" tabindex="-1">系统默认浏览器</button>
-              </div>
-            </div>
-            <p>系统浏览器可复用你已有的登录态（国际版推荐）；内嵌窗口与你日常浏览器隔离，更干净。</p>
-            <div class="field-row">
-              <button id="web-login-button" class="primary">打开网页登录</button>
-              <button id="web-login-cancel" style="display:none">取消等待</button>
-              <span class="detail" id="web-login-hint">将打开内嵌窗口，登录完成后自动加入账号列表；关掉此窗口即取消等待</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="modal-section" id="add-json-block" hidden>
-          <h3>粘贴登录态 JSON</h3>
-          <p>如果当前环境无法打开登录窗口，也可以把已有的 accessToken/refreshToken JSON 粘进来直接启用。</p>
+          <h3>网页登录</h3>
+          <p>打开官方 WorkBuddy 登录页，完成登录后自动加入账号列表（排在全局队列最后，不改变已有账号的相对顺序）。账号昵称取自上游，无需手动填写。</p>
           <div class="field-row">
-            <label for="account-name">备注名</label>
-            <input id="account-name" type="text" maxlength="100" placeholder="可选，例如：工作账号">
+            <span class="add-seg-label">打开方式</span>
+            <div class="seg add-seg" id="add-login-mode" role="radiogroup" aria-label="网页登录的打开方式">
+              <button type="button" class="seg-item active" data-value="embedded" role="radio" aria-checked="true" tabindex="0">内嵌窗口</button>
+              <button type="button" class="seg-item" data-value="external" role="radio" aria-checked="false" tabindex="-1">系统默认浏览器</button>
+            </div>
           </div>
-          <div class="field-row" style="margin-top:9px;">
-            <textarea id="auth-json-input" placeholder='{"accessToken":"...","refreshToken":"...","uid":"...","expiresAt":1730000000000}'></textarea>
-          </div>
-          <div class="field-row" style="margin-top:9px;">
-            <button id="upload-button" class="primary" disabled>导入并启用</button>
+          <p>系统浏览器可复用你已有的登录态（国际版推荐）；内嵌窗口与你日常浏览器隔离，更干净。</p>
+          <div class="field-row">
+            <button id="web-login-button" class="primary">打开网页登录</button>
+            <button id="web-login-cancel" style="display:none">取消等待</button>
+            <span class="detail" id="web-login-hint">将打开内嵌窗口，登录完成后自动加入账号列表；关掉此窗口即取消等待</span>
           </div>
         </div>
       </div>
@@ -1071,6 +1074,51 @@
     </div>
   </div>
 
+  <!-- 更换端口弹窗：端口冲突（被占用 / 被系统保留）时的出口之一。
+       只在侧栏那两个按钮点开时显示，不常驻。 -->
+  <div id="port-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="port-modal-title">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="port-modal-title">更换网关端口</h2>
+        <button id="port-modal-close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-section">
+          <h3>当前状态</h3>
+          <p id="port-modal-status" class="detail"></p>
+        </div>
+
+        <div class="modal-section">
+          <h3>新端口</h3>
+          <div class="field-row">
+            <label for="port-input">端口号</label>
+            <input id="port-input" type="number" min="1024" max="65535" step="1"
+                   placeholder="例如 3066" autocomplete="off">
+          </div>
+          <div id="port-hint" class="detail"></div>
+          <div class="detail" style="margin-top:8px">
+            端口需在 1024-65535 之间。1023 及以下是系统保留范围，普通程序无法监听。
+          </div>
+        </div>
+
+        <div class="modal-section">
+          <h3>换端口后要改的地方</h3>
+          <p class="detail">
+            网关地址会变成 <code id="port-new-base">http://127.0.0.1:—</code>。
+            已经把这个地址填进其它工具（Claude Code、Cherry Studio 等）的，
+            需要一并改成新地址，否则那些工具会连不上。
+          </p>
+        </div>
+
+        <div class="detail" id="port-modal-message" style="min-height:18px"></div>
+      </div>
+      <div class="modal-foot">
+        <button id="port-modal-cancel">取消</button>
+        <button id="port-modal-save" class="primary">保存并重启</button>
+      </div>
+    </div>
+  </div>
+
   <div id="mapping-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="mapping-modal-title">
     <div class="modal">
       <div class="modal-head">
@@ -1144,6 +1192,10 @@
        设置页的开关写它，所以排在所有业务脚本之前，它们执行时就能用上。 -->
   <script src="units.js"></script>
   <script src="app.js"></script>
+  <!-- 端口状态面板：侧栏那两条状态（网关进程 / 可用账号）与端口冲突时的两个出口。
+       必须在 app.js 之后：它通过 window.wbApp 读状态、调 toast 与顶栏重画
+       （app.js 的 render() 也会反过来委托它，用可选链，谁先就绪都不报错）。 -->
+  <script src="port-panel.js"></script>
   <script src="clipboard.js"></script>
   <!-- 网关页「可用模型」区块（渲染 / 本地过滤 / 刷新模型清单按钮）：必须排在
        app.js 之后 —— 它在加载期就从 window.wbApp 取 esc / toast / getState
@@ -1160,6 +1212,10 @@
        建 WorkBuddy 那一份（DOM 在下面那个弹窗里），也必须在 add-provider-forms.js 之前
        —— 小浣熊那份由它建。 -->
   <script src="web-login.js"></script>
+  <!-- 手机验证码登录的交互引擎（当前只有 AutoClaw 用）：与小浣熊的网页登录是两套
+       东西 —— 那条链路开窗口等回调，这条在本弹窗里「发码 → 填码 → 换 token」。
+       必须在 add-provider-forms.js 之前 —— 加载期由它建 AutoClaw 那一份。 -->
+  <script src="sms-login.js"></script>
   <script src="add-account.js"></script>
   <!-- 提供商目录：provider 摘要与「作用提供商」写入的唯一前端入口。
        必须排在所有消费者（desensitize-panel / accounts-groups / logs-panel）之前 -->
@@ -1199,10 +1255,12 @@
        它内部用 ResizeObserver 重绘图表，容器宽度变化（改窗口、切列数）都能自适应。 -->
   <script src="report.js"></script>
   <script src="proxy-form.js"></script>
-  <!-- 「登录 / 添加账号」弹窗的提供商分叉（提供商分段控件 / 三家表单块 / 弹窗内所有
-       .seg 的交互）。必须在 account-panel.js 之前：它自带加载期绑定（mountAddProviderUi
+  <!-- 「登录 / 添加账号」弹窗的提供商分叉（提供商分段控件 / 各家的表单块 / 弹窗内 .seg 的交互）。
+       add-qoder.js 先于 add-provider-forms.js：后者在加载期读它的表单配置。
+       两者都必须在 account-panel.js 之前：它们自带加载期绑定（mountAddProviderUi
        等，需要 #add-modal 已解析），且两个「登录 / 添加账号」按钮的监听要按
        「add-account.js → 本文件 → account-panel.js」的顺序注册（同元素同事件按注册顺序触发）。 -->
+  <script src="add-qoder.js"></script>
   <script src="add-provider-forms.js"></script>
   <script src="account-panel.js"></script>
   <!-- Markdown 渲染器：更新日志用。纯函数、无依赖，只认白名单语法（见文件头说明）；

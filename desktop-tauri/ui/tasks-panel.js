@@ -7,7 +7,8 @@
  * 与 logs-panel.js / settings-panel.js 同构，依赖 window.wbApp 的 esc / toast / refresh。
  *
  * ── 这一页管两类任务（接口也是两组）──────────────────────────
- *   · **间隔型**（凭证自动维护 / 模型目录刷新 / 日志页自动刷新 / 请求明细自动刷新）
+ *   · **间隔型**（凭证自动维护 / 定时查询积分 / 模型目录刷新 / 软件版本检查 /
+ *     日志页自动刷新 / 请求明细自动刷新）
  *     —— 形状统一：`{enabled, interval, unit}`，走 /api/scheduled-tasks。
  *   · **自动签到** —— 每天定点型：`{enabled, time}` 外加当天去重与启动补签，
  *     走 /api/auto-checkin。它与间隔型不是同一个形状，所以后端也是两组接口
@@ -37,7 +38,7 @@
   const SYNC_MS = 20_000;
 
   let panelBusy = false;
-  /** 最近一次拉到的任务清单（间隔型四条） */
+  /** 最近一次拉到的任务清单（间隔型各条） */
   let tasks = [];
   /** 最近一次拉到的自动签到状态 */
   let checkin = null;
@@ -181,7 +182,7 @@
               !data ? '不可用' : enabled ? (data.lastFiredToday ? '今日已执行' : '已开启') : '已关闭'}</span>
             ${data?.running ? '<span class="badge warn task-badge">执行中…</span>' : ''}
           </div>
-          <p class="task-desc">到点后自动签到勾选提供商的已启用账号（WorkBuddy 走每日签到接口；小浣熊走桌面端每日积分链路；国际版账号没有签到活动，会被跳过）。多个账号串行执行，避免同时请求触发上游风控。若启动时当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。各家签到接口都是幂等的，重复执行不会重复领取。</p>
+          <p class="task-desc">到点后自动签到勾选提供商的已启用账号（WorkBuddy 走每日签到接口，仅限国内版；小浣熊走桌面端每日积分链路；AutoClaw 走官方客户端的每日签到任务；国际版账号没有签到活动，会被跳过）。多个账号串行执行，避免同时请求触发上游风控。若启动时当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。各家签到接口都是幂等的，重复执行不会重复领取。</p>
           <div class="task-providers" id="task-checkin-providers">
             <span class="lead">签到提供商：</span>
             ${options.map(option => `
@@ -492,6 +493,10 @@
       toast(`✅ ${task.label}：${result?.summary || '已执行'}`);
       // 凭证刷新会改账号页的有效期 / 凭证状态，顺手刷新主界面
       if (id === 'credentialMaintenance') await refresh?.();
+      // 立即查询积分刚写下一份新快照，让账号页马上应用它 ——
+      // 否则用户点完「立即执行」切到账号页，看到的还是上一次的旧余额
+      // （要等 20 秒那一轮轮询才跟上，那正是「点了像没反应」）
+      if (id === 'usageQuery') await window.wbAccountsView?.syncBalancesSnapshot?.();
     } catch (error) {
       toast(`执行失败：${error.message}`, 'err');
       await load();

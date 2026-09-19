@@ -8,11 +8,6 @@ let state = null;
 // 注意它与 account-panel.js 里的 panelBusy 是两把互不相干的锁：弹窗内的保存不占这把锁。
 let busy = false;
 
-// 3065 是官方默认端口，但主进程可能被 AGENT2API_PROXY_PORT 覆盖，
-// 所以它只当兜底值：真实端口由 getBackendStatus() 异步补上（见 syncGatewayPort）。
-const PROXY_PORT = 3065;
-const PROXY_BASE = `http://127.0.0.1:${PROXY_PORT}`;
-
 // ─── 工具 ────────────────────────────────────
 
 function esc(value) {
@@ -157,17 +152,19 @@ function showPage(name, { persist = true } = {}) {
 function renderTopbarStatus() {
   const box = $('topbar-status');
   if (!box) return;
-  const health = state?.health || {};
   const session = state?.session || {};
   const accounts = state?.accounts?.accounts || [];
   const enabled = accounts.filter(a => a.enabled !== false).length;
   // accounts-model.js 在 app.js 之后加载，首屏这次调用可能早于它就绪，故用可选链
   const isRateLimited = window.wbAccountsModel?.isRateLimited;
   const limited = isRateLimited ? accounts.filter(a => a.enabled !== false && isRateLimited(a)).length : 0;
-  const up = health.upstreamConfigured;
+  // 「网关运行中」用的是**网关进程**的判据（壳侧 is_ready 探测，见 port-panel.js），
+  // 不是 upstreamConfigured（那个说的是有没有账号）。两者会独立变化：没账号不影响
+  // 网关监听，端口被占也不影响账号存在 —— 混用会让用户对着「未就绪」去查账号。
+  const gatewayUp = window.wbPortPanel?.isReady?.() === true;
   const chip = (text, kind = '', optional = false) =>
     `<span class="badge ${kind}${optional ? ' optional' : ''}"><span class="dot"></span>${esc(text)}</span>`;
-  const port = gatewayBase.replace(/^https?:\/\//, '');
+  const port = window.wbPortPanel?.portLabel?.() || '';
   /** 直接复用某面板已渲染的徽标文案（词表 / 日志面板自持状态，这里不重复计算） */
   const mirror = id => {
     const badge = $(id);
@@ -178,16 +175,16 @@ function renderTopbarStatus() {
   const views = {
     accounts: () => chip(`${enabled} 个启用`, enabled ? 'ok' : '')
       + (limited ? chip(`${limited} 个已限流`, 'warn') : ''),
-    gateway: () => (up ? chip('监听 127.0.0.1', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
+    gateway: () => (gatewayUp ? chip('监听 127.0.0.1', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
     keys: () => mirror('keys-status'),
     desensitize: () => mirror('desensitize-badge'),
     logs: () => mirror('logs-badge'),
     requests: () => mirror('req-badge'),
     // 定时任务页的徽标由 tasks-panel 自己渲染（「N / M 个已开启」），直接镜像
     tasks: () => mirror('tasks-badge'),
-    settings: () => (up ? chip('网关运行中', 'ok', true) : chip('未就绪', 'bad', true))
+    settings: () => (gatewayUp ? chip('网关运行中', 'ok', true) : chip('未就绪', 'bad', true))
       + (enabled ? chip(`${enabled} 个账号启用`) : ''),
-    overview: () => (up ? chip('网关运行中', 'ok') : chip('未就绪', 'bad'))
+    overview: () => (gatewayUp ? chip('网关运行中', 'ok') : chip('未就绪', 'bad'))
       + (session.loggedIn ? chip('已登录', 'ok') : chip('未登录', 'warn')),
   };
 
@@ -410,10 +407,7 @@ function renderSession() {
   const session = state?.session || {};
   const health = state?.health || {};
   const badge = $('session-badge');
-  // 本面板是 **workbuddy 语义**（登录态、昵称、UID 都指向上游 WorkBuddy 账号）：
-  // 首选账号优先取会话自己的 currentAccountId。账号优先级是全局一条队列之后，
-  // 它就是全局队首（与列表快照的 currentAccountId 同源同值）；
-  // 会话信息仍只认这个字段，不与账号页的行状态混用。
+  // 会话信息不随每个请求的选路结果变化。
   const sessionAccountId = session.currentAccountId || state?.accounts?.currentAccountId;
   const currentAccount = state?.accounts?.accounts?.find(a => a.id === sessionAccountId);
 
@@ -450,77 +444,12 @@ function renderSession() {
 
 // ─── 渲染：网关 / 模型 / 配置 ──────────────────
 
-/** 当前展示的网关地址：默认端口起步，拿到真实端口后替换 */
-let gatewayBase = PROXY_BASE;
-let gatewayPortResolved = false;
-let gatewayPortLoading = false;
-
-/** 只负责写这 3 个元素，首次渲染与端口补更新共用，避免两处文案走偏 */
-function paintGatewayAddress(base) {
-  $('api-chat').textContent = `POST ${base}/v1/chat/completions`;
-  $('api-models').textContent = `GET ${base}/v1/models`;
-  $('api-base').textContent = `${base}/v1`;
-  renderSidebarStatus();
-}
-
 /**
- * 侧边栏底部的网关状态：常驻显示，不必切到「网关」页也能确认服务是否在监听。
- *
- * 端口来自 gatewayBase（真实端口由 getBackendStatus 异步补上），
- * 就绪与否看 state.health.upstreamConfigured —— 与顶栏徽标同一判定口径，
- * 避免两处对「网关是否可用」给出不同答案。
- * 首次渲染时 state 还没到，显示「正在检查…」而不是谎报未就绪。
+ * 网关页的地址展示与侧栏那两条状态都由 port-panel.js 负责
+ * （它自持后端状态与端口）。这里只做转发。
  */
-function renderSidebarStatus() {
-  const dot = $('sidebar-status-dot');
-  const text = $('sidebar-status-text');
-  if (!dot || !text) return;
-  const port = gatewayBase.replace(/^https?:\/\//, '');
-  const health = state?.health;
-  if (!health) {
-    dot.className = 'live off';
-    text.textContent = `正在检查… · ${port}`;
-    return;
-  }
-  const up = health.upstreamConfigured;
-  dot.className = up ? 'live pulse' : 'live bad';
-  text.textContent = up ? `网关运行中 · ${port}` : `网关未就绪 · ${port}`;
-  const box = $('sidebar-status');
-  if (box) {
-    box.title = up
-      ? `本地网关正在监听 ${gatewayBase}，可直接调用 OpenAI 兼容接口`
-      : `上游未就绪（${health.upstreamBaseUrl || '未配置'}），网关暂时无法转发请求`;
-  }
-}
-
-/**
- * 显示给用户复制的地址必须是真实监听端口（否则复制出去连不上）。
- * render() 是同步的、调用方众多，所以这里先用兜底值渲染，再异步取真实端口补更新；
- * 取不到（抛错或字段缺失）就保持兜底值，页面照常显示，不留空也不报错。
- */
-async function syncGatewayPort() {
-  // 端口在进程启动时定死，成功拿到一次即长期有效；失败则留待下次渲染重试
-  if (gatewayPortResolved || gatewayPortLoading) return;
-  gatewayPortLoading = true;
-  try {
-    const status = await api.getBackendStatus();
-    const port = Number(status?.port) || 0;
-    if (!port) return;
-    gatewayPortResolved = true;
-    const next = `http://127.0.0.1:${port}`;
-    if (next === gatewayBase) return;
-    gatewayBase = next;
-    paintGatewayAddress(next);
-  } catch (error) {
-    console.warn('读取后端端口失败，网关地址沿用默认端口:', error.message);
-  } finally {
-    gatewayPortLoading = false;
-  }
-}
-
 function renderGateway() {
-  paintGatewayAddress(gatewayBase);
-  void syncGatewayPort();
+  window.wbPortPanel?.render?.();
 }
 
 /**
@@ -532,18 +461,13 @@ function renderProxyStatus() {
   const box = $('proxy-status');
   if (!box) return;
   const health = state?.health;
+  // 这里说的是「上游凭证」（有没有可用账号），与网关进程是否在监听是两件事，
+  // 所以措辞明确指向账号 —— 别再说成「代理不可用」（那会让人去查端口）
   if (!health?.upstreamConfigured) {
-    box.innerHTML = `<span style="color:var(--danger)">不可用：${esc(health?.unavailableReason || '无法连接代理')}</span>`;
+    box.innerHTML = `<span style="color:var(--danger)">无可用账号：${esc(health?.unavailableReason || '尚未登录')}</span>`;
     return;
   }
-  // 首选项与账号页同源：优先用后端按最近一次请求的模型派生的 `routedAccountId`
-  // （已剔除对该模型限流的账号，即「下一个请求真正会先试谁」），没给才回落到
-  // 不限模型的 `currentAccountId`。两处若各取各的，会出现「这一行说 A、账号页说 B」。
-  const snapshot = state?.accounts;
-  const currentId = state?.routedAccountId || snapshot?.currentAccountId;
-  const current = snapshot?.accounts?.find(a => a.id === currentId);
-  const who = current ? (current.nickname || current.name || current.uid || current.id) : '—';
-  box.textContent = `运行正常 · ${health.upstreamBaseUrl || ''} · 首选账号 ${who}（P${current?.priority ?? '—'}）`;
+  box.textContent = `运行正常 · ${health.upstreamBaseUrl || ''}`;
 }
 
 function render() {
@@ -554,7 +478,6 @@ function render() {
   renderProxyStatus();
   renderNavCounts();
   renderTopbarStatus();
-  renderSidebarStatus();
 }
 
 /**
@@ -655,9 +578,9 @@ async function runAccountAction(action, id) {
   busy = true;
   try {
     if (action === 'switch') {
-      await api.switchAccount(id);
+      const result = await api.switchAccount(id);
       await refresh();
-      toast('✅ 已设为首选账号（置顶转发顺序）');
+      toast(result?.changed === false ? '账号已在全局队列第一位' : '✅ 已将账号优先级调整到全局第一位');
     } else if (action === 'refresh') {
       await api.refreshAccountToken(id);
       await refresh();
@@ -704,7 +627,7 @@ $('btn-refresh-token').addEventListener('click', async () => {
   }
 });
 $('btn-logout').addEventListener('click', async () => {
-  if (!confirm('确定退出登录？这会把首选账号从列表里删除（可重新登录加回来）。')) return;
+  if (!confirm('确定退出登录？这会删除当前登录态对应的账号记录（可重新登录加回来）。')) return;
   if (busy) return;
   busy = true;
   try {
@@ -746,12 +669,13 @@ window.wbApp = {
   updateUpdateBadge,
 };
 
-// ─── 启动自动维护：主进程会拉一次临期 token 刷新 + 余额查询 ───
-api.onAutoMaintained?.(({ refreshed, balances }) => {
+// ─── 启动自动维护：主进程会拉一次临期 token 刷新 ───
+// 余额不在这里：它归「定时查询积分」那条定时任务（首轮在网关就绪后立刻跑一次，
+// 见 commands.rs 的 startup_maintenance），界面由下面的轮询读快照应用。
+api.onAutoMaintained?.(({ refreshed }) => {
   const count = Array.isArray(refreshed) ? refreshed.length : 0;
-  const applied = window.wbAccountsView?.applyBalances(balances) || 0;
-  if (count || applied) window.wbAccountsView?.render();
-  if (count) toast(`已自动刷新 ${count} 个临期账号的 Token，并更新积分余额`);
+  if (count) window.wbAccountsView?.render();
+  if (count) toast(`已自动刷新 ${count} 个临期账号的 Token`);
 });
 
 // ─── 初始化 ───────────────────────────────────
@@ -784,9 +708,19 @@ function paintIcons() {
 }
 paintIcons();
 
+// ─── 端口状态与冲突处置 ───────────────────────
+//
+// 侧栏那两条状态（网关进程 / 可用账号）与端口冲突时的两个出口
+// （结束占用进程 / 更换端口）都在 port-panel.js 里 —— 它自持后端状态与
+// 一整套弹窗交互，留在本文件会让这里继续膨胀。本文件只负责在 render()
+// 里委托它重画，并在首屏主动问一次后端状态。
+
 showPage(localStorage.getItem(PAGE_KEY) || 'overview', { persist: false });
 
 refresh();
+// 首屏就问一次后端状态：此时 state 还没回来，侧栏两条状态各自显示
+// 「正在检查…」，拿到结果后立刻变成真值（端口冲突会直接给出失败原因）
+void window.wbPortPanel?.sync?.();
 
 /**
  * 启动即自动检查一次更新：有新版本时在「设置」导航项上给提示。
@@ -807,9 +741,16 @@ document.addEventListener('DOMContentLoaded', () => {
 setInterval(() => {
   if (document.hidden) return;
   refresh();
+  // 后端状态一起轮询：网关可能在这期间起停（端口冲突、用户结束占用进程后重启），
+  // 而管理 API 打不通时 refresh() 只会静默失败，看不出发生了什么
+  void window.wbPortPanel?.sync?.();
   // 日志未读错误也一起轮询：否则人不在日志页时，只有日志面板那次 10 秒轮询
   // 才会更新徽标 —— 而那个轮询恰恰只在日志页可见时才发请求（见 logs-panel.js）
   void syncLogsBadge();
+  // 「定时查询积分」的结果快照也跟着这一轮读一次：后端的定时任务在跑，
+  // 界面得跟上它（否则用户不点按钮就永远停在启动那次的旧余额上）。
+  // 快照时间戳没变时它自己会早退，不会造成无谓的重绘。
+  void window.wbAccountsView?.syncBalancesSnapshot?.();
 }, 20_000);
 
 // 定时「软件版本检查」的结果轮询（1 分钟）。

@@ -10,37 +10,46 @@
   --font-sans: "Segoe UI", "Microsoft YaHei", "Microsoft YaHei UI", system-ui, sans-serif;
   --font-mono: Consolas, "Cascadia Mono", "Courier New", monospace;
 
-  /* 画布与表面：三层高度，越靠上越亮 */
-  --bg: oklch(0.96 0 0);
+  /* 导航、工作区、内容表面分别配色；表格不再单独压暗。 */
+  /* --bg 是工作区画布（body）：比内容卡片浅一档，卡片靠描边与投影浮在上面 */
+  --bg: oklch(0.978 0.00265 286.35);
   --surface: oklch(1 0 0);
-  --surface-2: oklch(0.97 0 0);
+  --surface-2: oklch(0.97670 0.00265 286.35);
   --surface-3: oklch(0.95 0 0);
-  /* 凹槽色：承担两类用途 —— ①侧栏底（.sidebar）、②面板底注（.panel-foot），
-     以及 .field / .switch-card / .modal-section 这类「凹槽底 + 1px 描边」的内嵌块。
-     这里从 0.955 加深到 0.93（与画布 0.96 相差 0.03）：原来的 0.955 只比画布深一点点，
-     属于「略有区分」的弱区分，在侧栏这类大面积的底上够用，但在「凹槽底 + 描边」的
-     内嵌块里会让描边与底色糊在一起，撑不起一个明确的凹槽边界。
-     深一档后与画布的层次立刻分开，两类用途的方向仍然一致（都比承载它的面更深）。
-     注：账号列表（.acct-scroll）原先是第③类用途，现改用下面的 --surface-well ——
-     列表区要的是「几乎贴着白、只压一点点」的浅凹，与这里的深凹槽不是一档。 */
-  --surface-inset: oklch(0.93 0 0);
-  /* 列表区的「浅凹」底：账号卡片列表（.acct-scroll）专用。
-     取值方向与 --surface-inset 相反 —— 它比画布（--bg 0.96）略亮、比卡片（--surface 1.0）
-     略暗，卡片仍有浮起关系，但整体是「一片近白的浅底」，不再是被压深的槽底。
-     之所以单独成一个令牌，而不是复用 --surface-2：--surface-2 在深色主题下是 0.305，
-     比卡片（0.285）更亮 —— 方向反了，卡片会从「浮起」变成「陷下去」；
-     本令牌在深色下走的是加深方向（见深色块），两套主题的收敛方向才一致。
-     oklch(0.97 0 0) 换算到 sRGB 即 #F5F5F5，与用户给定的目标色一致。 */
-  --surface-well: oklch(0.97 0 0);
-  /* 边框：必须比凹槽底（--surface-inset 0.93）深一档。
-     凹槽底从 0.955 加深到 0.93 后与旧边框值（0.93）撞成了同一个色，
-     于是 .field / .switch-card / .modal-section 这类「凹槽底 + 1px 描边」的内嵌块
-     描边与底色同色、整条边隐形。故整体下调一档恢复可见描边：
-     常规边框 0.93 → 0.90（比凹槽底深、比画布 0.96 深），
-     强边框 0.88 → 0.84 同步下调，两者间隔仍是 0.05，两档层次不塌。 */
-  --border: oklch(0.90 0 0);
-  --border-strong: oklch(0.84 0 0);
+  /* 浮层（下拉、菜单、提示气泡）：坐在控件之上，取承载面同色 + 大投影 */
+  --surface-raised: oklch(1 0 0);
+  /* 内嵌凹槽：卡片里那些「凹下去」的小块（表单块、切换卡、代码块、明细面板）。
+     它是卡内的一小块，不是整块内容表面，所以仍比卡片深一档。 */
+  --surface-inset: oklch(0.93517 0.00535 286.30);
+  /* 列表区底：与所在卡片同色（表格不再自成一层暗底）。
+     行与行靠 1px 分隔线区分，不再靠明度反差。 */
+  --table-bg: var(--surface);
+  /* 表头必须不透明（行要从它下面滚过），但只与表体同色 ——
+     它与表体的分界交给底部那条 1px 描边，不另起一条色带。 */
+  --table-head-bg: var(--surface);
+  /* 行悬浮：比表面深（浅色）/ 亮（深色）一档的薄底，同一表达式两套主题都成立 */
+  --row-hover: var(--surface-2);
+  --border: oklch(0.145 0 0 / 10%);
+  --border-strong: oklch(0.145 0 0 / 20%);
   --hairline: oklch(0.145 0 0 / 8%);
+
+  /* 控件填充与描边：与承载面分开，于是表面提亮后按钮、输入框依然立得住，
+     不必再靠压暗整块内容来衬托它们。 */
+  --control-bg: oklch(0.95815 0 0);
+  --control-hover: oklch(0.93214 0.00536 286.30);
+  --control-border: oklch(0.145 0 0 / 14%);
+  --control-border-hover: oklch(0.145 0 0 / 24%);
+
+  /* 侧栏：全站唯一「退后一层」的大面积底色，深浅两套都取中性灰。 */
+  --sidebar-bg: oklch(0.92123 0.00460 258.33);
+  --sidebar-border: oklch(0.145 0 0 / 16%);
+  --sidebar-fg: oklch(0.43287 0.01676 258.37);
+  --sidebar-muted: oklch(0.51200 0.02088 261.29);
+  --nav-hover: oklch(0.145 0 0 / 5%);
+  --nav-selected-bg: oklch(0.89318 0.04237 253.82);
+  --nav-selected-border: oklch(0.83311 0.05788 254.15);
+  --nav-selected-fg: oklch(0.42649 0.12275 255.60);
+  --nav-count-bg: oklch(0.84405 0.05294 251.09);
 
   /* 文本三档 */
   --text: oklch(0.145 0 0);
@@ -53,10 +62,6 @@
   --primary-soft: color-mix(in srgb, var(--primary) 10%, white);
   --primary-bd: color-mix(in srgb, var(--primary) 28%, white);
   --primary-fg: oklch(0.48 0.2 257.3);
-
-  /* 背景渐变：由品牌色淡化而来，故排在品牌之后 */
-  --bg-grad-a: color-mix(in srgb, var(--primary) 3%, white);
-  --bg-grad-b: color-mix(in srgb, var(--primary) 6%, white);
 
   /* 语义色 */
   --ok: oklch(0.596 0.145 163.225);
@@ -113,26 +118,34 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --bg: oklch(0.21 0 0);
-  --bg-grad-a: oklch(1 0 0 / 3%);
-  --bg-grad-b: oklch(0.623 0.206 255.3 / 6%);
-  --surface: oklch(0.285 0 0);
-  --surface-2: oklch(0.305 0 0);
-  --surface-3: oklch(0.335 0 0);
-  /* 凹槽色：用途与浅色同（侧栏底 / 面板底注 / 内嵌块）。
-     从 0.205 加深到 0.19：原来只比画布（0.21）深 0.005，几乎看不出来，
-     撑不起「凹槽底 + 描边」这类内嵌块的边界。加深后与画布差 0.02，
-     仍比画布更深（凹陷方向不变）。 */
-  --surface-inset: oklch(0.19 0 0);
-  /* 列表区的「浅凹」底（.acct-scroll）：深色下没有「比画布亮」的余量可用 ——
-     画布已是 0.21、卡片 0.285，再往上加亮会逼近卡片，卡片就浮不起来了；
-     于是走反方向：比画布（0.21）更深一档，取 0.19。
-     数值与 --surface-inset 相同，但语义独立：这里是「列表区要一个比画布略沉的底」，
-     那边是「内嵌块的凹槽」，将来任一方调整都不必迁就另一方。 */
-  --surface-well: oklch(0.19 0 0);
+  --bg: oklch(0 0 0);
+  --surface: oklch(0.26154 0.00554 286.01);
+  --surface-2: oklch(0.28254 0.00726 285.93);
+  --surface-3: oklch(0.32737 0.01050 285.81);
+  --surface-raised: oklch(0.30 0.005 286);
+  /* 内嵌凹槽：比卡片（0.2615）深一档；列表区与表面同色，见 --table-bg */
+  --surface-inset: oklch(0.215 0.005 286);
+  --table-bg: var(--surface);
+  --table-head-bg: var(--surface);
+  --row-hover: var(--surface-2);
   --border: oklch(1 0 0 / 10%);
-  --border-strong: oklch(1 0 0 / 17%);
-  --hairline: oklch(1 0 0 / 7%);
+  --border-strong: oklch(1 0 0 / 20%);
+  --hairline: oklch(1 0 0 / 9%);
+
+  --control-bg: oklch(0.36572 0.00850 285.97);
+  --control-hover: oklch(0.40758 0.00993 285.95);
+  --control-border: oklch(1 0 0 / 15%);
+  --control-border-hover: oklch(1 0 0 / 25%);
+
+  --sidebar-bg: oklch(0.19212 0.00399 286.02);
+  --sidebar-border: oklch(1 0 0 / 13%);
+  --sidebar-fg: oklch(0.79794 0.01342 266.68);
+  --sidebar-muted: oklch(0.67832 0.01760 262.73);
+  --nav-hover: oklch(1 0 0 / 6%);
+  --nav-selected-bg: oklch(0.34658 0.05986 253.12);
+  --nav-selected-border: oklch(0.46337 0.07464 249.11);
+  --nav-selected-fg: oklch(0.93281 0.03331 250.99);
+  --nav-count-bg: oklch(0.43273 0.06483 250.27);
 
   --text: oklch(0.965 0 0);
   --text-2: oklch(0.85 0 0);
@@ -176,19 +189,33 @@
   :root[data-theme="system"] {
     color-scheme: dark;
 
-    --bg: oklch(0.21 0 0);
-    --bg-grad-a: oklch(1 0 0 / 3%);
-    --bg-grad-b: oklch(0.623 0.206 255.3 / 6%);
-    --surface: oklch(0.285 0 0);
-    --surface-2: oklch(0.305 0 0);
-    --surface-3: oklch(0.335 0 0);
-    /* 必须与上方 :root[data-theme="dark"] 的取值完全一致：
-       两者描述的是同一套深色主题，只是触发方式不同（显式深色 / 跟随系统）。 */
-    --surface-inset: oklch(0.19 0 0);
-    --surface-well: oklch(0.19 0 0);
+    --bg: oklch(0 0 0);
+    --surface: oklch(0.26154 0.00554 286.01);
+    --surface-2: oklch(0.28254 0.00726 285.93);
+    --surface-3: oklch(0.32737 0.01050 285.81);
+    --surface-raised: oklch(0.30 0.005 286);
+    --surface-inset: oklch(0.215 0.005 286);
+    --table-bg: var(--surface);
+    --table-head-bg: var(--surface);
+    --row-hover: var(--surface-2);
     --border: oklch(1 0 0 / 10%);
-    --border-strong: oklch(1 0 0 / 17%);
-    --hairline: oklch(1 0 0 / 7%);
+    --border-strong: oklch(1 0 0 / 20%);
+    --hairline: oklch(1 0 0 / 9%);
+
+    --control-bg: oklch(0.36572 0.00850 285.97);
+    --control-hover: oklch(0.40758 0.00993 285.95);
+    --control-border: oklch(1 0 0 / 15%);
+    --control-border-hover: oklch(1 0 0 / 25%);
+
+    --sidebar-bg: oklch(0.19212 0.00399 286.02);
+    --sidebar-border: oklch(1 0 0 / 13%);
+    --sidebar-fg: oklch(0.79794 0.01342 266.68);
+    --sidebar-muted: oklch(0.67832 0.01760 262.73);
+    --nav-hover: oklch(1 0 0 / 6%);
+    --nav-selected-bg: oklch(0.34658 0.05986 253.12);
+    --nav-selected-border: oklch(0.46337 0.07464 249.11);
+    --nav-selected-fg: oklch(0.93281 0.03331 250.99);
+    --nav-count-bg: oklch(0.43273 0.06483 250.27);
 
     --text: oklch(0.965 0 0);
     --text-2: oklch(0.85 0 0);
@@ -242,10 +269,6 @@ body {
   line-height: 1.55;
   color: var(--text);
   background-color: var(--bg);
-  background-image:
-    radial-gradient(1000px 460px at 6% -12%, var(--bg-grad-a) 0%, rgba(255, 255, 255, 0) 62%),
-    radial-gradient(820px 420px at 98% -6%, var(--bg-grad-b) 0%, rgba(255, 255, 255, 0) 58%);
-  background-attachment: fixed;
   -webkit-font-smoothing: antialiased;
 }
 

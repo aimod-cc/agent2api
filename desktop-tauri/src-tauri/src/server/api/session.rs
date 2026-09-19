@@ -189,6 +189,28 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
             None => return management_error(400, format!("未知的提供商：{other}")),
         },
     };
+    if kind == crate::server::core::providers::ProviderKind::Qoder {
+        let handle = match state.login().start_qoder_login(edition.as_deref()) {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
+            "edition": task.edition, "provider": "qoder" }));
+    }
+    // CatPaw：上游把 token **推**到我们的 loopback 回调上（见 core::login::catpaw），
+    // 所以这里除了发起还要把回调基址告诉它 —— 那必须是本网关自己的监听地址，
+    // 而上游的 redirect 白名单只放行 127.0.0.1 / localhost（实测）。
+    if kind == crate::server::core::providers::ProviderKind::CatPaw {
+        let callback_base = format!("http://127.0.0.1:{}", state.port);
+        let handle = match state.login().start_catpaw_login(&callback_base).await {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
+            "edition": task.edition, "provider": "catpaw" }));
+    }
     if kind != crate::server::core::providers::ProviderKind::WorkBuddy {
         return start_web_login(state, kind).await;
     }
@@ -308,6 +330,232 @@ pub async fn login_callback(State(state): State<ServerState>, body: Bytes) -> Re
     {
         Ok(account_id) => ok_json(json!({ "accountId": account_id })),
         Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+// ─── POST /api/session/login/catpaw-callback ────────────────
+
+/// CatPaw 网页登录的 loopback 回调（**上游直接 POST 到本机**）。
+///
+/// ── 与小浣熊那个 callback 的根本差别 ─────────────────────────
+/// 小浣熊那条是**壳侧登录窗口**认出自定义协议 URL 后转交给网关的（Tauri 没有
+/// Electron 的协议接管能力，见 `login_callback` 的说明）；CatPaw 这条是
+/// **上游自己发起的 HTTP POST** —— 美团 passport 的 `login-callback` 页面把
+/// `{token, state}` 表单提交到我们在授权 URL 里给的 `redirect` 地址，
+/// 而那个地址就是本网关自己的 loopback 端口（见 `core::login::catpaw`）。
+///
+/// ── 为什么这条不挂 protected ─────────────────────────────────
+/// 调用方是**浏览器里的上游页面**，它当然没有我们的 API Key。安全性由
+/// `state` 承担：一次性随机串，只在本进程内生成并与登录任务一一对应
+/// （`finish_catpaw_login` 里逐字比对）。伪造者猜不中 state 就换不到任何东西 ——
+/// 这与小浣熊那条挂 protected 并不矛盾：那条的调用方是我们自己的登录窗口，
+/// 它本来就带着 API Key。
+///
+/// ── 为什么同时接受表单与 JSON ────────────────────────────────
+/// 上游是**表单提交**（content-type 为 `application/x-www-form-urlencoded`；
+/// 依据是上游 CSP 的 `form-action` 与客户端 loopback 只接受表单/JSON 两种），
+/// 而本网关内部调用用的是 JSON。两种都解析，省得将来换调用方时再改一次。
+///
+/// 响应是给人看的 HTML（浏览器会停在这一页），因此不走 `ok_json` 那套信封。
+///
+/// ── 为什么要显式补 `Access-Control-Allow-Private-Network` ────
+/// 这次回调是**从公网页面（`catpaw.meituan.com`）发往本机 127.0.0.1 的跨源
+/// 请求**（上游用 fetch/XHR 提交，不是顶层表单导航 —— 否则它不需要任何 CORS
+/// 头）。浏览器对「公网 → 私有网络」的这类请求会做 Private Network Access
+/// 检查：预检里带 `Access-Control-Request-Private-Network`，而响应**必须**回
+/// `Access-Control-Allow-Private-Network: true`，否则请求被拦、凭证根本到不了
+/// 我们这里（症状：用户看到上游的「登录成功」页、窗口不关、网关一直等）。
+///
+/// 官方客户端的 loopback 正是为此专门回了这个头（`auth-DSFS1FEr.js` 里的
+/// `Lr` 常量 = `{Origin: *, Allow-Private-Network: true}`）。全局 CORS 中间件
+/// 只回三个标准头（照抄 Node 版，不为这一个端点改动全局行为），因此这里单点补齐。
+pub async fn login_catpaw_callback(State(state): State<ServerState>, body: Bytes) -> Response {
+    let (token, task_state) = parse_catpaw_callback(&body);
+    let response = match state.login().finish_catpaw_login(&token, &task_state).await {
+        Ok(()) => catpaw_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
+        Err(message) => catpaw_callback_page(400, &format!("登录失败：{message}")),
+    };
+    attach_private_network_headers(response)
+}
+
+/// 给回调响应补上私有网络访问许可（见 `login_catpaw_callback` 的说明）。
+///
+/// 顺带把 `Allow-Origin` 也显式写一遍：全局 CORS 中间件已经写了，这里重复设置
+/// 同一个值是无害的（幂等），但它让「这个端点的跨源许可」在一处可见 ——
+/// 将来若有人调整全局 CORS 策略，这条回调不会跟着被改坏。
+fn attach_private_network_headers(mut response: Response) -> Response {
+    use axum::http::header::HeaderValue;
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str("*") {
+        headers.insert("access-control-allow-origin", value);
+    }
+    if let Ok(value) = HeaderValue::from_str("true") {
+        headers.insert("access-control-allow-private-network", value);
+    }
+    response
+}
+
+/// 从回调 body 里取 `(token, state)`：先按表单解析，再退回 JSON。
+fn parse_catpaw_callback(body: &[u8]) -> (String, String) {
+    let text = String::from_utf8_lossy(body);
+    if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+        if payload.get("token").is_some() || payload.get("state").is_some() {
+            let token = payload.get("token").and_then(Value::as_str).unwrap_or("");
+            let task_state = payload.get("state").and_then(Value::as_str).unwrap_or("");
+            return (token.to_string(), task_state.to_string());
+        }
+    }
+    // 表单（上游的实际形态）：token=<…>&state=<…>
+    let mut token = String::new();
+    let mut task_state = String::new();
+    for pair in text.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = decode_form_component(key);
+        if key == "token" {
+            token = decode_form_component(value);
+        } else if key == "state" {
+            task_state = decode_form_component(value);
+        }
+    }
+    (token, task_state)
+}
+
+/// 表单字段解码（`+` → 空格，`%XX` → 字节）。
+///
+/// 不复用 `auth::urlencoding`：那个是**编码**（反方向），且这里的输入来自上游
+/// 表单，必须按 `application/x-www-form-urlencoded` 的规则处理 `+`。
+fn decode_form_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            // 需要完整的三字节 `%XX`：`index + 3 <= len`。
+            // 若收尾处只剩两位（`%A`）就按普通字节处理，不吞掉它。
+            b'%' if index + 3 <= bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                    .ok()
+                    .and_then(|text| u8::from_str_radix(text, 16).ok());
+                match hex {
+                    Some(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    None => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 回调结果页（浏览器停在它上边，用户看到人话即可）。
+///
+/// 不带任何脚本与外链：这一页的内容我们完全控制，注入面越小越好。
+fn catpaw_callback_page(status: u16, message: &str) -> Response {
+    use axum::response::IntoResponse;
+
+    let escaped = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    let html = format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
+         <title>CatPaw 登录</title></head>\
+         <body style=\"font-family:system-ui,sans-serif;padding:48px;text-align:center\">\
+         <p style=\"font-size:16px\">{escaped}</p></body></html>"
+    );
+    (
+        axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK),
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
+}
+
+// ─── POST /api/session/login/sms/send 与 /verify ────────────
+
+/// 发送短信验证码（**AutoClaw 专用**，手机号验证码登录的第一步）。
+///
+/// ── 为什么这不是「网页登录」──────────────────────────────────
+/// 另外两家的网页登录形态是「开登录窗口 → 用户登录 → 回调带授权码 → 换凭证」。
+/// AutoClaw 没有这条路（详见 `providers::autoclaw::login` 的模块头：桌面端没有
+/// 公网 Web 应用、账号体系里没有授权码，国内版唯一入口是手机号 + 验证码）。
+/// 因此这里既不开窗口也不起任务，就是**一次同步的上游调用**。
+///
+/// body `{phone}` → `{deviceId}`。
+///
+/// ── 为什么把 deviceId 回给前端 ──────────────────────────────
+/// 上游把「发的这个码」绑在发码时的 device_id 上，登录必须带同一个 ——
+/// 但网关不替用户保存这个中间态（一次登录可以跨多次 HTTP 请求、也可以被用户
+/// 放弃，存在服务端只会多一份要清理的状态）。回给前端让它随下一次请求带回，
+/// 是这里最省事又不丢正确性的做法。
+pub async fn login_sms_send(body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    match crate::server::core::providers::autoclaw::login::send_code(phone).await {
+        Ok(result) => ok_json(result),
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+/// 用手机号 + 验证码登录并**直接落成账号**（AutoClaw 专用）。
+///
+/// body `{phone, code, deviceId?, name?}` → `{account, list}` —— 响应形状与
+/// `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，落盘、
+/// 命名、去重、优先级分配全部复用既有的添加路径（`add_autoclaw_account`），
+/// 前端因此可以直接把结果交给同一个「已添加账号」收尾逻辑。
+pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
+    let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
+    let device_id = payload.get("deviceId").and_then(Value::as_str);
+    let credentials =
+        match crate::server::core::providers::autoclaw::login::login_with_code(phone, code, device_id)
+            .await
+        {
+            Ok(credentials) => credentials,
+            Err(error) => return management_error(error.status_code, error.message),
+        };
+    // 备注名：用户显式填的优先；没填则用脱敏手机号（`130****4229`）——
+    // 比默认的「账号 830290」更像用户自己认得出来的标识
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            credentials
+                .get("phoneTail")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let store = state.store();
+    match store.add_autoclaw_account(&credentials, name.as_deref()) {
+        Ok(account) => {
+            let label = account
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("AutoClaw 账号");
+            logging::log("[Login]", &format!("✅ AutoClaw 登录成功: {label}"));
+            ok_json(json!({ "account": account, "list": store.list_accounts() }))
+        }
+        Err(error) => super::accounts::store_error(error),
     }
 }
 

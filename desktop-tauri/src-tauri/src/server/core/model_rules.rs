@@ -214,13 +214,27 @@ impl ModelRules {
     }
 
     /// 该 (provider, id) 是否已做过默认规则种子。
-    /// 新条目按 `provider:id` 精确匹配；旧版纯 id 条目对任何 provider 都算已种
-    /// （旧种子是全局动作，重种一遍只是把同样的默认值再写一次，没必要）。
+    ///
+    /// ── 旧版纯 id 条目的兼容**只对 workbuddy / raccoon 成立**（别放宽）──
+    /// 升级前的 `seeded` 存的是纯 id（旧版种子是全局动作），读取时对这两家
+    /// 保留「纯 id 也算已种」的兼容：重种一遍只是把同样的默认值再写一次，
+    /// 没必要。
+    ///
+    /// 但这个兼容**不能给所有 provider 开**：Qoder 的目录里有 `Auto` /
+    /// `GLM-5.3` / `DeepSeek-V4-Pro` 这类与 workbuddy / raccoon 清单**同名**的
+    /// 模型，它们的纯 id 早已躺在旧版 `seeded` 里 —— 一律算已种的话，Qoder
+    /// 这几个模型会**跳过白名单种子**而在全新安装上默认启用，与「只默认开
+    /// Qwen3.8-Flash」的预期正好相反。旧版种子从未处理过 Qoder，
+    /// 那批标记对 Qoder 不构成「已种」的证据。
     fn is_seeded(&self, provider: &str, id: &str) -> bool {
         let key = format!("{provider}:{id}");
-        self.seeded.iter().any(|item| {
-            item.eq_ignore_ascii_case(&key) || item.eq_ignore_ascii_case(id)
-        })
+        if self.seeded.iter().any(|item| item.eq_ignore_ascii_case(&key)) {
+            return true;
+        }
+        if !matches!(provider, "workbuddy" | "raccoon") {
+            return false;
+        }
+        self.seeded.iter().any(|item| item.eq_ignore_ascii_case(id))
     }
 }
 
@@ -408,12 +422,26 @@ pub fn seed_raccoon_defaults(ids: &[String]) -> Option<String> {
     Some(format!("🧩 小浣熊模型默认规则: {}", parts.join("；")))
 }
 
-// ─── WorkBuddy 清单的默认规则种子 ────────────────────
+// ─── 各清单的「默认启用白名单」种子 ────────────────────
 
 /// WorkBuddy 清单的**默认启用白名单**：模型首次出现在清单里时，只有这里的
 /// 模型保持默认启用，其余一律默认**禁用**（管理页可见、开关关着，用户可手动
 /// 启用 —— 与小浣熊种子同一哲学：「默认值」只决定初始状态，不决定 forever）。
 pub const WORKBUDDY_DEFAULT_ENABLED: &[&str] = &["hy3", "hy4-preview-f", "deepseek-v4.1-flash"];
+
+/// Qoder 清单的**默认启用白名单**：同 WorkBuddy 种子的语义，只是白名单里
+/// 只留一个模型。
+///
+/// ── 为什么 Qoder 只留 Qwen3.8-Flash ────────────────────────
+/// Qoder 是 agent 形态的上游，目录里绝大多数条目要么是**套餐档位别名**
+/// （`Auto` / `Ultimate` / `Performance` / `Efficient` / `Sonus` / `Cantus`），
+/// 要么是需要更高档套餐才可用的模型。默认全开会让这台网关对外的模型列表
+/// 凭空多出十几个用户几乎不会点名的名字，而且它们还会参与 `/v1/models` 的
+/// 同名认领 —— 把别家真正在用的同名模型（如 `GLM-5.3` / `Kimi-K3`）挤掉。
+/// `Qwen3.8-Flash` 是免费档通常可用的那个（静态兜底清单里 `enabled` 恒为真
+/// 的两个 Qwen3.8 系模型之一，且面向日常对话），拿它当唯一默认项最贴近
+/// 「装上就能用」的预期。
+pub const QODER_DEFAULT_ENABLED: &[&str] = &["Qwen3.8-Flash"];
 
 /// WorkBuddy 清单的**默认规则种子**：对 `ids` 里每个还没种过的模型记入
 /// `seeded`，不在 [`WORKBUDDY_DEFAULT_ENABLED`] 里的同时默认禁用。
@@ -426,29 +454,63 @@ pub const WORKBUDDY_DEFAULT_ENABLED: &[&str] = &["hy3", "hy4-preview-f", "deepse
 ///
 /// 返回给日志的摘要；没有新种过的模型时返回 None（不落盘）。
 pub fn seed_workbuddy_defaults(ids: &[String]) -> Option<String> {
+    seed_default_enabled("workbuddy", "WorkBuddy", WORKBUDDY_DEFAULT_ENABLED, ids)
+}
+
+/// Qoder 清单的**默认规则种子**：语义与 [`seed_workbuddy_defaults`] 完全一致，
+/// 只是白名单是 [`QODER_DEFAULT_ENABLED`]。
+///
+/// 调用点同样两类：清单**首次落地**（`providers::qoder::models::refresh`，远程
+/// 目录从上游拉回来时），以及编排入口对**当前缓存清单**的补种（见
+/// `providers::adapter` 的 `seed_current_qoder_defaults` —— 覆盖「有账号但远程
+/// 刷新失败，手里只有静态兜底清单」与升级用户首次打开管理页的情形）。
+pub fn seed_qoder_defaults(ids: &[String]) -> Option<String> {
+    seed_default_enabled("qoder", "Qoder", QODER_DEFAULT_ENABLED, ids)
+}
+
+/// 「默认启用白名单」种子的公共实现（WorkBuddy 与 Qoder 共用）。
+///
+/// 对 `ids` 里每个还没种过的模型：不在 `whitelist` 里的默认禁用，并把
+/// `(provider, id)` 记入 `seeded`。`label` 只进日志文案。
+///
+/// ── 为什么 seeded 单独变化也要落盘（而不是只看「有没有新禁用」）──────
+/// 旧实现只在「这次真禁用了某个模型」时才 save，于是「模型已被别处的规则
+/// 禁用 → 本次没有新禁用 → seeded 没落地」这个组合下，下次启动会**重种一遍** ——
+/// 用户在这期间手动启用过它的话，会被这一次重种悄悄改回禁用。种子是
+/// 「只对首次出现生效」的承诺，那承诺必须落盘才算数。
+fn seed_default_enabled(
+    provider: &str,
+    label: &str,
+    whitelist: &[&str],
+    ids: &[String],
+) -> Option<String> {
     let mut rules = current();
+    let seeded_before = rules.seeded.len();
     let mut disabled_added: Vec<String> = Vec::new();
     for id in ids {
         let id = id.trim();
-        if id.is_empty() || rules.is_seeded("workbuddy", id) {
+        if id.is_empty() || rules.is_seeded(provider, id) {
             continue;
         }
-        rules.seeded.push(format!("workbuddy:{id}"));
-        let default_enabled = WORKBUDDY_DEFAULT_ENABLED
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(id));
-        if !default_enabled && !rules.is_disabled("workbuddy", id) {
-            set_membership(&mut rules.disabled, Some("workbuddy"), id, true);
+        rules.seeded.push(format!("{provider}:{id}"));
+        let default_enabled = whitelist.iter().any(|name| name.eq_ignore_ascii_case(id));
+        if !default_enabled && !rules.is_disabled(provider, id) {
+            set_membership(&mut rules.disabled, Some(provider), id, true);
             disabled_added.push(id.to_string());
         }
     }
-    if disabled_added.is_empty() {
+    if rules.seeded.len() == seeded_before {
+        // 没有新模型：一个字节都不用落盘
         return None;
     }
     save(&rules);
+    if disabled_added.is_empty() {
+        // 有新的种子标记、但都被别处的规则禁着了 —— 落盘即可，日志不必吵
+        return None;
+    }
     Some(format!(
-        "🧩 WorkBuddy模型默认规则: 默认只启用 [{}]；默认禁用 {} 个 [{}]",
-        WORKBUDDY_DEFAULT_ENABLED.join(", "),
+        "🧩 {label}模型默认规则: 默认只启用 [{}]；默认禁用 {} 个 [{}]",
+        whitelist.join(", "),
         disabled_added.len(),
         disabled_added.join(", ")
     ))

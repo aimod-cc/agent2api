@@ -61,7 +61,7 @@
   z-index: 2;
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);
-  background: var(--surface-2);
+  background: var(--table-head-bg);
   color: var(--text-3);
   font-size: 10.5px;
   font-weight: 600;
@@ -72,7 +72,7 @@
 
 .models-table td { padding: 8px 14px; border-bottom: 1px solid var(--hairline); vertical-align: middle; }
 .models-table tbody tr:last-child td { border-bottom: 0; }
-.models-table tbody tr:hover td { background: color-mix(in srgb, var(--text) 2%, transparent); }
+.models-table tbody tr:hover td { background: var(--row-hover); }
 .models-table th.r, .models-table td.r { text-align: right; }
 .models-table td.empty { padding: 26px 14px; text-align: center; color: var(--text-3); }
 
@@ -92,15 +92,16 @@
 .models-table tr.off td { opacity: .5; }
 .models-table tr.off td.state, .models-table tr.off td.r { opacity: 1; }
 
-/* 提供商分组行 */
+/* 提供商分组行：表内的一条分组带。取 --surface-2，只比表体差一档 ——
+   它仍是「表里的一行」，不该用卡内凹槽那档深色（那会把表切成几块）。 */
 .models-table .tr-group td {
   padding: 5px 14px;
-  background: var(--surface-inset);
+  background: var(--surface-2);
   color: var(--text-2);
   font-size: 11.5px;
   font-weight: 600;
 }
-.models-table .tr-group td:hover { background: var(--surface-inset); }
+.models-table .tr-group td:hover { background: var(--surface-2); }
 .models-table .prov-tag {
   display: inline-block;
   margin-right: 8px;

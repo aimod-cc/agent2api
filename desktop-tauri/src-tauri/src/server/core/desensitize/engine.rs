@@ -50,7 +50,8 @@ pub const MAX_TERM_LENGTH: usize = 200;
 /// 默认词表：客户端固定 system 模板里的合规声明高频词。
 /// 这些词取自真实被上游审核拦下的模板（"拒绝协助 DoS 攻击 / 漏洞利用开发 /
 /// 凭证测试 / C2 框架…"），属于「拒绝作恶」的声明而非有害输入，却会被误判。
-/// 末条是客户端 system 模板里被上游审核整句误拦的真实文案，整句作为一个词条。
+/// 末三条是客户端 system 模板里被上游审核误拦的真实文案（整句/整段作为词条），
+/// 其中两个「自称句」实测是 Claude Code 客户端 system 首段被拦的触发点。
 /// 注意：这里必须是纯文本，零宽空格是运行时由脱敏逻辑插入的。
 pub const DEFAULT_TERMS: &[&str] = &[
     "DoS",
@@ -85,10 +86,12 @@ pub const DEFAULT_TERMS: &[&str] = &[
     "zero-day",
     "0day",
     "Main branch (you will usually use this for PRs)",
+    "You are Claude Code",
+    "Anthropic's official CLI for Claude",
 ];
 
 /// 默认词表当前版本：每次往 DEFAULT_TERMS 追加新词条时 +1，并在迁移表登记
-pub const DEFAULT_TERMS_VERSION: u32 = 2;
+pub const DEFAULT_TERMS_VERSION: u32 = 3;
 
 /// 默认词表补词迁移表：版本号 → 该版本新增的默认词条。
 ///
@@ -96,8 +99,10 @@ pub const DEFAULT_TERMS_VERSION: u32 = 2;
 /// 因此按版本做一次性合并：文件里记录已合并到哪个版本（defaultsVersion），
 /// 启动加载时把缺失的新词条按忽略大小写补进去，合并完落盘并更新版本标记。
 /// 用「只补登记词条」而不是「与 DEFAULT_TERMS 求并集」，是为了保护用户的删除权。
-pub const DEFAULT_TERM_MIGRATIONS: &[(u32, &[&str])] =
-    &[(2, &["Main branch (you will usually use this for PRs)"])];
+pub const DEFAULT_TERM_MIGRATIONS: &[(u32, &[&str])] = &[
+    (2, &["Main branch (you will usually use this for PRs)"]),
+    (3, &["You are Claude Code", "Anthropic's official CLI for Claude"]),
+];
 
 // ─── JS 语义小工具 ──────────────────────────────────────────
 

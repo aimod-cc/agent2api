@@ -16,6 +16,9 @@
 //!   adapter.rs      **ProviderAdapter 实现**（T-c2）：请求构造（双模型标识头 +
 //!                   X-Authorization）/ 错误分类 / 凭证 / SSE model 回写声明，
 //!                   移植来源：`autoclaw-upstream-client.mjs` 的转发链
+//!   balance.rs      积分钱包 + 订阅信息查询（移植来源 `account-balance.mjs`）
+//!   checkin.rs      每日签到（**逆向**：老项目没有这条链路，接口从 AutoClaw
+//!                   桌面端的 app.asar 里读出并实测确认）
 //!
 //! ── 接线现状（T-c2 已落地）──────────────────────────────────
 //! `adapter_for(AutoClaw)` 返回 [`adapter::AUTOCLAW_ADAPTER`]，`implemented_kinds()`
@@ -57,6 +60,8 @@
 //! crypto::decode_jwt_claims(&str) -> Option<Value>
 //! crypto::strip_bearer(&str) -> String
 //! adapter::AUTOCLAW_ADAPTER           静态适配器实例（`adapter_for` 返回它）
+//! balance::query_usage(&AccountStore, &str) -> Result<Value, GatewayError>
+//! checkin::claim_daily_signin(&AccountStore, &str) -> Result<Value, GatewayError>
 //! ```
 //!
 //! ── 两个 id 别搞混 ──────────────────────────────────────────
@@ -73,7 +78,9 @@
 
 pub mod adapter;
 pub mod balance;
+pub mod checkin;
 pub mod crypto;
 pub mod credentials;
+pub mod login;
 pub mod models;
 pub mod refresh;

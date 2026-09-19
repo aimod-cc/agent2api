@@ -2,23 +2,13 @@
 /* global wbApp */
 
 /**
- * 「登录 / 添加账号」弹窗里按提供商分叉的部分：提供商分段控件、未知提供商的
- * 「即将上线」占位块、小浣熊 / CatPaw / AutoClaw 三家的三种添加方式（数据驱动见
- * ADD_FORMS），以及弹窗内**所有** .seg 分段控件的交互（点击 / 方向键 /
- * roving tabindex，见 bindSeg）。
+ * 按提供商构造添加账号表单，并统一绑定弹窗内的分段控件。
+ * WorkBuddy 的账号版本与网页登录区块在 index.html，交互在 add-account.js。
  *
- * 来源：原 account-panel.js 的「添加账号弹窗：按提供商分叉」段与「事件绑定」段里
- * 属于它的那部分，按下标拆出，逐字搬移、行为不变。
+ * 本文件须在 add-account.js 之后、account-panel.js 之前加载：添加按钮上的
+ * 监听按此顺序打开弹窗、同步提供商，再同步账号面板。
  *
- * 弹窗骨架（#add-modal）与 WorkBuddy 区块（账号版本 / 登录方式 / 打开方式 / 粘贴
- * 登录态 JSON）仍写在 index.html 里；WorkBuddy 那块的登录与分段控件联动在
- * add-account.js。加载顺序见 index.html：本文件排在 add-account.js 之后、
- * account-panel.js 之前 —— 它自带加载期绑定（mountAddProviderUi 等，需要 DOM 已
- * 解析），且两个「登录 / 添加账号」按钮的监听要按「add-account.js → 本文件 →
- * account-panel.js」的顺序注册（同元素同事件按注册顺序触发）。
- *
- * 依赖：wbApp 的 esc / toast / refresh、window.wbProviders（提供商摘要）、
- * window.__TAURI_INTERNALS__（POST /api/accounts）与 DOM id；不依赖 account-panel.js。
+ * 依赖 wbApp、wbProviders、Tauri 的 api_request 命令与已解析的弹窗 DOM。
  */
 (() => {
   const $ = id => document.getElementById(id);
@@ -27,7 +17,7 @@
   // ─── 添加账号弹窗：按提供商分叉 ─────────────
 
   const ADD_PROVIDER_SEG_ID = 'add-provider-seg';
-  /** WorkBuddy 原有区块的容器（注入后原有四个 .modal-section 都搬进它） */
+  /** WorkBuddy 账号版本与网页登录区块的容器 */
   const ADD_WB_BLOCK_ID = 'add-block-workbuddy';
   const ADD_PLACEHOLDER_ID = 'add-block-placeholder';
 
@@ -36,7 +26,7 @@
    * 方向键、Home / End 切换选中项。选中态写在 .active + aria-checked 上，并用
    * roving tabindex（只有选中项能被 Tab 到）表达「一组里只能选一个」，与 index.html
    * 里的初始标记同一套约定。切换后派发 SEG_EVENT，由关心它的模块在容器上监听：
-   * add-account.js 接 WorkBuddy 那三个（版本 / 登录方式 / 打开方式），本模块接提供商与添加方式。
+   * add-account.js 接 WorkBuddy 的版本与打开方式，本模块接提供商与添加方式。
    */
   const SEG_EVENT = 'wb-seg-change';
 
@@ -100,16 +90,9 @@
   /** 单行控件的长度上限：备注名按 100（后端会截断），其余标识字段按 256 */
   const maxLengthOf = field => (field.key === 'name' ? MAX_NAME_LENGTH : MAX_IDENTITY_LENGTH);
 
-  /** 粘贴内容里是否有非空字符串键（本地预检用；键名与后端取值链对齐） */
-  const hasText = (object, keys) =>
-    keys.some(key => typeof object[key] === 'string' && object[key].trim());
-
   /**
-   * 三家的「填表单添加」配置：同时驱动块构造（buildProviderBlock）与提交
-   * （addProviderManual / Json / Desktop）。字段 key 就是请求体里的键名，
-   * 与后端取值链逐一对齐（见各条注释）；方式二统一是「整份 JSON 展开 + 覆盖
-   * provider」，方式三统一是 `{ provider, importDesktop: true }`（后端各读自己的
-   * 桌面端登录态文件）。`manualNoteHtml` 用于带行内链接的说明（只有小浣熊有）。
+   * 各家表单字段直接对应请求体键名；桌面端导入统一提交
+   * `{ provider, importDesktop: true }`，由后端读取对应客户端的登录态文件。
    */
   const ADD_FORMS = [
     {
@@ -135,12 +118,6 @@
         { key: 'token', label: 'token', rows: 3, placeholder: '粘贴 access_token（一长串 JWT）' },
         { key: 'refreshToken', inputKey: 'refresh', label: 'refreshToken', rows: 2, optional: true, placeholder: '可选' },
       ],
-      jsonTitle: '粘贴小浣熊 auth.json 内容',
-      jsonNoteHtml: '把客户端登录态文件（含 <code>access_token</code> / <code>refresh_token</code>）整个粘进来即可，字段名会自动识别，无需手工挑字段。',
-      jsonPlaceholder: '{"access_token":"...","refresh_token":"..."}',
-      jsonSource: '小浣熊 auth.json 内容',
-      jsonCheck: parsed => hasText(parsed, ['access_token', 'token', 'auth_token', 'accessToken']),
-      jsonMissing: '内容里没有 access_token（请确认这是小浣熊的登录态文件）',
       desktopNote: '读本机小浣熊客户端当前的登录态建一个「桌面端实时登录态」账号：凭证不落账号文件、每次实时读取（删掉这条记录不影响客户端登录态）。客户端重新登录后，点「刷新 Token」即可同步。',
     },
     {
@@ -148,19 +125,39 @@
       // （即 X-Passport-Token）、uid / userId / loginName、name；没有刷新机制
       provider: 'catpaw',
       label: 'CatPaw',
-      manualNote: 'token 是 CatPaw 的 X-Passport-Token（登录态 Cookie）。后端要求 uid 或 loginName 来标识账号，本手填表单需填写 uid；含 loginName 的账号记录可用下方 JSON 方式添加。CatPaw 没有刷新机制，token 过期后需在客户端重新登录。',
+      // 网页登录：美团 passport 授权页 + **上游把 token 推回本机网关的 loopback
+      // 回调**（见 src-tauri/src/server/core/login/catpaw.rs 的模块头）。
+      //
+      // ── 为什么这一家有两种「打开方式」──────────────────────────
+      // 回调是上游往**本机网关的 http://127.0.0.1:<port> 发的一次表单 POST**，
+      // 不是自定义协议深链（那是小浣熊的形态，必须靠系统注册才收得到，所以
+      // 那家只给内嵌窗口）。既然回调落点与「哪个浏览器」无关，系统浏览器
+      // 就完全走得通 —— 而且它是内嵌窗口走不通时的兜底：美团 passport 的
+      // 扫码登录 / 第三方账号登录在部分环境下会拒绝内嵌窗口。
+      webLogin: {
+        noteHtml: '打开 CatPaw 官方登录页（美团 passport），用你的 CatPaw 账号完成登录：'
+          + '登录成功后官方页面会把登录凭证回调到本机网关，自动加入账号列表（界面不显示明文 token）。',
+        button: '打开 CatPaw 网页登录',
+        busyText: '等待 CatPaw 登录完成…',
+        modes: [
+          {
+            value: 'embedded',
+            label: '内嵌窗口（推荐）',
+            hint: '将打开内嵌窗口；登录完成后自动加入账号列表。关掉窗口即取消等待',
+          },
+          {
+            value: 'external',
+            label: '系统浏览器',
+            hint: '将用系统默认浏览器打开登录页（会复用浏览器里已登录的美团账号）；完成登录后自动加入账号列表，关掉弹窗即取消等待',
+          },
+        ],
+      },
+      manualNote: 'token 是 CatPaw 的 X-Passport-Token（登录态 Cookie），uid 为必填的账号标识。CatPaw 没有刷新机制，token 过期后需在客户端重新登录。',
       fields: [
         { key: 'token', label: 'token', rows: 3, placeholder: 'CatPaw 的 X-Passport-Token（登录态 Cookie）' },
         { key: 'uid', label: 'uid', placeholder: '必填，CatPaw 账号标识' },
         { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空则用登录名或 uid' },
       ],
-      jsonTitle: '粘贴旧项目账号 JSON',
-      jsonNote: '把旧项目 catpaw-proxy-accounts.json 里的一条账号记录整个粘进来即可：字段名自动识别，provider 一律归到 CatPaw。',
-      jsonPlaceholder: '{"id":"...","uid":"...","accessToken":"..."}',
-      jsonSource: 'CatPaw 旧项目账号 JSON',
-      jsonCheck: parsed => hasText(parsed, ['accessToken', 'token', 'access_token', 'auth_token'])
-        || hasText(parsed.auth || {}, ['accessToken', 'token', 'access_token']),
-      jsonMissing: '内容里没有 accessToken / token（请确认这是 CatPaw 的账号记录）',
       desktopNote: '读本机 CatPaw 客户端当前的登录态建一个「桌面端实时登录态」账号：凭证不落账号文件、每次实时读取（删掉这条记录不影响客户端登录态）。客户端重新登录后重新导入即可同步。',
       desktopHint: '读取 ~/.meituan-catpaw/auth.json，需已在 CatPaw 客户端登录',
     },
@@ -170,35 +167,38 @@
       provider: 'autoclaw',
       label: 'AutoClaw',
       manualNote: 'token 可填明文 JWT；token / refreshToken 字符串支持 enc: 前缀，后端在 Windows 上使用本机密钥解密。未填写 refreshToken 无法自动续期；deviceId 可选。',
+      // 手机验证码登录（AutoClaw 国内版**唯一**的官方登录方式）。
+      // 这一家没有网页登录：上游不开授权页、没有授权码回调，也没有公网 Web 版，
+      // 官方客户端自己就是手机号 + 短信验证码。理由详见
+      // src-tauri/src/server/core/providers/autoclaw/login.rs 的模块头。
+      smsLogin: {
+        noteHtml: '用 AutoClaw 绑定的手机号登录：点「获取验证码」，收到短信后填入并登录。'
+          + '这是 AutoClaw 官方唯一的登录方式（它没有网页授权登录），'
+          + '验证码由本机直接提交给官方接口，界面不显示 token。',
+      },
       fields: [
         { key: 'token', label: 'token', rows: 3, placeholder: '明文 JWT 或 auth.json 里的 enc: 加密值（自动解密）' },
         { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: '没有则无法自动续期' },
         { key: 'deviceId', label: 'deviceId', optional: true, placeholder: '可选，续期时带上' },
         { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空则用 userId' },
       ],
-      jsonTitle: '粘贴 AutoClaw auth.json 内容',
-      jsonNote: '粘贴 %APPDATA%/AutoClaw/auth.json 的完整内容：token（或 accessToken）、refreshToken、deviceId。token / refreshToken 字符串的 enc: 前缀由后端解密，不识别 enc_value 键。',
-      jsonPlaceholder: '{"token":"enc:...","refreshToken":"enc:...","deviceId":"..."}',
-      jsonSource: 'AutoClaw auth.json 内容',
-      jsonCheck: parsed => hasText(parsed, ['token', 'accessToken']),
-      jsonMissing: '内容里没有 token / accessToken（请确认这是 AutoClaw 的 auth.json）',
       desktopNote: '读本机 AutoClaw 客户端当前的登录态（%APPDATA%/AutoClaw/auth.json，DPAPI + AES-GCM 解密）建一个「桌面端实时登录态」账号：凭证不落账号文件、每次实时读取（删掉这条记录不影响客户端登录态）。',
       desktopHint: '读取 %APPDATA%/AutoClaw/auth.json 并解密，仅 Windows',
     },
-  ];
+    window.wbQoderAddForm,
+  ].filter(Boolean);
 
-  /** 块 id / input id 的前缀：三家都与 provider id 同名，直接复用（少一处要维护的字段） */
+  /** 块 id / input id 的前缀与 provider id 同名，直接复用（少一处要维护的字段） */
   const prefixOf = config => config.provider;
   // inputKey 保留小浣熊既有的 refresh-input id，请求体键仍为 refreshToken。
   const fieldIdOf = (config, field) => `${config.provider}-${field.inputKey || field.key}-input`;
   const addButtonText = config => config.addButton || `添加 ${config.label} 账号`;
-  /** 方式一标题：默认「填写凭证添加」，小浣熊沿用原文案 */
+  /** 手填表单标题：默认「填写凭证添加」，小浣熊沿用原文案 */
   const manualTitleOf = config => config.manualTitle || '填写凭证添加';
-  /** 方式一 / 方式二说明：`*Html`（带行内标记）优先，否则转义纯文本 */
+  /** 说明中的行内标记优先，否则转义纯文本 */
   const noteOf = (html, text) => (html || esc(text));
   const manualNoteOf = config => noteOf(config.manualNoteHtml, config.manualNote);
-  const jsonNoteOf = config => noteOf(config.jsonNoteHtml, config.jsonNote);
-  /** 方式三按钮：没有 desktopHint 的（小浣熊）不挂 title */
+  /** 桌面端导入按钮：没有 desktopHint 的（小浣熊）不挂 title */
   const desktopButtonOf = config => `<button id="${prefixOf(config)}-desktop-button"`
     + (config.desktopHint ? ` title="${esc(config.desktopHint)}"` : '')
     + `>从本机导入桌面端登录态</button>`;
@@ -208,23 +208,30 @@
   for (const config of ADD_FORMS) ADD_FORM_PROVIDERS[config.provider] = `add-block-${config.provider}`;
 
   /**
-   * 三家的三种添加方式：分段项文案要短（并排一行，太长会把弹窗挤到换行），
+   * 添加方式的候选分段项：文案要短（并排一行，太长会把弹窗挤到换行），
    * 详细说明留在各段自己的标题与正文里。id 同时用于拼段落的元素 id：
    * `${provider}-${id}-block`。
    *
-   * `webOnly` 的那一项（网页登录）只对**支持网页登录**的家露出（见 methodsOf），
-   * 且排在最前面 —— 它是用户最容易走通的一条路（不必知道 token 长什么样、
-   * 也不用找客户端的登录态文件）。
+   * 露出哪些项由 methodsOf 按各家配置裁剪：手机验证码登录只给配了 `smsLogin`
+   * 的家（AutoClaw）且排在最前 —— 它是那一家唯一走得通的官方登录方式，用户
+   * 最该先看到它；网页登录只给支持它的家；桌面端导入只给 desktop !== false 的家。
    */
   const ADD_METHODS = [
+    { id: 'sms', label: '手机验证码登录', smsOnly: true },
     { id: 'web', label: '网页登录', webOnly: true },
     { id: 'manual', label: '填写凭证' },
-    { id: 'json', label: '粘贴 JSON' },
     { id: 'desktop', label: '导入桌面端登录态' },
   ];
 
-  /** 这一家的添加方式列表（不支持网页登录的家把那一项去掉） */
-  const methodsOf = config => ADD_METHODS.filter(method => !method.webOnly || config.webLogin);
+  const regionOf = config => segValueOf($(`${prefixOf(config)}-region-seg`))
+    || config.regionOptions?.[0]?.value;
+  const methodsOf = config => ADD_METHODS.filter(method => {
+    if (method.id === 'sms') return Boolean(config.smsLogin);
+    if (method.id === 'web') return config.webLogin
+      && (!config.webLogin.region || regionOf(config) === config.webLogin.region);
+    if (method.id === 'desktop') return config.desktop !== false;
+    return true;
+  });
 
   /**
    * 注入添加账号弹窗的提供商选择区，并把既有 WorkBuddy 区块收进一个容器。
@@ -256,7 +263,7 @@
     });
     body.appendChild(workbuddy);
 
-    // ③ 三家的表单块（raccoon / catpaw / autoclaw，同一套构造，见 ADD_FORMS）
+    // ③ 各家的表单块（同一套构造，见 ADD_FORMS）
     for (const config of ADD_FORMS) {
       const block = document.createElement('div');
       block.id = ADD_FORM_PROVIDERS[config.provider];
@@ -280,8 +287,8 @@
 
   /**
    * 拼一个表单块（数据驱动，见 ADD_FORMS）：一个分段控件在若干段之间切换 ——
-   * 网页登录（只有支持网页登录的家有）/ 填写凭证 / 粘贴 JSON / 导入桌面端登录态，
-   * 选中哪种只显示哪一段。控件的 id 用 `${prefix}-${key}-input`，
+   * 网页登录 / 填写凭证 / 导入桌面端登录态，选中哪种只显示哪一段
+   * （某一项不适用于这家时不生成对应段落）。控件的 id 用 `${prefix}-${key}-input`，
    * 由提交函数反查，因此这里不必留 DOM 引用。
    */
   function buildProviderBlock(config) {
@@ -300,11 +307,13 @@
       `<button type="button" class="seg-item${index ? '' : ' active'}" data-value="${method.id}"`
       + ` role="radio" aria-checked="${index ? 'false' : 'true'}"`
       + ` tabindex="${index ? '-1' : '0'}">${esc(method.label)}</button>`).join('');
-    return `<div class="modal-section">
+    return `${regionBlockOf(config)}<div class="modal-section">
         <h3>添加方式</h3>
         <div class="seg add-seg" id="${prefix}-method-seg" role="radiogroup"
           aria-label="${esc(config.label)} 账号的添加方式">${methodItems}</div>
       </div>
+
+      ${smsLoginBlockOf(config)}
 
       ${webLoginBlockOf(config)}
 
@@ -318,18 +327,14 @@
         </div>
       </div>
 
-      <div class="modal-section" id="${prefix}-json-block" hidden>
-        <h3>${esc(config.jsonTitle)}</h3>
-        <p>${jsonNoteOf(config)}</p>
-        <div class="field-row stack">
-          <textarea id="${prefix}-json-input" rows="4" placeholder='${esc(config.jsonPlaceholder)}'></textarea>
-        </div>
-        <div class="field-row">
-          <button id="${prefix}-json-button" class="primary">识别并添加</button>
-        </div>
-      </div>
+      ${desktopBlockOf(config)}`;
+  }
 
-      <div class="modal-section" id="${prefix}-desktop-block" hidden>
+  /** 桌面端登录态导入段：只有能导入的家生成（Qoder 没有这个来源） */
+  function desktopBlockOf(config) {
+    if (config.desktop === false || !config.desktopNote) return '';
+    const prefix = prefixOf(config);
+    return `<div class="modal-section" id="${prefix}-desktop-block" hidden>
         <h3>从本机导入桌面端登录态</h3>
         <p>${esc(config.desktopNote)}</p>
         <div class="field-row">
@@ -338,33 +343,104 @@
       </div>`;
   }
 
+  /** 地区分段：只有带 regionOptions 的提供商（Qoder）生成 */
+  function regionBlockOf(config) {
+    if (!config.regionOptions?.length) return '';
+    const prefix = prefixOf(config);
+    const items = config.regionOptions.map((option, index) =>
+      `<button type="button" class="seg-item${index ? '' : ' active'}" data-value="${esc(option.value)}"`
+      + ` role="radio" aria-checked="${index ? 'false' : 'true'}"`
+      + ` tabindex="${index ? '-1' : '0'}">${esc(option.label)}</button>`).join('');
+    return `<div class="modal-section">
+        <h3>地区</h3>
+        <div class="seg add-seg" id="${prefix}-region-seg" role="radiogroup"
+          aria-label="${esc(config.label)} 账号地区">${items}</div>
+      </div>`;
+  }
+
   /**
-   * 网页登录那一段（只有配了 webLogin 的家有）。
+   * 手机验证码登录那一段（只有配了 `smsLogin` 的家生成，当前只有 AutoClaw）。
    *
-   * ── 为什么不用 .add-sub 包一层 ──────────────────────────────
-   * `.add-sub` 是 index.html 里 WorkBuddy「第二级」的样式（左侧竖线 + 缩进），
-   * 那里它是**挂在「登录方式」分段控件之下**的子项，缩进表达从属关系。
-   * 这里「网页登录」本身就是「添加方式」的一个段落（与填写凭证 / 粘贴 JSON 平级），
-   * 再用同一套缩进会让它看起来是上一段的下级。两处结构不同，视觉就该不同。
+   * ── 为什么它不是「网页登录」的一种形态 ───────────────────────
+   * 网页登录的交互是「开窗口 → 用户在官方页面上操作 → 网关等回调」，因此复用了
+   * web-login.js 那套等待/取消/轮询。这条链路完全不同：上游没有授权页、没有回调，
+   * 就是「发码 → 用码换 token」两次同步请求，全程在本弹窗里完成。硬塞进网页登录
+   * 只会让那个引擎多出一堆「这条路没有窗口也没有 state」的分支。
    *
-   * 这里**没有**「打开方式」这一级：小浣熊只支持内嵌窗口（回调是自定义协议深链，
-   * 系统浏览器模式下要靠系统注册该协议才收得到，见 src-tauri/src/login.rs 的模块头）。
-   * 交互不在这个文件里 —— 引擎是 ui/web-login.js（两家共用），这里只出 DOM。
+   * 「获取验证码」与「登录」是两个按钮：发码是个独立的用户动作（要等短信到达），
+   * 合并成一个按钮就得替用户猜「这次点的是发码还是登录」。
+   */
+  function smsLoginBlockOf(config) {
+    if (!config.smsLogin) return '';
+    const prefix = prefixOf(config);
+    return `<div class="modal-section" id="${prefix}-sms-block" hidden>
+        <h3>手机验证码登录</h3>
+        <p>${config.smsLogin.noteHtml
+          || '用 AutoClaw 账号绑定的手机号登录：点击「获取验证码」，收到短信后填入下方并登录。验证码由本机直接提交给官方接口，界面不显示 token。'}</p>
+        <div class="field-row">
+          <label for="${prefix}-sms-phone">手机号（必填）</label>
+          <input id="${prefix}-sms-phone" type="text" maxlength="11" placeholder="11 位大陆手机号">
+          <button id="${prefix}-sms-send">获取验证码</button>
+        </div>
+        <div class="field-row">
+          <label for="${prefix}-sms-code">验证码（必填）</label>
+          <input id="${prefix}-sms-code" type="text" maxlength="6" placeholder="6 位数字验证码">
+        </div>
+        <div class="field-row">
+          <label for="${prefix}-sms-name">备注名</label>
+          <input id="${prefix}-sms-name" type="text" placeholder="可选，留空则用脱敏手机号">
+        </div>
+        <div class="field-row">
+          <button id="${prefix}-sms-submit" class="primary">登录并添加</button>
+          <span class="detail" id="${prefix}-sms-hint"></span>
+        </div>
+      </div>`;
+  }
+
+  /**
+   * 网页登录那一段（只有配置了网页登录的提供商才生成）。交互由 web-login.js 统一管理。
+   *
+   * ── 两种形态（由配置决定）────────────────────────────────────
+   *   · 没有 `modes` 的（小浣熊）：一个按钮 + 取消 + 一行提示。它的回调是自定义
+   *     协议深链，系统浏览器模式下要靠系统注册该协议才收得到，所以只给内嵌窗口。
+   *   · 有 `modes` 的（Qoder）：多一级「打开方式」分段控件（`.add-sub`，与
+   *     WorkBuddy 那一级同款样式）—— 内嵌窗口每次用全新临时环境，系统浏览器
+   *     复用浏览器已有登录态，两条路各有走不通的场景（见各家配置里的说明）。
+   *
+   * 「打开方式」只在网页登录那一段里出现，因此它是这一段的二级结构；而**切换
+   * 打开方式不改变方法列表**（与地区不同），也就是说这里不需要 rebuildMethods。
    */
   function webLoginBlockOf(config) {
     if (!config.webLogin) return '';
     const prefix = prefixOf(config);
     const web = config.webLogin;
+    const modeSeg = web.modes?.length
+      ? `<div class="add-sub">
+          <span class="detail">打开方式</span>
+          <div class="seg" id="${prefix}-web-mode" role="radiogroup"
+            aria-label="${esc(config.label)} 网页登录的打开方式">${web.modes.map((mode, index) =>
+    `<button type="button" class="seg-item${index ? '' : ' active'}" data-value="${esc(mode.value)}"`
+    + ` role="radio" aria-checked="${index ? 'false' : 'true'}"`
+    + ` tabindex="${index ? '-1' : '0'}">${esc(mode.label)}</button>`).join('')}</div>
+        </div>`
+      : '';
     return `<div class="modal-section" id="${prefix}-web-block">
         <h3>网页登录</h3>
         <p>${web.noteHtml}</p>
+        ${modeSeg}
         <div class="field-row">
           <button id="${prefix}-web-button" class="primary">${esc(web.button)}</button>
           <button id="${prefix}-web-cancel" style="display:none">取消等待</button>
-          <span class="detail" id="${prefix}-web-hint">${esc(web.hint)}</span>
+          <span class="detail" id="${prefix}-web-hint">${
+    esc(web.hint || web.modes?.[0]?.hint || '')}</span>
         </div>
       </div>`;
   }
+
+  /** 网页登录选中的打开方式（没有这一级时给空串，由壳侧按各家默认处理） */
+  const webModeOf = config => (config.webLogin?.modes?.length
+    ? segValueOf($(`${prefixOf(config)}-web-mode`)) || config.webLogin.modes[0].value
+    : '');
 
   /** 方式分段：选中哪种只显示哪一段（各段自己的表单、按钮与监听都不动，只切显隐） */
   function syncProviderMethod(config) {
@@ -374,6 +450,34 @@
       const block = $(`${prefix}-${method.id}-block`);
       if (block) block.hidden = method.id !== value;
     }
+  }
+
+  /**
+   * 重建方式分段（地区切换后调用）。
+   *
+   * 目前没有哪一家会因地区改变方法列表（Qoder 两站都支持网页登录），因此这
+   * 通常是一次无变化的原地重建；保留它是为了**结构上**正确 —— `methodsOf`
+   * 仍按 `webLogin.region` 裁剪，将来若某家只支持单一站点，切地区时这里就会
+   * 真的收起那一项。
+   *
+   * 为什么必须重算选中项：收起的那一项可能正是当前选中项 —— 只重建按钮不改选中，
+   * 屏幕上会出现「所有段都藏着、一个可见的选中项也没有」。因此选中项不在新列表里时
+   * 退到第一项，这是用户此刻唯一能走通的路。
+   */
+  function rebuildMethods(config) {
+    const prefix = prefixOf(config);
+    const seg = $(`${prefix}-method-seg`);
+    if (!seg) return;
+    const methods = methodsOf(config);
+    seg.innerHTML = methods.map((method, index) =>
+      `<button type="button" class="seg-item${index ? '' : ' active'}" data-value="${method.id}"`
+      + ` role="radio" aria-checked="${index ? 'false' : 'true'}"`
+      + ` tabindex="${index ? '-1' : '0'}">${esc(method.label)}</button>`).join('');
+    bindSeg(seg);
+    if (!methods.some(method => method.id === segValueOf(seg))) {
+      setSegValue(seg, methods[0].id);
+    }
+    syncProviderMethod(config);
   }
 
   /** 当前选中的提供商 id（弹窗打开时复位到 WorkBuddy，见文件末尾的两个入口按钮） */
@@ -439,16 +543,9 @@
     syncAddProvider();
   }
 
-  // ─── 三家的三种添加方式（数据驱动，配置见 ADD_FORMS）─────────
+  // ─── 账号添加（数据驱动，配置见 ADD_FORMS）─────────
 
-  /**
-   * 统一提交入口：`POST /api/accounts`（body 直接带 provider 字段）。
-   *
-   * 为什么不走 bridge.rs 的 uploadAccount：那个方法会把入参整形（强制补 edition、
-   * 解析 JSON 文本），是 workbuddy 专属的路径，契约里也明确「workbuddy 添加方式不变」。
-   * 其余三家这条需要透传 provider / token / refreshToken / importDesktop，
-   * 走 api_request 的通用命令最直接（body 原样交给后端，契约 §5 的分支在服务端）。
-   */
+  /** 统一提交入口：POST /api/accounts，保留各提供商自己的凭证字段。 */
   async function postAccount(payload) {
     const internals = window.__TAURI_INTERNALS__;
     if (!internals || typeof internals.invoke !== 'function') {
@@ -476,7 +573,7 @@
     }
   }
 
-  /** 添加成功后统一收尾：关窗、刷新列表、提示（三家逐字同一套） */
+  /** 添加成功后统一收尾：关窗、刷新列表、提示 */
   async function afterAdd(name, label) {
     $('add-modal')?.classList.remove('open');
     await wbApp.refresh?.();
@@ -489,10 +586,7 @@
   /** 清空该块的表单（添加成功后调用；失败时保留内容方便改动重试） */
   function clearProviderForms(config) {
     const prefix = prefixOf(config);
-    const ids = [
-      ...config.fields.map(field => fieldIdOf(config, field)),
-      `${prefix}-json-input`,
-    ];
+    const ids = config.fields.map(field => fieldIdOf(config, field));
     for (const id of ids) {
       const node = $(id);
       if (node) node.value = '';
@@ -501,10 +595,15 @@
     if (hint) hint.textContent = '';
   }
 
-  /** 方式一：手填字段（只有必填项校验；可选字段留空就不进请求体） */
+  /**
+   * 手工填写凭证提交（只有必填项校验；可选字段留空就不进请求体）。
+   * 各家的字段名由 ADD_FORMS 的 fields 声明，后端按 provider 分派解析。
+   */
   async function addProviderManual(config) {
     const prefix = prefixOf(config);
     const payload = { provider: config.provider };
+    // 地区（Qoder）：整块共用一个分段控件
+    if (config.regionOptions?.length) payload.mode = regionOf(config);
     for (const field of config.fields) {
       const value = $(fieldIdOf(config, field)).value.trim();
       if (!field.optional && !value) { toast(`请填写 ${field.label}`, 'err'); return; }
@@ -522,52 +621,7 @@
     });
   }
 
-  /**
-   * 方式二：粘贴整份登录态 JSON（字段名由后端自动识别）。
-   *
-   * 本地只做「是 JSON 对象 + 认得出凭证」两道预检：整段粘进来时用户最容易粘错层级
-   * （例如把整个配置文件的外层对象贴进来），在这里说清楚比等后端 400 更直观。
-   * `provider` 放在展开之后 —— 粘贴内容里即使带着别家的 provider 也一律归到当前家
-   * （后端按 provider 分派，串了就会把凭证存进别家的组）。
-   */
-  async function addProviderJson(config) {
-    const prefix = prefixOf(config);
-    const text = $(`${prefix}-json-input`).value.trim();
-    if (!text) { toast(`请粘贴${config.jsonSource}`, 'err'); return; }
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      toast('粘贴内容不是有效 JSON', 'err');
-      return;
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      toast('粘贴内容必须是一个 JSON 对象', 'err');
-      return;
-    }
-    if (!config.jsonCheck(parsed)) {
-      toast(config.jsonMissing, 'err');
-      return;
-    }
-    const button = $(`${prefix}-json-button`);
-    await runAdd(button, async () => {
-      try {
-        // name 单独挑出来，别把整个对象当备注名传（后端只认字符串）
-        const name = typeof parsed.name === 'string' ? parsed.name.trim() : '';
-        const data = await postAccount({
-          ...parsed,
-          provider: config.provider,
-          ...(name ? { name } : {}),
-        });
-        clearProviderForms(config);
-        await afterAdd(addedLabelOf(data?.account), config.label);
-      } catch (error) {
-        toast(`添加失败：${error.message}`, 'err');
-      }
-    });
-  }
-
-  /** 方式三：从本机导入桌面端登录态（后端各读自己的登录态文件） */
+  /** 从本机导入桌面端登录态（后端各读自己的登录态文件） */
   async function addProviderDesktop(config) {
     const button = $(`${prefixOf(config)}-desktop-button`);
     await runAdd(button, async () => {
@@ -582,7 +636,7 @@
   }
 
   /**
-   * 方式一（网页登录）：建一份 ui/web-login.js 的控制器并挂上两个按钮。
+   * 网页登录：建一份 ui/web-login.js 的控制器并挂上两个按钮。
    *
    * 为什么交互在 web-login.js 而不是这里：同一套等待态 / 取消 / 按钮复位
    * WorkBuddy 也要用，两份实现迟早分叉（见那个文件的模块头）。本文件只负责
@@ -600,27 +654,60 @@
   function mountWebLogin(config) {
     if (!config.webLogin) return;
     const prefix = prefixOf(config);
+    const modes = config.webLogin.modes;
+    // 文案随打开方式与服务端状态变化（等待中不被覆盖，由引擎负责）
+    const texts = () => {
+      const mode = modes?.find(item => item.value === webModeOf(config));
+      return { button: config.webLogin.button, hint: mode?.hint || config.webLogin.hint || '' };
+    };
     const controller = window.wbWebLogin?.create({
       provider: config.provider,
       buttonId: `${prefix}-web-button`,
       cancelId: `${prefix}-web-cancel`,
       hintId: `${prefix}-web-hint`,
       busyText: config.webLogin.busyText,
-      texts: () => ({ button: config.webLogin.button, hint: config.webLogin.hint }),
-      // mode 固定 embedded：小浣熊只有内嵌窗口一种（理由见 webLoginBlockOf 的注释）。
-      // 后端对非 workbuddy 的 provider 也忽略 mode（那条链不读它）。
-      start: () => window.workbuddyDesktop.startLogin('cn', 'embedded', config.provider),
+      texts,
+      // ── 传哪个 edition 给壳侧 ──────────────────────────────────
+      // 优先级：配置里写死的 `edition`（某一家若将来只支持单一站点就填它）
+      //  → 地区分段的当前值（Qoder：国际版 global / 中国版 cn，两站都要登录）
+      //  → 'cn'（小浣熊没有地区级，且后端那条链不读这个字段）。
+      // Qoder 的 `global` 由壳侧归一成 `intl`（`login.rs` 的 edition_id），
+      // 所以这里原样把分段值传出去即可，不必在这里翻译。
+      start: () => window.workbuddyDesktop.startLogin(
+        config.webLogin.edition || regionOf(config) || 'cn',
+        webModeOf(config) || 'embedded',
+        config.provider),
       onSuccess: async () => {
-        // 只收起弹窗：这里不调 add-account.js 的 closeModal —— 那个函数还会清
-        // WorkBuddy 的粘贴表单，而本次流程与它无关（别家的输入不该被顺手清掉）
         $('add-modal')?.classList.remove('open');
         await wbApp.refresh?.();
         toast(`✅ ${config.label}账号已添加`);
       },
     });
     if (!controller) return; // web-login.js 未加载（脚本顺序被人改坏）时不静默吞掉按钮
+    // 切换打开方式只影响文案（方法列表与所选方法都不变，见 webLoginBlockOf 的注释）
+    const modeSeg = $(`${prefix}-web-mode`);
+    bindSeg(modeSeg);
+    modeSeg?.addEventListener(SEG_EVENT, () => controller.syncTexts());
     $(`${prefix}-web-button`)?.addEventListener('click', () => controller.start());
     $(`${prefix}-web-cancel`)?.addEventListener('click', () => controller.cancel());
+  }
+
+
+  /**
+   * 手机验证码登录：把配置与收尾交给 ui/sms-login.js 的引擎
+   * （DOM 已由 `smsLoginBlockOf` 拼好）。与小浣熊那套同一分工 —— 本文件只回答
+   * 「这一家有这条链路时把 DOM 与回调交出去」，交互本身（发码 / 登录 / 按钮
+   * 忙态 / deviceId 记忆）在那个文件里，避免本文件继续膨胀。
+   *
+   * `onSuccess` 复用 afterAdd：验证码登录接口返回的形状与 `POST /api/accounts`
+   * 一致（`{account, list}`），收尾逻辑没有理由分两套。
+   */
+  function mountSmsLogin(config) {
+    if (!config.smsLogin) return;
+    window.wbSmsLogin?.create({
+      provider: config.provider,
+      onSuccess: data => afterAdd(addedLabelOf(data?.account), config.label),
+    });
   }
 
   /** 「登录态文件在哪」的提示：点一下把路径显示在旁边（不打开文件管理器，只给地址） */
@@ -632,11 +719,10 @@
     }
   }
 
-  // 添加账号弹窗：分段控件的交互 + 提供商切换 + 三家的三种添加方式（逐块按前缀挂监听，见 ADD_FORMS）
+  // 添加账号弹窗：分段控件交互、提供商切换与各家的添加方式。
   mountAddProviderUi();
-  // WorkBuddy 区块的三个分段控件（版本 / 登录方式 / 打开方式）结构在 index.html 里，
-  // 交互同样归这里绑定；切换后由 add-account.js 的监听接住（见 add-account.js 事件绑定处的注释）
-  for (const id of ['add-edition-seg', 'add-login-method', 'add-login-mode']) bindSeg($(id));
+  // WorkBuddy 的版本与打开方式由 add-account.js 处理选中项变化。
+  for (const id of ['add-edition-seg', 'add-login-mode']) bindSeg($(id));
   syncAddProviderOptions();
   $(ADD_PROVIDER_SEG_ID)?.addEventListener(SEG_EVENT, () => {
     addProvider = segValueOf($(ADD_PROVIDER_SEG_ID)) || 'workbuddy';
@@ -645,13 +731,20 @@
   for (const config of ADD_FORMS) {
     const prefix = prefixOf(config);
     const seg = $(`${prefix}-method-seg`);
+    // 地区分段（Qoder）：切换后重算方式列表（当前没有哪家会因此收起某一项，
+    // 但选中项仍以新列表为准 —— 见 rebuildMethods 的说明）。
+    // 网页登录那一段不必跟着重建：它的按钮与提示只随「打开方式」变化，
+    // 而「登录哪一站」是发起时现读地区分段值的（见 mountWebLogin 的 start）。
+    const regionSeg = $(`${prefix}-region-seg`);
+    bindSeg(regionSeg);
+    regionSeg?.addEventListener(SEG_EVENT, () => rebuildMethods(config));
     bindSeg(seg);
     seg?.addEventListener(SEG_EVENT, () => syncProviderMethod(config));
     syncProviderMethod(config);
     $(`${prefix}-add-button`)?.addEventListener('click', () => addProviderManual(config));
-    $(`${prefix}-json-button`)?.addEventListener('click', () => addProviderJson(config));
     $(`${prefix}-desktop-button`)?.addEventListener('click', () => addProviderDesktop(config));
     mountWebLogin(config);
+    mountSmsLogin(config);
   }
   document.addEventListener('click', event => {
     if (event.target.closest('[data-raccoon-hint]')) showRaccoonHint(event);

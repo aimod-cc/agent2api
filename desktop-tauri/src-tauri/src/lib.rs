@@ -27,6 +27,8 @@ mod commands;
 mod gateway;
 mod legacy_install;
 mod login;
+mod login_profile;
+mod port_conflict;
 mod server;
 mod settings;
 mod state;
@@ -136,6 +138,11 @@ pub fn run() {
             commands::api_request,
             commands::api_request_text,
             commands::backend_status,
+            commands::port_occupant,
+            commands::end_port_occupant,
+            commands::restart_app,
+            commands::check_port,
+            commands::change_port,
             commands::start_login,
             commands::login_state,
             commands::cancel_login,
@@ -263,9 +270,17 @@ pub fn run() {
 
             // 启动后端；就绪后再跑一次启动维护（临期 token 刷新 + 余额查询）
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = backend::ensure_ready(&handle).await {
-                    eprintln!("[backend] 启动失败: {error}");
-                    let _ = handle.emit("backend:error", error);
+                if let Err(failure) = backend::ensure_ready(&handle).await {
+                    eprintln!("[backend] 启动失败: {}", failure.message);
+                    // 存一份到 AppState：事件是一次性的，界面可能在事件发出之后
+                    // 才订阅（窗口还在加载、WebView 被刷新），那时只能靠主动查
+                    // （backend_status）拿到失败原因，否则状态灯永远说不清为什么灰着
+                    if let Some(state) = handle.try_state::<AppState>() {
+                        if let Ok(mut guard) = state.backend.lock() {
+                            guard.failure = Some(failure.clone());
+                        }
+                    }
+                    let _ = handle.emit("backend:error", failure);
                     return;
                 }
                 commands::startup_maintenance(handle).await;

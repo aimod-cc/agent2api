@@ -10,6 +10,8 @@ use std::sync::Mutex;
 
 use tokio::sync::oneshot;
 
+use crate::port_conflict::StartupFailure;
+
 /// 进程内 HTTP 服务器的停机句柄。
 ///
 /// 旧版本这里放的是 `Option<Child>`（外部 node 子进程）；后端改成进程内服务器后
@@ -21,6 +23,13 @@ pub struct BackendHandle {
     /// 停机信号发送端；take 走后不再持有（shutdown 幂等）
     pub shutdown_tx: Option<oneshot::Sender<()>>,
     pub port: u16,
+    /// 最近一次启动失败（成功启动后清空）。
+    ///
+    /// 为什么要存下来：`backend:error` 是一次性事件，而界面可能在事件发出**之后**
+    /// 才订阅（窗口还没加载完、用户刷新了 WebView）。只靠事件的话，用户重启界面
+    /// 就再也看不到「为什么起不来」——只能看到一个永远灰着的状态灯。
+    /// 存一份让界面随时能查，事件只负责「提醒你现在就去查」。
+    pub failure: Option<StartupFailure>,
 }
 
 /// 一次进行中的登录：state 用于轮询后端，edition/mode 供界面展示与取消时判断。

@@ -14,7 +14,8 @@
  * ── 与 accounts-view.js 的分工 ─────────────────────────────────
  * 缓存（usageMap / checkinMap）与面板展开态（openPanels）分属两侧：
  *   · usageMap / checkinMap 住在本文件：它们是**请求结果**，写入者只有本文件的
- *     query/checkin 四条路径与 app.js 的启动自动维护（经 wbAccountsView.applyBalances）。
+ *     query/checkin 四条路径、`syncSnapshot`（定时查询那一轮的快照），
+ *     以及外部的 `applyBalances`（经 wbAccountsView 转发）。
  *   · openPanels 留在 accounts-view.js：它表达的是「用户展开过哪一行」，是**视图状态**，
  *     表格重绘时要跟着行一起算，搬过来只会让两边互相回调。
  * 因此本文件需要重绘时**调 `window.wbAccountsView?.render?.()`** 而不是自己 import ——
@@ -23,9 +24,10 @@
  * 副本**，因为「查询中」这个中间态（写 null）必须让视图立刻看见，拷贝一份就对不上了。
  *
  * ── 为什么后端语义一行不改 ─────────────────────────────────────
- * 四家都支持余额查询（各自的适配器实现），但**只有 WorkBuddy 有签到活动**。
- * 这个不对称不是界面取舍而是上游事实，所以签到那条链的目标集合（启用 + 国内版 +
- * workbuddy）在后端与前端都按同一口径过滤；改动它会让「提示签了 3 个、实际签了 2 个」。
+ * 五家都支持余额查询（各自的适配器实现），但**有签到活动的只有三家**
+ * （WorkBuddy 国内版 / 小浣熊 / AutoClaw）。这个不对称不是界面取舍而是上游事实，
+ * 所以签到那条链的目标集合（启用 + 非国际版 + 所属家有签到）在后端与前端都按
+ * 同一口径过滤；改动它会让「提示签了 3 个、实际签了 2 个」。
  * 本文件因此原样承接拆分前的判定与文案，只换存放位置。
  */
 (() => {
@@ -73,7 +75,7 @@
       : { error: row.error ? String(row.error) : '余额响应为空', code: row.code };
   }
 
-  /** 把一批余额结果写进列表缓存（启动自动维护与批量查询共用）。返回写入条数。 */
+  /** 把一批余额结果写进列表缓存（定时快照、批量查询与外部调用共用）。返回写入条数。 */
   function applyBalances(balances) {
     const rows = Array.isArray(balances?.results) ? balances.results : [];
     let applied = 0;
@@ -83,6 +85,40 @@
       applied++;
     }
     return applied;
+  }
+
+  /**
+   * 拉一次「定时查询积分」的结果快照并写进缓存，返回是否应用了新的一轮。
+   *
+   * ── 为什么要有这条 ────────────────────────────────────────
+   * 余额查询在后端有条定时任务（默认每 10 分钟查全部账号），结果存在后端快照里。
+   * 界面不点按钮时也要跟着它更新 —— 否则定时任务在后台跑得好好的，用户看到的
+   * 还是启动那一次的旧余额，那正是「定时查询」最容易让人觉得「没生效」的地方。
+   *
+   * `at` 是那一刻的毫秒时间戳，用它判断「这一轮我应用过了没」：
+   * 轮询时快照的时间戳没变就直接返回，不做无谓的整表重绘。
+   * **失败的行同样会被应用**（后端快照里就带着它们），于是账号页会明确显示
+   * 「查询失败」而不是悄悄留着上一个成功的旧值 —— 这是这条链路的既定口径。
+   *
+   * 失败静默（不 toast）：它是 20 秒一次的轮询，网关长时间不可用会变成刷屏 ——
+   * 与 `app.js` 里 refresh / syncLogsBadge 那两条轮询同一取舍。上游的账号级失败
+   * 不走这里，它们由快照内的失败行表达，界面上有明确标记。
+   */
+  let lastSnapshotAt = 0;
+  async function syncSnapshot() {
+    try {
+      const data = await api.getBalancesSnapshot?.();
+      const at = Number(data?.at) || 0;
+      // at = 0 表示本进程还没定时查过（刚启动、或任务被关掉）—— 不覆盖已有缓存
+      if (!at || at === lastSnapshotAt) return false;
+      lastSnapshotAt = at;
+      if (!applyBalances(data)) return false;
+      repaint();
+      return true;
+    } catch {
+      // 静默：下一次轮询自然重试；账号页保持上一轮的结果不变
+      return false;
+    }
   }
 
   /**
@@ -198,8 +234,8 @@
   async function checkinAll() {
     if (checkinBusy) return;
     const targets = checkinableAccounts(accounts());
-    if (!targets.length) { toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版账号）', 'err'); return; }
-    if (!confirm(`将对 ${targets.length} 个 WorkBuddy 国内版账号串行签到，可能需要一点时间。继续？`)) return;
+    if (!targets.length) { toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版 / 小浣熊 / AutoClaw）', 'err'); return; }
+    if (!confirm(`将对 ${targets.length} 个账号串行签到，可能需要一点时间。继续？`)) return;
     checkinBusy = true;
     const button = document.getElementById('btn-checkin-all');
     if (button) { button.disabled = true; button.textContent = '签到中…'; }
@@ -212,7 +248,7 @@
       const total = data?.total ?? 0;
       const skipped = Number(data?.skipped) || 0;
       toast(`签到完成：${succeeded}/${total} 个账号成功领取`
-        + (skipped ? `（跳过 ${skipped} 个已禁用/国际版/非 WorkBuddy 账号）` : ''), succeeded < total ? 'err' : 'ok');
+        + (skipped ? `（跳过 ${skipped} 个已禁用 / 国际版 / 所属家无签到的账号）` : ''), succeeded < total ? 'err' : 'ok');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       targets.forEach(a => checkinMap.set(a.id, `签到失败：${message}`));
@@ -231,6 +267,7 @@
     checkinMap,
     refreshCaches,
     applyBalances,
+    syncSnapshot,
     queryUsageFor,
     queryAllUsage,
     checkinFor,

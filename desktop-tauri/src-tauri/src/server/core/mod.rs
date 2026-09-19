@@ -21,8 +21,10 @@
 //!   credential_maintenance.rs 凭证自动维护（遍历账号 → 刷新临期凭证；判定逻辑
 //!                        在适配器，见 `providers::adapter` 的扩展 5）
 //!   scheduled_tasks.rs   间隔型定时任务注册表与调度循环（凭证维护 / 模型刷新 /
-//!                        两个前端自动刷新；开关与间隔来自 config，路由见
-//!                        `api::scheduled_tasks`）
+//!                        定时查询积分 / 两个前端自动刷新；开关与间隔来自 config，
+//!                        路由见 `api::scheduled_tasks`）
+//!   usage_query.rs       余额 / 积分查询（目标集合解析 + 跨账号并发 + 定时那一轮的
+//!                        结果快照；查询逻辑在 core 是为了让手动与定时共用一份）
 //!   update/              软件更新（版本/出网/下载状态机）（workbuddy-update.mjs）
 //!
 //! ── 模型清单的三个层次（Agent2API 改造 W2a-T2）─────────────
@@ -56,3 +58,4 @@ pub mod routing;
 pub mod scheduled_tasks;
 pub mod update;
 pub mod upstream;
+pub mod usage_query;

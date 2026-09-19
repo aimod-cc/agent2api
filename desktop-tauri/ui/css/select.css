@@ -38,9 +38,9 @@
   justify-content: flex-start;
   gap: 6px;
   padding: 0 10px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--r-md);
-  background: var(--surface);
+  background: var(--control-bg);
   color: var(--text);
   font-size: 12.5px;
   font-weight: 400;
@@ -52,8 +52,8 @@
 }
 
 .select-trigger:hover:not(:disabled) {
-  background: var(--surface-3);
-  border-color: var(--border-strong);
+  background: var(--control-hover);
+  border-color: var(--control-border-hover);
 }
 
 .select-trigger:focus-visible {
@@ -64,7 +64,7 @@
 .select-trigger:disabled {
   /* 比 button:disabled 的 .45 稍强一点：下拉文案要读得清「当前选的是什么」 */
   opacity: .6;
-  background: var(--surface-3);
+  background: var(--control-bg);
   color: var(--text-3);
   cursor: not-allowed;
   pointer-events: none;
@@ -107,7 +107,9 @@
 /* ─── 浮层 ───
    z-index 取 35：要在弹窗遮罩（.modal-mask，30）之上 —— 账号设置 / 批量操作
    两个弹窗里就有出网代理下拉；又要留在轻提示（#toast，40）之下，
-   提示消息不该被下拉挡住。 */
+   提示消息不该被下拉挡住。
+   底色取 --surface-raised：与按钮、输入框的 --control-* 填充拉开一档，
+   浮层才像浮在控件之上（浅色同白，靠描边与投影区分；深色比卡片再亮一点）。 */
 .select-popover {
   position: fixed;
   z-index: 35;
@@ -117,9 +119,9 @@
   overflow-y: auto;
   /* 选项多时滚轮翻列表；滚动不会误关浮层（见 select.js 的滚动处理） */
   overscroll-behavior: contain;
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-strong);
   border-radius: var(--r-lg);
-  background: var(--surface);
+  background: var(--surface-raised);
   box-shadow: var(--shadow-3);
   /* 只淡入、不做位移或缩放：打开后立刻要量尺寸摆位置，
      transform 动画会让量到的坐标带上缩放系数 */
@@ -152,7 +154,7 @@
 /* 中性叠加：深色叠白、浅色叠黑，同一行声明两边都成立（与侧栏导航 hover 同款） */
 .select-option:hover,
 .select-option.is-highlight {
-  background: color-mix(in oklab, var(--text) 6%, transparent);
+  background: var(--nav-hover);
 }
 
 /* 选中项走品牌浅底，与导航选中态、分段控件保持一致 */

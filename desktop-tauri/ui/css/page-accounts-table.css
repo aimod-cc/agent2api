@@ -1,13 +1,8 @@
 /* Agent2API · 账号页「四家混排的一张表」（表格化改造新增的那一层）
 
    与 page-accounts.css / page-accounts-providers.css 的分工：
-   那两个文件是账号页原有的**卡片**骨架与多提供商增量，本次改造把列表从「按 provider
-   分组的卡片网格」换成「四家混排的一张表」后，卡片那一套规则就不再被引用了 ——
-   但**一条都没有删**（见 page-accounts.css 末尾的说明与本次改造的报告）：
-   行内明细面板 .row-panel 的形制、⋯ 菜单 .more-menu、.seg / .toolbar / .batch-bar
-   都还在用其中一部分，逐条甄别「哪条还活着」的成本远高于留着它们的成本，
-   而且将来若要恢复卡片视图，删掉就得重写一遍。
-   本文件只装**表格独有的**规则，排在 page-accounts-providers.css 之后引入。
+   行内明细面板 .row-panel、⋯ 菜单 .more-menu、.seg / .toolbar / .batch-bar
+   仍复用原账号页样式；本文件只装表格独有的规则，排在两份共享样式之后引入。
 
    ── 列宽的分配原则（这些数字是逆推出来的，不是随手取的）──────
    固定宽的列全部写死像素，「账号」列吃掉剩余宽度。理由：表格的价值在于纵向对齐，
@@ -56,15 +51,15 @@
 /* 表头：粘在滚动容器顶部。
    列表可能很长（十几家账号），滚下去以后「哪一列是什么」会看不见 ——
    账号表不像日志表有工具栏分组可以当参照，列头必须一直可读。
-   底色用 --surface-2 与批量栏同一档：它俩是列表上下两条「带」，
-   浅色下与列表底 --surface-well 同值（都是 0.97），靠 --hairline 划界。 */
+   底色取 --table-head-bg（比承载面亮一档的浅带），与表体同一块表面上的轻微分层，
+   不再自成一条更暗的横带。 */
 .acct-table thead th {
   position: sticky;
   top: 0;
   z-index: 2;
   padding: 7px 8px;
   border-bottom: 1px solid var(--border);
-  background: var(--surface-2);
+  background: var(--table-head-bg);
   color: var(--text-3);
   font-size: 10.5px;
   font-weight: 600;
@@ -143,7 +138,7 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 .acct-row .cell-usage,
 .acct-row .cell-actions { min-width: 0; }
 
-.acct-row:hover { background: var(--surface-well); }
+.acct-row:hover { background: var(--row-hover); }
 
 /* 勾选中的行：与批量栏的 .active 同一套主色柔底，视觉上呼应 */
 .acct-row.selected,
@@ -152,21 +147,6 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 /* 已禁用：整行压灰。不做成整行半透明 —— 那一行里的开关与菜单还要能点、要能看清 */
 .acct-row.disabled .acct-name .name { color: var(--text-3); }
 .acct-row.disabled .acct-sub { opacity: .75; }
-
-/* ─── 「当前使用中」（本家的队首）行 ───
-   ★ 与「首选」实心块回答「是谁」，这一条底色／竖条负责「在一屏里被扫到」。
-   两种表达缺一不可：只有文字标记时，一屏二十行里找队首要逐行读；
-   只有底色时，又说不清它到底代表什么（限流？勾选？）。
-   底色用 --primary-soft（与勾选态同色）—— 但勾选态另有勾选框，且竖条只在队首行出现，
-   两个语义在同一行上同时成立时也不冲突（队首被勾选是常态，不是异常）。 */
-.acct-row.is-first { background: var(--primary-soft); }
-.acct-row.is-first:hover { background: color-mix(in srgb, var(--primary) 15%, var(--surface)); }
-
-/* 行首竖条：画在第一个单元格的左内边距上（box-shadow 内阴影不受 border-collapse
-   影响，比 ::before 绝对定位更省事，也不会被表格的边界裁掉） */
-.acct-row.is-first > td:first-child {
-  box-shadow: inset 3px 0 0 var(--primary);
-}
 
 /* 组首行（换了一家）：上边框重一档，把「这一段的提供商变了」显出来。
    不打组头行 —— 那会把一张表重新切回四块（见 accounts-view.js 的说明）。 */
@@ -237,9 +217,6 @@ body.col-resizing { cursor: col-resize; user-select: none; }
   min-width: 0;
 }
 
-/* 队首的 ★：只在这一列出现（操作列那个实心块是同一个事实的另一种读法） */
-.acct-name .star { flex: 0 0 auto; color: var(--primary); font-size: 11px; line-height: 1; }
-
 /* 名称：单行省略。min-width: 0 是必须的 —— flex 项默认 min-width: auto
    会以「内容最小宽度」为底线，长邮箱会把它撑破、把后面的一切挤出去 */
 .acct-name .name {
@@ -306,9 +283,9 @@ body.col-resizing { cursor: col-resize; user-select: none; }
   width: 44px;
   height: 24px;
   padding: 0 4px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--control-border);
   border-radius: var(--r-sm);
-  background: var(--surface);
+  background: var(--control-bg);
   color: var(--text);
   font-family: var(--font-mono);
   font-size: 11.5px;
@@ -322,8 +299,8 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 .prio-input::-webkit-outer-spin-button,
 .prio-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
-.prio-input:hover { border-color: var(--border-strong); }
-.prio-input:focus { border-color: var(--primary); background: var(--surface); }
+.prio-input:hover { border-color: var(--control-border-hover); }
+.prio-input:focus { border-color: var(--primary); background: var(--control-bg); }
 .prio-input:disabled { opacity: .5; }
 
 /* ↑/↓ 拼成一组（与卡片时代的 .order-btns 同一形制，只是尺寸收小到表格行的尺度）。
@@ -464,9 +441,7 @@ body.col-resizing { cursor: col-resize; user-select: none; }
   gap: 4px;
 }
 
-.acct-actions button,
-.acct-actions .is-current,
-.acct-actions .is-head {
+.acct-actions button {
   height: 25px;
   padding: 0 8px;
   border-radius: var(--r-sm);
@@ -477,40 +452,6 @@ body.col-resizing { cursor: col-resize; user-select: none; }
   border-color: var(--primary-bd);
   background: var(--primary-soft);
   color: var(--primary-fg);
-}
-
-/* 「首选」：不是可点的操作，而是「这行就是本家队首」的状态声明。
-   做成整排按钮里唯一的实心块 —— 一屏二十行里，实心块是唯一能一眼扫到的形状。
-   （底色与前景派生手法与全局 button.primary 一致：深色主题下 --surface 是近黑，
-   直接用它会变成蓝底黑字，故取「表面色向白提亮」的近白。） */
-.acct-actions .is-current {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--primary);
-  border: 1px solid var(--primary);
-  color: color-mix(in srgb, var(--surface) 8%, white);
-  font-weight: 600;
-  box-shadow: var(--shadow-1);
-  white-space: nowrap;
-  user-select: none;
-}
-
-/* 「队首」：它确实是队列第一位，但对最近使用的模型正限流，请求会顺延到下一位。
-   与实心「首选」块同形（同为状态声明、不可点），但用描边而非实心 + 告警色，
-   读起来是「排在前面、此刻却被跳过」—— 实心蓝表示「就是它」，
-   一个词只配一种视觉。同样不能放「设为首选」按钮：它已经在最前，
-   点了不会改变任何事（promote_to_front 返回 changed:false）。*/
-.acct-actions .is-head {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  background: var(--warn-soft);
-  border: 1px solid var(--warn-bd);
-  color: var(--warn);
-  font-weight: 600;
-  white-space: nowrap;
-  user-select: none;
 }
 
 /* ─── 展开的明细行（积分 / 签到）───
@@ -524,7 +465,7 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 .acct-panels > td {
   padding: 0 10px 8px;
   border-bottom: 1px solid var(--hairline);
-  background: var(--surface-well);
+  background: var(--table-bg);
 }
 
 .acct-panels .row-panel {

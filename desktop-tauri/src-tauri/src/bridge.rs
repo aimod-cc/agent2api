@@ -143,24 +143,10 @@ pub const BRIDGE_JS: &str = r#"
     deleteKey: id => call('DELETE', '/api/keys/' + encodeURIComponent(id)),
 
     // ── 多账号 ──
-    // switchAccount 即「设为当前」：把账号置顶为转发顺序第一位
+    // switchAccount 仅把账号移到全局队列第一位，不改变启用状态
     switchAccount: id => call('POST', '/api/accounts/current', { id }),
     refreshAccountToken: id => call('POST', '/api/accounts/refresh', id ? { id } : {}),
     removeAccount: id => call('DELETE', '/api/accounts/' + encodeURIComponent(id)),
-    uploadAccount: (name, fileText, edition) => {
-      let parsed;
-      try {
-        parsed = JSON.parse(fileText);
-      } catch (error) {
-        throw new Error('粘贴内容不是有效 JSON');
-      }
-      return call('POST', '/api/accounts', {
-        name: typeof name === 'string' ? name.trim().slice(0, 100) : '',
-        ...parsed,
-        // 弹窗里选的版本优先于粘贴内容里的同名字段
-        edition: edition === 'intl' ? 'intl' : 'cn',
-      });
-    },
     updateAccount: (id, patch) => call('PATCH', '/api/accounts/' + encodeURIComponent(id), patch),
     moveAccount: (id, direction) =>
       call('POST', '/api/accounts/' + encodeURIComponent(id) + '/move', {
@@ -196,14 +182,37 @@ pub const BRIDGE_JS: &str = r#"
     getCheckinStatus: () => call('GET', '/api/checkin/status'),
     claimCheckin: () => call('POST', '/api/checkin', {}),
     getAllBalances: () => call('GET', '/api/accounts/usage'),
+    // 最近一次「定时查询积分」的结果快照（形状同上，多一个 at 时间戳）。
+    // 账号页轮询它，于是用户不点按钮也能看到最新余额。
+    getBalancesSnapshot: () => call('GET', '/api/accounts/usage/snapshot'),
     checkinAllAccounts: id => call('POST', '/api/accounts/checkin', id ? { id } : {}),
+
+    // ── 手机验证码登录（AutoClaw 专用）──
+    // 与网页登录那条链（开窗口、等回调）不同：上游没有授权页，就是「发码 →
+    // 用码换 token」两次同步调用，所以走管理 API 而不是 start_login。
+    //
+    // 必须走 call 而不是让界面自己 invoke('api_request')：call 会经 invoke/asError
+    // 把壳侧 `Err(String)` 归一成 Error —— 绕过它时 rejection 携带的是**裸字符串**，
+    // 界面的 `error.message` 会拿到 undefined，显示成「登录失败：undefined」。
+    // `sendSmsCode` 返回的 deviceId 要原样回传给 verify（上游把验证码绑在发码时
+    // 那台设备上，见 api::session::login_sms_send 的说明）。
+    sendSmsCode: phone => call('POST', '/api/session/login/sms/send', { phone: String(phone || '') }),
+    verifySmsLogin: payload =>
+      call('POST', '/api/session/login/sms/verify', {
+        phone: String((payload && payload.phone) || ''),
+        code: String((payload && payload.code) || ''),
+        // deviceId / name 可选：空串会被后端当成一个真值带上去，
+        // 因此按「有值才带」整形（与其它命令的省略语义一致）
+        ...((payload && payload.deviceId) ? { deviceId: String(payload.deviceId) } : {}),
+        ...((payload && payload.name) ? { name: String(payload.name) } : {}),
+      }),
 
     // ── 定时签到 ──
     getAutoCheckin: () => call('GET', '/api/auto-checkin'),
     saveAutoCheckin: patch => call('POST', '/api/auto-checkin', patch),
     runAutoCheckinNow: () => call('POST', '/api/auto-checkin/run', {}),
 
-    // ── 间隔型定时任务（凭证自动维护 / 模型刷新 / 两个前端自动刷新）──
+    // ── 间隔型定时任务（凭证自动维护 / 定时查询积分 / 模型刷新 / 两个前端自动刷新）──
     // 改一条任务用 PATCH（后端同时受理 POST 作别名：CORS 允许方法里没有 PATCH，
     // 浏览器直连时预检会拦下它；走本桥的调用两种都能用，这里按规范用 PATCH）。
     getScheduledTasks: () => call('GET', '/api/scheduled-tasks'),
@@ -272,9 +281,24 @@ pub const BRIDGE_JS: &str = r#"
     // ── 事件 ──
     onStateChanged: callback => on('accounts:state-changed', callback),
     onAutoMaintained: callback => on('accounts:auto-maintained', callback),
+    // 启动失败（含端口冲突）。payload 是 StartupFailure：
+    // { message, conflict, canEndOccupant }。事件只是「去查一次」的提醒，
+    // 状态以 getBackendStatus 为准 —— 它可能在界面订阅之前就发出去了。
+    onBackendError: callback => on('backend:error', callback),
 
-    // ── 本壳特有：后端就绪状态（界面可选使用） ──
+    // ── 本壳特有：后端就绪状态与端口冲突处置（界面可选使用） ──
+    // 后端返回 { ready, port, portFromEnv, failure }：failure 为 null 表示
+    // 启动正常，非 null 时带 { message, conflict, canEndOccupant }，
+    // 界面据此决定给不给「结束占用进程 / 更换端口」两个出口。
     getBackendStatus: () => invoke('backend_status'),
+    // 查 / 结束占用网关端口的进程（只动查到的那个 PID，不做无差别清理）
+    getPortOccupant: () => invoke('port_occupant'),
+    endPortOccupant: () => invoke('end_port_occupant'),
+    // 换端口：checkPort 只探测不写盘（供输入框即时校验），
+    // changePort 会写设置文件并重启后端，changePort 内部已包含一次探测
+    checkPort: port => invoke('check_port', { port: Number(port) }),
+    changePort: port => invoke('change_port', { port: Number(port) }),
+    restartApp: () => invoke('restart_app'),
 
     // ── 本壳特有：窗口主题 ──
     // 三态语义：'dark' / 'light' 把窗口主题钉死，null 交回系统跟随（对应 Rust 侧的 None）。

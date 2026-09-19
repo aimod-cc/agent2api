@@ -107,8 +107,8 @@
 /* 分段控件前的行内标签（如「打开方式」）：与 .field-row > label 同形制 */
 #add-modal .add-seg-label { color: var(--text-2); font-size: 12.5px; white-space: nowrap; }
 
-/* 第二级（打开方式 + 登录按钮）挂在第一级所在段内：缩进 + 左侧竖线，
-   让「这是上一级选出来的子项」一眼可见，而不是与第一级并列的另一块 */
+/* 网页登录那一段里的「打开方式」（Qoder）：缩进 + 左侧竖线，
+   让「这是网页登录的子项」一眼可见，而不是与它并列的另一块。 */
 #add-modal .add-sub {
   display: flex;
   flex-direction: column;
@@ -117,13 +117,11 @@
   border-left: 2px solid var(--border);
 }
 
-/* .modal-section 自带 display:flex，会盖掉浏览器默认的 [hidden]{display:none}
-   （作者样式优先于 UA 样式），所以显隐必须显式压回来 —— 弹窗里靠 hidden
-   控制显隐的有：粘贴 JSON 段、WorkBuddy 的第二级、三家的方式分段各段。 */
+/* .modal-section 自带 display:flex，需显式覆盖浏览器的 hidden 默认样式。 */
 #add-modal .modal-section[hidden],
 #add-modal .add-sub[hidden] { display: none; }
 
-/* 纵向表单行（token / refreshToken / auth.json）：标签在上、输入框占满整宽 ——
+/* 纵向表单行（token / refreshToken）：标签在上、输入框占满整宽 ——
    这些值很长，横排会把输入框压成一条缝 */
 .field-row.stack { flex-direction: column; align-items: stretch; gap: 6px; }
 .field-row.stack > label { color: var(--text-2); font-size: 12.5px; }

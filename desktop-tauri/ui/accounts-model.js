@@ -6,7 +6,7 @@
  *
  * ── 与 accounts-groups.js 的分工（按职责拆分后）─────────────────
  * provider 能力表与摘要归一化、可用性 / 限流判定、筛选口径与分段计数、全局队列的
- * 位置表与队首派生 —— 这些**纯逻辑**在 accounts-groups.js（挂 window.wbAccountsGroups），
+ * 位置表 —— 这些**纯逻辑**在 accounts-groups.js（挂 window.wbAccountsGroups），
  * 本文件按名解构回来，并在文件末尾**原样再导出**。于是 window.wbAccountsModel 的
  * 公开面与拆分前同构，消费方（accounts-view.js / app.js）不必改引用路径 ——
  * 与本项目既有的转发做法一致（accounts-view.js 也把 accounts-model 的函数再导出给
@@ -36,12 +36,11 @@
     tokenExpiryOf,
     supportsUsage,
     isDesktopAccount,
+    supportsChat,
     byPriorityOrder,
     typeLabel,
     isEnabled,
     isRateLimited,
-    usableForModel,
-    hasCredentials,
     accountEdition,
     supportsCheckin,
     checkinableAccounts,
@@ -52,9 +51,6 @@
     visibleAccounts,
     filterCounts,
     positionMap,
-    pickForModel,
-    pickQueueHead,
-    routedId,
     activeLimits,
   } = window.wbAccountsGroups;
 
@@ -68,7 +64,7 @@
   /**
    * 状态标签集合：这一区只表达**健康状态**。
    *
-   * 「首选」不在这里 —— 它表达的是转发顺序（队首），不是账号健康状况。
+   * 「设为首选」是排序操作，不是账号健康状况。
    * 「限流」也不在这里 —— 限额按模型记，它有自己的一列（点开看具体模型），
    * 挤在状态列里只能给一个没有信息量的「限流」两个字。
    * 只标「需要关注的状态」；一切正常时给一个「正常」标签 ——
@@ -77,6 +73,13 @@
   function accountTags(account) {
     const enabled = isEnabled(account);
     const tags = [
+       // 没有转发能力的家：它的启用开关对转发没有意义，这里如实说明，
+       // 而不是给它一个与事实不符的「正常」标签。判据是后端的 chatSupported
+       // （适配器的 supports_chat() 声明），当前五家都能转发，因此这条在
+       // 正常配置下不会出现 —— 留着是为了「将来某家处于只有账号管理的
+       // 过渡期」时界面能自己说清楚，而不用再改这里。
+       supportsChat(account)
+        ? '' : statusTag('仅账号管理', 'plain', '该提供商的推理转发尚未接入，账号不参与转发'),
       enabled ? '' : statusTag('已禁用', 'bad', '该账号已禁用，不参与转发'),
       // 代理配了解析不出来时明确标出：转发会回退直连，属于需要留意的情况
       account.proxy?.error ? statusTag('代理异常', 'bad', `${account.proxy.error}（转发时会回退直连）`) : '',
@@ -177,13 +180,21 @@
     if (entry.success) {
       const d = entry.data || {};
       const parts = ['<span class="badge ok">✅ 签到成功</span>'];
-      if (Number.isFinite(d.points) && d.points) parts.push(`<span>本次 +${esc(d.points)} 积分</span>`);
+      // 积分字段两家口径不同：WorkBuddy 在 `data.points`（计费接口的嵌套结构），
+      // 小浣熊与 AutoClaw 在顶层 `rewardPoints`（它们的 claim 是自造的扁平形状，
+      // 没有 data 这一层）。两个都认，缺一不可 —— 只认前者会让后两家的
+      // 「+N 积分」凭空消失，用户看不到签到到底领到了什么。
+      const points = Number.isFinite(d.points) ? d.points : entry.rewardPoints;
+      if (Number.isFinite(points) && points) parts.push(`<span>本次 +${esc(points)} 积分</span>`);
       if (Number.isFinite(d.continuousDays)) parts.push(`<span>连续 ${esc(d.continuousDays)} 天</span>`);
       if (Number.isFinite(d.totalDays)) parts.push(`<span>累计 ${esc(d.totalDays)} 天</span>`);
       return `<div class="row-panel">${parts.join('')}${close}</div>`;
     }
+    // 未领取：`code` 只有 WorkBuddy 的 claim 带（上游业务码）；小浣熊与 AutoClaw
+    // 的 claim 不带它，此时只显示 msg，不要露出一个 `code=?`
+    const code = entry.code === undefined ? '' : `<span>code=${esc(entry.code)}</span>`;
     return `<div class="row-panel"><span class="badge warn">${esc(entry.msg || '未领取')}</span>`
-      + `<span>code=${esc(entry.code ?? '?')}</span>${close}</div>`;
+      + `${code}${close}</div>`;
   }
 
   // ─── 卡片 ──────────────────────────────────
@@ -272,13 +283,12 @@
     tokenExpiryOf,
     supportsUsage,
     isDesktopAccount,
+    supportsChat,
     // 基础判定
     byPriorityOrder,
     typeLabel,
     isEnabled,
     isRateLimited,
-    usableForModel,
-    hasCredentials,
     accountEdition,
     supportsCheckin,
     checkinableAccounts,
@@ -290,9 +300,6 @@
     visibleAccounts,
     filterCounts,
     positionMap,
-    pickForModel,
-    pickQueueHead,
-    routedId,
     activeLimits,
     // 标签与面板
     statusTag,

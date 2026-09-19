@@ -100,10 +100,11 @@ pub struct RetentionPatch {
 
 // ─── 定时任务设置的键名与边界（config.json 里的字段名**就是契约**）─────
 //
-// 间隔型任务（凭证维护 / 模型刷新 / 两个前端自动刷新）打包在 `scheduledTasks`
+// 间隔型任务（凭证维护 / 定时查询积分 / 模型刷新 / 软件版本检查 / 两个前端
+// 自动刷新）打包在 `scheduledTasks`
 // 对象下；自动签到不在其中 —— 它是**每天定点**型，时刻与上次执行结果由
 // `core::auto_checkin` 自己管（`autoCheckin` 字段），本模块不重复持有。
-// 页面上的四条间隔型任务是「同一个形状」，所以配置也写成同一形状，
+// 页面上的这些间隔型任务是「同一个形状」，所以配置也写成同一形状，
 // 免得读侧要按任务名各写一套解析。
 
 /// 间隔型任务的配置对象键
@@ -118,6 +119,8 @@ pub const KEY_LOGS_AUTO_REFRESH: &str = "logsAutoRefresh";
 pub const KEY_REQUESTS_AUTO_REFRESH: &str = "requestsAutoRefresh";
 /// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向 GitHub 查最新发布版本）
 pub const KEY_UPDATE_CHECK: &str = "updateCheck";
+/// 定时查询积分在 `scheduledTasks` 下的子键（后端定时查全部账号的余额 / 积分）
+pub const KEY_USAGE_QUERY: &str = "usageQuery";
 
 /// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
 pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
@@ -135,6 +138,12 @@ pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 10;
 /// GitHub 匿名限额是 60 次/小时/IP：5 分钟一次（12 次/小时）留足余量；
 /// 下限仍是全局的 INTERVAL_MIN_MINUTES，但设到 1 分钟贴着限额跑没有意义。
 pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 5;
+/// 定时查询积分的默认间隔（分钟）：每 10 分钟查一次全部账号的余额。
+///
+/// 与凭证维护同档：一条余额查询就是逐账号打一次上游的积分接口，
+/// 10 分钟一次（每小时 6 轮）对这个「看一眼还剩多少」的需求足够，
+/// 也不会因为间隔过密给上游添负担、触发风控。
+pub const DEFAULT_USAGE_QUERY_MINUTES: i64 = 10;
 
 /// 间隔型任务的取值范围。上下限分两套（分钟 / 秒），因为两类任务的合理区间
 /// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（5 秒～10 分钟）。
@@ -154,7 +163,7 @@ pub struct IntervalTask {
     pub interval: i64,
 }
 
-/// 四条间隔型任务的配置（设置页「定时任务」区域）。
+/// 六条间隔型任务的配置（设置页「定时任务」区域）。
 ///
 /// 与 `RetentionSettings` 同一取舍：几个值总是一起用（GET 一次返回、各自循环
 /// 各取所需），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
@@ -165,6 +174,7 @@ pub struct ScheduledSettings {
     pub logs_auto_refresh: IntervalTask,
     pub requests_auto_refresh: IntervalTask,
     pub update_check: IntervalTask,
+    pub usage_query: IntervalTask,
 }
 
 impl Default for ScheduledSettings {
@@ -189,6 +199,10 @@ impl Default for ScheduledSettings {
             update_check: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_UPDATE_CHECK_MINUTES,
+            },
+            usage_query: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_USAGE_QUERY_MINUTES,
             },
         }
     }
@@ -217,7 +231,7 @@ pub struct RuntimeConfig {
     /// 取用（回调形式），从 `Value` 里逐个取值要处理类型不符、缺字段、范围夹紧，
     /// 放在这里解析一次即可；`raw` 仍是写盘时的唯一底稿。
     retention: RetentionSettings,
-    /// 四条间隔型定时任务的开关与间隔（设置页「定时任务」区域）。
+    /// 六条间隔型定时任务的开关与间隔（设置页「定时任务」区域）。
     ///
     /// 与保留期同一理由：凭证维护与模型刷新的循环**每一轮都要重读**它
     /// （改完设置下一轮生效，不重启进程），从 `Value` 里翻一次要处理一堆
@@ -392,15 +406,17 @@ fn interval_field(task: &Map<String, Value>, default: i64, min: i64, max: i64) -
 
 /// 从一条任务的子对象里取开关。
 ///
-/// **缺字段按开启**：这四条任务在本次改造前都是无条件运行的（凭证维护每 10 分钟、
-/// 两个前端面板每 10 秒、模型刷新随 /v1/models 触发），升级上来的 config.json
-/// 里没有 `scheduledTasks` —— 若把「没配过」读成「关闭」，用户什么也没动，
-/// 凭证却不再自动续期了。写侧（`PUT /api/scheduled-tasks`）则要求显式布尔值。
+/// **缺字段按开启**：这些任务在本次改造前都是无条件运行的（凭证维护每 10 分钟、
+/// 两个前端面板每 10 秒、模型刷新随 /v1/models 触发；定时查询积分是后来新增的，
+/// 它没有「改造前」—— 缺字段同样按开启，与新装用户第一次打开的行为一致），
+/// 升级上来的 config.json 里没有 `scheduledTasks` —— 若把「没配过」读成「关闭」，
+/// 用户什么也没动，凭证却不再自动续期了。写侧（`PUT /api/scheduled-tasks`）
+/// 则要求显式布尔值。
 fn task_enabled(task: &Map<String, Value>, default: bool) -> bool {
     task.get("enabled").and_then(Value::as_bool).unwrap_or(default)
 }
 
-/// 由原始 JSON 解析四条间隔型任务（缺字段各自用默认值）
+/// 由原始 JSON 解析六条间隔型任务（缺字段各自用默认值）
 fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
     let defaults = ScheduledSettings::default();
     let task = |key: &str, interval: i64, min: i64, max: i64| {
@@ -438,6 +454,12 @@ fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
         update_check: task(
             KEY_UPDATE_CHECK,
             defaults.update_check.interval,
+            INTERVAL_MIN_MINUTES,
+            INTERVAL_MAX_MINUTES,
+        ),
+        usage_query: task(
+            KEY_USAGE_QUERY,
+            defaults.usage_query.interval,
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
         ),
@@ -710,7 +732,7 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
 ///
 /// 与 `set_retention` 同一模式：内存快照与 raw 底稿一起改 —— 前者让正在跑的
 /// 循环下一轮就用新间隔（不必重启进程），后者保证写盘时不吃掉兄弟字段
-/// （只改一条任务时，`scheduledTasks` 下其余三条必须原样保留）。
+/// （只改一条任务时，`scheduledTasks` 下其余各条必须原样保留）。
 pub fn set_scheduled_task(
     key: &str,
     patch: IntervalTaskPatch,

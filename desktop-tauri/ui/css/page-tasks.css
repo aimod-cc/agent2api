@@ -7,15 +7,33 @@
    把短的挤成一条窄柱；两端对齐则自然按内容分配。
 
    颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
+
+   滚动：页面外框锁高（见 layout.css 的 `[data-page="tasks"]` 那组声明），
+   滚动发生在本文件声明的 .task-list 上 —— 与日志页把滚动交给 .log-list 同款，
+   面板头与页脚条因此常驻，不会跟着任务条数一起滚出视野。
    ───────────────────────────────────────────── */
 
 .task-list {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  /* 列表吃掉面板头与页脚条之间的剩余高度，滚动只发生在这里 */
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  /* 卡片是「整体重建」式重绘（结构变化时 task-list.innerHTML 一次替换），
+     与账号表 / 日志列表同理：滚动锚定会算到被移除的节点上，补偿出一个莫名的
+     滚动位移。这里统一禁用，重绘不改变视口、滚动位置严格保持。 */
+  overflow-anchor: none;
 }
 
+/* 空态（加载中 / 无任务 / 后端不可用）在列表里居中：
+   列表成了 flex 列容器 + 滚动区，只有这一条内容时它会被顶在左上角
+   （与日志页 `.log-list > .log-empty:only-child` 同一处理）。 */
+.task-list > .log-empty:only-child { margin: auto; }
+
 .task-item {
+  flex: none;   /* 列表是 flex 列容器 + 滚动区：卡片不许被压缩，超出的一律交给列表滚动 */
   display: flex;
   align-items: flex-start;
   justify-content: space-between;

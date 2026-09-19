@@ -22,8 +22,11 @@ pub fn file_path() -> PathBuf {
 
 /// 应用设置。
 ///
-/// 前后端之间以 camelCase JSON 传输（`closeToTray` / `autostart`），
+/// 前后端之间以 camelCase JSON 传输（`closeToTray` / `autostart` / `proxyPort`），
 /// 与 renderer 的字段名保持一致，界面无需做任何映射。
+///
+/// `default` 用在结构体上（而非逐字段）：这样后续新增字段时，**旧设置文件里
+/// 缺这个键不会导致整份设置反序列化失败**——缺的字段各自取 Default。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppSettings {
@@ -31,13 +34,20 @@ pub struct AppSettings {
     pub close_to_tray: bool,
     /// 开机自动启动
     pub autostart: bool,
+    /// 网关监听端口。
+    ///
+    /// 0 = 未设置，回落到默认 3065（与 `gateway::proxy_port()` 的语义一致）。
+    /// 存这里而不是后端 config.json：端口决定**壳侧**管理客户端的连接目标，
+    /// 且要在服务端 bind 之前就读到，属于「应用级启动设置」而非网关业务配置。
+    /// 改这个值需要重启进程才生效（服务端 bind 之后端口改不了）。
+    pub proxy_port: u16,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         // 关闭到托盘默认开启：网关的价值在于后台持续转发，
         // 用户点关闭通常只是想收起界面，而不是让转发中断
-        Self { close_to_tray: true, autostart: false }
+        Self { close_to_tray: true, autostart: false, proxy_port: 0 }
     }
 }
 
