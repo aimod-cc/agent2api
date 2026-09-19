@@ -385,6 +385,11 @@
   min-height: 0;
   overflow-y: auto;
   padding-bottom: 20px;
+  /* 各页面的列表都是「整表重建」式重绘（tbody.innerHTML 整体替换）。
+     滚动锚定（overflow-anchor）在这种重建下会把锚点算到被移除的节点上，
+     补偿出一个莫名的滚动位移 —— 用户点一个开关，页面自己跳一大截。
+     这里统一禁用：重绘不改变视口，滚动位置严格保持。 */
+  overflow-anchor: none;
 }
 
 /* 页头：标题 + 一句话说明 */
@@ -417,7 +422,12 @@
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
   box-shadow: var(--shadow-2);
+  /* 这里只需要「按圆角裁掉子内容」，不是滚动：hidden 会把面板变成滚动容器，
+     模型表（tbody 整体重绘）触发浏览器的滚动锚定补偿时，面板会被滚走一大截
+     且永远没人把它滚回来（面板头 / 工具栏 / 表头全被卷出视野，看起来像坍缩）。
+     clip 是纯裁剪、不可滚动；老内核不认识 clip 时回退到 hidden，行为同旧版。 */
   overflow: hidden;
+  overflow: clip;
 }
 
 .panel-head {

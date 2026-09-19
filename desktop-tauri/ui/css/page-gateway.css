@@ -44,8 +44,9 @@
 .models-refresh-note:empty { display: none; }
 .models-refresh-note.err { color: var(--danger); }
 
-/* 表格（模型管理 / 网关 Key 共用）：贴面板左右边缘，表头粘顶 */
-.models-table-wrap { overflow: auto; max-height: min(62vh, 720px); border-top: 1px solid var(--border); }
+/* 表格（模型管理 / 网关 Key 共用）：贴面板左右边缘，表头粘顶。
+   overflow-anchor 同 .page.active：tbody 重建时不做锚定补偿，行内点开关视口不动 */
+.models-table-wrap { overflow: auto; overflow-anchor: none; max-height: min(62vh, 720px); border-top: 1px solid var(--border); }
 
 .models-table {
   width: 100%;
