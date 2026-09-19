@@ -133,7 +133,7 @@ fn configure(id: &str, body: &Bytes) -> Response {
 /// （与 `/api/models/refresh` 带着清单返回同一个理由）。
 async fn run_now(state: &ServerState, id: &str) -> Response {
     let store = state.store().clone();
-    match scheduled_tasks::run_now(&store, id).await {
+    match scheduled_tasks::run_now(&store, state.update(), id).await {
         Ok(summary) => ok_json(json!({
             "summary": summary,
             "task": scheduled_tasks::task_by_id(id),

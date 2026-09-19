@@ -143,8 +143,25 @@ pub(super) async fn query_usage(
 ///   ④ `code` 存在且非 0 → 502 取 `message`；
 ///   ⑤ 取 `data ?? payload`（源实现 `payload?.data ?? payload`）。
 async fn request_json(origin: &str, path: &str, token: &str) -> Result<Value, GatewayError> {
+    request_json_ex(origin, "GET", path, token, &[], REQUEST_TIMEOUT_MS).await
+}
+
+/// `request_json` 的通用形态：方法与附加头可指定（桌面登录积分链路需要
+/// `X-Client-Platform` / `X-Client-Version` / `X-Raccoon-Language` 三个头，
+/// 账单核对需要更长的超时 —— 见 `claim_daily_grant` 的说明）。
+///
+/// 其余判定链与 `request_json` 完全一致；`method` 目前只有 GET / POST 两种用法
+/// （上游的积分域没有其它方法）。
+async fn request_json_ex(
+    origin: &str,
+    method: &str,
+    path: &str,
+    token: &str,
+    extra_headers: &[(String, String)],
+    timeout_ms: u64,
+) -> Result<Value, GatewayError> {
     let url = format!("{origin}{path}");
-    let headers: Vec<(String, String)> = vec![
+    let mut headers: Vec<(String, String)> = vec![
         ("Accept".to_string(), "application/json".to_string()),
         // 源实现 `token.replace(/^Bearer\s+/i, '')` 后再拼 Bearer：
         // 用户粘贴的 token 可能自带前缀，重复拼会得到 `Bearer Bearer xxx`。
@@ -155,10 +172,10 @@ async fn request_json(origin: &str, path: &str, token: &str) -> Result<Value, Ga
             format!("Bearer {}", super::jwt::strip_bearer(token)),
         ),
     ];
+    headers.extend(extra_headers.iter().cloned());
     // 直连（源实现这条链路是裸 fetch，见模块头）
-    let response = send_raw("GET", &url, None, &headers, None, Some(REQUEST_TIMEOUT_MS))
-        .await
-        .map_err(|error| {
+    let response =
+        send_raw(method, &url, None, &headers, None, Some(timeout_ms)).await.map_err(|error| {
             if error.is_timeout() {
                 GatewayError::with_status(504, "积分查询超时")
             } else {
@@ -261,4 +278,168 @@ fn to_int(value: Option<&Value>) -> Option<i64> {
         return None;
     }
     Some(number.floor() as i64)
+}
+
+// ─── 每日「签到」（桌面登录积分发放）─────────────────────────
+//
+// 小浣熊没有 WorkBuddy 那种「每日签到」接口；它的每日奖励走的是**桌面端
+// 登录积分**链路：官方桌面客户端每次启动会打两个接口，服务端据此按天发放
+// 每日积分（1.x 源实现 account-balance.mjs / account-routes.mjs 的
+// desktop-grant 已验证）。这里复刻同一条链路作为「签到」：
+//   ① POST /api/web/desktop/v1/login/points/grant —— 首次桌面登录奖励
+//      （一次性，幂等；已发放过时上游返回 granted=false）；
+//   ② GET  /api/web/office/v3/setting_info —— **每日积分的发放触发器**
+//      （按天幂等），发放通知在响应的 point_grant_popups / point_grant_toast；
+//   ③ GET  /api/web/points/v1/bills —— 核对今日实际入账，作为权威结果
+//      （账单接口慢，limit=20 实测约 9 秒，用独立超时兜底；失败降级，
+//      不影响 ①② 的领取本身）。
+
+/// 账单核对的拉取条数与超时（源实现 GRANT_CHECK_LIMIT / GRANT_CHECK_TIMEOUT_MS）
+const GRANT_CHECK_LIMIT: usize = 20;
+const GRANT_CHECK_TIMEOUT_MS: u64 = 25_000;
+
+/// 客户端身份头：官方桌面端启动时带的两个头（源实现 grantDesktopLoginPoints）
+fn desktop_client_headers() -> Vec<(String, String)> {
+    vec![
+        ("X-Client-Platform".to_string(), "desktop-windows".to_string()),
+        ("X-Client-Version".to_string(), "v1.0.0".to_string()),
+    ]
+}
+
+/// 小浣熊账号的每日签到（claim 形状与 WorkBuddy 的 claim_daily_checkin 对齐：
+/// `{success, msg}` —— billing::checkin 的汇总只认这两个字段）。
+///
+/// `success` 的口径是「**今日积分确有入账**」（账单核对），而不是某一步的
+/// HTTP 成败：发放是服务端在 setting_info 上按天幂等完成的，重复执行
+/// 不会重复入账，账单里看得到就是领到了。
+pub async fn claim_daily_grant(
+    store: &AccountStore,
+    account_id: &str,
+) -> Result<Value, GatewayError> {
+    let credentials = credentials::snapshot_for(store, account_id)?;
+    if credentials.token.trim().is_empty() {
+        return Err(GatewayError::with_status(
+            401,
+            "该账号没有可用凭证，无法签到",
+        ));
+    }
+    let origin = main_site_url();
+
+    // ① 桌面登录奖励（一次性）。失败不阻断：它对老账号注定是 granted=false，
+    //    真正的每日发放在 ② 里 —— 与 1.x 源实现「单步失败继续走完」一致
+    let desktop_grant = match request_json_ex(
+        &origin,
+        "POST",
+        "/api/web/desktop/v1/login/points/grant",
+        &credentials.token,
+        &desktop_client_headers(),
+        REQUEST_TIMEOUT_MS,
+    )
+    .await
+    {
+        Ok(data) => {
+            json!({ "granted": data.get("granted").and_then(Value::as_bool) == Some(true) })
+        }
+        Err(error) => json!({ "granted": false, "error": error.message }),
+    };
+
+    // ② 每日积分发放触发器（按天幂等）。失败必须体现在结果里 ——
+    //    这步不成功当日就没有发放，账单核对会给出「今日未见入账」
+    let mut settings_headers = desktop_client_headers();
+    settings_headers.push(("X-Raccoon-Language".to_string(), "zh".to_string()));
+    let settings = match request_json_ex(
+        &origin,
+        "GET",
+        "/api/web/office/v3/setting_info",
+        &credentials.token,
+        &settings_headers,
+        REQUEST_TIMEOUT_MS,
+    )
+    .await
+    {
+        Ok(data) => {
+            // 发放通知原样透出（结构与上游一致，界面不深入解析）
+            json!({
+                "popups": data.get("point_grant_popups").cloned().unwrap_or(Value::Null),
+                "toast": data.get("point_grant_toast").cloned().unwrap_or(Value::Null),
+            })
+        }
+        Err(error) => json!({ "popups": Value::Null, "toast": Value::Null, "error": error.message }),
+    };
+
+    // ③ 账单核对今日入账（慢接口独立超时；失败降级为 grantsError）
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let bills_path = format!(
+        "/api/web/points/v1/bills?paging.limit={GRANT_CHECK_LIMIT}&paging.offset=0"
+    );
+    let (grants, grants_error) = match request_json_ex(
+        &origin,
+        "GET",
+        &bills_path,
+        &credentials.token,
+        &[],
+        GRANT_CHECK_TIMEOUT_MS,
+    )
+    .await
+    {
+        Ok(data) => {
+            let items = data.get("items").and_then(Value::as_array);
+            let grants: Vec<Value> = items
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            // points>0 且 created_at 的日期部分 == 本地今天
+                            // （源实现直接比对字符串前 10 位，口径一致）
+                            let points = to_int(item.get("points"))?;
+                            if points <= 0 {
+                                return None;
+                            }
+                            let created_at =
+                                item.get("created_at").and_then(Value::as_str).unwrap_or("");
+                            if created_at.get(..10) != Some(today.as_str()) {
+                                return None;
+                            }
+                            Some(json!({
+                                "name": item.get("event_name").and_then(Value::as_str).unwrap_or("积分发放"),
+                                "points": points,
+                                "at": created_at.replace('T', " ").get(11..19).unwrap_or(""),
+                            }))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (grants, None)
+        }
+        Err(error) => (Vec::new(), Some(error.message)),
+    };
+
+    let granted_today = grants.iter().map(|item| to_int(item.get("points")).unwrap_or(0)).sum::<i64>();
+    let mut msg_parts: Vec<String> = Vec::new();
+    if desktop_grant.get("granted").and_then(Value::as_bool) == Some(true) {
+        msg_parts.push("桌面登录奖励已发放".to_string());
+    }
+    if granted_today > 0 {
+        msg_parts.push(format!("今日积分 +{granted_today}"));
+    } else if grants_error.is_some() {
+        // 账单核对失败拿不到权威结果，不谎报成功
+        msg_parts.push("未能核对今日入账".to_string());
+    } else {
+        msg_parts.push("今日未见积分入账（可能已领取）".to_string());
+    }
+    if let Some(error) = grants_error.as_deref() {
+        msg_parts.push(format!("账单核对失败：{error}"));
+    } else if desktop_grant.get("error").and_then(Value::as_str).is_some() {
+        // 首次奖励领取失败对老账号是常态（granted=false），但真错误还是提一句
+        msg_parts.push("桌面登录奖励未领取".to_string());
+    }
+
+    Ok(json!({
+        "success": granted_today > 0,
+        "msg": msg_parts.join("；"),
+        "grantsToday": grants,
+        "desktopGrant": desktop_grant,
+        "settings": settings,
+        "grantsError": grants_error.map(Value::String).unwrap_or(Value::Null),
+    }))
 }

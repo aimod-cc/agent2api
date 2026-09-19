@@ -499,12 +499,40 @@
     setListScroll('log-list');
     toast(hideOn ? '已隐藏脱敏日志' : '已显示全部日志');
   });
+  /**
+   * 从别的页面跳转过来并把分类筛选预设好（定时任务页「查看签到日志」按钮用）。
+   *
+   * 分类下拉的选项由后端字典填充、且只填一次（见 fillCategories）——
+   * 用户可能还没打开过日志页，这里先确保下拉已就位（没就位就先跑一次加载，
+   * 它会顺带填充），再设值并按新分类重拉。最后切页面交给调用方之外的
+   * showPage：本方法只负责「页面加载完就是这个筛选」，切页由任务页自己调
+   * wbApp.showPage（见 tasks-panel 的按钮处理）—— 但为了这个按钮一次点击
+   * 就到位，这里把切页也包进来（showPage 在 app.js 的 wbApp 上）。
+   */
+  async function showCategory(category) {
+    const select = $('logs-category');
+    if (!select) return;
+    if (select.dataset.filled !== '1' || !select.querySelector(`option[value="${category}"]`)) {
+      await load({ silent: true });
+    }
+    if (!$('logs-category').querySelector(`option[value="${category}"]`)) return;
+    $('logs-category').value = category;
+    // 程序赋值不派发 change，增强外壳（select.js）的触发器文本也不会自己跟上
+    // —— 与 models-panel.js 设置映射弹窗下拉后显式 sync 同一个既有模式
+    window.wbSelect?.sync?.(select);
+    page = 1;
+    await load({ resetPage: true });
+    window.wbApp?.showPage?.('logs', { persist: true });
+  }
+
   window.wbLogsPanel = {
     load,
     render,
     lastStats: () => stats,
     // 「定时任务」页改完间隔后推给本面板（见 applyAutoRefresh 的说明）
     applyAutoRefresh,
+    // 跳转入口：预设分类并切页（目前只有「查看签到日志」用）
+    showCategory,
   };
 
   // 首屏自持加载：即便 app.js 的 refresh 失败，日志页也能独立显示真实状态。

@@ -47,6 +47,48 @@ pub const TICK_MS: u64 = 30_000;
 /// 默认触发时刻：零点一分（Node 版 DEFAULT_TIME）
 pub const DEFAULT_TIME: &str = "00:01";
 
+/// 可勾选的签到提供商（界面上的两个复选框）。默认全选。
+///
+/// WorkBuddy 走腾讯的每日签到接口；小浣熊走「桌面登录积分」链路
+/// （`providers::raccoon` 的每日积分发放，见该模块的说明）。
+pub const CHECKIN_PROVIDERS: [&str; 2] = ["workbuddy", "raccoon"];
+
+/// 缺省的签到提供商集合（全选）
+pub fn default_providers() -> Vec<String> {
+    CHECKIN_PROVIDERS.iter().map(|id| id.to_string()).collect()
+}
+
+/// 提供商的展示名（从注册表查，查不到就原样回显 id）
+fn provider_label(id: &str) -> &str {
+    crate::server::core::providers::PROVIDERS
+        .iter()
+        .find(|meta| meta.id == id)
+        .map(|meta| meta.label)
+        .unwrap_or(id)
+}
+
+/// 归一化配置里的提供商清单：只认 CHECKIN_PROVIDERS 里的 id（去重、保持顺序），
+/// 缺失 / 空数组 / 全是非法值都回落到「全选」—— 旧配置文件里没有这个字段，
+/// 读出来必须是合法的默认行为。
+pub fn normalize_providers(value: Option<&Value>) -> Vec<String> {
+    let Some(list) = value.and_then(Value::as_array) else {
+        return default_providers();
+    };
+    let picked: Vec<String> = CHECKIN_PROVIDERS
+        .iter()
+        .filter(|id| {
+            list.iter()
+                .any(|item| item.as_str() == Some(*id))
+        })
+        .map(|id| id.to_string())
+        .collect();
+    if picked.is_empty() {
+        default_providers()
+    } else {
+        picked
+    }
+}
+
 /// config.json 里承载定时签到状态的键
 const CONFIG_KEY: &str = "autoCheckin";
 
@@ -190,6 +232,8 @@ fn today_at(time_text: &str, now: DateTime<Local>) -> Option<DateTime<Local>> {
 struct CheckinState {
     enabled: bool,
     time: String,
+    /// 要签到的提供商（见 CHECKIN_PROVIDERS；缺省全选）
+    providers: Vec<String>,
     last_fired_date: Option<String>,
     last_result: Option<Value>,
 }
@@ -216,7 +260,13 @@ fn read_state() -> CheckinState {
         .and_then(Value::as_str)
         .map(str::to_string);
     let last_result = raw.get("lastResult").filter(|value| value.is_object()).cloned();
-    CheckinState { enabled, time, last_fired_date, last_result }
+    CheckinState {
+        enabled,
+        time,
+        providers: normalize_providers(raw.get("providers")),
+        last_fired_date,
+        last_result,
+    }
 }
 
 /// 合并写回 `autoCheckin`（对应 Node 版 writeState 的 `{...current, ...patch}`）。
@@ -313,6 +363,11 @@ impl AutoCheckin {
         json!({
             "enabled": state.enabled,
             "time": state.time,
+            // 界面按这份清单勾选复选框；顺序即 CHECKIN_PROVIDERS 的注册顺序
+            "providers": state.providers,
+            "providerOptions": CHECKIN_PROVIDERS.iter().map(|id| {
+                json!({ "id": id, "label": provider_label(id) })
+            }).collect::<Vec<_>>(),
             "lastFiredDate": state.last_fired_date,
             "lastFiredToday": state.last_fired_date.as_deref() == Some(local_date_key(now).as_str()),
             "nextRunAt": next_run_at,
@@ -345,7 +400,14 @@ impl AutoCheckin {
         write_state(json!({ "lastFiredDate": today }));
         logging::log("[Checkin]", &format!("⏰ 定时签到开始（{reason}）"));
 
-        let outcome = match checkin::run_checkin(&self.store, &self.billing, None).await {
+        let outcome = match checkin::run_checkin(
+            &self.store,
+            &self.billing,
+            read_state().providers.as_slice(),
+            None,
+        )
+        .await
+        {
             Ok(result) => Some(self.record_success(&result, &today, reason)),
             Err(error) => {
                 // 失败也写 lastResult（failed 里放错误文案），与 Node 的 catch 分支一致
@@ -533,6 +595,29 @@ impl AutoCheckin {
         if let Some(value) = payload.get("time") {
             patch.insert("time".to_string(), Value::String(normalize_time(Some(value))?));
         }
+        if let Some(value) = payload.get("providers") {
+            // 勾选清单：只认注册过的提供商 id（去重、按注册顺序落盘）；
+            // 一个都不勾没有意义 —— 定时到点也无账号可签，直接拒绝并说明。
+            let Some(list) = value.as_array() else {
+                return Err(AutoCheckinConfigError::new("providers 必须是字符串数组"));
+            };
+            let picked: Vec<Value> = CHECKIN_PROVIDERS
+                .iter()
+                .filter(|id| list.iter().any(|item| item.as_str() == Some(*id)))
+                .map(|id| Value::String(id.to_string()))
+                .collect();
+            if picked.is_empty() {
+                let names = CHECKIN_PROVIDERS
+                    .iter()
+                    .map(|id| provider_label(id))
+                    .collect::<Vec<_>>()
+                    .join("、");
+                return Err(AutoCheckinConfigError::new(format!(
+                    "至少勾选一家签到提供商（{names}）"
+                )));
+            }
+            patch.insert("providers".to_string(), Value::Array(picked));
+        }
         if patch.is_empty() {
             return Err(AutoCheckinConfigError::new("没有需要更新的字段"));
         }
@@ -552,10 +637,27 @@ impl AutoCheckin {
         } else if before.time != after.time {
             logging::log("[Checkin]", &format!("定时签到时间已改为 {}", after.time));
         }
+        if before.providers != after.providers {
+            let names = |list: &[String]| {
+                list.iter()
+                    .map(|id| provider_label(id))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            };
+            logging::log(
+                "[Checkin]",
+                &format!("签到范围已改为 {}", names(&after.providers)),
+            );
+        }
         if after.enabled {
             self.start();
         }
         Ok(self.state())
+    }
+
+    /// 当前配置的签到提供商（账号页批量签到与定时签到共用同一份口径）。
+    pub fn configured_providers(&self) -> Vec<String> {
+        read_state().providers
     }
 
     /// 立即执行一次（界面上的「立即签到」按钮走这里，与定时触发同一条路径）。

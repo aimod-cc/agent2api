@@ -637,7 +637,12 @@ pub async fn accounts_checkin(state: &ServerState, body: &Bytes) -> Response {
             .filter(|value| !value.is_empty()),
         Err(_) => return management_error(400, "请求内容不是有效 JSON"),
     };
-    match checkin::run_checkin(state.store(), state.billing(), id.as_deref()).await {
+    // 批量路径的提供商范围取自动签到的同一份配置（两处入口一个口径）；
+    // 指定 id 的单签不受范围限制（见 resolve_checkin_targets 的说明）
+    let providers = state.auto_checkin().configured_providers();
+    match checkin::run_checkin(state.store(), state.billing(), providers.as_slice(), id.as_deref())
+        .await
+    {
         Ok(result) => ok_json(result),
         Err(error) => management_error(error.status_code, error.message),
     }

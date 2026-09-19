@@ -51,17 +51,21 @@ pub fn supports_checkin(account: &Value) -> bool {
     account.get("edition").and_then(Value::as_str) != Some("intl")
 }
 
-/// 该账号是否属于**有签到活动的那一家**（Agent2API W3-T4）。
+/// 账号的提供商 id（缺失时按默认 provider 处理，与账号存储的兜底口径一致）。
 ///
-/// 签到（与积分一样）是 WorkBuddy 的概念：小浣熊侧没有这个接口，
-/// 拿它的 token 去打腾讯的签到接口只会稳定报错。公开形态里 `provider` 缺失时
-/// 按默认 provider（workbuddy）处理 —— 与账号存储 `provider()` 的兜底口径一致。
-fn belongs_to_default_provider(account: &Value) -> bool {
+/// 签到范围的判定按提供商分派：WorkBuddy 走腾讯的每日签到接口，小浣熊走
+/// 桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）——
+/// 两家的接口互不相通，拿小浣熊的 token 去打腾讯的签到接口只会稳定报错。
+fn provider_of(account: &Value) -> &str {
     account
         .get("provider")
         .and_then(Value::as_str)
-        .map(|provider| provider == crate::server::core::providers::DEFAULT_PROVIDER_ID)
-        .unwrap_or(true)
+        .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID)
+}
+
+/// 该账号是否在本次签到的提供商范围内
+fn matches_provider_filter(account: &Value, providers: &[String]) -> bool {
+    providers.iter().any(|id| id == provider_of(account))
 }
 
 /// 账号快照里的「可用」判定（Node: `account.available !== false`）
@@ -92,14 +96,15 @@ fn accounts_of(store: &AccountStore) -> Vec<Value> {
 
 /// 签到目标集合。
 ///
-/// 批量（`id` 为空）：可用账号 ∩ 已启用 ∩ **属于默认 provider** ∩ 非国际版，
-/// `skipped` = 可用总数 − 可签到数。
+/// 批量（`id` 为空）：可用账号 ∩ 已启用 ∩ **提供商在 `providers` 范围内** ∩ 非国际版，
+/// `skipped` = 可用总数 − 可签到数。范围由配置给出（WorkBuddy / 小浣熊可勾选），
+/// 定时签到与账号页批量签到共用同一份口径。
 /// 指定 id：命中即用（**不过滤 available，也不过滤 provider**），
-/// 国际版直接报 400 —— 用户点的是谁就签谁，小浣熊账号交给上游去拒绝
-/// （与「显式指定就执行」的既有语义一致；批量路径必须过滤，否则点一次
-/// 「签到」会连小浣熊账号一起打）。
+/// 国际版直接报 400 —— 用户点的是谁就签谁，与「显式指定就执行」的既有语义一致；
+/// 批量路径必须过滤，否则会把范围外的账号也签一遍。
 pub fn resolve_checkin_targets(
     store: &AccountStore,
+    providers: &[String],
     id: Option<&str>,
 ) -> Result<(Vec<Value>, usize), CheckinError> {
     let all = accounts_of(store);
@@ -122,7 +127,7 @@ pub fn resolve_checkin_targets(
         .into_iter()
         .filter(is_enabled)
         .filter(supports_checkin)
-        .filter(belongs_to_default_provider)
+        .filter(|account| matches_provider_filter(account, providers))
         .collect();
     let skipped = total - eligible.len();
     Ok((eligible, skipped))
@@ -130,6 +135,10 @@ pub fn resolve_checkin_targets(
 
 /// 单个账号签到。已签到（上游非 0 code）不算错误，原样返回结果 ——
 /// 前端把「今天已签到」显示成一条 warn 提示。
+///
+/// 按提供商分派：WorkBuddy 走计费服务的每日签到；小浣熊走桌面登录积分链路
+/// （`providers::raccoon::balance::claim_daily_grant`，claim 形状已对齐成
+/// `{success, msg}`，汇总口径两家具余一致）。
 pub async fn checkin_for(
     store: &AccountStore,
     billing: &BillingService,
@@ -137,13 +146,38 @@ pub async fn checkin_for(
 ) -> Value {
     let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
+    let display = name.as_str().unwrap_or(&id).to_string();
+    if provider_of(account) == "raccoon" {
+        return match crate::server::core::providers::raccoon::balance::claim_daily_grant(store, &id)
+            .await
+        {
+            Ok(claim) => {
+                let success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
+                let msg = claim.get("msg").and_then(Value::as_str).unwrap_or("");
+                if success {
+                    logging::log("[Accounts]", &format!("账号 {display}: 签到成功（{msg}）"));
+                } else {
+                    logging::log("[Accounts]", &format!("账号 {display}: 签到未领取（{msg}）"));
+                }
+                json!({ "id": id, "name": name, "claim": claim, "error": Value::Null })
+            }
+            Err(error) => {
+                logging::verbose("[Accounts]", &format!("账号 {id} 签到失败: {}", error.message));
+                json!({
+                    "id": id,
+                    "name": name,
+                    "claim": Value::Null,
+                    "error": error.message,
+                })
+            }
+        };
+    }
     let Some(entry) = store.get_session_by_id(&id) else {
         return json!({ "id": id, "name": name, "claim": Value::Null, "error": "没有可用凭证" });
     };
     match billing.claim_daily_checkin(Some(&entry.session)).await {
         Ok(claim) => {
             let success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
-            let display = name.as_str().unwrap_or(&id);
             if success {
                 logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
             } else {
@@ -166,14 +200,16 @@ pub async fn checkin_for(
 
 /// 执行一次签到并汇总（Node 版 `runCheckin(id)`）。
 ///
-/// `id` 为 None 时签全部符合条件的账号（定时签到走这条）。
+/// `id` 为 None 时签全部符合条件的账号（定时签到走这条），范围由 `providers`
+/// 决定（配置里勾选的提供商，缺省全选；**指定 id 单签时不受范围限制**）。
 /// **串行**：避免多账号同时打上游触发 11128 风控。
 pub async fn run_checkin(
     store: &AccountStore,
     billing: &BillingService,
+    providers: &[String],
     id: Option<&str>,
 ) -> Result<Value, CheckinError> {
-    let (targets, skipped) = resolve_checkin_targets(store, id)?;
+    let (targets, skipped) = resolve_checkin_targets(store, providers, id)?;
     let mut results = Vec::with_capacity(targets.len());
     for account in &targets {
         results.push(checkin_for(store, billing, account).await);

@@ -467,7 +467,7 @@ impl ServerState {
         // ── 为什么循环里不处理停机信号 ────────────────────────────
         // 服务器停机时进程会结束，任务随之消失。用 tauri 的 spawn
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
-        core::scheduled_tasks::spawn(state.store.clone());
+        core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
 
         Ok(state)
     }

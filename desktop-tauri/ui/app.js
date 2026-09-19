@@ -756,3 +756,19 @@ setInterval(() => {
   // 才会更新徽标 —— 而那个轮询恰恰只在日志页可见时才发请求（见 logs-panel.js）
   void syncLogsBadge();
 }, 20_000);
+
+// 定时「软件版本检查」的结果轮询（1 分钟）。
+//
+// 真正的检查在**后端定时任务**里跑（定时任务页的「软件版本检查」，默认 5 分钟
+// 一次，结果缓存于 UpdateManager）；这里只是低频读一次缓存来亮/灭侧栏徽标，
+// 不自己打 GitHub —— 匿名限额 60 次/小时，双端各查一遍就贴顶了。
+// hasUpdate 为 null（无法比较）或 false 时 syncUpdateBadge 自会不亮标；
+// 读到 checked:false（本进程还没查过）不覆盖 lastUpdateInfo ——
+// 启动那次壳命令检查的结果仍是最准的一份。
+setInterval(() => {
+  if (document.hidden) return;
+  void api.getUpdateStatus?.().then(info => {
+    if (!info || info.checked === false) return;
+    wbApp.updateUpdateBadge(info);
+  }).catch(() => { /* 静默：下一次轮询自然重试 */ });
+}, 60_000);

@@ -48,6 +48,11 @@ const REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// 请求 GitHub 的 UA（Node 版字面量）
 const USER_AGENT: &str = "workbuddy-local-proxy";
 
+/// 本应用的当前版本号（编译期取自 Cargo.toml，发布流程与 tauri.conf.json
+/// 同步更新）。壳的 `checkUpdate` 命令用的是运行时 package_info —— 两者常态
+/// 一致；后端定时检查（scheduled_tasks）拿不到 Tauri 句柄，用这一份自足。
+pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 // ─── 下载任务状态 ───────────────────────────────────────────
 
 /// 下载任务（对应 Node 版闭包里的 `task` 对象）。
@@ -101,6 +106,12 @@ struct Inner {
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// 最近一次拉到的 Release（内存缓存）
     latest: Option<Value>,
+    /// 最近一次「检查更新」的结果（内存缓存）。
+    ///
+    /// 只在 check 成功后写入：定时任务（scheduled_tasks 的「软件版本检查」）
+    /// 到点跑一次 check，前端轮询 `/api/update/status` 读这里来亮侧栏徽标，
+    /// 不必自己再打一遍 GitHub（匿名限额 60 次/小时，双端各查一遍就翻倍了）。
+    last_check: Option<Value>,
     repository: String,
     download_dir: PathBuf,
 }
@@ -127,6 +138,7 @@ impl UpdateManager {
                 task: None,
                 cancel_flag: None,
                 latest: None,
+                last_check: None,
                 repository,
                 download_dir: directory.join("updates"),
             })),
@@ -156,9 +168,22 @@ impl UpdateManager {
     ///
     /// `current_version` 由桌面端传入（后端不知道自己被哪个壳打包）；
     /// 缺省时只回报最新版本，不做「是否有更新」的判断。
+    /// 成功的结果缓存进 `last_check`（见 Inner 字段说明）。
     pub async fn check(&self, current_version: &str) -> Result<Value, UpdateError> {
         self.refresh_latest().await?;
-        Ok(self.build_check_result(current_version))
+        let result = self.build_check_result(current_version);
+        self.lock().last_check = Some(result.clone());
+        Ok(result)
+    }
+
+    /// 最近一次「检查更新」的结果；本进程还没检查过时返回 `checked:false`。
+    ///
+    /// 供 `/api/update/status`（前端 60 秒轮询）与定时任务共用同一份缓存。
+    pub fn last_check(&self) -> Value {
+        match self.lock().last_check.clone() {
+            Some(result) => result,
+            None => json!({ "checked": false }),
+        }
     }
 
     /// 拉取最新 Release（对应 refreshLatest）。

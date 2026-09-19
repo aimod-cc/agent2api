@@ -24,6 +24,10 @@ use crate::server::logs_store::{LogEntry, LogStore, NewEntry};
 
 /// 标签 → 日志分类，与桌面端筛选下拉一致（照抄 Node 版 TAG_CATEGORY）。
 /// 后续切片使用新标签时必须在这里登记，否则会落到默认分类 server。
+///
+/// 定时任务三分类（自动签到 / 凭证自动维护 / 软件版本检查）是**新增**的分类：
+/// 登记前 `[Checkin]` / `[Maintenance]` / `[Update]` 都落到 server —— 历史条目
+/// 保持原分类不动，分类筛选只对今后落库的条目生效。
 const TAG_CATEGORY: &[(&str, &str)] = &[
     ("[Server]", "server"),
     ("[Init]", "server"),
@@ -39,6 +43,9 @@ const TAG_CATEGORY: &[(&str, &str)] = &[
     ("[Logs]", "server"),
     ("[Billing]", "upstream"),
     ("[Activity]", "upstream"),
+    ("[Checkin]", "checkin"),
+    ("[Maintenance]", "maintenance"),
+    ("[Update]", "update"),
     // [HTTP] 为每个入站请求的 verbose 日志，类别与服务日志相同
     ("[HTTP]", "server"),
 ];

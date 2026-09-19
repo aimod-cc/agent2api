@@ -216,6 +216,8 @@ pub const BRIDGE_JS: &str = r#"
     // checkUpdate 走壳命令：当前版本号只有壳知道（后端是独立进程），
     // 由壳把版本带上去交给后端比较
     checkUpdate: () => invoke('check_update'),
+    // 最近一次「检查更新」的结果（定时任务写入；app.js 轮询它亮侧栏徽标）
+    getUpdateStatus: () => call('GET', '/api/update/status'),
     downloadUpdate: payload => invoke('download_update', {
       url: String((payload && payload.url) || ''),
       name: (payload && payload.name) ? String(payload.name) : null,

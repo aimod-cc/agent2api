@@ -41,8 +41,10 @@ pub const FILE_NAME: &str = "logs.jsonl";
 pub const MAX_ENTRIES: usize = 500;
 /// 日志级别，数值越大越严重（用于「该级别及以上」筛选）
 pub const LEVELS: [&str; 4] = ["debug", "info", "warn", "error"];
-/// 分类字典：与桌面端筛选下拉一致（key → 中文标签）
-pub const CATEGORIES: [(&str, &str); 7] = [
+/// 分类字典：与桌面端筛选下拉一致（key → 中文标签）。
+/// checkin / maintenance / update 是定时任务三分类（自动签到 / 凭证自动维护 /
+/// 软件版本检查），只对登记映射之后落库的条目生效 —— 历史条目不迁移。
+pub const CATEGORIES: [(&str, &str); 10] = [
     ("server", "服务"),
     ("auth", "登录"),
     ("account", "账号"),
@@ -50,6 +52,9 @@ pub const CATEGORIES: [(&str, &str); 7] = [
     ("upstream", "上游"),
     ("desensitize", "脱敏"),
     ("config", "配置"),
+    ("checkin", "自动签到"),
+    ("maintenance", "凭证自动维护"),
+    ("update", "软件版本检查"),
 ];
 
 const MAX_MESSAGE_LENGTH: usize = 1000;

@@ -74,6 +74,13 @@ async fn dispatch(
         };
     }
 
+    if method == Method::GET && full_path == "/api/update/status" {
+        // 最近一次「检查更新」的结果（定时任务与壳命令写入，前端 60 秒轮询
+        // 读这里亮侧栏徽标，自己不再打 GitHub —— 匿名限额 60 次/小时）。
+        // 本进程还没查过时是 {checked:false}，前端按「未知」处理，不亮标。
+        return ok_json(state.update().last_check());
+    }
+
     if method == Method::POST && full_path == "/api/update/download" {
         // 非法 JSON 在 Node 里是 JSON.parse 抛错 → errorPayload 500 proxy_error
         // （与 /api/auto-checkin 同一条路径），这里保持一致

@@ -164,6 +164,10 @@
         state.push(`${head}${extras.length ? `，${extras.join('、')}` : ''}${failed}`);
       }
     }
+    // 签到提供商复选框：选项与默认勾选都由后端下发（providerOptions / providers），
+    // 前端不抄一份清单 —— 以后加第三家时只改后端
+    const providers = Array.isArray(data?.providers) ? data.providers : [];
+    const options = Array.isArray(data?.providerOptions) ? data.providerOptions : [];
     return `
       <div class="task-item" data-task="${CHECKIN_ID}">
         <div class="task-main">
@@ -177,7 +181,16 @@
               !data ? '不可用' : enabled ? (data.lastFiredToday ? '今日已执行' : '已开启') : '已关闭'}</span>
             ${data?.running ? '<span class="badge warn task-badge">执行中…</span>' : ''}
           </div>
-          <p class="task-desc">到点后自动签到全部已启用的国内版账号（国际版没有签到活动，会被跳过）；多个账号串行执行，避免同时请求触发上游风控。若启动时当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。上游签到接口是幂等的，重复执行只会返回「已领取」。</p>
+          <p class="task-desc">到点后自动签到勾选提供商的已启用账号（WorkBuddy 走每日签到接口；小浣熊走桌面端每日积分链路；国际版账号没有签到活动，会被跳过）。多个账号串行执行，避免同时请求触发上游风控。若启动时当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。各家签到接口都是幂等的，重复执行不会重复领取。</p>
+          <div class="task-providers" id="task-checkin-providers">
+            <span class="lead">签到提供商：</span>
+            ${options.map(option => `
+            <label class="check">
+              <input type="checkbox" data-checkin-provider="${esc(option.id)}"
+                     ${providers.includes(option.id) ? 'checked' : ''} ${data ? '' : 'disabled'}>
+              <span>${esc(option.label)}</span>
+            </label>`).join('')}
+          </div>
           <div class="task-state" id="task-checkin-state">${state.join('　·　')}</div>
         </div>
         <div class="task-actions">
@@ -185,6 +198,7 @@
             <span class="task-interval-label">每天</span>
             <input type="time" id="task-checkin-time" value="${esc(data?.time || '00:01')}" ${data ? '' : 'disabled'}>
           </span>
+          <button class="sm" id="btn-task-checkin-logs">查看签到日志</button>
           <button class="sm" id="btn-task-checkin-run" ${data ? '' : 'disabled'}>立即签到</button>
         </div>
       </div>`;
@@ -291,6 +305,10 @@
     if (document.activeElement !== time && typeof checkin.time === 'string') time.value = checkin.time;
     badge.className = `badge ${enabled ? 'ok' : ''} task-badge`.trim();
     badge.textContent = enabled ? (checkin.lastFiredToday ? '今日已执行' : '已开启') : '已关闭';
+    // 提供商勾选：就地回填（勾选是瞬时动作，一般没有编辑中的焦点冲突）
+    const picked = Array.isArray(checkin.providers) ? checkin.providers : [];
+    document.querySelectorAll('#task-checkin-providers input[data-checkin-provider]')
+      .forEach(input => { input.checked = picked.includes(input.dataset.checkinProvider); });
 
     const lines = [];
     if (!enabled) {
@@ -492,6 +510,8 @@
     const time = $('task-checkin-time');
     if (toggle) toggle.disabled = true;
     if (time) time.disabled = true;
+    $('task-checkin-providers')?.querySelectorAll('input[data-checkin-provider]')
+      .forEach(input => { input.disabled = true; });
     try {
       checkin = await api.saveAutoCheckin(patch);
       updateCheckin();
@@ -505,7 +525,16 @@
       panelBusy = false;
       if (toggle) toggle.disabled = false;
       if (time) time.disabled = false;
+      $('task-checkin-providers')?.querySelectorAll('input[data-checkin-provider]')
+        .forEach(input => { input.disabled = false; });
     }
+  }
+
+  /** 收集签到提供商复选框的当前勾选（change 事件里拼 patch 用） */
+  function pickedProviders() {
+    return [...document.querySelectorAll('#task-checkin-providers input[data-checkin-provider]')]
+      .filter(input => input.checked)
+      .map(input => input.dataset.checkinProvider);
   }
 
   async function runCheckin(button) {
@@ -575,6 +604,11 @@
         );
         return;
       }
+      // 签到提供商勾选：按收集到的完整清单保存（后端校验至少一家）
+      if (target.matches('[data-checkin-provider]')) {
+        void saveCheckin({ providers: pickedProviders() }, '签到提供商');
+        return;
+      }
 
       const item = target.closest('.task-item');
       if (!item) return;
@@ -600,6 +634,11 @@
     list.addEventListener('click', event => {
       if (event.target.id === 'btn-task-checkin-run') {
         void runCheckin(event.target);
+        return;
+      }
+      // 「查看签到日志」：跳到日志页并把分类筛选预设成「自动签到」
+      if (event.target.id === 'btn-task-checkin-logs') {
+        void window.wbLogsPanel?.showCategory?.('checkin');
         return;
       }
       const run = event.target.closest('[data-task-run]');

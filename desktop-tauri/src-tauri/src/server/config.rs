@@ -116,6 +116,8 @@ pub const KEY_MODEL_REFRESH: &str = "modelRefresh";
 pub const KEY_LOGS_AUTO_REFRESH: &str = "logsAutoRefresh";
 /// 请求明细页自动刷新在 `scheduledTasks` 下的子键（同上）
 pub const KEY_REQUESTS_AUTO_REFRESH: &str = "requestsAutoRefresh";
+/// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向 GitHub 查最新发布版本）
+pub const KEY_UPDATE_CHECK: &str = "updateCheck";
 
 /// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
 pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
@@ -128,6 +130,11 @@ pub const DEFAULT_MODEL_REFRESH_MINUTES: i64 = 60;
 /// 两个前端自动刷新的默认间隔（秒）：与改造前页内硬编码的 10 秒一致
 pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 10;
 pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 10;
+/// 软件版本检查默认间隔（分钟）：每 5 分钟查一次 GitHub 最新发布。
+///
+/// GitHub 匿名限额是 60 次/小时/IP：5 分钟一次（12 次/小时）留足余量；
+/// 下限仍是全局的 INTERVAL_MIN_MINUTES，但设到 1 分钟贴着限额跑没有意义。
+pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 5;
 
 /// 间隔型任务的取值范围。上下限分两套（分钟 / 秒），因为两类任务的合理区间
 /// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（5 秒～10 分钟）。
@@ -157,6 +164,7 @@ pub struct ScheduledSettings {
     pub model_refresh: IntervalTask,
     pub logs_auto_refresh: IntervalTask,
     pub requests_auto_refresh: IntervalTask,
+    pub update_check: IntervalTask,
 }
 
 impl Default for ScheduledSettings {
@@ -177,6 +185,10 @@ impl Default for ScheduledSettings {
             requests_auto_refresh: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS,
+            },
+            update_check: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_UPDATE_CHECK_MINUTES,
             },
         }
     }
@@ -422,6 +434,12 @@ fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             defaults.requests_auto_refresh.interval,
             INTERVAL_MIN_SECONDS,
             INTERVAL_MAX_SECONDS,
+        ),
+        update_check: task(
+            KEY_UPDATE_CHECK,
+            defaults.update_check.interval,
+            INTERVAL_MIN_MINUTES,
+            INTERVAL_MAX_MINUTES,
         ),
     }
 }

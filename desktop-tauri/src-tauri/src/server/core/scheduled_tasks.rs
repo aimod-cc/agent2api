@@ -90,13 +90,15 @@ pub struct TaskDef {
 pub const TASK_CREDENTIAL_MAINTENANCE: &str = config::KEY_CREDENTIAL_MAINTENANCE;
 /// 模型目录定时刷新
 pub const TASK_MODEL_REFRESH: &str = config::KEY_MODEL_REFRESH;
+/// 软件版本定时检查
+pub const TASK_UPDATE_CHECK: &str = config::KEY_UPDATE_CHECK;
 /// 日志页自动刷新（前端定时器）
 pub const TASK_LOGS_AUTO_REFRESH: &str = config::KEY_LOGS_AUTO_REFRESH;
 /// 请求明细页自动刷新（前端定时器）
 pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 
 /// 任务清单（顺序 = 界面上的显示顺序：先后端、后前端，同类按重要性）
-pub const TASKS: [TaskDef; 4] = [
+pub const TASKS: [TaskDef; 5] = [
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
         label: "凭证自动维护",
@@ -118,6 +120,18 @@ pub const TASKS: [TaskDef; 4] = [
         min: config::INTERVAL_MIN_MINUTES,
         max: config::INTERVAL_MAX_MINUTES,
         default_interval: config::DEFAULT_MODEL_REFRESH_MINUTES,
+    },
+    TaskDef {
+        id: TASK_UPDATE_CHECK,
+        label: "软件版本检查",
+        description: "定期向 GitHub 查询最新发布版本，发现新版本时在侧栏「设置」上亮提示并记一条\
+                      「软件版本检查」日志（已是最新则不打扰）。间隔设得过密可能触发 GitHub 匿名限额\
+                      （60 次/小时），5 分钟一次是稳妥值。",
+        unit: "minutes",
+        runner: Runner::Backend,
+        min: config::INTERVAL_MIN_MINUTES,
+        max: config::INTERVAL_MAX_MINUTES,
+        default_interval: config::DEFAULT_UPDATE_CHECK_MINUTES,
     },
     TaskDef {
         id: TASK_LOGS_AUTO_REFRESH,
@@ -280,6 +294,8 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         settings.credential_maintenance
     } else if id == TASK_MODEL_REFRESH {
         settings.model_refresh
+    } else if id == TASK_UPDATE_CHECK {
+        settings.update_check
     } else if id == TASK_LOGS_AUTO_REFRESH {
         settings.logs_auto_refresh
     } else if id == TASK_REQUESTS_AUTO_REFRESH {
@@ -422,31 +438,40 @@ enum Trigger {
 ///
 /// `id` 必须是 `Runner::Backend` 的任务（前端任务由页面自己刷新，
 /// 后端跑不了它们）；认不出 / 类型不符都返回 `Err`，由路由层转 400。
-pub async fn run_now(store: &AccountStore, id: &str) -> Result<String, String> {
+pub async fn run_now(
+    store: &AccountStore,
+    update: &crate::server::core::update::UpdateManager,
+    id: &str,
+) -> Result<String, String> {
     let task = find(id).ok_or_else(|| format!("未知的定时任务: {id}"))?;
     if task.runner != Runner::Backend {
         return Err(format!("「{}」由界面自己刷新，无法在后端立即执行", task.label));
     }
     // 与调度循环共用同一条执行路径：手动跑与定时跑的行为必须完全一致
     //（否则「立即执行成功、定时那次却失败」这类分叉极难排查）
-    run_backend(store, task, Trigger::Manual)
+    run_backend(store, update, task, Trigger::Manual)
         .await
         .ok_or_else(|| format!("「{}」正在执行中，请稍候", task.label))
 }
 
 /// 跑一条后端任务（调度循环与「立即执行」的共同入口）。
 ///
-/// 调用方**必须**先确认 `task.runner == Runner::Backend`：本函数只认这两条
+/// 调用方**必须**先确认 `task.runner == Runner::Backend`：本函数只认这几条
 /// 分支的 id，认不出的会在置了「执行中」之后返回 None，把状态卡住。
 /// 两条调用点（`spawn` 的循环与 `run_now`）都已在上游筛过。
 ///
 /// 返回 `None` 表示这次被跳过（同一任务已在跑，或 id 不在后端任务之列）；
 /// `Some(摘要)` 是执行结果的一句话。
 ///
-/// **不返回错误**：两条后端任务自身的失败都已经收敛成摘要文案
-/// （凭证维护逐条状态、模型刷新逐家结果），这里再抛一次只会让「部分失败」
-/// 变成整条 HTTP 非 2xx，反而丢掉其余成功的信息。
-async fn run_backend(store: &AccountStore, task: &TaskDef, trigger: Trigger) -> Option<String> {
+/// **不返回错误**：后端任务自身的失败都已经收敛成摘要文案
+/// （凭证维护逐条状态、模型刷新逐家结果、版本检查的 GitHub 侧错误），
+/// 这里再抛一次只会让「部分失败」变成整条 HTTP 非 2xx，反而丢掉其余成功的信息。
+async fn run_backend(
+    store: &AccountStore,
+    update: &crate::server::core::update::UpdateManager,
+    task: &TaskDef,
+    trigger: Trigger,
+) -> Option<String> {
     if task.runner != Runner::Backend {
         return None;
     }
@@ -496,6 +521,32 @@ async fn run_backend(store: &AccountStore, task: &TaskDef, trigger: Trigger) -> 
                 "已刷新（各家按自身缓存策略决定是否真拉取）".to_string()
             }
         }
+        TASK_UPDATE_CHECK => {
+            // 定时检查更新。结果缓存进 UpdateManager（前端轮询 /api/update/status
+            // 亮侧栏徽标），「发现新版本」才写一条日志 —— 已是最新的轮次若也落库，
+            // 日志页会被每 5 分钟一条的「无事发生」淹掉（与凭证维护的空轮次同一取舍）。
+            // 失败收敛成摘要（GitHub 限额 / 网络），不打断调度。
+            let current = crate::server::core::update::CURRENT_VERSION;
+            match update.check(current).await {
+                Ok(info) => {
+                    let latest = info
+                        .get("latestVersion")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let has_update = info.get("hasUpdate").and_then(Value::as_bool);
+                    if has_update == Some(true) && !latest.is_empty() {
+                        logging::log(
+                            "[Update]",
+                            &format!("发现新版本 {latest}（当前 {current}）"),
+                        );
+                        format!("发现新版本 {latest}（当前 {current}）")
+                    } else {
+                        "已是最新".to_string()
+                    }
+                }
+                Err(error) => format!("检查失败：{}", error.message),
+            }
+        }
         _ => {
             with_run(task.id, |entry| entry.running = false);
             return None;
@@ -514,7 +565,7 @@ async fn run_backend(store: &AccountStore, task: &TaskDef, trigger: Trigger) -> 
 /// **首轮就绪即跑**：spawn 出来的第一次循环不等间隔，直接跑一次两条任务 ——
 /// 这替代了改造前 bootstrap 里那两处「启动时刷新一次」（凭证维护与模型目录），
 /// 于是「关掉任务 = 启动也不刷」这条一致性成立；开启时行为与改造前相同。
-pub fn spawn(store: AccountStore) {
+pub fn spawn(store: AccountStore, update: crate::server::core::update::UpdateManager) {
     tauri::async_runtime::spawn(async move {
         // 首轮：给两条后端任务排上「现在就执行」的期，于是紧接着的第一次循环
         // 立刻就跑一次。这替代了改造前 bootstrap 里那两处「启动时刷新一次」
@@ -549,7 +600,7 @@ pub fn spawn(store: AccountStore) {
                 // 到点：跑一次（`run_backend` 内部按当前间隔重新排期）。
                 // 模型刷新的自动路径尊重各家 TTL，与「立即执行」的强制刷新分开，
                 // 差异收在 `run_backend` 的 `Trigger` 分支里 —— 这里不重复一遍。
-                run_backend(&store, task, Trigger::Scheduled).await;
+                run_backend(&store, &update, task, Trigger::Scheduled).await;
             }
             tokio::time::sleep(Duration::from_millis(TICK_MS)).await;
         }
