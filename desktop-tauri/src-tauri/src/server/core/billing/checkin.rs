@@ -51,6 +51,19 @@ pub fn supports_checkin(account: &Value) -> bool {
     account.get("edition").and_then(Value::as_str) != Some("intl")
 }
 
+/// 该账号是否属于**有签到活动的那一家**（Agent2API W3-T4）。
+///
+/// 签到（与积分一样）是 WorkBuddy 的概念：小浣熊侧没有这个接口，
+/// 拿它的 token 去打腾讯的签到接口只会稳定报错。公开形态里 `provider` 缺失时
+/// 按默认 provider（workbuddy）处理 —— 与账号存储 `provider()` 的兜底口径一致。
+fn belongs_to_default_provider(account: &Value) -> bool {
+    account
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(|provider| provider == crate::server::core::providers::DEFAULT_PROVIDER_ID)
+        .unwrap_or(true)
+}
+
 /// 账号快照里的「可用」判定（Node: `account.available !== false`）
 fn is_available(account: &Value) -> bool {
     account
@@ -79,8 +92,12 @@ fn accounts_of(store: &AccountStore) -> Vec<Value> {
 
 /// 签到目标集合。
 ///
-/// 批量（`id` 为空）：可用账号 ∩ 已启用 ∩ 非国际版，`skipped` = 可用总数 − 可签到数。
-/// 指定 id：命中即用（**不过滤 available**），国际版直接报 400。
+/// 批量（`id` 为空）：可用账号 ∩ 已启用 ∩ **属于默认 provider** ∩ 非国际版，
+/// `skipped` = 可用总数 − 可签到数。
+/// 指定 id：命中即用（**不过滤 available，也不过滤 provider**），
+/// 国际版直接报 400 —— 用户点的是谁就签谁，小浣熊账号交给上游去拒绝
+/// （与「显式指定就执行」的既有语义一致；批量路径必须过滤，否则点一次
+/// 「签到」会连小浣熊账号一起打）。
 pub fn resolve_checkin_targets(
     store: &AccountStore,
     id: Option<&str>,
@@ -105,6 +122,7 @@ pub fn resolve_checkin_targets(
         .into_iter()
         .filter(is_enabled)
         .filter(supports_checkin)
+        .filter(belongs_to_default_provider)
         .collect();
     let skipped = total - eligible.len();
     Ok((eligible, skipped))

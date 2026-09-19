@@ -1,0 +1,126 @@
+/* ─────────────────────────────────────────────
+   定时任务页：任务卡片列表（开关 / 间隔 / 立即执行）
+
+   一张卡片 = 一行任务：左侧是名称、说明与运行状态，右侧是间隔输入与动作按钮。
+   卡片用 flex 两端对齐而不是 grid 定列宽：说明文字的长度差别很大
+   （「请求明细自动刷新」一行就说完，凭证维护要两句），定列宽会让长的那条
+   把短的挤成一条窄柱；两端对齐则自然按内容分配。
+
+   颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
+   ───────────────────────────────────────────── */
+
+.task-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.task-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+/* 说明区吃掉剩余宽度（动作区定宽，见下） */
+.task-main {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;   /* 允许收缩：否则长说明会把动作区顶出卡片 */
+  flex: 1 1 auto;
+}
+
+.task-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+/* 标题里的开关：名字跟在 track 后面，与设置页的开关行列一致 */
+.task-title .switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.task-name { color: var(--text); }
+
+/* 状态徽标（已开启 / 已关闭 / 执行中…）不参与伸缩，紧跟标题右侧 */
+.task-badge { flex: 0 0 auto; }
+
+.task-desc {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+/* 运行状态一行（上次 / 下次执行）：等宽数字，扫一眼就能对齐比较 */
+.task-state {
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 右侧动作区：间隔输入 + 立即执行，纵向居中于卡片
+   （align-items 用 center 而不是 flex-start：卡片高时按钮贴着顶端会显得散） */
+.task-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.task-interval {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-3);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+/* 间隔输入框与设置页保留天数的数字框同一套处理：
+   收窄到 74px（间隔最多四位数）、等宽字形、左对齐（右对齐会让步进箭头
+   在 hover 时推着数字走）。max-width 必须显式写：components.css 给
+   input[type=number] 设了 130px，这里要覆盖它 */
+.task-interval input[type="number"] {
+  flex: 0 0 auto;
+  width: 74px;
+  max-width: 74px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 时刻输入（自动签到那条）：time 控件窄一点更好看，与数字框同宽 */
+.task-interval input[type="time"] {
+  flex: 0 0 auto;
+  width: 96px;
+  max-width: 96px;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-interval-unit { color: var(--text-3); }
+
+/* 窄窗口：动作区折到说明下方整行铺开。
+   不折的话「每天 00:01 + 立即签到」这一组会把说明压成一条窄柱，
+   中文在窄柱里换行几乎无法阅读（与日志页筛选行同一处理思路）。 */
+@media (max-width: 900px) {
+  .task-item {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .task-actions {
+    justify-content: flex-start;
+  }
+}

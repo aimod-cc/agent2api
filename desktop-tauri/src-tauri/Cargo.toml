@@ -1,7 +1,7 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "1.2.0"
-description = "WorkBuddy 本地代理桌面端 — 会话与多账号管理"
+version = "2.0.0"
+description = "Agent2API 桌面端 — 多提供商本地网关与会话管理"
 authors = ["aimod-cc"]
 edition = "2021"
 rust-version = "1.77"
@@ -10,8 +10,8 @@ rust-version = "1.77"
 # 根 README「许可」一节也写明两者共同构成完整的授权与使用约定。
 # 因此不单独声明 SPDX 的 "MIT"（会漏掉附加限制），改为指向实际的 LICENSE 文件。
 license-file = "../../LICENSE"
-repository = "https://github.com/aimod-cc/workbuddy-proxy"
-homepage = "https://github.com/aimod-cc/workbuddy-proxy"
+repository = "https://github.com/aimod-cc/agent2api"
+homepage = "https://github.com/aimod-cc/agent2api"
 
 [lib]
 name = "workbuddy_proxy_desktop_lib"
@@ -55,6 +55,30 @@ tokio-stream = "0.1"
 # 都要用 bytes::Bytes（reqwest 只再导出 Response，不导出 Bytes 本身），
 # 转发链路要自己拼 SSE 帧，所以显式依赖（版本与 axum/reqwest 内部一致）
 bytes = "1"
+# CatPaw 适配器的内联图片压缩（providers/catpaw/image_compress.rs）。上游不拉
+# http 图片、图片只能 base64 内联，>60KB 的图必须缩（最长边 1568 + JPEG 降质）。
+# image 本来就在依赖树里：tauri 的 image-png 特性只开了 png 解码，这里追加
+# jpeg（编码 + 解码）与 webp（解码）—— 同版本同 target 的特性会合并，所以不是
+# 引进第二个 image，只是让已编译的它多带两个编解码器（纯 Rust：zune-jpeg /
+# image-webp，没有 C 编译依赖，也无 nasm 之类的外部工具要求）。
+# 刻意不开 default：rayon（多线程）与 avif/tiff/gif 等其余格式都与本模块无关，
+# 开了只会白涨体积。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# data URL 的 base64 解/编码。base64 0.22.1 已经是 reqwest 的非可选依赖
+# （同样走特性合并，不新增 crate、不新增编译产物）。
+base64 = "0.22"
+# AutoClaw 适配器的 encryption 侧（providers/autoclaw/crypto.rs）：Electron
+# safeStorage 的 os_crypt 密文是 AES-256-GCM，密钥由 DPAPI 解出。
+# 刻意 **关掉 default**：默认特性里的 getrandom/rand_core 是给「生成密钥」用的，
+# 我们只做「用已知 key + nonce 解密」，一个随机源都不需要，开了只会白涨依赖。
+# 留下 aes（AES-256 分组密码本体）与 alloc（Aead::decrypt 返回 Vec 必需）——
+# 两者都是纯 Rust（aes / ghash / polyval），无 C 编译依赖、也不要求 nasm。
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+# AutoClaw 鉴权接口的请求签名：X-Auth-Sign = MD5(appId&timestamp&appKey)
+# （providers/autoclaw/credentials.rs 的刷新调用，见 autoclaw-upstream-client.mjs）。
+# 只加它自己：digest 0.10.7 与 cfg-if 都已被 sha2 拉进依赖树（特性合并，不新增）。
+# MD5 在这里**不是**安全边界，只是复刻桌面端客户端的固定指纹，不要换成别的摘要。
+md-5 = "0.10"
 
 # 查端口监听者与结束进程树改用纯 Win32 API（iphlpapi 的 GetExtendedTcpTable、
 # Toolhelp 进程快照 + OpenProcess/TerminateProcess）。原先靠 spawn taskkill /
@@ -71,6 +95,21 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Threading",
 ] }
+# AutoClaw 适配器要解 Electron safeStorage 的 os_crypt 密钥：DPAPI 的
+# CryptUnprotectData（providers/autoclaw/crypto.rs，架构文档 §10.1 指定的依赖）。
+# ── 为什么是 windows 而不是上面那个 windows-sys ──────────────
+# windows-sys 是**扁平句柄 + 手写 GetLastError**（本文件上方「查端口监听者」
+# 那几项就是这种用法：状态码自己判、错误码自己取）。DPAPI 这里要的是
+# 「一次调用 + 结构化错误 + 释放 DPAPI 分配的内存」，windows crate 正好提供
+# `Result<()>` 错误传播与 `HLOCAL`（带 Drop 语义的 LocalAlloc 句柄），
+# 少一层手写的错误码处理。
+# ── 体积控制 ────────────────────────────────────────────────
+# 只开 Win32_Security_Cryptography 这一个叶子 feature（它自动带上父级
+# Win32_Security → Win32 → Win32_Foundation，所以 LocalFree/HLOCAL 都能用）。
+# Catalog / Certificates / Sip / UI 四个子模块没开，它们的绑定不进编译。
+# 版本锁 0.61：tauri 2.11 已经在用 windows 0.61.3（见 Cargo.lock），
+# 这里只是**给同一个 crate 追加特性**（特性合并），不再引入第二个 windows。
+windows = { version = "0.61", features = ["Win32_Security_Cryptography"] }
 
 [features]
 default = ["custom-protocol"]

@@ -20,7 +20,7 @@ const MENU_SHOW: &str = "tray-show";
 const MENU_QUIT: &str = "tray-quit";
 
 /// 托盘提示文字
-const TOOLTIP: &str = "WorkBuddy 本地代理";
+const TOOLTIP: &str = "Agent2API · 多提供商本地网关";
 
 /// 创建托盘图标。应用启动时调用一次即可。
 pub fn create(app: &AppHandle) -> tauri::Result<()> {

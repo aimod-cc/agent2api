@@ -4,6 +4,23 @@
    热力图五档用 --hm-* 变量集中定义，格子与图例共用，色值只有一处。
    ───────────────────────────────────────────── */
 
+/* ─── 图表配色 ───
+   折线图有两条线（命中率 + 总 Token），各配一条纵轴，所以颜色是「哪个读数
+   属于哪根轴」的唯一线索：读数字、读标注、读刻度都靠它把三处串起来。
+   两条线的颜色在这里各定义一次，浅色 / 深色 / 跟随系统三处主题共用同一组
+   令牌名，深色下换成在深底上够亮的取值（与 --ok / --warn 那批语义色同一手法）。
+   用量线取琥珀而不是再借一个语义色：warn 在别处表示「需要注意」，
+   而 Token 用量本身没有好坏之分，借它会让这条线的颜色带上原本没有的暗示。 */
+:root {
+  --chart-tokens: oklch(0.72 0.16 65);
+
+  --hm-0: var(--surface-3);
+  --hm-1: color-mix(in srgb, var(--primary) 22%, var(--surface-3));
+  --hm-2: color-mix(in srgb, var(--primary) 45%, var(--surface-3));
+  --hm-3: color-mix(in srgb, var(--primary) 70%, var(--surface-3));
+  --hm-4: var(--primary);
+}
+
 /* ─── 热力图色阶 ───
    品牌色按透明度分档，而不是写五个色值：
    浅色主题下品牌蓝叠在近白底上、深色下叠在深灰底上，
@@ -12,13 +29,6 @@
    两个基色都取令牌：浅色叠 --surface-3（比画布深一档的槽色）、
    深色叠 --surface-inset（深色下唯一比画布更深的凹槽色），
    这样「最浅一档」在两套主题里都稳稳低于任何一档着色格。 */
-:root {
-  --hm-0: var(--surface-3);
-  --hm-1: color-mix(in srgb, var(--primary) 22%, var(--surface-3));
-  --hm-2: color-mix(in srgb, var(--primary) 45%, var(--surface-3));
-  --hm-3: color-mix(in srgb, var(--primary) 70%, var(--surface-3));
-  --hm-4: var(--primary);
-}
 
 :root[data-theme="dark"] {
   --hm-1: color-mix(in srgb, var(--primary) 34%, var(--surface-inset));
@@ -27,12 +37,24 @@
   --hm-4: var(--primary);
 }
 
+/* 深色下的用量线：上面那个琥珀色（0.72 亮度）在深底上够亮，但与深色主题的
+   --warn 几乎同色，两条线并排时容易把用量线误读成告警色。这里换成更浅、
+   更偏橙的一档，与同屏的 --warn 拉开距离。 */
+:root[data-theme="dark"] {
+  --hm-1: color-mix(in srgb, var(--primary) 34%, var(--surface-inset));
+  --hm-2: color-mix(in srgb, var(--primary) 56%, var(--surface-inset));
+  --hm-3: color-mix(in srgb, var(--primary) 78%, var(--surface-inset));
+  --hm-4: var(--primary);
+  --chart-tokens: oklch(0.8 0.15 75);
+}
+
 @media (prefers-color-scheme: dark) {
   :root[data-theme="system"] {
     --hm-1: color-mix(in srgb, var(--primary) 34%, var(--surface-inset));
     --hm-2: color-mix(in srgb, var(--primary) 56%, var(--surface-inset));
     --hm-3: color-mix(in srgb, var(--primary) 78%, var(--surface-inset));
     --hm-4: var(--primary);
+    --chart-tokens: oklch(0.8 0.15 75);
   }
 }
 
@@ -62,6 +84,76 @@
   font-size: 11.5px;
   font-weight: 400;
   font-variant-numeric: tabular-nums;
+}
+
+/* ─── Top 提供商占比 ───
+   每行「名字 + 条 + 请求数 + 百分比」四列。用 HTML + 百分比宽度而不是 SVG：
+   这一块没有坐标轴与刻度，条宽只要跟着容器伸缩即可，SVG 反而要多挂一个
+   ResizeObserver 去量宽度重绘（三张图的观察器是给坐标轴用的，这里用不上）。
+
+   列宽：名字与百分比定宽（名字给 96px，中文名最长到「AutoClaw」这一档放得下，
+   放不下由省略号收住；百分比 48px 容得下 100.0%），中间的条吃掉剩余宽度。
+   百分比用等宽数字，纵着扫下来小数点对齐才好比。 */
+.provider-shares {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.provider-share {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) 56px 48px;
+  align-items: center;
+  gap: 10px;
+  cursor: default;
+}
+
+.provider-share .name {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 轨道：定高 + 圆角，与热力图格子同一档观感（都是「一格量化数据」） */
+.provider-share .track {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-3);
+}
+
+.provider-share .bar {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: 999px;
+  background: var(--primary);
+  transition: width .18s ease;
+}
+
+/* 请求数与百分比：都走等宽 + 右对齐，各行竖着比对才齐 */
+.provider-share .num,
+.provider-share .pct {
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.provider-share .pct { color: var(--text); font-weight: 600; }
+
+/* 窄窗口：名字列收窄（中文名短，96px 在那个宽度下太占），条仍吃掉剩余部分 */
+@media (max-width: 900px) {
+  .provider-share { grid-template-columns: 80px minmax(0, 1fr) 52px 46px; gap: 8px; }
 }
 
 /* ─── 热力图 ───
@@ -103,15 +195,33 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* 图例：五档色块横排，与格子共用同一组变量 */
-.heat-legend { display: inline-flex; align-items: center; gap: 3px; }
-.heat-legend span {
+/* 图例：五档色块 + 每档的请求数范围，与格子共用同一组变量。
+   每项是「色块 + 说明」的一小格，整体是一条会自动换行的横排 ——
+   窄窗口下挤不开就换到下一行，不会把说明文字压成省略号。 */
+.heat-legend {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+
+.heat-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.heat-legend span[class^="l"] {
   width: 11px;
   height: 11px;
   border-radius: 2px;
   border: 1px solid var(--border);
   background: var(--hm-0);
 }
+
 .heat-legend span.l1 { background: var(--hm-1); border-color: transparent; }
 .heat-legend span.l2 { background: var(--hm-2); border-color: transparent; }
 .heat-legend span.l3 { background: var(--hm-3); border-color: transparent; }
@@ -121,9 +231,11 @@
 
 /* ─── 图表容器 ───
    宽度由面板决定，SVG 按量到的像素宽度绘制；容器本身不设最小宽度，
-   免得 ResizeObserver 把「被压缩的宽度」当成真实宽度反复重算。 */
-.chart-wrap { position: relative; width: 100%; overflow: hidden; }
-.chart-wrap.tall { min-height: 210px; }
+   免得 ResizeObserver 把「被压缩的宽度」当成真实宽度反复重算。
+   高度下限与两张图各自的 SVG 高度对齐（折线 230 / 柱状 240）：
+   否则数据没回来时容器只有一行「正在加载…」那么高，数据到了整页会往下跳一截。 */
+.chart-wrap { position: relative; width: 100%; min-height: 230px; overflow: hidden; }
+.chart-wrap.tall { min-height: 240px; }
 
 /* 网格线：比边框更淡，只做读数辅助，不与柱子抢视觉 */
 .chart-grid {
@@ -132,6 +244,9 @@
   shape-rendering: crispEdges;
 }
 
+/* ─── 命中率折线（左轴）───
+   主色画命中率、琥珀色画用量：两条线在同一张图里，颜色是唯一能把它们与
+   各自那侧刻度连起来的线索（左轴=蓝、右轴=琥珀），所以两处的色值必须同源。 */
 .chart-line {
   fill: none;
   stroke: var(--primary);
@@ -140,8 +255,55 @@
   stroke-linecap: round;
 }
 
-/* 折线上的点：填充取表面色 + 主色描边，悬停那一带不被线吃掉 */
+.chart-line.tokens { stroke: var(--chart-tokens); }
+
+/* 折线上的点：填充取表面色 + 与所属线同色的描边，悬停那一带不被线吃掉。
+   两条线的点各写一条规则（而不是行内 style）：颜色只在 CSS 里定义一次。 */
 .chart-dot { fill: var(--surface); stroke: var(--primary); stroke-width: 2; }
+.chart-dot.tokens { stroke: var(--chart-tokens); }
+
+/* 点上的读数标注：与所属那条线同色，读数字时不必回忆「哪个颜色是哪条线」。
+   字号比坐标轴文字大一档（11 vs 10）—— 它是这张图的主要读数，不是辅助刻度。 */
+.chart-label {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  /* 描边取承载面颜色：标注落在网格线或折线上时，仍能看清字 */
+  stroke: var(--surface);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.chart-label.rate { fill: var(--primary); }
+.chart-label.tokens { fill: var(--chart-tokens); }
+
+/* ─── 折线图图例 ───
+   两条线 + 两条轴，图例回答「哪根线是哪根轴」。色块与线、标注共用
+   --primary / --chart-tokens，色值只有那一处定义。 */
+.chart-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 16px;
+  font-size: 11.5px;
+}
+
+.chart-legend .swatch {
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--primary);
+}
+
+.chart-legend .swatch.tokens { background: var(--chart-tokens); }
+
+/* 「左轴 / 右轴」是补充说明，比线名轻一档，不与线名抢注意力 */
+.chart-legend .axis-hint {
+  color: var(--text-3);
+  font-size: 10.5px;
+}
 
 .bar { fill: var(--primary); }
 

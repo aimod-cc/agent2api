@@ -5,6 +5,8 @@
  * 界面代码只依赖 window.workbuddyDesktop 这个接口，不感知具体壳，
  * 因此从 Electron 迁到 Tauri 时前端一行未改。职责拆成几块：
  *   server/      进程内 HTTP 服务器（网关本体；原为外部 node 后端进程）
+ *                `server/config_migration.rs` 是 1.x 配置目录迁移的唯一实现，
+ *                由本文件 setup 第一步调用（必须早于任何配置目录写盘）
  *   backend.rs   服务生命周期（启动/健康检查/退出停机信号）
  *   gateway.rs   管理 API 的 HTTP 客户端（含 API Key 读取与统一解包）
  *   login.rs     登录窗口与轮询
@@ -23,6 +25,7 @@ mod backend;
 mod bridge;
 mod commands;
 mod gateway;
+mod legacy_install;
 mod login;
 mod server;
 mod settings;
@@ -32,7 +35,10 @@ mod update;
 
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_autostart::ManagerExt as AutostartExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
+use server::config_migration::MigrationOutcome;
 use state::AppState;
 
 /** 主窗口默认尺寸与最小尺寸（与原 Electron 端保持一致） */
@@ -51,6 +57,58 @@ const AUTOSTART_FLAG: &str = "--autostart";
 /// 本次启动是否由开机自启触发
 fn launched_by_autostart() -> bool {
     std::env::args().any(|arg| arg == AUTOSTART_FLAG)
+}
+
+/// 启动期致命错误的用户提示与收尾：显示可读原因 → 结束进程。
+///
+/// ── 为什么不是 `return Err(...)` ─────────────────────────────
+/// 当前 Tauri（2.11）在 `setup` 返回 `Err` 时是 `panic!("Failed to setup app")`，
+/// 而本项目 release 是 `panic = "abort"` —— 用户只会看到一个闪退，拿不到
+/// 「旧数据在哪、为什么失败、怎么恢复」这些关键信息。这里改为显式路径：
+/// 错误原样（含路径与系统错误，不含文件内容）走控制台 + 原生错误对话框，
+/// 用户确认后以非零码结束进程，全程不写任何配置文件。
+///
+/// ── 对话框为什么用非阻塞 `show` ─────────────────────────────
+/// setup 钩子跑在主线程上，`blocking_show` 的文档明确要求不能在主线程调用
+/// （会冻住事件循环）；插件文档给的 setup 用法就是 `show(callback)`。
+/// 回调在用户点掉对话框后触发，那里再请求退出 —— 期间事件循环照常运行，
+/// 但 setup 已提前返回、窗口与托盘都没建，不会有任何初始化或写盘动作。
+///
+/// ── 看门狗 ─────────────────────────────────────────────────
+/// 对话框万一没能显示（例如主线程任务投递失败），进程会变成「没有窗口、
+/// 没有托盘、却仍占着单实例锁」的僵尸：用户再点图标只会把消息发给这个
+/// 隐形进程，永远启动不起来。看门狗保证失败路径一定有终点；超时足够长
+/// （5 分钟），正常用户读提示的时间远小于它。
+///
+/// ── 退出路径不会写盘 ────────────────────────────────────────
+/// 迁移失败时 `settings::load()` 从未执行，`close_to_tray` 保持默认 false，
+/// 因此 `ExitRequested` 分支不会拦截退出，只会调 `backend::shutdown` ——
+/// 那里只做停机信号与日志，不发网络请求、不写配置文件（后端从未启动，
+/// 定时签到全局句柄也未初始化）。`app.exit` 只触发 ExitRequested/Exit，
+/// 不会再走一遍 setup 之后的初始化；看门狗走 `process::exit` 更直接：
+/// 此时没有窗口、托盘、后台任务或文件句柄需要收尾。
+fn report_startup_failure(app: &tauri::AppHandle, error: &str) {
+    /// 用户长时间不确认时强制结束的上限
+    const FORCE_EXIT_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+
+    let message = format!(
+        "Agent2API 启动已中止：{error}\n\n\
+         本次未改动、未删除任何旧数据，也未创建新配置目录。\
+         排除原因（磁盘空间、文件占用、权限）后重新打开本程序即可自动重试迁移。"
+    );
+    eprintln!("[Startup] ❌ {message}");
+    let handle = app.clone();
+    app.dialog()
+        .message(message)
+        .title("Agent2API 无法启动")
+        .kind(MessageDialogKind::Error)
+        .show(move |_| handle.exit(1));
+
+    std::thread::spawn(|| {
+        std::thread::sleep(FORCE_EXIT_AFTER);
+        eprintln!("[Startup] ⚠️  错误提示长时间未确认，强制结束本次启动");
+        std::process::exit(1);
+    });
 }
 
 pub fn run() {
@@ -97,6 +155,34 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
+            // ── 第一步：一次性配置目录迁移（`~/.workbuddy-proxy` → `~/.agent2api`）──
+            // 必须是**全进程最早**的一处配置目录访问：晚于任何写盘（桌面设置、
+            // config.json、日志库、账号库）时，一旦迁移失败，后续写盘就会把新目录
+            // 建出来，`target.exists()` 从此为真，迁移再也无法重试，用户看到的是
+            // 「账号/配置全没了」。放在这里，失败时下面所有会写盘的初始化都不执行。
+            //
+            // 这时日志库还没装，所以迁移日志只能走控制台（`eprintln!`，见 logging）。
+            match server::config_migration::migrate_config_dir() {
+                Ok(MigrationOutcome::Migrated { from, to }) => {
+                    eprintln!(
+                        "[Config] 📦 配置目录已迁移: {} → {}（旧目录保留，可回退）",
+                        from.display(),
+                        to.display()
+                    );
+                }
+                Ok(MigrationOutcome::NothingToDo) => {}
+                // 用户用环境变量显式指定了配置目录：迁移不适用，也不该提示打扰
+                Ok(MigrationOutcome::SkippedEnvOverride) => {}
+                Err(error) => {
+                    // 迁移失败不能继续：以空配置启动会让新目录被后续写盘建出来，
+                    // 迁移从此不会重试，且用户看到的是「数据消失」。
+                    // 这里显示可读错误（原生对话框）后结束本次启动 ——
+                    // 旧目录原样保留，新目录未被创建，下次启动自动重试。
+                    report_startup_failure(&handle, &error);
+                    return Ok(());
+                }
+            }
+
             // 设置先读一次并缓存：窗口事件回调是同步的，需要立即拿到
             // close_to_tray 才能决定关窗是隐藏还是退出
             let app_settings = settings::load();
@@ -104,6 +190,57 @@ pub fn run() {
                 let state = app.state::<AppState>();
                 state.window.set_close_to_tray(app_settings.close_to_tray);
             }
+
+            // ── 旧「当前用户」级安装的清理 + 自启登记刷新（1.x → perMachine 迁移）──
+            // 安装器改成 perMachine 后以管理员身份运行，此时 `%LOCALAPPDATA%` 与
+            // HKCU 指向管理员账户，读不到也删不掉发起安装的用户的旧安装 ——
+            // 只有这里（普通用户上下文的启动期）能覆盖到它。
+            //
+            // 旧版还把自启登记写成 `%LOCALAPPDATA%\<旧产品名>`、值名用旧产品名；
+            // 新版装在 Program Files、值名换成 productName，两条互不覆盖，旧的那条
+            // 指向已被删除的路径，用户不开设置页就永远不会被修正，自启静默失效。
+            //
+            // ── 为什么两件事放在同一个后台任务里顺序执行 ──────────────
+            // 两件事都要读/写 HKCU 的 Run 键（清理判「旧登记是否已失效」、刷新写
+            // 新登记），顺序执行让刷新看到的是清理之后的状态，也避免两个线程交错
+            // 操作同一处注册表。
+            //
+            // 放后台：旧目录可能含 88MB 的 node.exe，`remove_dir_all` 叠加杀软扫描
+            // 会明显拖慢启动，而这两件事与后续初始化没有任何依赖关系。
+            // 失败只记日志、下次启动重试，绝不阻断启动（见 legacy_install 模块头）。
+            let autostart_wanted = app_settings.autostart;
+            let cleanup_handle = handle.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                // ── 开发态（debug 构建）不做安装迁移 ────────────────────────
+                // 这两个动作都会改真实系统状态：清理会删掉本机已安装的正式版
+                // （安装目录 + 快捷方式 + 卸载项），自启刷新会把开机自启登记指向
+                // `target\debug` 下的调试副本。而 `tauri dev` 是日常动作 ——
+                // 跑一次就把用户装的正式版删了，代价远大于收益（实际发生过：
+                // 开发态启动后，开始菜单/桌面快捷方式全部失效）。
+                // release 打包（唯一的发布形态）行为完全不变；要验证清理逻辑
+                // 本身，用 `tauri build` 出的安装包跑。
+                if cfg!(debug_assertions) {
+                    return;
+                }
+                legacy_install::cleanup_legacy_user_install();
+                if !autostart_wanted {
+                    return;
+                }
+                let name = cleanup_handle.package_info().name.clone();
+                // 幂等：登记已指向当前 exe 时不做任何写入；用户在任务管理器
+                // 「启动」页里停用过的也不重建（判定见 legacy_install）
+                if !legacy_install::autostart_needs_refresh(&name) {
+                    return;
+                }
+                match cleanup_handle.autolaunch().enable() {
+                    Ok(()) => {
+                        eprintln!("[Cleanup] 已按当前安装路径重新登记开机自启（升级迁移）: {name}")
+                    }
+                    Err(error) => {
+                        eprintln!("[Cleanup] 重新登记开机自启失败（下次启动再试）: {error}")
+                    }
+                }
+            });
 
             // 托盘先建好再建窗口：开机自启不显示窗口，托盘是唯一入口
             if let Err(error) = tray::create(&handle) {
@@ -115,7 +252,7 @@ pub fn run() {
             // 开机自启时不显示窗口（visible(false) 比先显示再隐藏更干净，
             // 不会在任务栏闪一下）。
             WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-                .title("WorkBuddy 本地代理 · 会话与账号管理")
+                .title("Agent2API · 多提供商本地网关")
                 .inner_size(WIN_WIDTH, WIN_HEIGHT)
                 .min_inner_size(WIN_MIN_WIDTH, WIN_MIN_HEIGHT)
                 .center()

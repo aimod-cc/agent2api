@@ -31,7 +31,7 @@ use axum::extract::Request;
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -71,7 +71,12 @@ pub fn router(state: ServerState) -> Router {
     let protected = Router::new()
         .route(
             "/api/config",
-            get(api::config_api::get_config).post(api::config_api::post_config),
+            get(api::config_api::get_config)
+                .post(api::config_api::post_config)
+                // PUT 是 Agent2API 改造新增的**别名**（架构文档 §5 的接口表写作
+                // GET/PUT）：走同一个处理函数，行为逐字一致。既有前端只发 POST，
+                // 多注册一个方法不影响它；新前端按 §5 发 PUT 也能用。
+                .put(api::config_api::post_config),
         )
         .route(
             "/api/logs",
@@ -144,6 +149,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/session/login/start", post(api::session::login_start))
         .route("/api/session/login/wait", get(api::session::login_wait))
         .route("/api/session/login/cancel", post(api::session::login_cancel))
+        // 网页登录的回调入口：壳侧登录窗口把 `office-raccoon://auth/callback?…`
+        // 原样 POST 到这里（Tauri 不能像 Electron 那样在会话里注册协议处理器，
+        // 见 api::session::login_callback 的说明）。与其他 login/* 一样在
+        // protected 组 —— 它写账号库，必须过 API Key。
+        .route("/api/session/login/callback", post(api::session::login_callback))
         .route("/api/session/refresh", post(api::session::session_refresh))
         .route("/api/session/logout", post(api::session::session_logout))
         .route("/auth/login", post(api::session::auth_login))
@@ -152,6 +162,18 @@ pub fn router(state: ServerState) -> Router {
         // Node 版这条查 API Key，所以挂 protected；/v1/models 不查，
         // 挂在上面 public 组（分组判据见各自注释）
         .route("/v1/chat/completions", post(api::chat::chat_completions))
+        // 手动刷新模型清单（网关页按钮）：它会**真打上游**（各家的模型目录接口），
+        // 所以和 /v1/chat/completions 一样必须过 API Key；GET /v1/models 那条
+        // 免鉴权的只读探针不受影响（两者是不同的东西，见 api::models 模块头）。
+        // 永远返回 2xx：逐家结果自己表达成败，理由见该模块头
+        .route("/api/models/refresh", post(api::models::refresh_models))
+        // 模型管理（启停 / 隐藏 / 映射）与网关 Key 列表：都是写配置的管理接口，挂 protected
+        .route("/api/models/manage", get(api::model_manage::get_manage))
+        .route("/api/models/state", post(api::model_manage::set_state))
+        .route("/api/models/mappings", post(api::model_manage::add_mapping))
+        .route("/api/models/mappings/remove", post(api::model_manage::remove_mapping))
+        .route("/api/keys", get(api::keys_api::list_keys).post(api::keys_api::create_key))
+        .route("/api/keys/{id}", patch(api::keys_api::update_key).delete(api::keys_api::delete_key))
         // ── 内容脱敏（对照 workbuddy-desensitize-routes.mjs）──
         // 八条端点全部走 checkApiKey，所以整组挂 protected。
         // 用 any(...) 注册三条入口（无尾段 + 尾斜杠 + 通配尾段），方法/路径判定
@@ -172,6 +194,21 @@ pub fn router(state: ServerState) -> Router {
             get(api::auto_checkin::get_state).post(api::auto_checkin::configure),
         )
         .route("/api/auto-checkin/run", post(api::auto_checkin::run_now))
+        // ── 间隔型定时任务（凭证自动维护 / 模型目录刷新 / 两个前端自动刷新）──
+        // 挂 protected：它能改后端后台任务的执行节奏（间隔 1 分钟会让网关持续
+        // 打上游），并触发真打上游的刷新，敏感度与 /api/retention 同级。
+        //
+        // 三条入口都是 any(...)、方法判定交给 `api::scheduled_tasks::entry` ——
+        // 与 /api/accounts、/api/desensitize 同一取舍：拆成独立 axum 路由会让
+        // 「已注册路径 + 未注册方法」变成 405 兜底，而这个前缀下希望统一给 404。
+        // 单独登记尾斜杠形态：`/api/scheduled-tasks/` 在 `{*rest}` 里匹配不上
+        // （通配要求至少一个非空段），不登记就会落到全局 404。
+        .route("/api/scheduled-tasks", any(api::scheduled_tasks::entry))
+        .route("/api/scheduled-tasks/", any(api::scheduled_tasks::entry))
+        .route(
+            "/api/scheduled-tasks/{*rest}",
+            any(api::scheduled_tasks::entry),
+        )
         // ── 软件更新（对照 server.mjs 749-773 行）──
         // Node 是 `path.startsWith('/api/update/')` 的前缀判定：命中后逐条比对，
         // 都不匹配则落到全局 404（不带 success 信封）。用 {*rest} 通配入口 +
@@ -237,7 +274,8 @@ async fn cors(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
     let method = request.method().as_str().to_string();
     // 详细模式下记录每个入站请求（对应 Node 版 `if (opts.verbose && !path.startsWith('/v1/'))`）
-    // ——只有开了 WORKBUDDY_VERBOSE=1 才会入库，普通启动只是控制台多一行
+    // ——只有开了 AGENT2API_VERBOSE=1（旧名 WORKBUDDY_VERBOSE 仍可读）才入库，
+    // 普通启动只是控制台多一行
     if logging::is_verbose() && !path.starts_with("/v1/") {
         let query = request.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
         logging::verbose("[HTTP]", &format!("← {method} {path}{query}"));
@@ -272,11 +310,12 @@ fn attach_cors(headers: &mut axum::http::HeaderMap) {
 async fn require_api_key(request: Request, next: Next) -> Response {
     // 每次都读内存快照（不是读文件），所以「刚保存的新 key」下一个请求就生效
     let snapshot = crate::server::config::current();
-    let Some(expected) = snapshot.api_key() else {
+    let keys = snapshot.active_api_keys();
+    if keys.is_empty() {
         return next.run(request).await;
-    };
+    }
 
-    if request_matches_key(&request, expected) {
+    if keys.iter().any(|expected| request_matches_key(&request, expected)) {
         return next.run(request).await;
     }
 

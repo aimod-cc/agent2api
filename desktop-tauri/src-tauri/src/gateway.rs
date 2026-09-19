@@ -16,14 +16,21 @@ use serde_json::Value;
 pub const DEFAULT_PORT: u16 = 3065;
 pub const REQUEST_TIMEOUT_MS: u64 = 60_000;
 
-/// 实际使用端口：允许用 WORKBUDDY_PROXY_PORT 覆盖。
+/// 实际使用端口：允许用 AGENT2API_PROXY_PORT 覆盖
+/// （旧名 WORKBUDDY_PROXY_PORT 仍可读，新名优先）。
 /// 默认 3065；端口被别的程序占用时可用它改端口并行运行。
 pub fn proxy_port() -> u16 {
-    std::env::var("WORKBUDDY_PROXY_PORT")
+    env_port("AGENT2API_PROXY_PORT")
+        .or_else(|| env_port("WORKBUDDY_PROXY_PORT")) // 旧名兼容读（1.x 起沿用）
+        .unwrap_or(DEFAULT_PORT)
+}
+
+/// 读环境变量里的端口：未设置 / 非数字 / 0 一律当未设置（回落到下一级）
+fn env_port(name: &str) -> Option<u16> {
+    std::env::var(name)
         .ok()
         .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port > 0)
-        .unwrap_or(DEFAULT_PORT)
 }
 
 /// 管理 API 的响应信封：`{ success, data, error }`。
@@ -74,24 +81,55 @@ fn describe_error(value: &Value) -> String {
     value.to_string()
 }
 
-/// 配置目录：与后端共用 `~/.workbuddy-proxy`（可用环境变量覆盖）
+/// 配置目录：与后端共用 `~/.agent2api`（可用环境变量覆盖）。
+///
+/// **这是配置目录的唯一事实来源**：`server::config::config_dir()` 直接转发到
+/// 这里，所以「壳读 key」与「服务端读写数据」永远指向同一个目录。改名时
+/// 只需改本函数与下面 `default_config_dir` 的后缀，别处不要再写目录名字面量
+/// —— 唯一的例外是 `server::config` 里的 `LEGACY_DIR_NAME`，它要引用 1.x 的
+/// 旧目录名做一次性拷贝（迁移实现在 `server::config_migration`）。
+///
+/// 环境变量：`AGENT2API_PROXY_HOME` 优先，旧名 `WORKBUDDY_PROXY_HOME` 兼容读
+/// （1.x 的启动脚本/快捷方式里可能还留着旧名）。
 pub fn config_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var("WORKBUDDY_PROXY_HOME") {
-        let trimmed = custom.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
+    env_path("AGENT2API_PROXY_HOME")
+        .or_else(|| env_path("WORKBUDDY_PROXY_HOME")) // 旧名兼容读
+        .unwrap_or_else(default_config_dir)
+}
+
+/// 读环境变量里的目录覆盖：未设置 / 全空白一律当未设置
+fn env_path(name: &str) -> Option<PathBuf> {
+    let custom = std::env::var(name).ok()?;
+    let trimmed = custom.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(trimmed))
     }
+}
+
+/// 默认配置目录：`{用户主目录}/.agent2api`
+fn default_config_dir() -> PathBuf {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".workbuddy-proxy")
+    PathBuf::from(home).join(".agent2api")
 }
 
 /// 读取本地 API Key。仅读文件、不出本机；未配置时返回 None。
+/// 先取 `apiKeys` 里第一把启用的 Key，没有该列表再退回旧的单 Key 字段 `apiKey`。
 fn read_api_key() -> Option<String> {
     let text = std::fs::read_to_string(config_dir().join("config.json")).ok()?;
     let json: Value = serde_json::from_str(&text).ok()?;
+    if let Some(list) = json.get("apiKeys").and_then(Value::as_array) {
+        return list
+            .iter()
+            .filter(|item| !matches!(item.get("enabled"), Some(Value::Bool(false))))
+            .filter_map(|item| item.get("key").and_then(Value::as_str))
+            .map(str::trim)
+            .find(|key| !key.is_empty())
+            .map(str::to_string);
+    }
     let key = json.get("apiKey")?.as_str()?.trim().to_string();
     if key.is_empty() {
         None

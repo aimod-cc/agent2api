@@ -1,4 +1,4 @@
-/* WorkBuddy 本地代理 · 设置面板（启动与托盘 / 账号导入导出 / 自动签到 / 数据保留） */
+/* Agent2API · 设置面板（启动与托盘 / 账号导入导出 / 软件更新 / 数据保留） */
 /* global workbuddyDesktop, wbApp */
 
 /**
@@ -15,21 +15,19 @@
  *
  * 例外一：本文件还管着两类「后端说了算」的数据，它们不走上面的主进程契约，
  * 也不进 localStorage，而是经 HTTP 桥收发（workbuddyDesktop 里的 call 系列）：
- *   · 自动签到 / 软件更新 —— 读回来展示、改完写回去；
+ *   · 软件更新 —— 读回来展示、改完写回去（实际由 update-panel.js 负责，这里只调它的 load）；
  *   · 数据保留天数（getRetention / saveRetention → /api/retention）——
  *     三项保留期存在后端 config.json 里，改小会让后端**立即删除**超出的历史数据
  *     （接口语义见 server/api/stats_api.rs），所以它在保存前多一道二次确认。
  *   两类共用同一套姿势：读失败降级展示、写成功以接口返回值为准重读。
  *
- * 例外二：「账号列表两侧留白」与「设置页当前分类」都是纯前端偏好
+ * 定时任务（自动签到 + 四条间隔型任务）**不在本文件**：它们已迁到独立的
+ * 「定时任务」页（tasks-panel.js）—— 那是「到点自动干活」的一类东西，
+ * 混在设置页里既不好找，也没法和同类任务对照着调。
+ *
+ * 例外二：「设置页当前分类」是纯前端偏好
  * （localStorage + DOM 属性 / class），与主题切换同类，不经主进程，
  * 因此不参与下面的加载 / 保存流程。
- * 它控制账号页卡片列表的横向留白，分两层：关闭（默认）时保留与内容区同源的 --pad
- * 两侧间距（不是贴边）、把网格轨道切到「300 下限 + 1fr 瓜分」，
- * 列表占满面板宽度、卡片随宽、宽屏一行 4 张卡；
- * 开启则恢复两侧 16px 留白与 340–353px 的紧凑封顶口径。
- * 机制与取舍细节见 page-accounts.css 中关闭态规则上方的注释，这里不复述。
- * 它只作用于账号页；内容区宽度与其它页面都不受影响。
  */
 (() => {
   const api = workbuddyDesktop;
@@ -88,33 +86,10 @@
     }
   }
 
-  // ─── 界面偏好：账号列表两侧留白 ────────────────
-
-  // 纯前端偏好，只落在 localStorage；主进程不参与，键与取值同 <head> 里的内联脚本。
-  // 键名带 accounts 是刻意的：这个开关只作用于账号页的卡片列表，不是内容宽度开关 ——
-  // 关闭（默认）时保留与内容区同源的 --pad 两侧间距，同时把轨道口径切成
-  // 「300 下限 + 1fr 瓜分」，列表占满面板宽度、卡片随宽、宽屏一行 4 张卡；
-  // 开启则恢复两侧 16px 留白与 340–353px 封顶的紧凑口径。
-  // 内容区的居中限宽在任何页面都不受影响（细节见 page-accounts.css 关闭态注释）。
-  const ACCOUNTS_MARGIN_KEY = 'workbuddy-desktop-accounts-margin';
-
-  /** 把偏好同时落到 localStorage 与 <html data-content>：CSS 只认后者 */
-  function applyContentMargin(margin) {
-    const on = margin === 'on';
-    localStorage.setItem(ACCOUNTS_MARGIN_KEY, on ? 'on' : 'off');
-    document.documentElement.dataset.content = on ? 'margin' : 'full';
-  }
-
-  /** 开关初始状态：缺省（从未设置过）与 'off' 同样按「列表无左右留白」处理 */
-  function syncContentMarginToggle() {
-    const toggle = $('settings-content-margin');
-    if (toggle) toggle.checked = localStorage.getItem(ACCOUNTS_MARGIN_KEY) === 'on';
-  }
-
   // ─── 界面偏好：设置页当前分类 ────────────────
 
-  // 同样是纯前端偏好（localStorage + DOM class），主进程不参与，
-  // 与主题、账号列表留白同套命名。它只决定「设置页进来时展开哪一类」，
+  // 纯前端偏好（localStorage + DOM class），主进程不参与，
+  // 与主题同套命名。它只决定「设置页进来时展开哪一类」，
   // 不改变任何设置值本身，所以不进下面的加载 / 保存流程。
   const SETTINGS_CAT_KEY = 'workbuddy-desktop-settings-cat';
 
@@ -135,7 +110,7 @@
       pane.classList.toggle('active', pane.dataset.cat === target);
     });
     // 切回同一页时把内容滚回顶部：否则上一类的滚动位置会带到新分类上，
-    // 打开「服务」却停在半截
+    // 打开「关于」却停在半截
     const panes = document.querySelector('.settings-panes');
     if (panes) panes.scrollTop = 0;
   }
@@ -145,16 +120,40 @@
     showCategory(localStorage.getItem(SETTINGS_CAT_KEY));
   }
 
+  // ─── 界面偏好：计量单位 ──────────────────────
+
+  /**
+   * 「中文单位」与主题、当前分类同属于纯前端偏好：值与该存哪、默认是什么
+   * 由 `units.js` 一个地方说了算（报表页也读它），这里只负责把开关画成
+   * 当前状态、并在拨动时写回去。
+   *
+   * 拨一下就立即生效：不用重新加载页面、也不用重新拉数据 —— 报表页订阅了
+   * `wb-units-changed`，收到后用手里那份数据原地重绘（见 report.js）。
+   */
+  function renderUnits() {
+    const toggle = $('settings-chinese-units');
+    if (!toggle) return;
+    const on = window.wbUnits?.isChinese?.() !== false;
+    toggle.checked = on;
+    $('units-state').textContent = on
+      ? '当前显示为「1.2亿 / 8400万」这类中文量级。'
+      : '当前显示为「1.20M / 8.4k」这类英文缩写。';
+  }
+
+  function applyUnits(on) {
+    window.wbUnits?.setChinese?.(on);
+    renderUnits();
+    toast(on ? '✅ 已改用中文单位（亿 / 万）' : '✅ 已改用英文单位（M / k）');
+  }
+
   // ─── 渲染 ───────────────────────────────────
 
   /** 设置页数据入口（app.js 切入该页时调用） */
   async function load() {
-    // 纯前端偏好没有后端回读，每次进设置页都按 localStorage 校准一次
-    syncContentMarginToggle();
     restoreCategory();
+    renderUnits();
     await Promise.all([
       loadSettings(),
-      loadAutoCheckin(),
       loadRetention(),
       window.wbUpdatePanel?.load?.(),
     ]);
@@ -275,106 +274,6 @@
       }
 
       // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数与首选账号等
-      await wbApp.refresh?.();
-    });
-  }
-
-  // ─── 渲染：自动签到 ─────────────────────────
-
-  /** 把「下次执行」化成一句人话；后端没给时间时退回只描述开关状态 */
-  function describeNextRun(state) {
-    if (!state?.enabled) return '定时签到未开启，账号需要手动签到。';
-    const nextAt = Number(state.nextRunAt) || 0;
-    if (!nextAt) return `每天 ${state.time} 自动签到。`;
-    const next = new Date(nextAt);
-    const today = new Date();
-    const sameDay = next.toDateString() === today.toDateString();
-    const stamp = `${String(next.getHours()).padStart(2, '0')}:${String(next.getMinutes()).padStart(2, '0')}`;
-    return `每天 ${state.time} 自动签到，下次执行：${sameDay ? '今天' : '明天'} ${stamp}`
-      + `${state.lastFiredToday ? '（今天已执行）' : ''}`;
-  }
-
-  /** 上次执行结果写成一行摘要；失败明细只列前两条，与账号页的密度一致 */
-  function describeLastResult(result) {
-    if (!result) return '';
-    const when = result.at ? new Date(Number(result.at)).toLocaleString('zh-CN', { hour12: false }) : '';
-    const head = `${when ? `${when} ` : ''}上次执行（${result.reason || '定时'}）：`
-      + `${Number(result.succeeded) || 0}/${Number(result.total) || 0} 个账号成功领取`;
-    const extras = [];
-    if (Number(result.skipped)) extras.push(`跳过 ${result.skipped} 个`);
-    if (Number(result.failedCount)) extras.push(`失败 ${result.failedCount} 个`);
-    const suffix = extras.length ? `，${extras.join('、')}` : '';
-    const failed = Array.isArray(result.failed) && result.failed.length
-      ? `（${result.failed.slice(0, 2).join('；')}${result.failed.length > 2 ? ' 等' : ''}）`
-      : '';
-    return `${head}${suffix}${failed}`;
-  }
-
-  function renderAutoCheckin(state) {
-    const toggle = $('settings-auto-checkin');
-    const time = $('settings-auto-checkin-time');
-    const badge = $('checkin-badge');
-    if (!toggle || !time || !badge) return;
-
-    if (!state || typeof state !== 'object') {
-      badge.className = 'badge bad';
-      badge.textContent = '不可用';
-      $('settings-checkin-state').textContent = '后端未返回自动签到设置';
-      return;
-    }
-
-    toggle.checked = state.enabled === true;
-    // 只在用户没在编辑时回填时间：否则轮询/重载会把正在输入的值冲掉
-    if (document.activeElement !== time && typeof state.time === 'string') time.value = state.time;
-
-    badge.className = `badge ${state.enabled ? 'ok' : ''}`.trim();
-    badge.textContent = state.enabled ? (state.lastFiredToday ? '今日已执行' : '已开启') : '未开启';
-
-    const lines = [describeNextRun(state), describeLastResult(state.lastResult)].filter(Boolean);
-    $('settings-checkin-state').textContent = lines.join('　·　');
-  }
-
-  async function loadAutoCheckin() {
-    try {
-      renderAutoCheckin(await api.getAutoCheckin());
-    } catch (error) {
-      console.warn('读取自动签到设置失败:', error.message);
-      renderAutoCheckin(null);
-    }
-  }
-
-  /** 保存自动签到设置（开关与时刻一起提交，契约要求显式给出改动的字段） */
-  async function saveAutoCheckin(patch, label) {
-    const toggle = $('settings-auto-checkin');
-    const time = $('settings-auto-checkin-time');
-    if (toggle) toggle.disabled = true;
-    if (time) time.disabled = true;
-    try {
-      const saved = await api.saveAutoCheckin(patch);
-      renderAutoCheckin(saved);
-      toast(`✅ 已更新「${label}」`);
-    } catch (error) {
-      toast(`保存失败：${error.message}`, 'err');
-      await loadAutoCheckin(); // 回滚到后端的真实状态
-    } finally {
-      if (toggle) toggle.disabled = false;
-      if (time) time.disabled = false;
-    }
-  }
-
-  async function runCheckinNow() {
-    await guard($('btn-checkin-now'), '签到中…', async () => {
-      const result = await api.runAutoCheckinNow();
-      const succeeded = Number(result?.succeeded) || 0;
-      const total = Number(result?.total) || 0;
-      const failed = Number(result?.failedCount) || 0;
-      if (failed) {
-        toast(`签到完成：${succeeded}/${total} 成功，${failed} 个失败`, 'err');
-      } else {
-        toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取`);
-      }
-      if (result?.state) renderAutoCheckin(result.state);
-      // 积分可能已变化，顺带刷新账号页的余额展示
       await wbApp.refresh?.();
     });
   }
@@ -618,24 +517,10 @@
 
   $('settings-close-to-tray').addEventListener('change', event => saveToggles(event.target));
   $('settings-autostart').addEventListener('change', event => saveToggles(event.target));
+  // 单位开关不进 readToggles 的 patch：它不走主进程，是纯本地偏好（见上）
+  $('settings-chinese-units')?.addEventListener('change', event => applyUnits(event.target.checked));
   $('btn-settings-export').addEventListener('click', exportAccounts);
   $('btn-settings-import').addEventListener('click', importAccounts);
-
-  $('settings-auto-checkin')?.addEventListener('change', event =>
-    saveAutoCheckin({ enabled: event.target.checked, time: $('settings-auto-checkin-time').value },
-      '自动签到开关'));
-  // 时间用 change 而不是 input：拖动时间选择器时不该每动一下就发一次请求
-  $('settings-auto-checkin-time')?.addEventListener('change', event =>
-    saveAutoCheckin({ enabled: $('settings-auto-checkin').checked, time: event.target.value },
-      '签到触发时刻'));
-  $('btn-checkin-now')?.addEventListener('click', runCheckinNow);
-
-  // 账号列表留白是即改即生效的本地偏好，没有失败路径，也不需要守卫与回滚；
-  // 生效范围由 CSS 的 :root[data-content] + .acct-grid 规则决定，这里只管存值与贴属性
-  $('settings-content-margin')?.addEventListener('change', event => {
-    applyContentMargin(event.target.checked ? 'on' : 'off');
-    toast(event.target.checked ? '已开启账号列表两侧留白' : '已关闭账号列表两侧留白');
-  });
 
   // 分类切换同样是纯本地偏好：绑定挂在导航容器上（事件委托），
   // 这样以后新增分类不必再补一行绑定
@@ -676,10 +561,8 @@
 
   $('btn-retention-refresh')?.addEventListener('click', () => loadRetention().then(() => toast('保留天数已刷新')));
 
-  window.wbSettingsPanel = { load, render: renderSettings, renderAutoCheckin, renderRetention };
+  window.wbSettingsPanel = { load, render: renderSettings, renderRetention };
 
-  // 偏好开关自己维护 checked，不依赖 load()：脚本在 body 末尾执行，DOM 已就绪
-  syncContentMarginToggle();
   // 保留天数在首次读到后端值之前保持禁用：空输入框既能被误改，也没法参与
   // 「新值是否小于旧值」的判断（见 saveRetentionField 里 previous 为 null 的分支）。
   // 读成功后由 renderRetention 解禁，读失败则维持禁用并挂上「不可用」徽标

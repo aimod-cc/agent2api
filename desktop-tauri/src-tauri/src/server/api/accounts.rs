@@ -1,17 +1,27 @@
 //! 账号管理路由（对照 src/workbuddy-account-routes.mjs 逐条实现）。
 //!
-//!   GET    /api/accounts                账号列表（含当前账号标记、优先级、启用状态、代理）
+//!   GET    /api/accounts                账号列表（含当前账号标记、优先级、启用状态、代理、
+//!                                       provider 与顶层 providers 摘要）
 //!   POST   /api/accounts                手动添加账号（accessToken/refreshToken JSON）
 //!   GET    /api/accounts/export         导出全部账号（含 token，换机器后导入继续用）
 //!   POST   /api/accounts/import         导入账号（merge：按 uid 匹配，命中更新、未命中追加）
 //!   POST   /api/accounts/current        把账号置顶（即切换当前账号）{ id }
 //!   POST   /api/accounts/batch          批量操作 { action, ids, proxy? }
 //!   POST   /api/accounts/refresh        刷新指定（或当前）账号的 token { id? }
+//!   POST   /api/accounts/refresh-expiring 刷新**全部**已过期/临期的账号凭证（批量）
 //!   GET    /api/accounts/usage          逐账号查询积分/额度（并发，单账号失败不拖垮整批）
 //!   POST   /api/accounts/checkin        签到（串行，跳过已禁用与国际版账号）{ id? }
 //!   PATCH  /api/accounts/{id}           修改账号属性 { name?, priority?, enabled?, proxy? }
 //!   POST   /api/accounts/{id}/move      与相邻账号交换优先级 { direction: 'up' | 'down' }
 //!   DELETE /api/accounts/{id}           删除账号
+//!
+//! ── Agent2API 改造在本文件的行为 ─────────────────────────────
+//!   - 列表响应的**形状是增量的**：每个账号对象多一个 `provider`、顶层多一个
+//!     `providers` 摘要（都由 `AccountStore::list_accounts` 组装，本文件不用改）；
+//!   - `POST /api/accounts` 按 payload 的 provider **穷举分派**（见 `add_account`）；
+//!   - `usage` 从「只服务 workbuddy」扩到**四家混查**（余额查询移植）：目标集合
+//!     不再按 provider 过滤，逐账号分流到 `ProviderAdapter::query_usage`。
+//!     `checkin` 仍然只服务 workbuddy；其余 CRUD 语义保持不变。
 //!
 //! 出网代理的两条（/api/proxies、/api/proxies/test）在 `api::proxies`，
 //! 但它们的入口 `proxies_entry` 留在本文件 —— 与账号入口挨着，便于对照
@@ -42,6 +52,8 @@ use crate::server::core::account_store::AccountStoreError;
 use crate::server::core::auth::WorkBuddyAuthError;
 use crate::server::core::billing::checkin;
 use crate::server::core::proxies::ProxyConfigError;
+use crate::server::core::providers::adapter::adapter_for;
+use crate::server::core::providers::ProviderKind;
 use crate::server::errors::management_error;
 use crate::server::http::{ok_json, parse_body};
 use crate::server::logging;
@@ -156,7 +168,7 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
 ///
 ///   ① 固定子路径（无尾段的一批）：GET/POST ``、GET export、POST import、
 ///      POST current、POST batch、POST refresh、GET usage、POST checkin
-///   ② POST + 以 `/move` 结尾 → 调整顺序
+///   ② POST + 以 `/move` 结尾 → 调整顺序；以 `/rate-limits/clear` 结尾 → 清除限流标记
 ///   ③ PATCH / DELETE + 有剩余段 → 当成账号 id（**不做白名单校验**，
 ///      所以 `DELETE /api/accounts/export` 是「删一个叫 export 的账号」）
 ///   ④ 谁都不命中 → 404「Not found: <METHOD> <path>」（管理 API 信封）
@@ -190,17 +202,25 @@ pub async fn dispatch(
         ("POST", "current") => return set_current(&state, body).await,
         ("POST", "batch") => return batch_accounts(&state, body).await,
         ("POST", "refresh") => return refresh_account(&state, body).await,
-        ("GET", "usage") => return accounts_usage(&state).await,
+        ("POST", "refresh-expiring") => return refresh_expiring_accounts(&state).await,
+        // 余额 / 积分查询（四家混查）实现在 `api::accounts_usage`（拆分见那里的模块头）
+        ("GET", "usage") => return super::accounts_usage::accounts_usage(&state).await,
         ("POST", "checkin") => return accounts_checkin(&state, body).await,
         _ => {}
     }
 
-    // ③ POST + /move 结尾
+    // ③ POST + /move 结尾；POST + /rate-limits/clear 结尾
     if method == Method::POST {
         if let Some(id) = rest.strip_suffix("/move") {
             let id = decode_segment(id);
             if !id.is_empty() {
                 return move_account(&state, &id, body).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/rate-limits/clear") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return clear_rate_limits(&state, &id, body);
             }
         }
     }
@@ -221,15 +241,86 @@ pub async fn dispatch(
 
 // ─── POST /api/accounts ─────────────────────────────────────
 
+/// 添加账号：**按 payload 的 provider 分派到各家的添加路径**（W3-T4 起，
+/// W4a 改为注册表驱动的穷举分派）。
+///
+/// ── 分派规则（W4a：不再手写「workbuddy/raccoon」清单）──────────
+/// provider 字段先过 `providers::kind_from_id` 换算（**注册表就是白名单**，
+/// 见 `providers::is_known_provider_id` 的说明），再按 kind 穷举：
+///   ① `Raccoon` → 小浣熊路径：`importDesktop === true` 导入桌面端实时登录态
+///      （忽略 token 字段）；否则手动添加（token / refreshToken，或粘贴
+///      auth.json 内容）；
+///   ② `CatPaw` → CatPaw 路径（W5-T-d4）：`importDesktop === true` 导入桌面端
+///      实时登录态（`~/.meituan-catpaw/auth.json`）；否则手动添加（token + uid/
+///      loginName，兼容粘贴原项目账号记录与桌面端 auth.json 内容）；
+///   ③ `AutoClaw` → AutoClaw 路径（W4b-T-c2）：`importDesktop === true` 导入
+///      桌面端实时登录态（`%APPDATA%/AutoClaw/auth.json`，DPAPI 解密）；
+///      否则手动添加（token/refreshToken + deviceId，`enc:` 密文自动解密）；
+///   ④ `WorkBuddy` 或**字段缺失** → 既有 workbuddy 路径（`store.add_account`
+///      不读 payload 里的 provider，见该函数的说明）。
+///
+/// ── AutoClaw 曾经在这里显式 400（历史，别改回去）─────────────────
+/// W4a–W4b 之间它的凭证链路还没落地，那时这里对它的 payload 报 400：若让它落进
+/// ④ 的兜底，用户会得到一条**200 + 存进 workbuddy 组**的账号（凭证是别家的、
+/// 分组是错的、转发永远失败），界面上看不出异常。W4b-T-c2 起它有自己的分支
+/// （③），该 400 随之退役；纪律不变 —— **绝不写进没人认的组**。分派用穷举
+/// match：新增 provider 时编译器会强制给出分支；注册表里没有的 id（前端比后端
+/// 新、或手改的请求）仍走 ④ —— 老客户端不带 provider 字段，未知 id 不能报错。
 pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
     let payload = match parse_json_body(&body, "上传内容不是有效 JSON") {
         Ok(value) => value,
         Err(response) => return response,
     };
-    match state.store().add_account(&payload, None) {
+    let provider = payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let store = state.store();
+    // 三家（小浣熊 / CatPaw / AutoClaw）的分派形状相同：`importDesktop: true`
+    // 导入桌面端实时登录态，否则按 payload 手动添加。差异只在调哪个方法，
+    // 因此这里把「取 flag + 取 name」收一次，各分支只留一行调用。
+    let import_desktop = payload
+        .get("importDesktop")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let import_name = name.as_deref();
+    let result = match crate::server::core::providers::kind_from_id(provider) {
+        Some(crate::server::core::providers::ProviderKind::Raccoon) => {
+            if import_desktop {
+                store.import_raccoon_desktop_account("manual")
+            } else {
+                store.add_raccoon_account(&payload, import_name)
+            }
+        }
+        Some(crate::server::core::providers::ProviderKind::CatPaw) => {
+            if import_desktop {
+                store.import_catpaw_desktop_account("manual")
+            } else {
+                store.add_catpaw_account(&payload, import_name)
+            }
+        }
+        // AutoClaw（W4b-T-c2）：粘贴 token / refreshToken（含 `enc:` 密文自动解密）
+        // → 手动添加；`importDesktop: true` → 导入桌面端实时登录态（记录不落 token）
+        Some(crate::server::core::providers::ProviderKind::AutoClaw) => {
+            if import_desktop {
+                store.import_autoclaw_desktop_account("manual")
+            } else {
+                store.add_autoclaw_account(&payload, import_name)
+            }
+        }
+        Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
+            store.add_account(&payload, None)
+        }
+    };
+    match result {
         Ok(account) => ok_json(json!({
             "account": account,
-            "list": state.store().list_accounts(),
+            "list": store.list_accounts(),
         })),
         Err(error) => store_error(error),
     }
@@ -353,6 +444,17 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
 
 // ─── POST /api/accounts/refresh ─────────────────────────────
 
+/// 刷新账号 token（**按账号所属 provider 分派**）。
+///
+/// workbuddy 账号走既有的 `AuthService::refresh_account`；小浣熊与 AutoClaw 账号
+/// 各走自家适配器的 `refresh_access_token`；**CatPaw 账号没有可刷新的东西**
+/// （§9.1：`X-Passport-Token` 过期只能在桌面端重新登录，没有 refreshToken），
+/// 因此这里明确报 400 并说明做法 —— 静默走 workbuddy 的刷新会拿 CatPaw 的凭证
+/// 去打腾讯的鉴权接口。
+///
+/// 为什么不统一到一个抽象：四家的刷新协议毫无共同点，而「刷新」是**管理动作**、
+/// 不是转发链路上的 provider 契约（那条契约的 `refresh_access_token` 是转发时的
+/// 同账号重试语义）。分派点只有这一处。
 pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     let payload = match parse_json_body(&body, "请求内容不是有效 JSON") {
         Ok(value) => value,
@@ -371,6 +473,32 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
         },
     };
     logging::verbose("[Accounts]", &format!("刷新账号 token: {id}"));
+    // 小浣熊账号：走它自己的刷新（结果由 `credentials::refresh` 回写）
+    if state.store().raccoon_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Raccoon).await;
+    }
+    // AutoClaw 账号：同一套「读凭证 → 强制刷新 → 按来源回写」的适配器链路。
+    // **桌面端实时登录态不主动刷新**（原项目 `account-routes.mjs` 的同款拒绝）：
+    // 网关与桌面端共用同一个 refresh_token，网关侧刷新会造成轮换竞态，
+    // 因此这类账号明确报 400 并说明做法（`autoclaw::credentials` 模块头详述）。
+    if let Some(record) = state.store().autoclaw_account_record(&id) {
+        if record.get("desktop").and_then(Value::as_bool).unwrap_or(false) {
+            return management_error(
+                400,
+                "AutoClaw 桌面端登录态由桌面客户端维护，网关不主动刷新：\
+                 请在 AutoClaw 桌面端重新登录后重试",
+            );
+        }
+        return refresh_provider_account(state, &id, ProviderKind::AutoClaw).await;
+    }
+    // CatPaw 账号：没有刷新机制（见本函数的说明）
+    if state.store().catpaw_account_record(&id).is_some() {
+        return management_error(
+            400,
+            "CatPaw 登录态没有刷新机制：请在 CatPaw 桌面端重新登录，\
+             然后在本页重新导入桌面端登录态（或重新粘贴新的登录凭证）",
+        );
+    }
     match state.auth().refresh_account(&id).await {
         Ok(_) => ok_json(json!({
             "refreshedId": id,
@@ -380,19 +508,60 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     }
 }
 
+/// 「读凭证 → 强制刷新 → 回写」这条适配器链路的手动刷新（小浣熊 / AutoClaw 共用）。
+///
+/// 两家的刷新协议完全不同（各自的 `credentials` / `refresh` 模块），但**管理动作
+/// 的形状一致**：拿该账号的凭证、走 `refresh_access_token`（force 语义，不看临期
+/// 窗口）、按来源回写。这里是唯一调用点，差异全在各家适配器里。
+async fn refresh_provider_account(state: &ServerState, id: &str, kind: ProviderKind) -> Response {
+    let adapter = adapter_for(kind);
+    match adapter.refresh_access_token(state.store(), id).await {
+        Ok(_) => ok_json(json!({
+            "refreshedId": id,
+            "list": state.store().list_accounts(),
+        })),
+        Err(error) => {
+            logging::log("[Accounts]", &format!("❌ {}", error.message));
+            management_error(i32::from(error.http_status().as_u16()), error.message)
+        }
+    }
+}
+
+// ─── POST /api/accounts/refresh-expiring ────────────────────
+
+/// 刷新**全部**已过期 / 临期的账号凭证（批量维护动作）。
+///
+/// 与 `/api/accounts/refresh` 的分工：那条是**用户指定一个账号**的强制刷新
+/// （不看临期窗口）；这条是**系统遍历全部账号**、只刷确实需要刷的那些。
+/// 判定标准与刷新协议都在各家适配器里，本 handler 只透出结果 ——
+/// 为什么这条判断不能留在壳侧、为什么失败不给非 2xx，
+/// 见 `core::credential_maintenance` 的模块头与本文件那条 400 的说明。
+pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
+    let report =
+        crate::server::core::credential_maintenance::refresh_expiring_report(state.store()).await;
+    ok_json(report)
+}
+
 // ─── GET /api/accounts/usage 与 POST /api/accounts/checkin ──
 
-/// 批量操作的目标集合：默认跳过已禁用账号（避免无谓地打上游）。
-///
+/// 批量操作（usage/checkin）的目标集合：默认跳过已禁用账号（避免无谓地打上游）。
 /// 对照 Node 版 `resolveBatchTargets`：给了 id 就只取该账号且**不看 enabled**
 /// （用户显式指定就该执行）；没给 id 时取全部启用账号，并统计被跳过的数量。
-/// 返回 `(targets, skipped)`；`Err` 是已经构造好的错误响应。
 ///
-/// 返回 `Box<Response>`：axum 的 Response 有 128 字节，直接塞进 Result 会让
-/// 这个「热路径上的小函数」每次返回都搬一大块（clippy 的 result_large_err）。
-/// 包一层 Box 只在这条**错误**分支上多一次分配，正常路径零开销。
-fn resolve_batch_targets(
+/// `provider`：`Some(id)` 只取该家（**签到**必须这样——它是 workbuddy 独有的
+/// 概念，拿别家账号打腾讯的签到接口只会稳定报错）；`None` 跨四家取
+/// （**余额查询**用它：四家的余额接口各不相同、由各自适配器负责）。
+/// 显式指定 id 时**不做过滤**（与「显式指定就执行」的既有语义一致）。
+///
+/// 返回 `Box<Response>` 是为了压住 clippy 的 result_large_err（axum 的 Response
+/// 有 128 字节）：Box 只在这条**错误**分支上多一次分配，正常路径零开销。
+///
+/// `pub(super)`：余额查询（`api::accounts_usage`）也要用同一条目标集合解析 ——
+/// 两条接口的 `skipped` 口径与「显式指定 id 不过滤」的语义必须同源，
+/// 各写一份必然分叉。
+pub(super) fn resolve_batch_targets(
     state: &ServerState,
+    provider: Option<&str>,
     id: Option<&str>,
 ) -> Result<(Vec<Value>, usize), Box<Response>> {
     let snapshot = state.store().list_accounts();
@@ -401,17 +570,21 @@ fn resolve_batch_targets(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // provider 缺失的账号按 workbuddy 归属（与 store 的 `provider()` 兜底口径
+    // 一致：旧记录没有这个字段），否则它们会在两种过滤下都被漏掉
+    let in_scope = |account: &Value| match provider {
+        None => true,
+        Some(provider) => account
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID)
+            == provider,
+    };
     let is_available = |account: &Value| {
-        account
-            .get("available")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+        account.get("available").and_then(Value::as_bool).unwrap_or(true)
     };
     let is_enabled = |account: &Value| {
-        account
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+        account.get("enabled").and_then(Value::as_bool).unwrap_or(true)
     };
     if let Some(id) = id.filter(|value| !value.is_empty()) {
         let found: Vec<Value> = accounts
@@ -424,7 +597,11 @@ fn resolve_batch_targets(
         }
         return Ok((found, 0));
     }
-    let available: Vec<Value> = accounts.into_iter().filter(is_available).collect();
+    let available: Vec<Value> = accounts
+        .into_iter()
+        .filter(in_scope)
+        .filter(is_available)
+        .collect();
     let skipped = available.len();
     let targets: Vec<Value> = available.into_iter().filter(is_enabled).collect();
     let skipped = skipped - targets.len();
@@ -432,102 +609,12 @@ fn resolve_batch_targets(
 }
 
 /// ── 签到目标解析搬去了 `core::billing::checkin` ─────────────
-/// `resolve_checkin_targets` / `checkin_for` / `runCheckin` 三段整体下沉到
-/// core：定时签到（core::auto_checkin）与 `POST /api/accounts/checkin` 必须共用
-/// 同一段逻辑（Node 版是把 accountRoutes.runCheckin 注入 createAutoCheckin）。
-/// 这里只剩 `accounts_checkin` 一个转发壳，规则与 `skipped` 口径的说明见
-/// `core::billing::checkin::resolve_checkin_targets` 的注释。
-/// 注意上面的 `resolve_batch_targets` **仍留在这里**：
-/// `/api/accounts/usage` 的并发查询要用它，且它的 `skipped` 口径与签到不同。
+/// `resolve_checkin_targets` / `checkin_for` / `runCheckin` 三段整体下沉到 core：
+/// 定时签到（core::auto_checkin）与 `POST /api/accounts/checkin` 必须共用同一段
+/// 逻辑。这里只剩 `accounts_checkin` 一个转发壳，规则见
+/// `core::billing::checkin::resolve_checkin_targets`。`resolve_batch_targets`
+/// 仍留在这里（`/api/accounts/usage` 的并发查询要用它，`skipped` 口径不同）。
 
-/// 积分查询失败的原因：区分「没有凭证」（Node 的早退分支，字段少 name）
-/// 与「请求失败」（走 catch 分支，字段带 name）。
-enum UsageFailure {
-    /// 账号没有可用凭证 —— Node 里那个 `return { id, usage:null, error }`
-    NoCredentials,
-    /// 其余失败 —— Node 里 catch 里那句 `return { id, name, usage:null, error }`
-    Request(String),
-}
-
-/// 单个账号的积分查询。token 失效时刷新后重试一次；
-/// 任何失败都收敛为 `{error}` 而不是抛出，保证批量查询不被单个账号拖垮。
-async fn query_usage_for(state: &ServerState, account: &Value) -> Value {
-    let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
-    let name = account.get("name").cloned().unwrap_or(Value::Null);
-    match query_usage_inner(state, &id).await {
-        Ok(usage) => json!({ "id": id, "name": name, "usage": usage, "error": Value::Null }),
-        Err(UsageFailure::NoCredentials) => {
-            // Node 的这条早退 `return` **不含 name 键**（只有 catch 分支才带）
-            json!({ "id": id, "usage": Value::Null, "error": "没有可用凭证" })
-        }
-        Err(UsageFailure::Request(message)) => {
-            logging::verbose("[Accounts]", &format!("账号 {id} 积分查询失败: {message}"));
-            json!({ "id": id, "name": name, "usage": Value::Null, "error": message })
-        }
-    }
-}
-
-/// 查询一个账号的积分简报，401 时刷新 token 后重试一次。
-///
-/// 「401 说明 token 被服务端拒绝而非临期」—— Node 版据此才走刷新重试；
-/// 其它错误直接抛出（不浪费时间在刷新上）。
-async fn query_usage_inner(state: &ServerState, id: &str) -> Result<Value, UsageFailure> {
-    let Some(entry) = state.store().get_session_by_id(id) else {
-        return Err(UsageFailure::NoCredentials);
-    };
-    match state
-        .billing()
-        .query_credits_summary(Some(&entry.session), None)
-        .await
-    {
-        Ok(usage) => Ok(usage),
-        Err(error) => {
-            if error.status_code != 401 {
-                return Err(UsageFailure::Request(error.message));
-            }
-            // token 被上游拒绝：刷新后重试一次
-            let Some(creds) = state.store().get_credentials_by_id(id) else {
-                return Err(UsageFailure::Request(error.message));
-            };
-            if creds.refresh_token.is_empty() {
-                return Err(UsageFailure::Request(error.message));
-            }
-            if let Err(refresh_error) = state.auth().refresh_account(id).await {
-                return Err(UsageFailure::Request(refresh_error.message));
-            }
-            let Some(entry) = state.store().get_session_by_id(id) else {
-                return Err(UsageFailure::Request(error.message));
-            };
-            state
-                .billing()
-                .query_credits_summary(Some(&entry.session), None)
-                .await
-                .map_err(|retry| UsageFailure::Request(retry.message))
-        }
-    }
-}
-
-/// GET /api/accounts/usage
-///
-/// 逐账号并发查询积分汇总（`{ results: [{id,name,usage,error}], skipped }`）。
-///
-/// **并发**是关键：Node 版用 `Promise.all(targets.map(queryUsageFor))`，
-/// 20 个账号串行查询会让前端转圈 20 次往返。这里用 `join_all` 在同一个任务里
-/// 并发轮询（每个 future 都是网络等待，天然交错），并且**结果顺序与 targets
-/// 一致** —— 与 `Promise.all` 的语义完全相同。目标集合最多是
-/// MAX_ACCOUNTS(20) 个启用账号，不需要额外的并发限流。
-pub async fn accounts_usage(state: &ServerState) -> Response {
-    let (targets, skipped) = match resolve_batch_targets(state, None) {
-        Ok(value) => value,
-        Err(response) => return *response,
-    };
-    let futures: Vec<_> = targets
-        .iter()
-        .map(|account| query_usage_for(state, account))
-        .collect();
-    let results = futures::future::join_all(futures).await;
-    ok_json(json!({ "results": results, "skipped": skipped }))
-}
 
 /// POST /api/accounts/checkin
 ///
@@ -569,12 +656,47 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
     if !patch.is_object() {
         return management_error(400, "请求内容必须是 JSON 对象");
     }
+    // CatPaw 的余额查询凭证（`balanceToken`）先落盘：它是**这一家独有**的字段，
+    // 通用 `update_account` 不认识它（见 `update_catpaw_balance_token` 的说明：
+    // 不把它塞进四家共用的 apply_patch）。放在通用 patch 之前做，于是同一次
+    // 「保存设置」里改备注名与改凭证都会生效，而通用 patch 不会因为多出来的
+    // 键报错（它按字段白名单取值，未知键本就被忽略）。
+    let mut balance_changes: Vec<String> = Vec::new();
+    if let Some(value) = patch.get("balanceToken") {
+        if state.store().catpaw_account_record(&id).is_none() {
+            // 「账号不存在」与「账号存在但不是 CatPaw」要分开说：前者让用户刷新页面，
+            // 后者告诉他这个字段不属于这家（静默忽略会让用户以为存进去了）。
+            let known = state
+                .store()
+                .list_accounts()
+                .get("accounts")
+                .and_then(Value::as_array)
+                .map(|accounts| {
+                    accounts
+                        .iter()
+                        .any(|item| item.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .unwrap_or(false);
+            return if known {
+                management_error(400, "只有 CatPaw 账号有余额查询凭证（balanceToken）")
+            } else {
+                store_error(AccountStoreError::new("账号不存在", 404))
+            };
+        }
+        match state.store().update_catpaw_balance_token(&id, value) {
+            Ok(changes) => balance_changes = changes,
+            Err(error) => return store_error(error),
+        }
+    }
     match state.store().update_account(&id, &patch) {
-        Ok((account, changes)) => ok_json(json!({
-            "account": account,
-            "changes": changes,
-            "list": state.store().list_accounts(),
-        })),
+        Ok((account, mut changes)) => {
+            changes.extend(balance_changes);
+            ok_json(json!({
+                "account": account,
+                "changes": changes,
+                "list": state.store().list_accounts(),
+            }))
+        }
         Err(error) => store_error(error),
     }
 }
@@ -607,6 +729,47 @@ pub async fn move_account(state: &ServerState, id: &str, body: &Bytes) -> Respon
         }
         Err(error) => store_error(error),
     }
+}
+
+// ─── POST /api/accounts/{id}/rate-limits/clear ─────────────────
+
+/// 清除账号的限流标记：body `{model?}`，给了模型只清那一个，否则全清。
+///
+/// 这是账号页「限流明细」面板上的动作。语义只是「让本机立刻重新尝试这个模型」：
+/// 标记是本机从上游 429 推断出来的冷却期，清掉之后下一次请求若仍被上游限流，
+/// 会再次被标记 —— 所以这个动作是安全的，不需要二次确认。
+/// 返回 `{cleared: 清掉的模型数, list}`，前端拿 list 直接刷新。
+pub fn clear_rate_limits(state: &ServerState, id: &str, body: &Bytes) -> Response {
+    if id.is_empty() {
+        return management_error(400, "缺少账号 id");
+    }
+    let payload = if body.is_empty() {
+        Value::Object(Default::default())
+    } else {
+        match parse_json_body(body, "请求内容不是有效 JSON") {
+            Ok(value) => value,
+            Err(response) => return response,
+        }
+    };
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let cleared = match model {
+        Some(model) => usize::from(state.store().clear_rate_limit(id, model)),
+        None => state.store().clear_all_rate_limits(id),
+    };
+    if cleared > 0 {
+        logging::log(
+            "[Accounts]",
+            &format!(
+                "🧹 已清除账号 {id} 的限流标记（{}）",
+                model.map(|value| value.to_string()).unwrap_or_else(|| format!("{cleared} 个模型"))
+            ),
+        );
+    }
+    ok_json(json!({ "cleared": cleared, "list": state.store().list_accounts() }))
 }
 
 // ─── DELETE /api/accounts/{id} ──────────────────────────────

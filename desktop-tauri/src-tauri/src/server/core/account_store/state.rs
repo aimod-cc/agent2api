@@ -14,16 +14,24 @@
 use serde_json::{Map, Value};
 
 use crate::server::core::account_store::priority::normalize_priority_value;
+use crate::server::core::providers::DEFAULT_PROVIDER_ID;
 
 /// 整个 accounts.json 的内存形态。
 ///
-/// 顶层只认识 `accounts`（Node 版 `load()` 同样只解析这一个键），
-/// 其余顶层字段（旧版本的 currentAccountId 之类）刻意不解析 —— Node 版读盘时
-/// 就已经丢弃它们，「下次保存即自然消失」是既定行为。
+/// 顶层只认识 `accounts` 与 `priorityScope`；其余顶层字段（旧版本的
+/// currentAccountId 之类）刻意不解析 —— 读盘时丢弃、下次保存即自然消失。
+///
+/// `priority_scope` 是优先级号段的作用域标记：`"global"` 表示账号文件已经按
+/// 「全局一条队列」编号过。旧版本按 provider 各排各的队（文件里没有这个标记），
+/// 启动迁移据此判断要不要做一次跨家的重新编号（见 `store_admin::migrate_startup`）。
 #[derive(Clone, Debug, Default)]
 pub struct AccountState {
     pub accounts: Vec<StoredAccount>,
+    pub priority_scope: Option<String>,
 }
+
+/// `priority_scope` 的当前取值：全局一条队列
+pub const PRIORITY_SCOPE_GLOBAL: &str = "global";
 
 /// 一条账号记录：原样持有的 JSON 对象 + 容错访问器。
 #[derive(Clone, Debug)]
@@ -84,6 +92,37 @@ impl StoredAccount {
 
     pub fn id(&self) -> &str {
         self.fields.get("id").and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// 所属提供商 id（`"workbuddy"` / `"raccoon"`，契约见 `core::providers`）。
+    ///
+    /// **容错口径**：字段缺失、为空串、或不是字符串时一律回落
+    /// `DEFAULT_PROVIDER_ID`（workbuddy）—— 历史数据都来自 workbuddy 单上游时代，
+    /// 而「未知 provider 字符串」则原样返回（可能是新版本写入的账号被旧版本读到，
+    /// 强行归一成 workbuddy 会让它出现在错误的组里；原样透出至少能在界面上看见）。
+    /// 与 Node 版 `record.provider || 'workbuddy'` 的宽松语义一致。
+    pub fn provider(&self) -> String {
+        match self.fields.get("provider") {
+            Some(Value::String(text)) if !text.trim().is_empty() => text.trim().to_string(),
+            _ => DEFAULT_PROVIDER_ID.to_string(),
+        }
+    }
+
+    /// 写入 provider 字段（惰性迁移与新增账号用）
+    pub fn set_provider(&mut self, provider: &str) {
+        self.fields
+            .insert("provider".to_string(), Value::String(provider.to_string()));
+    }
+
+    /// 记录里**显式**写了 provider 字段吗（惰性迁移据此判断要不要补写）。
+    ///
+    /// 与 `provider()` 的区别：后者对缺失字段做默认值兜底，本函数只看字段本身，
+    /// 所以「字段缺失」与「字段值就是 workbuddy」能区分开 —— 迁移只在缺失时才写盘。
+    pub fn provider_explicit(&self) -> Option<&str> {
+        match self.fields.get("provider") {
+            Some(Value::String(text)) if !text.trim().is_empty() => Some(text.trim()),
+            _ => None,
+        }
     }
 
     pub fn name(&self) -> String {
@@ -221,6 +260,44 @@ impl StoredAccount {
         !self.access_token().is_empty()
     }
 
+    // ── 小浣熊账号字段（Agent2API W3-T4）─────────────────────
+
+    /// 是否为「桌面端实时登录态」账号（架构文档 §3.2）。
+    ///
+    /// 判据是记录里的 `desktop: true` 标记，而不是硬编码 id ——
+    /// id 只是缺省值（`raccoon-desktop`），标记才是语义。
+    pub fn is_desktop(&self) -> bool {
+        matches!(self.fields.get("desktop"), Some(Value::Bool(true)))
+    }
+
+    /// 是否**有可用凭证** —— 转发选路的统一判据。
+    ///
+    /// 与 `has_token()` 的差别：小浣熊的桌面端实时账号按设计**不落 token**
+    /// （凭证在 `~/.box-agent/config/auth.json`，每次实时读），所以
+    /// 「记录里有 accessToken」对它是恒假的。只认 `has_token()` 会让这类账号
+    /// 在选路时被整体跳过，转发直接 401。
+    ///
+    /// workbuddy 账号与其它 provider 的普通账号不受影响（它们的 `desktop`
+    /// 字段不存在 → 判据退化成 `has_token()`，与改造前逐字相同）。
+    pub fn has_credentials(&self) -> bool {
+        self.has_token() || self.is_desktop()
+    }
+
+    /// 小浣熊账号的用户 ID（`userId`；workbuddy 侧对应 `uid`）
+    pub fn user_id(&self) -> String {
+        as_text(self.fields.get("userId"))
+    }
+
+    /// 小浣熊账号的 token 过期时间（`tokenExpiresAt`，毫秒）
+    pub fn token_expires_at(&self) -> Option<f64> {
+        positive_number(self.fields.get("tokenExpiresAt"))
+    }
+
+    /// 账号来源（`imported` / `manual` / …；缺失给空串）
+    pub fn source(&self) -> String {
+        as_text(self.fields.get("source"))
+    }
+
     /// 选路排序键：`(优先级, 加入时间)`
     pub fn order_key(&self) -> (i64, i64) {
         (self.priority(), self.added_at())
@@ -239,6 +316,20 @@ impl StoredAccount {
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.fields.get(key)
     }
+}
+
+// ─── 优先级判定的数据源（全局一条队列）────────────────────
+
+/// 全部账号的三元组 `(id, name, priority)` —— 优先级冲突判定与号段分配的
+/// **唯一数据源**（正是 `find_priority_holder` / `next_free_priority` 要的形态）。
+///
+/// 优先级是全局唯一的（见 `priority.rs` 模块头），所以这里不按 provider 过滤；
+/// 写入侧（新增 / 改优先级）统一从这里取，避免某处漏掉变成局部判定。
+pub fn priority_peers(accounts: &[StoredAccount]) -> Vec<(String, String, i64)> {
+    accounts
+        .iter()
+        .map(|record| (record.id().to_string(), record.name(), record.priority()))
+        .collect()
 }
 
 /// 把数值转成 JSON：**整数形式的数写成整数**。

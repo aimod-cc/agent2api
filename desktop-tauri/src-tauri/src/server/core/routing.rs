@@ -1,6 +1,7 @@
 //! 账号选路 —— 严格优先级排队（对照 Node 版 src/workbuddy-routing.mjs 全量移植）。
 //!
-//! 优先级是「主备序号」：优先级必须全局唯一（由 account-store 在写入侧保证），
+//! 优先级是「主备序号」：优先级必须唯一（Agent2API 改造后作用域收窄为
+//! **同 provider 内**，由 account-store 在写入侧保证，见其模块头），
 //! 不允许多个账号并列 —— 并列会让「同级」语义失效。本模块只做**纯判定**，
 //! 数据来源是账号存储的公开形态（`store.list_accounts()` 的 `accounts` 数组），
 //! 字段就是 UI 上看到的那几个：`id` / `name` / `priority` / `addedAt` /
@@ -111,6 +112,52 @@ pub fn pick_account_by_priority(
     }
     candidates.sort_by(compare_by_priority);
     candidates.into_iter().next()
+}
+
+/// 按**指定模型**派生队首：候选先收窄到「清单里有这个模型的家」，再走
+/// [`pick_account_by_priority`] 的常规判据（启用 + 该模型未限流 + 优先级序）。
+///
+/// ── 为什么要单独有这个函数（`pick_current` 不够用）──────────────
+/// 账号库里的「当前账号」是**不限模型**的队首（只判启用 + 凭证），转发层却还要
+/// 剔除「对该模型限流中」的账号。两者在「队首正被限流」时给出不同答案：界面标着
+/// ★ 的那个账号，请求根本不会走它。账号页要回答的是「下一个请求会先用谁」，
+/// 所以必须按模型派生，见 `/api/session` 的 `routedAccountId`。
+///
+/// ── 为什么要传 `providers` 而不是只给 model ──────────────────
+/// 全局队列里四家混排，但一家只能承接**它自己清单里有的**模型（见
+/// `providers::router::route_for_forward`）。少了这道收窄，一个「优先级更小、
+/// 也对该模型未限流、但根本不提供该模型」的账号会被误判成队首。
+/// `providers` 为空（未知模型）时不过滤 —— 宁可退回全局队首，也不给空答案。
+///
+/// `hasCredentials` 也算进判据：转发挑出候选后还要取到会话才用，无凭证的账号
+/// 必然被跳过，前端按同一口径推算时才不会把这种账号标成 ★。
+pub fn pick_for_model(
+    accounts: &[Value],
+    model: &str,
+    providers: &[&str],
+    now: i64,
+) -> Option<Value> {
+    let candidates: Vec<Value> = accounts
+        .iter()
+        .filter(|account| {
+            if !providers.is_empty() && !providers.iter().any(|known| *known == provider_of(account))
+            {
+                return false;
+            }
+            !matches!(account.get("hasCredentials"), Some(Value::Bool(false)))
+        })
+        .cloned()
+        .collect();
+    pick_account_by_priority(&candidates, model, &[], now)
+}
+
+/// 账号记录上的 provider id（缺失按默认 provider 兜底，与 store 的
+/// `StoredAccount::provider` 同口径）。
+pub fn provider_of(account: &Value) -> &str {
+    account
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID)
 }
 
 /// 选路决策的完整快照（供日志展示与排障）：

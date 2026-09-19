@@ -1,4 +1,4 @@
-/* WorkBuddy 本地代理 · 账号设置与批量操作面板 */
+/* Agent2API · 账号设置 / 批量操作 */
 /* global workbuddyDesktop, wbApp, wbProxyForm */
 
 /**
@@ -7,7 +7,12 @@
  *   - 批量操作（启用 / 禁用 / 改代理 / 删除）
  *
  * 代理表单由 wbProxyForm 提供（与批量弹窗共用同一份实现）。
- * 优先级唯一约束：输入框旁实时提示已占用数值，冲突时标红并在保存前拦下。
+ * 优先级唯一约束：输入框旁实时提示已占用数值，冲突时标红并在保存前拦下；
+ * 该约束的作用域是**同 provider 内**（后端 provider_peers 的口径），
+ * 因此占用提示也只列同一家的账号 —— 跨家比较会给出错误的「已被占用」告警。
+ *
+ * 「登录 / 添加账号」弹窗的提供商分叉（提供商分段控件、未知提供商的占位块、
+ * 三家的表单块、弹窗内 .seg 分段控件的交互）在 add-provider-forms.js。
  */
 (() => {
   const api = workbuddyDesktop;
@@ -38,23 +43,39 @@
     return account?.nickname || account?.name || account?.id || '';
   }
 
+  /** 账号所属 provider（缺失按 workbuddy 兜底，与后端 store 同口径） */
+  const providerOf = account =>
+    (typeof account?.provider === 'string' && account.provider) || 'workbuddy';
+
+  /**
+   * 同 provider 的其它账号：优先级唯一性的作用域就是这一组。
+   *
+   * 后端 `store_crud` 的 `provider_peers` 只在**同一家**内校验唯一与号段，
+   * 于是「workbuddy 有 P100」与「小浣熊有 P100」是合法并存。这里必须按同一口径
+   * 过滤：跨家比较会把一个完全可以保存的数值报成「已被占用」，用户只能改用大号段。
+   */
+  function peersOf(account) {
+    const provider = providerOf(account);
+    return allAccounts().filter(item => item.id !== account.id && providerOf(item) === provider);
+  }
+
   // ─── 单账号设置 ─────────────────────────────
 
   /**
-   * 优先级占用提示：列出已被占用的数值，并在输入冲突时即时标红。
-   * 优先级全局唯一（写入侧强制），让用户一眼看到哪些号段被占了，
+   * 优先级占用提示：列出同 provider 内已被占用的数值，并在输入冲突时即时标红。
+   * 优先级在**同一家内**唯一（写入侧强制），让用户一眼看到哪些号段被占了，
    * 比事后被 409 拒绝友好得多。
    */
   function refreshPriorityUsage() {
     const input = $('account-priority-input');
     const hint = $('priority-usage');
     if (!input || !hint) return;
+    const account = findAccount(editingId);
+    if (!account) return;
     const value = Number(input.value);
-    const holder = allAccounts().find(a => a.id !== editingId && Number(a.priority) === value);
-    const used = allAccounts()
-      .filter(a => a.id !== editingId)
-      .map(a => Number(a.priority))
-      .sort((a, b) => a - b);
+    const peers = peersOf(account);
+    const holder = peers.find(item => Number(item.priority) === value);
+    const used = [...new Set(peers.map(item => Number(item.priority)))].sort((a, b) => a - b);
 
     if (holder) {
       input.style.borderColor = 'var(--danger)';
@@ -62,7 +83,9 @@
       return;
     }
     input.style.borderColor = '';
-    hint.textContent = used.length ? `已占用：${used.join('、')}` : '暂无其他账号占用优先级';
+    hint.textContent = used.length
+      ? `同提供商已占用：${used.join('、')}`
+      : '同提供商内暂无其他账号占用优先级';
   }
 
   async function openSettings(id) {
@@ -75,6 +98,7 @@
     $('account-priority-input').value = String(account.priority ?? DEFAULT_PRIORITY);
     $('account-enabled-input').checked = account.enabled !== false;
     $('account-modal-status').textContent = '';
+    mountBalanceTokenField(account);
 
     if (!settingsProxyForm) settingsProxyForm = wbProxyForm.create($('account-proxy-form'));
     const mode = settingsProxyForm.fill(account.proxy);
@@ -91,8 +115,82 @@
     }
   }
 
+  // ─── CatPaw 的余额查询凭证（balanceToken）─────
+
+  /**
+   * 余额凭证输入框：**只有 CatPaw 账号有这一项**，所以动态注入而不是写死在
+   * index.html 里（写死的话每家账号打开设置都会看到一个与自己无关的输入框，
+   * 而 index.html 同时被其它任务维护，这里不重排/新增它的既有节点）。
+   *
+   * ── 为什么这个值是单独一项，不能复用 token ──────────────────────
+   * CatPaw 转发用的是 `X-Passport-Token`，而余额接口（美团 credit 域）要的是
+   * **网页会话 cookie 里的 token2**（原项目单独存的一项，见
+   * `providers/catpaw/balance.rs` 模块头）。两者名字像但不是一回事，
+   * 所以这里必须让用户能单独填。
+   *
+   * `hasBalanceToken` 由后端公开形态给出（**只给真假，不给值** —— 它是完整凭证，
+   * 不进账号列表这种会被截图/贴出来排障的界面）：已配置时占位提示「留空则不修改」，
+   * 并给一个显式的「清除」按钮（凭证轮换后可能要清掉再填新的）。
+   */
+  const BALANCE_TOKEN_ROW_ID = 'account-balance-token-row';
+
+  function mountBalanceTokenField(account) {
+    $(BALANCE_TOKEN_ROW_ID)?.remove();
+    if (providerOf(account) !== 'catpaw') return;
+    const section = $('account-name-input')?.closest('.modal-section');
+    if (!section) return;
+    const configured = account.hasBalanceToken === true;
+    const row = document.createElement('div');
+    row.id = BALANCE_TOKEN_ROW_ID;
+    row.className = 'field-row';
+    row.style.marginTop = '9px';
+    row.innerHTML = `<label for="account-balance-token-input">余额查询凭证</label>`
+      + `<input id="account-balance-token-input" type="text" `
+      + `placeholder="${configured ? '已配置，留空则不修改' : '可选：网页登录态的 token2'}" `
+      + `title="CatPaw 的余额接口要的是网页会话凭证（token2），与转发用的 X-Passport-Token 不是同一个值；不填也能正常转发，只是查不了余额">`
+      // 清除是**显式动作**（保存时的空值一律理解为「不修改」，见 readBalanceTokenPatch）
+      + (configured
+        ? `<button id="account-balance-token-clear" title="清除已配置的余额查询凭证">清除</button>`
+        : '');
+    section.appendChild(row);
+    $('account-balance-token-clear')?.addEventListener('click', clearBalanceToken);
+  }
+
+  /** 清除余额凭证（立即落库，不走保存按钮 —— 它是一个独立的撤销动作） */
+  async function clearBalanceToken() {
+    if (panelBusy || !editingId) return;
+    panelBusy = true;
+    try {
+      await api.updateAccount(editingId, { balanceToken: null });
+      mountBalanceTokenField({ ...findAccount(editingId), hasBalanceToken: false });
+      toast('✅ 已清除余额查询凭证');
+      await wbApp.refresh?.();
+    } catch (error) {
+      toast(`清除失败：${error.message}`, 'err');
+    } finally {
+      panelBusy = false;
+    }
+  }
+
+  /**
+   * 读余额凭证输入框的值：空串 = **不修改**（不是清除）。
+   *
+   * 为什么不做「清空即清除」：后端公开形态只给 `hasBalanceToken` 真假、不回显原值，
+   * 于是这个输入框永远是空的 —— 若把「空」解释成清除，用户每次保存设置
+   * （比如只改备注名）都会把已经配好的凭证删掉。清除走上面那个显式按钮。
+   */
+  function readBalanceTokenPatch() {
+    const input = $('account-balance-token-input');
+    if (!input) return null;
+    const value = input.value.trim();
+    return value ? { balanceToken: value } : null;
+  }
+
   function closeSettings() {
     $('account-modal').classList.remove('open');
+    // 余额凭证行是注入的（只有 CatPaw 账号有）：顺手清掉，避免下次打开别家账号
+    // 时它还在（mountBalanceTokenField 也会先删，这里只是让关闭态也干净）
+    $(BALANCE_TOKEN_ROW_ID)?.remove();
     editingId = null;
   }
 
@@ -110,12 +208,13 @@
     }
     const priority = Number($('account-priority-input').value);
     if (!Number.isFinite(priority)) { toast('优先级必须是数字', 'err'); return; }
-    // 本地先挡一次冲突（后端也会校验），省得白跑一趟请求
+    // 本地先挡一次冲突（后端也会校验），省得白跑一趟请求。
+    // 冲突范围是**同 provider**：跨家同名数值合法（见 peersOf 的说明）
     const clamped = Math.min(MAX_PRIORITY, Math.max(MIN_PRIORITY, Math.round(priority)));
-    const holder = allAccounts().find(a => a.id !== editingId && Number(a.priority) === clamped);
+    const holder = peersOf(account).find(item => Number(item.priority) === clamped);
     if (holder) {
       $('account-modal-status').innerHTML =
-        `<span style="color:var(--danger)">优先级 ${esc(String(clamped))} 已被「${esc(labelOf(holder))}」占用，请换一个数值</span>`;
+        `<span style="color:var(--danger)">优先级 ${esc(String(clamped))} 已被同一提供商的「${esc(labelOf(holder))}」占用，请换一个数值</span>`;
       refreshPriorityUsage();
       return;
     }
@@ -125,11 +224,15 @@
     button.disabled = true;
     button.textContent = '保存中…';
     try {
+      // CatPaw 的余额凭证是**按需附加**的字段（别的家没有这一项，
+      // 输入框也不存在）：没填就不进 patch，后端据此保持原值不变
+      const balancePatch = readBalanceTokenPatch();
       await api.updateAccount(editingId, {
         name: $('account-name-input').value.trim() || account.name,
         priority: clamped,
         enabled: $('account-enabled-input').checked,
         proxy,
+        ...(balancePatch || {}),
       });
       // 先关窗并反馈成功：改动已经落库，刷新只是让列表卡片跟上，
       // 不该让用户对着「保存中…」再多等一次网络往返（刷新若被排队更是等不到头）。
@@ -262,6 +365,12 @@
     }
   }
 
+  // ─── 优先级占用提示：作用域是「同 provider」 ───
+  //
+  // 后端把优先级唯一性收窄到 provider 内（account_store::provider_peers），
+  // 于是「workbuddy 有 P100」与「小浣熊有 P100」是合法并存。这里按同一口径过滤，
+  // 否则跨家比较会把一个完全可以保存的数值报成「已被占用」，用户只能改用大号段。
+
   // ─── 事件绑定 ───────────────────────────────
 
   // 单账号设置
@@ -294,6 +403,8 @@
     close: closeSettings,
     openBatch,
     closeBatch,
+    /** 「登录 / 添加账号」弹窗打开时可用：按 providers 摘要重建选项并复位到 WorkBuddy */
+    syncAddProvider: () => window.wbAccountAddForms?.syncAddProvider(),
     /** 账号列表刷新后调用：Clash 端口可能已在 Clash 侧改过 */
     invalidate: () => {
       wbProxyForm.invalidateClashCache();

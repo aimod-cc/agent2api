@@ -27,6 +27,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::errors::GatewayError;
 
+use super::sse::ModelRewrite;
 use super::usage::RequestTelemetry;
 
 /// 流式读取的上限保护：单条 SSE 行长度（解析失败的行会原样丢掉，
@@ -49,14 +50,24 @@ pub struct AggregatedCompletion {
 /// 而转发链路本身是异步的）。它只被写入、不参与 `acc` 的构建 ——
 /// **不影响返回的 body**（usage 的透传口径由 aggregate 自己的
 /// `self.usage` 负责，与这里无关，两条路径互不干扰）。
+///
+/// `model_rewrite` 与流式分支同源（适配器的 `sse_model_rewrite()`）：
+/// **非流式响应体里的 `model` 同样要回写**成客户端请求的名字 ——
+/// 客户端拿到的 model 名不该因为「要不要流式」而变样（源实现
+/// `forwardChatCompletions` 的非流式分支也是 `payload.model = requestedModel`）。
 pub async fn aggregate_sse_completion(
     response: reqwest::Response,
     telemetry: Arc<RequestTelemetry>,
+    model_rewrite: Option<ModelRewrite>,
 ) -> Result<AggregatedCompletion, GatewayError> {
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
-    let mut acc = CompletionAccumulator::default();
-
+    let mut acc = CompletionAccumulator { rewrite: model_rewrite, ..Default::default() };
+    // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
+    // 没有下发流可言），所以第一个**上游** chunk 在这里记 —— 它就是
+    // 「上游开始吐内容」的时刻。非流式请求的用时要等聚合完才有意义，
+    // 首响补上了「上游是快是慢」这半边（与流式路径同口径：首次为准）。
+    let mut first_chunk_seen = false;
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(|error| {
             GatewayError::with_status(
@@ -64,6 +75,10 @@ pub async fn aggregate_sse_completion(
                 format!("上游流中断: {}", crate::server::core::egress::describe_error_detail(&error)),
             )
         })?;
+        if !first_chunk_seen {
+            first_chunk_seen = true;
+            telemetry.note_first_frame();
+        }
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         // 逐行消费（只处理到最后一个 '\n' 之前的内容）
         while let Some(index) = buffer.find('\n') {
@@ -100,6 +115,8 @@ struct CompletionAccumulator {
     usage: Option<Value>,
     chunk_count: usize,
     tool_calls: BTreeMap<i64, Value>,
+    /// model 名回写参数（None = 不改写，沿用上游给的 model）
+    rewrite: Option<ModelRewrite>,
 }
 
 impl CompletionAccumulator {
@@ -244,7 +261,13 @@ impl CompletionAccumulator {
                 crate::server::logging::now_ms() / 1000
             }),
         );
-        body.insert("model".to_string(), Value::String(self.model));
+        // model 名回写（见 `aggregate_sse_completion` 的说明）：配置了回写时
+        // 用客户端请求的名字，否则沿用上游给的（可能为空串 —— 与改造前一致）
+        let model = match &self.rewrite {
+            Some(rewrite) => rewrite.requested.clone(),
+            None => self.model,
+        };
+        body.insert("model".to_string(), Value::String(model));
         body.insert(
             "choices".to_string(),
             json!([{

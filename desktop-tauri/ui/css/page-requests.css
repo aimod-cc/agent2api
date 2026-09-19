@@ -1,0 +1,219 @@
+/* ─────────────────────────────────────────────
+   请求日志页：转发明细表（列形态参考 OmniProxy 的请求日志）
+   列表容器与筛选行（.log-list / .log-empty / .log-filters / .log-pager）
+   沿用 page-logs.css 的同一套声明，本文件只写表格本身与窄窗口重排。
+   颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
+   ───────────────────────────────────────────── */
+
+/* 八列：时间 / 提供商·账号 / 重试 / 状态 / 模型 / 用时 / 用量 / 错误。
+   时间与用时定宽（等宽数字 + tabular-nums，竖着比对才齐），
+   其余占弹性宽度（都是不定长内容，给固定宽度会互相挤）：
+   模型 1.3fr（claude-sonnet-4-5 这类名字要放得下），
+   用量 1.6fr（两行读数里 in/out/all 最长），超出由省略号收住、完整值进 title。 */
+.req-row,
+.req-head {
+  display: grid;
+  grid-template-columns:
+    92px minmax(0, 1.1fr) 52px 68px minmax(0, 1.3fr) 96px minmax(0, 1.6fr) minmax(0, 1.2fr);
+  gap: 12px;
+  align-items: center;
+  padding: 10px 14px;
+  /* 列表是 flex 列容器：条目不许被压缩，超出的一律交给列表滚动 */
+  flex: none;
+}
+
+/* 表头：粘在列表顶部。列表自身滚动，滚动条是它自己的（不是页面），
+   sticky 的参照物就是 .log-list，因此顶部偏移写 0。 */
+.req-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+
+.req-row { border-bottom: 1px solid var(--hairline); transition: background .12s ease; }
+.req-row:last-child { border-bottom: none; }
+.req-row:hover { background: var(--surface-2); }
+
+/* 表头里用时一格跟数值同侧对齐（数值列是右对齐的） */
+.req-head .req-dur { text-align: right; }
+
+/* 失败行轻微着色，与事件日志 error 行同一手法（不干扰阅读的淡底） */
+.req-row.failed { background: color-mix(in srgb, var(--danger-soft) 45%, transparent); }
+.req-row.failed:hover { background: var(--danger-soft); }
+
+/* 无值占位（重试 / 错误列的「-」）：比正文淡一档，空着会被当成渲染缺失 */
+.req-none { color: var(--text-3); }
+
+/* 时间列：日期 + 时刻两行，等宽避免每一行的冒号错位。
+   数据格与表头格共用同一个类名（窄窗口要按列重排，见文件末尾的媒体查询），
+   所以每一条排版声明都带 .req-row 前缀限定在数据行上 —— 否则表头会被一并
+   套上等宽字体，一行小标题看着像数据。 */
+.req-row .req-time {
+  display: flex;
+  flex-direction: column;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 提供商 / 账号：同格两行，提供商在上（主读数）、账号在下（次）。
+   两者都是短名词，省略号收住长名字，完整值在各自的 title 里。 */
+.req-row .req-target {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.req-row .req-provider,
+.req-row .req-acct {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.req-row .req-provider { color: var(--text-2); font-size: 12px; }
+.req-row .req-acct { color: var(--text-3); font-size: 11.5px; }
+
+/* 无提供商 / 无账号（旧数据或请求在任何账号接手前就失败）：给破折号 */
+.req-provider.is-empty,
+.req-acct.is-empty { color: var(--text-3); }
+
+/* 模型名：标识符用等宽，超长从尾部省略（完整值在 title 里） */
+.req-row .req-model {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 用时：等宽 + 右对齐，相邻行的数字能直接竖着比大小。
+   两行：总用时（主读数）+ 首响（次读数，淡一档，与用量列的 sub 同一手法）——
+   OmniProxy 的用时列就是这个形态。只有数据行是两行，表头仍是单行文本
+   （所有排版声明都带 .req-row 前缀限定在数据行上，见上方 .req-time 的说明）。 */
+.req-row .req-dur {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.req-row .req-dur-line {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
+/* 首响是次读数：淡一档、小半号，不抢总用时 */
+.req-row .req-dur-line.sub {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+/* 用量两行：in / out / all 与 缓存读取 / 命中率。
+   等宽 + tabular-nums，超出省略（完整两行读数在 title 里）。 */
+.req-row .req-usage {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.req-usage-line {
+  overflow: hidden;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 第二行（缓存读取 / 命中率）是附加说明：淡一档，不抢主读数 */
+.req-usage-line.sub { color: var(--text-3); }
+
+/* 错误列：红字省略，完整值在 title 里；它是排查的入口，红着比藏着好 */
+.req-row .req-error {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--danger);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 窄窗口：拆成多行，免得八列都缩成省略号。
+   断点取 1200px：默认窗口 1060px 时内容区约 772px，八列必然挤，
+   以下面的四列重排为准；拉宽到 1200 以上才换八列横排。
+
+   ── 为什么每个格子都显式写 grid-row / grid-column ──
+   只给部分格子写列位置时，剩余格子由自动放置算法补空，落点取决于「哪个格子
+   已被占」这个隐式状态：以后往行里插一个新字段，落点会整体错一格且不报错。
+   写死行列值后，增删字段只影响它自己那一格。 */
+@media (max-width: 1200px) {
+  .req-row,
+  .req-head {
+    grid-template-columns: 92px minmax(0, 1fr) 68px 52px;
+    row-gap: 4px;
+  }
+
+  /* 表头只保留第一行的四格，其余列头隐藏（列位置已重排，留着会冲突） */
+  .req-head .req-time { grid-row: 1; grid-column: 1 / 2; }
+  .req-head .req-model { grid-row: 1; grid-column: 2 / 3; }
+  .req-head .req-status { grid-row: 1; grid-column: 3 / 4; }
+  .req-head .req-retry { grid-row: 1; grid-column: 4 / 5; }
+  .req-head .req-target,
+  .req-head .req-dur,
+  .req-head .req-usage,
+  .req-head .req-error-cell { display: none; }
+
+  /* 第一行：时间 + 模型 + 状态 + 重试 */
+  .req-row .req-time { grid-row: 1; grid-column: 1 / 2; }
+  .req-row .req-model { grid-row: 1; grid-column: 2 / 3; }
+  .req-row .req-status { grid-row: 1; grid-column: 3 / 4; }
+  .req-row .req-retry { grid-row: 1; grid-column: 4 / 5; }
+  /* 第二行：提供商 / 账号 + 用时（用时贴右） */
+  .req-row .req-target { grid-row: 2; grid-column: 1 / 3; }
+  .req-row .req-dur { grid-row: 2; grid-column: 3 / 5; }
+  /* 第三行：用量整行铺开（两行读数不再被列宽挤省略） */
+  .req-row .req-usage { grid-row: 3; grid-column: 1 / -1; }
+  /* 第四行：错误。整行铺开时允许折行；没有错误的行不渲染这格 */
+  .req-row .req-error {
+    grid-row: 4;
+    grid-column: 1 / -1;
+    white-space: normal;
+    word-break: break-word;
+  }
+  /* 「-」占位不再独占一行：窄窗口下空行比省略号更难解释 */
+  .req-row .req-error-cell { display: none; }
+}
+
+/* 窄窗口：页头的自动刷新开关整行铺开，与日志页、报表页的时间范围同款处理。
+   不折的话开关会压在标题文案上换行，标题与 intro 各自占一行，读起来像断了半句。 */
+@media (max-width: 900px) {
+  .page[data-page="requests"] .page-head .head-actions {
+    flex-basis: 100%;
+    margin-left: 0;
+    justify-content: flex-start;
+  }
+}

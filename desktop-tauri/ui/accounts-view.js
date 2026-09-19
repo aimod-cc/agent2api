@@ -1,416 +1,135 @@
-/* WorkBuddy 本地代理 · 账号列表视图与行内操作（积分 / 签到 / 徽章） */
-/* global workbuddyDesktop, wbApp */
+/* Agent2API · 账号列表视图（全局一条队列的一张表 + 行内操作） */
+/* global workbuddyDesktop, wbApp, wbAccountsModel, wbAccountsTable, wbAccountsColumns, wbUsageActions, wbAccountsFilters */
 
 /**
- * 独立于 app.js 的账号视图模块：账号列表的渲染（含优先级 / 启用 / 代理徽章）
- * 与行内批量操作（积分查询、签到）集中在这里，主脚本只负责账号级的切换/删除/设置。
+ * 账号页的**有状态**那一半：表格重绘、批量选择、行内面板展开、⋯ 菜单定位、
+ * 优先级行内编辑、事件委托。
  *
- * 依赖 window.wbApp：esc / toast / formatTime / getState，
- * 通过 window.wbAccountsView 暴露给 app.js：
- *   render()                     重绘账号列表（筛选、分组、徽章、行内面板）
- *   renderNavCount()             导航上的账号数徽标
- *   refreshCaches(validIds)      清理已删除账号的本地缓存
- *   queryAllUsage()/queryFor(id) 积分
- *   checkinAll()/checkinFor(id)  签到
- *   checkinableAccounts(list)    可签到账号（启用 + 国内版）
- *   bindEvents()                 绑定筛选器与账号行按钮事件
+ * ── 全局一条队列（优先级不再按 provider 分段）────────────────────
+ * 优先级在后端是全局唯一的：四家账号混排在同一条队列里，转发时按优先级从小到大
+ * 逐个尝试，跳过禁用 / 不支持该模型 / 该模型限流中的账号（见 priority.rs 与
+ * rotate.rs）。所以这张表：
+ *   · 行序 = 优先级升序（不再按 provider 分块，也没有组首分隔线）；
+ *   · 「首选」= **下一个请求会先用的账号**（后端 `routedAccountId`：按最近一次
+ *     请求的模型派生，已剔除对该模型限流的账号）。它可能不是队列第一位 ——
+ *     队首正对该模型限流时，那一位显示为「队首」块，见 accounts-table 的 actionsCell；
+ *   · ↑/↓ 与全局相邻账号交换（对方可能是另一家的账号）；
+ *   · 「先用哪一家」由队列里排最前的支持该模型的账号决定，
+ *     provider 只再是账号的一个属性（不再有独立的「转发路由」设置）。
+ *
+ * ── 文件分工 ──────────────────────────────────────────────────
+ *   · `usage-actions.js`    余额 / 签到：发请求、写缓存、播报（不碰 DOM）
+ *   · `accounts-table.js`   一行长什么样：列定义与单元格 HTML（纯展示）
+ *   · `accounts-columns.js` 列宽拖动与持久化
+ *   · `accounts-filters.js` 筛选维度：状态、动态注入的下拉、分段计数徽标
+ *   · 本文件                重绘编排、批量选择、事件委托、优先级行内编辑
+ * 缓存 Map（usageMap / checkinMap）由 usage-actions 持有并**按引用**导出，
+ * 因为「查询中」（写 null）这个中间态要让视图立刻看到，拷贝一份就对不上了。
+ * 筛选状态同理：`wbAccountsFilters.state` 是本文件读的那一份对象本身。
  */
 (() => {
   const api = workbuddyDesktop;
   const $ = id => document.getElementById(id);
-  const { esc, toast, formatTime } = wbApp;
+  const { toast } = wbApp;
   // 领域判定与标签渲染抽到 accounts-model.js（纯逻辑，无状态），这里直接引用
   const {
-    byPriorityOrder,
-    isEnabled,
-    isRateLimited,
-    usableForModel,
-    accountEdition,
+    providerOf,
+    supportsUsage,
     supportsCheckin,
     checkinableAccounts,
-    accountTags,
-    metaLine,
-    editionCell,
+    visibleAccounts,
+    positionMap,
+    routedId,
+    pickQueueHead,
+    moreMenuHtml,
     usagePanelHtml: usagePanelHtmlOf,
+    limitPanelHtml: limitPanelHtmlOf,
     checkinPanelHtml: checkinPanelHtmlOf,
+    byPriorityOrder,
   } = wbAccountsModel;
+  // 余额 / 签到动作层（本次从本文件拆出），缓存按引用取用
+  const actions = wbUsageActions;
+  const { usageMap, checkinMap } = actions;
+  // 表格渲染层：列定义、行、明细行
+  const table = wbAccountsTable;
+  // 列宽：渲染时要喂 colgroup，交互（拖动/双击还原）由它自己委托
+  const columns = wbAccountsColumns;
+  // 筛选维度（状态与它自己的那部分 DOM）在 accounts-filters.js —— state 是同一个对象
+  const filters = wbAccountsFilters;
+  const accountFilter = filters.state;
 
-  const usageMap = new Map();   // accountId -> usage | error string | null(loading)
-  const checkinMap = new Map(); // accountId -> claimResult | error string | null(loading)
-  /**
-   * 四个独立筛选维度，可任意组合：
-   *   edition = all|cn|intl     账号版本
-   *   enabled = all|enabled|disabled  启用状态
-   *   limit   = all|normal|limited    限额状态（只对启用中的账号有意义）
-   *   model   = ''|模型 id       只看该模型的可用账号（限额按模型记，所以限额维度随它变）
-   */
-  const accountFilter = { edition: 'all', enabled: 'all', limit: 'all', model: '' };
-  /** 用户是否手动选过模型：没选过时跟随「最近一次请求的模型」 */
-  let modelPicked = false;
   /** 批量选择的账号 id（只作用于当前勾选，不随筛选变化自动增减） */
   const selectedIds = new Set();
   /** 最近一次渲染出的可见账号 id（「全选」只作用于这批） */
   let lastVisibleIds = [];
-
-  let usageBusy = false;
-  let checkinBusy = false;
+  /** 正在编辑中的优先级输入框（重绘前记下、重绘后放回，见 accounts-table.js） */
+  let editingSnapshot = null;
+  /**
+   * 重绘中标志：整张表被 innerHTML 换掉时，浏览器可能对**被移除的**输入框补发一个
+   * focusout —— 那个输入框已经脱离文档，但 dataset.prio 与用户敲了一半的值都还在，
+   * 于是「失焦提交」会被冤枉地触发一次 PATCH（把用户根本没打算提交的中间值存下去）。
+   * 重绘期间把它置真、结束置假，commitPriority 见真就跳过。
+   */
+  let rendering = false;
 
   const accounts = () => wbApp.getState()?.accounts?.accounts || [];
   const snapshot = () => wbApp.getState()?.accounts;
 
   // ─── 行内面板：展开状态 ─────────────────────
-  //
-  // 面板按需展开：只有用户点过「积分」/「签到」（或批量操作带出结果）之后才渲染。
-  // 收起状态下面板 HTML 为空串，行高保持一行。
-  // 面板内容本身由 accounts-model.js 渲染（纯展示，入参是缓存里的 entry）。
-
-  /** 已展开明细的账号：accountId -> Set<'usage' | 'checkin'> */
+  // 面板按需展开（用户点过「限流」/「积分」/「签到」或批量操作带出结果之后），收起时 HTML 为空串。
+  /** 已展开明细的账号：accountId -> Set<'limits' | 'usage' | 'checkin'> */
   const openPanels = new Map();
 
-  function panelOpen(accountId, kind) {
-    return openPanels.get(accountId)?.has(kind) === true;
-  }
+  const panelOpen = (accountId, kind) => openPanels.get(accountId)?.has(kind) === true;
 
   /** 展开 / 收起某账号的某块明细 */
   function setPanelOpen(accountId, kind, open) {
+    if (!accountId) return;
     const set = openPanels.get(accountId) || new Set();
     if (open) set.add(kind); else set.delete(kind);
     if (set.size) openPanels.set(accountId, set);
     else openPanels.delete(accountId);
   }
 
-  function usagePanelHtml(account) {
-    if (!panelOpen(account.id, 'usage')) return '';
-    return usagePanelHtmlOf(account, usageMap.get(account.id));
+  /** 批量展开入口：余额 / 签到的批量动作在 usage-actions.js，展开态归本文件管 */
+  function openPanelsFor(ids, kind) {
+    for (const id of ids) setPanelOpen(id, kind, true);
   }
 
-  function checkinPanelHtml(account) {
-    if (!panelOpen(account.id, 'checkin')) return '';
-    return checkinPanelHtmlOf(account, checkinMap.get(account.id));
+  /** 该账号当前要渲染的行内明细（未展开时为空串） */
+  function panelsHtml(account) {
+    let html = '';
+    if (panelOpen(account.id, 'limits')) html += limitPanelHtmlOf(account);
+    if (panelOpen(account.id, 'usage')) html += usagePanelHtmlOf(account, usageMap.get(account.id));
+    if (panelOpen(account.id, 'checkin')) html += checkinPanelHtmlOf(account, checkinMap.get(account.id));
+    return html;
   }
 
-  // ─── 卡片渲染 ──────────────────────────────
+  // ─── 列表渲染 ──────────────────────────────
 
   /**
-   * 单张账号卡渲染（不含分组标题）。
-   * position / total 为该账号在全局转发顺序里的位置，用于显示 P 值与
-   * 决定 ↑/↓ 按钮的可用性（队首不能上移、队尾不能下移）。
-   * routedId 为「当前视图下实际会被选中的账号 id」：选了模型时是该模型队列的
-   * 第一个可用账号，未选模型时是全局首选。
-   * model 为当前筛选的模型 id（空串 = 不限模型）。
+   * 一张表：所有可见账号按**全局优先级升序**排成一条队列（与后端选路同构）。
    *
-   * 卡片结构（自上而下，信息密度递减）：
-   *   ① 主体：勾选 / 账号名 + 状态区（版本徽章 + 状态徽章，贴卡片右缘）
-   *   ② 明细：额度类型 · 有效期 · 代理（未配置代理时只显示前两项）
-   *   ③ 提示：仅异常时出现的一行说明（429 恢复时间 / 代理异常）
-   *   ④ 底部：转发顺序在左，操作按钮在右
-   * 状态区（.card-state）是**名字行（.who-name）内部的末尾项**，不是 .card-head 的
-   * 独立一列：它靠 margin-left: auto 贴住名字行右缘，视觉上仍在卡片右上角；
-   * 而 .who 因此独占 .card-head 的剩余宽度，下面的明细行（.who-meta）拿到通栏宽度，
-   * 「代理」这类长项能多显示一大截（此前被状态区那一列白扣掉约 110–127px）。
-   * 版本徽章与状态徽章同处卡片右缘，是因为两者合起来回答的是同一个问题
-   * ——「这是什么账号、现在能不能用」；版本徽章若挂在账号名后面，名字会被两枚
-   * 标签夹住，扫读时先撞见标签、再找到名字。
-   * 频繁用到的操作留在卡内；启用/禁用、刷新 Token 与删除收进「⋯」菜单（点击才生成内容）。
+   * 每行的 ctx 都是现算的：位置表（序号与 ↑/↓ 边界）、队首（★ / 首选）、
+   * 各自的展开态。明细行紧跟在各自账号行之后（整宽内容，放进单元格会被那一列锁死）。
    */
-  function accountCardHtml(account, routedId, position, total, model = '') {
-    const isCurrent = account.id === routedId;
-    const enabled = isEnabled(account);
-    const picked = selectedIds.has(account.id);
-    const title = [
-      account.uid ? `uid ${account.uid}` : '',
-      account.updatedAt ? `更新于 ${formatTime(account.updatedAt)}` : '',
-    ].filter(Boolean).join('；');
-
-    const actions = [
-      `<span class="order-btns">`
-        + `<button data-action="move-up" data-id="${esc(account.id)}" title="与上一个账号交换优先级"${position <= 1 ? ' disabled' : ''}>↑</button>`
-        + `<button data-action="move-down" data-id="${esc(account.id)}" title="与下一个账号交换优先级"${position >= total ? ' disabled' : ''}>↓</button>`
-        + `</span>`,
-      `<button data-action="settings" data-id="${esc(account.id)}">设置</button>`,
-      isCurrent
-        ? '<button class="is-current" disabled title="已是转发顺序第一位，无需再置顶">首选</button>'
-        : `<button class="wide" data-action="switch" data-id="${esc(account.id)}" title="把该账号移到转发顺序第一位，并启用它">设为首选</button>`,
-      `<button data-action="usage" data-id="${esc(account.id)}" title="查询该账号剩余积分">积分</button>`,
-      // 签到按钮保持可见（国际版无签到活动，故仅国内版显示）
-      enabled && supportsCheckin(account)
-        ? `<button data-action="checkin" data-id="${esc(account.id)}" title="为该账号签到">签到</button>`
-        : '',
-      `<button data-action="more" data-id="${esc(account.id)}" title="更多操作">⋯</button>`,
-    ].filter(Boolean).join('');
-
-    const cardCls = [
-      'acct-card',
-      enabled ? '' : 'disabled',
-      picked ? 'selected' : '',
-      isCurrent ? 'is-first' : '',
-    ].filter(Boolean).join(' ');
-
-    return `<article class="${cardCls}" data-id="${esc(account.id)}">
-      <div class="card-head">
-        <span class="pick" title="勾选后可批量操作">
-          <input type="checkbox" data-pick="${esc(account.id)}"${picked ? ' checked' : ''}>
-        </span>
-        <div class="who">
-          <div class="who-name"${title ? ` title="${esc(title)}"` : ''}>
-            <span class="name">${esc(account.nickname || account.name || account.uid || '未命名账号')}</span>
-            <div class="card-state">${editionCell(account)}${accountTags(account, routedId, model) || '<span class="badge tag plain">—</span>'}</div>
-          </div>
-          <div class="who-meta">${metaLine(account, position)}</div>
-        </div>
-      </div>
-      ${cardNoteHtml(account, model)}
-      <div class="card-foot">
-        <span class="rank${isCurrent ? ' is-first' : ''}" title="转发顺序：数值越小越先用${position ? `；当前第 ${position} 位` : ''}">${isCurrent ? '<span class="star">★</span>' : ''}<span class="p">P</span>${Number(account.priority ?? 100)}</span>
-        <div class="card-actions">${actions}</div>
-      </div>
-      <div class="row-panels">${usagePanelHtml(account)}${checkinPanelHtml(account)}</div>
-    </article>`;
-  }
-
-  /** 无有效恢复时间时的退化文案：它本身就是完整一句，调用方据此不再拼「，恢复时间：」 */
-  const RESET_UNKNOWN = '已限流';
-
-  /** 某时刻所在自然日的零点（本地时区），用于按「日历天」计算今天 / 明天 */
-  const startOfDay = value => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
-
-  /**
-   * 限流恢复时间文案：今天 HH:mm / 明天 HH:mm / M月d日 HH:mm。
-   *
-   * 为什么带「今天 / 明天」而不是相对毫秒数或完整时间戳：限流是自动解除的，
-   * 用户扫过卡片时最关心「到点了没、还要等多久」——「明天 01:04」比
-   * 「09-19 01:04」少一步换算，也不会像「6 小时后」那样一过夜就说不清是哪天。
-   *
-   * 无有效时间戳（缺失 / 非法 / 已过，后者说明数据异常）时返回 RESET_UNKNOWN，
-   * 由调用方退化成只输出这一句。
-   */
-  function formatResetText(resetAt) {
-    const time = Number(resetAt);
-    if (!Number.isFinite(time) || time <= 0 || time <= Date.now()) return RESET_UNKNOWN;
-    const date = new Date(time);
-    const clock = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
-    // 按自然日求差而不是按 24 小时：今晚 23:50 到明天 00:10 只差 20 分钟，
-    // 但用户嘴里它就是「明天」，按毫秒差算会显示成「今天」，与直觉相反。
-    const days = Math.round((startOfDay(date) - startOfDay(new Date())) / 86400e3);
-    if (days === 0) return `今天 ${clock}`;
-    if (days === 1) return `明天 ${clock}`;
-    return `${date.getMonth() + 1}月${date.getDate()}日 ${clock}`;
-  }
-
-  /**
-   * 异常提示条：状态徽章只说「是什么」（限流 / 代理异常），这一行补「怎么办」。
-   * 只在有异常时返回内容，正常卡片不占这行高度 —— 否则整片卡片都被拉高，
-   * 却只为了重复一遍「一切正常」。
-   */
-  function cardNoteHtml(account, model = '') {
-    const notes = [];
-    if (isEnabled(account) && isRateLimited(account, model)) {
-      // 带恢复时间：用户最想知道的不是「被限流了」，而是「什么时候自动回来」——
-      // 写清楚时间点就不必去日志页翻限额切换记录。
-      // 时间点包 <strong> 加粗：这一行真正要读的是「几点回来」，「已限流，恢复时间：」
-      // 只是引出它的定语；两者同权重时时间点会被前七个字淹没。不在 strong 上写样式，
-      // 用浏览器默认的加粗即可（本项目其它 strong 也只调整文字色，见 components.css）。
-      // 退化态（无有效时间戳）没有可强调的对象，保持纯文本，不包空标签。
-      const resetText = formatResetText(account.rateLimits?.[model]?.resetAt);
-      notes.push(resetText === RESET_UNKNOWN ? resetText : `已限流，恢复时间：<strong>${resetText}</strong>`);
-    }
-    if (account.proxy?.error) {
-      notes.push(`代理不可用（${esc(account.proxy.error)}），转发时会回退直连`);
-    }
-    if (account.available === false) {
-      notes.push(esc(account.reason || '账号当前不可用'));
-    }
-    if (!notes.length) return '';
-    // 代理/不可用属于必须处理的故障，用红；纯限额是会自动绕过的，用黄
-    const bad = Boolean(account.proxy?.error) || account.available === false;
-    return `<div class="card-note ${bad ? 'bad' : 'warn'}"><span class="ico">⚠</span><span>${notes.join('；')}</span></div>`;
-  }
-
-  /**
-   * 打开「⋯」菜单：点击时才把菜单项插入 DOM，收起时移除。
-   * 之所以不是常驻隐藏（display:none），是因为布局探针会把「常驻但隐藏」的
-   * 按钮算进行内按钮集合，导致测量结果与实际可见操作不一致。
-   */
-  let openMenu = null;          // 当前展开的菜单元素
-  let menuScrollHost = null;    // 菜单展开期间挂着 scroll 监听的滚动容器
-  let menuScrollHandler = null; // 与之配对的监听函数，收起时用来摘掉
-
-  function closeMoreMenu() {
-    if (openMenu) { openMenu.remove(); openMenu = null; }
-    if (menuScrollHost && menuScrollHandler) {
-      menuScrollHost.removeEventListener('scroll', menuScrollHandler);
-    }
-    menuScrollHost = null;
-    menuScrollHandler = null;
-  }
-
-  /**
-   * 决定菜单往下弹还是往上弹（加 / 摘 .more-menu.flip）。
-   *
-   * 为什么必须量：菜单是卡片内的绝对定位块，而卡片网格在 .acct-scroll 这个
-   * 滚动容器里。列表底部那几张卡下方已经没有可视空间，固定往下弹的菜单会超出
-   * 容器底部被裁掉 —— 既看不见也点不到。反过来，卡片在列表顶部时下方空间充足，
-   * 又该正常往下弹，所以只能按当下的几何量出来判。
-   *
-   * 判定口径：菜单下沿越过「滚动容器可视底」与「视口底」里更靠上的那个，
-   * 就说明往下放不下。容器取不到时（防御，理论上不会发生）只跟视口底比。
-   *
-   * 为什么不用循环二次校验：翻转后的锚点是 .card-foot 的**上沿**（不是卡片上沿），
-   * 菜单底边离它只有 4px。会触发翻转的卡片本就处在可视区靠下的位置，锚点上方
-   * 至少还有整张卡的主体（账号名 + 明细行）再加容器里上方的余量，
-   * 而菜单最高也只是「三项 + 一条分隔线」，所以定一次方向就够。
-   */
-  function applyMenuDirection(menu) {
-    // 列表重绘会把菜单连同卡片一起换掉，此时元素已脱离文档，量不出有意义的值
-    if (!menu.isConnected) return;
-    // 先摘掉翻转态再量：带着 flip 量到的是「向上」的矩形，用它判定会一直得出
-    // 「下方有空间」，下一次滚动就把翻转撤销了 —— 必须量默认的向下位置。
-    // （同一帧内摘掉再加回不会闪：浏览器只在本轮 JS 跑完后绘制。）
-    menu.classList.remove('flip');
-    const rect = menu.getBoundingClientRect();
-    const scroller = menu.closest('.acct-scroll');
-    const bottomLimit = Math.min(
-      scroller ? scroller.getBoundingClientRect().bottom : Infinity,
-      document.documentElement.clientHeight,
-    );
-    menu.classList.toggle('flip', rect.bottom > bottomLimit);
-  }
-
-  function toggleMoreMenu(button, account) {
-    const already = openMenu && openMenu.dataset.for === account.id;
-    closeMoreMenu();
-    if (already) return;
-
-    const menu = document.createElement('div');
-    menu.className = 'more-menu';
-    menu.dataset.for = account.id;
-
-    // 菜单按「影响面」从大到小排：启用/禁用会改变这个账号是否参与转发，
-    // 是最重的一项，故放在最前；删除账号同理，排在最后并由 <hr> 隔开。
-    // 启用/禁用在本文件自行消化（见下方 data-menu-action 分支）：app.js 的
-    // runAccountAction 只认 switch / refresh / remove，未知 action 会被静默忽略。
-    // 两项都标 danger（同「删除账号」的红色）：它们会立刻改变转发可用性，
-    // 禁用还有可能把唯一可用账号停掉，颜色上必须先给一次警示。
-    const items = [];
-    items.push(isEnabled(account)
-      ? { action: 'disable', label: '禁用', danger: true }
-      : { action: 'enable', label: '启用', danger: true });
-    if (account.hasRefreshToken) {
-      items.push({ action: 'refresh', label: '刷新 Token' });
-    }
-    if (!account.desktop) {
-      items.push({ action: 'remove', label: '删除账号', danger: true });
-    }
-    // 菜单内不再重复行内已有的操作（设置/积分/设为首选都留在行上）
-    // 签到同属此列：它的入口只保留行内按钮一处（启用 + 国内版才渲染），
-    // 菜单里再挂一项等于同一动作有两个入口 —— 用户会疑心两者行为不同，
-    // 菜单也多出一行没有信息量的项。
-    // 分隔线只在 danger 项前面插：新加的启用/禁用落在 index 0，此处不会给它插前置线，
-    // 它本来就该是菜单的第一项，上方无需分隔。
-    menu.innerHTML = items.map((item, index) => {
-      const hr = item.danger && index > 0 ? '<hr>' : '';
-      return `${hr}<button data-menu-action="${item.action}" data-id="${esc(account.id)}"`
-        + `${item.danger ? ' class="danger"' : ''}>${esc(item.label)}</button>`;
-    }).join('');
-
-    // 挂在卡片底部操作区里，菜单就贴着按钮组弹出（.card-foot 是定位祖先），
-    // 随列表滚动一起移动，不会浮到别的卡片上
-    const host = button.closest('.card-foot') || button.closest('.acct-card');
-    host.appendChild(menu);
-    openMenu = menu;
-
-    // 插入后立刻按当下几何定一次方向：列表底部的卡片改用向上弹
-    applyMenuDirection(menu);
-
-    // 菜单开着时盯着滚动：滚动会带着卡片和菜单一起移动，原本放得下的方向可能
-    // 变得放不下（反之亦然），所以持续重测、只增删 flip 类，不关菜单。
-    // 监听用 passive 且只读几何，不干扰滚动性能；closeMoreMenu 时统一摘掉。
-    menuScrollHost = menu.closest('.acct-scroll');
-    if (menuScrollHost) {
-      menuScrollHandler = () => {
-        // 列表被整体重绘（后台推送刷新等）时，菜单会随旧卡片一起被换掉。
-        // 这里自行收尾，别把监听留在滚动容器上引用一个已脱离文档的节点。
-        if (!menu.isConnected) { closeMoreMenu(); return; }
-        applyMenuDirection(menu);
-      };
-      menuScrollHost.addEventListener('scroll', menuScrollHandler, { passive: true });
-    }
-  }
-
-  /** 转发顺序下的位置表：accountId → 第几位（1 起） */
-  function positionMap() {
-    const order = accounts().slice().sort(byPriorityOrder);
-    const map = new Map();
-    order.forEach((account, index) => map.set(account.id, index + 1));
-    return { map, total: order.length };
-  }
-
-  /**
-   * 更新各筛选分段的计数徽标。key 取自 HTML 上的 data-count：
-   * 三个维度的「全部」分别是 editionAll / enabledAll / limitAll，
-   * 各自代表「另外两个维度已选条件下的合计」，所以必须用不同的 key。
-   */
-  function updateSegCounts(counts) {
-    document.querySelectorAll('.seg-item').forEach(item => {
-      const badge = item.querySelector('.seg-count');
-      const key = badge?.dataset.count;
-      if (!badge || !key) return;
-      const value = counts[key] ?? 0;
-      badge.textContent = String(value);
-      item.classList.toggle('zero', value === 0);
-    });
-  }
-
   function render() {
     const list = $('account-list');
     if (!list) return;
-    // 先归一化筛选状态：状态选「禁用」时限额维度无意义，会被复位到「全部」
-    syncLimitAvailability();
-    syncModelFilter();
     const snap = snapshot();
     const all = Array.isArray(snap?.accounts) ? snap.accounts : [];
-    // 当前筛选的模型：为空表示「不限模型」（限额取任一模型的记录）
-    const model = accountFilter.model;
+    // 先归一化筛选状态（限流的可用性依赖状态已归一，顺序不能换）
+    filters.syncAll(all);
     $('accounts-count').textContent = String(all.length);
-    $('btn-query-usage').disabled = !all.length;
+    // 余额查询：四家都支持（各由自己的适配器实现），有任一账号有这个概念就可点
+    $('btn-query-usage').disabled = !all.some(supportsUsage);
     $('btn-checkin-all').disabled = !checkinableAccounts(all).length;
 
-    // 四个维度各自独立：版本 / 启用状态 / 限额 / 模型。
-    // 判定函数抽出来给「可见列表」和「分段计数」共用，保证徽标数字与点进去看到的结果永远一致。
-    const matchEdition = account => accountFilter.edition === 'all'
-      || accountEdition(account) === accountFilter.edition;
-    const matchEnabled = account => {
-      if (accountFilter.enabled === 'all') return true;
-      return accountFilter.enabled === 'enabled' ? isEnabled(account) : !isEnabled(account);
-    };
-    // 已禁用账号既不算「正常」也不算「已限流」：限流状态只对参与转发的账号有意义
-    // 限额判定按所选模型走 —— 这正是「模型筛选」的意义
-    const matchLimit = account => {
-      if (accountFilter.limit === 'all') return true;
-      if (!isEnabled(account)) return false;
-      return accountFilter.limit === 'limited' ? isRateLimited(account, model) : !isRateLimited(account, model);
-    };
-
-    const visible = all.filter(account => matchEdition(account) && matchEnabled(account) && matchLimit(account));
+    // 四个维度各自独立（提供商 / 版本 / 启用状态 / 限流），判定函数在 accounts-groups.js，
+    // 可见列表与分段计数共用同一份口径。
+    const visible = visibleAccounts(all, accountFilter);
     lastVisibleIds = visible.map(a => a.id);
-
-    // 计数：某分段显示的数字 = 「另外几个维度保持当前选择、本维度取该值」的账号数
-    const forEdition = all.filter(account => matchEnabled(account) && matchLimit(account));
-    const forEnabled = all.filter(account => matchEdition(account) && matchLimit(account));
-    const forLimit = all.filter(account => matchEdition(account) && matchEnabled(account));
-    updateSegCounts({
-      editionAll: forEdition.length,
-      cn: forEdition.filter(a => accountEdition(a) === 'cn').length,
-      intl: forEdition.filter(a => accountEdition(a) === 'intl').length,
-      enabledAll: forEnabled.length,
-      enabled: forEnabled.filter(isEnabled).length,
-      disabled: forEnabled.filter(a => !isEnabled(a)).length,
-      limitAll: forLimit.length,
-      normal: forLimit.filter(a => isEnabled(a) && !isRateLimited(a, model)).length,
-      limited: forLimit.filter(a => isEnabled(a) && isRateLimited(a, model)).length,
-    });
-
-    renderBatchBar(all, visible.map(a => a.id));
+    renderBatchBar(all, lastVisibleIds);
 
     if (!all.length) {
       list.innerHTML = '<div class="empty">暂无账号，请点击右上角「登录 / 添加账号」</div>';
@@ -420,49 +139,47 @@
       list.innerHTML = '<div class="empty">当前筛选条件下没有账号</div>';
       return;
     }
+    // 队首（★ / 「首选」）：优先用后端按「最近一次请求的模型」派生的
+    // `routedAccountId` —— 它把该模型限流中的账号剔除了，与转发层同一套判据，
+    // 标出来的就是这个请求真正会先试的账号。后端没给（旧版后端 / 模型未知）时
+    // 回落到不限模型的 `currentAccountId`，两者都不可用才由前端按同一判据派生。
+    const currentId = routedId(all, wbApp.getState?.()?.routedAccountId, snap.currentAccountId);
+    // 队列第一位（不看限额）：与 currentId 不同，说明它正被最近那个模型限流、
+    // 本次请求会顺延 —— 操作列据此把「设为首选」换成不可点的「队首」块
+    const queueHeadId = pickQueueHead(all)?.id || null;
+    const positions = positionMap(all);
 
-    // 版本选「全部」时按版本分组展示，选具体版本时只列该组
-    const groups = accountFilter.edition === 'all'
-      ? [
-        { key: 'cn', title: '国内账号', items: visible.filter(a => accountEdition(a) === 'cn') },
-        { key: 'intl', title: '国际账号', items: visible.filter(a => accountEdition(a) === 'intl') },
-      ].filter(group => group.items.length)
-      : [{ key: accountFilter.edition, title: '', items: visible }];
-
-    // 组内按转发顺序排列，与 P 值和 ↑/↓ 的方向保持一致
-    const { map: positions, total } = positionMap();
-    // 选了模型时，该模型实际会用哪个账号 —— 这是「这个模型的账号队列」的答案：
-    // 队列按优先级排，第一个「启用且对该模型未限流」的即为实际选中项。
-    const routedId = model ? pickForModel(all, model)?.id ?? null : snap.currentAccountId;
-    // 卡片网格：分组标题也是网格项，横跨整行
-    const body = groups.map(group => {
-      const title = group.title
-        ? `<div class="acct-group-title">${esc(group.title)} · ${group.items.length}</div>`
-        : '';
-      const items = group.items.slice().sort(byPriorityOrder);
-      return title + items
-        .map(a => accountCardHtml(a, routedId, positions.get(a.id) ?? 0, total, model))
-        .join('');
+    // 逐行渲染（priorityUsage 之类的提示数据不再需要：冲突只有后端一处判）
+    const body = visible.slice().sort(byPriorityOrder).map(account => {
+      const row = table.rowHtml(account, {
+        seat: positions.get(account.id) || { position: 1, total: 1 },
+        isCurrent: account.id === currentId,
+        isQueueHead: account.id === queueHeadId,
+        picked: selectedIds.has(account.id),
+        usageEntry: usageMap.get(account.id),
+        usageOpen: panelOpen(account.id, 'usage'),
+        limitsOpen: panelOpen(account.id, 'limits'),
+      });
+      const panels = panelsHtml(account);
+      return row + (panels ? table.panelsRowHtml(account, panels) : '');
     }).join('');
+
+    // 重绘会换掉整张表：正在编辑的优先级输入框要先记下、画完再放回原位
+    editingSnapshot = table.captureEditing();
+    rendering = true;
     list.className = 'acct-scroll';
-    list.innerHTML = `<div class="acct-grid">${body}</div>`;
+    list.innerHTML = table.tableHtml(body, columns.widths());
+    table.restoreEditing(editingSnapshot);
+    rendering = false;
+    // 表头那个「全选」是新画出来的节点，状态必须在它进 DOM **之后**再同步：
+    // renderBatchBar 里那次同步发生在 innerHTML 赋值之前，只能改到上一版表格里的
+    // 那个复选框（此刻已被换掉），所以这里补一次。
+    syncSelectAllBoxes(lastVisibleIds);
   }
 
   /**
-   * 某个模型的选路结果：优先级升序里第一个「启用且对该模型未限流」的账号。
-   * 与后端 pickAccountByPriority 的判定保持一致（不含 429 重试的排除列表）。
-   */
-  function pickForModel(list, model) {
-    const candidates = (list || [])
-      .filter(account => usableForModel(account, model))
-      .sort(byPriorityOrder);
-    return candidates[0] || null;
-  }
-
-  /**
-   * 批量操作栏：常驻显示，避免「必须先勾选才能全选」的死循环。
-   * 未勾选时按钮禁用；全选只覆盖当前筛选结果，不会选中被筛掉的账号。
-   * visibleIds 传的是 id 而不是账号对象，方便勾选时就地刷新操作栏而不重绘列表。
+   * 批量操作栏：常驻显示，避免「必须先勾选才能全选」的死循环；未勾选时按钮禁用。
+   * 全选只覆盖当前筛选结果。visibleIds 传 id 而非账号对象，便于就地刷新操作栏。
    */
   function renderBatchBar(all, visibleIds) {
     const bar = $('batch-bar');
@@ -485,11 +202,6 @@
       hint.textContent = hiddenByFilter ? `另有 ${hiddenByFilter} 个已勾选账号被当前筛选隐藏，仍会参与操作` : '';
     }
 
-    const box = $('batch-select-all');
-    const allPicked = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id));
-    box.checked = allPicked;
-    box.indeterminate = !allPicked && visibleIds.some(id => selectedIds.has(id));
-    box.disabled = !visibleIds.length;
     const label = $('batch-select-label');
     if (label) label.textContent = visibleIds.length ? `全选当前筛选结果（${visibleIds.length} 个）` : '没有可全选的账号';
 
@@ -497,68 +209,37 @@
       const button = $(id);
       if (button) button.disabled = !active;
     }
+    syncSelectAllBoxes(visibleIds);
+  }
+
+  /** 「全选」的两个入口（批量栏 + 表头）保持同一状态：勾满 / 半选 / 不可点 */
+  function syncSelectAllBoxes(visibleIds) {
+    const ids = visibleIds || lastVisibleIds;
+    const allPicked = ids.length > 0 && ids.every(id => selectedIds.has(id));
+    const somePicked = ids.some(id => selectedIds.has(id));
+    for (const id of ['batch-select-all', 'acct-select-all']) {
+      const box = $(id);
+      if (!box) continue;
+      box.checked = allPicked;
+      box.indeterminate = !allPicked && somePicked;
+      box.disabled = !ids.length;
+    }
   }
 
   /**
    * 把选中态同步到已有 DOM：勾选框、行高亮与操作栏。
-   * 就地更新而不是重绘整个列表 —— 重绘会丢掉滚动位置，勾选时还会丢失输入焦点。
+   * 就地更新而不是重绘整张表 —— 重绘会丢掉滚动位置，勾选时还会丢失输入焦点。
    */
   function syncSelectionUi() {
     document.querySelectorAll('#account-list input[data-pick]').forEach(box => {
       const picked = selectedIds.has(box.dataset.pick);
       box.checked = picked;
-      box.closest('.acct-card')?.classList.toggle('selected', picked);
+      box.closest('tr.acct-row')?.classList.toggle('selected', picked);
     });
     renderBatchBar(accounts(), lastVisibleIds);
   }
 
-  /**
-   * 模型筛选下拉：填充选项并保持选中项与 accountFilter.model 一致。
-   *
-   * 默认值优先取「最近一次实际请求的模型」——用户打开账号页最想知道的是
-   * 「我正在用的这个模型会走哪些账号」，而不是一个抽象的全局顺序。
-   * 用户手动选过之后（modelPicked）就不再自动跟随，避免抢走选择权。
-   */
-  function syncModelFilter() {
-    const select = $('account-model-filter');
-    if (!select) return;
-    const state = wbApp.getState() || {};
-    const models = Array.isArray(state.models) ? state.models : [];
-    const fallback = state.lastRequestModel || state.defaultModel || '';
-    // 未手动选过时持续跟随「最近一次请求的模型」：
-    // 用户关心的是「我现在用的这个模型走哪些账号」，换模型后就该跟着变。
-    // 手动选过之后（modelPicked）不再抢占他的选择。
-    if (!modelPicked && fallback) accountFilter.model = fallback;
-
-    // 选项只在模型目录变化时重建，避免每次渲染都重置滚动位置
-    const signature = models.map(m => m.id).join('|');
-    if (select.dataset.signature !== signature) {
-      select.dataset.signature = signature;
-      select.innerHTML = models.map(m => `<option value="${esc(m.id)}">${esc(m.name || m.id)}${m.isDefault ? '（默认）' : ''}</option>`).join('');
-    }
-    // 目录里没有当前选中值（如旧 id）时回落到第一项，避免出现空选择
-    if (accountFilter.model && !models.some(m => m.id === accountFilter.model)) {
-      accountFilter.model = models[0]?.id || '';
-    }
-    if (select.value !== accountFilter.model) select.value = accountFilter.model;
-  }
-
-  /**
-   * 限额维度与启用状态联动：状态筛成「禁用」时，正常/已限流都不存在，
-   * 于是把限额复位为「全部」并禁用该组分段，避免出现一个点了永远空的分段。
-   */
-  function syncLimitAvailability() {
-    const disabledOnly = accountFilter.enabled === 'disabled';
-    if (disabledOnly && accountFilter.limit !== 'all') accountFilter.limit = 'all';
-    const group = $('account-limit-filter');
-    if (!group) return;
-    group.querySelectorAll('.seg-item').forEach(item => {
-      item.disabled = disabledOnly && item.dataset.limit !== 'all';
-      item.classList.toggle('active', item.dataset.limit === accountFilter.limit);
-    });
-  }
-
-  /** 导航上的账号数徽标 */
+  /** 导航上的账号数徽标（总数：这是「我总共有几个登录态」，与家数无关） */
   function renderNavCount() {
     const all = accounts();
     const badge = $('nav-count-accounts');
@@ -567,346 +248,412 @@
     badge.classList.toggle('muted', all.length === 0);
   }
 
-  /** 清掉已删除账号的本地缓存 */
+  /** 清掉已删除账号的本地缓存（缓存本体在 usage-actions.js，展开态在本文件） */
   function refreshCaches(validIds) {
-    for (const id of usageMap.keys()) if (!validIds.has(id)) usageMap.delete(id);
-    for (const id of checkinMap.keys()) if (!validIds.has(id)) checkinMap.delete(id);
+    actions.refreshCaches(validIds);
     for (const id of openPanels.keys()) if (!validIds.has(id)) openPanels.delete(id);
   }
 
+  // ─── 优先级行内编辑 ─────────────────────────
+  //
+  // 输入框一直可编辑（不是双击才变控件，理由见 accounts-table.js 的 priorityCell）。
+  // 提交时机是**失焦**：读 input.value → 归一 → 与当前值相同就只把显示复原，
+  // 不同才发 PATCH。
+
+  const DEFAULT_PRIORITY = table.PRIORITY_DEFAULT;
+
+  /** 显示值 → 归一后的数字；非法（空 / NaN）返回 null，由调用方还原显示 */
+  function readPriorityInput(input) {
+    const raw = String(input.value ?? '').trim();
+    if (!raw) return null;
+    const value = Number(raw);
+    if (!Number.isFinite(value)) return null;
+    return table.clampPriority(value);
+  }
+
   /**
-   * 把一批余额结果写进列表缓存（启动自动维护与批量查询共用）。
-   * 返回写入条数，调用方据此决定要不要重绘。
+   * 提交一个优先级输入框。
+   *
+   * 失败（409 冲突）时**必须还原显示值**：留着用户输的数字会让人以为存进去了，
+   * 而实际的转发顺序没变 —— 下一次刷新时它会悄悄跳回去，那比当场报错更让人困惑。
+   * 后端的 409 文案已经带上了占位者的姓名（`优先级 100 已被账号「X」占用…`），
+   * 直接透出即可，不必在前端另写一套判据（前端不知道谁是占位者，除非再算一遍，
+   * 而两套算法迟早会分叉）。
    */
-  function applyBalances(balances) {
-    const rows = Array.isArray(balances?.results) ? balances.results : [];
-    let applied = 0;
-    for (const row of rows) {
-      if (!row?.id) continue;
-      usageMap.set(row.id, row.usage ? row.usage : (row.error ? String(row.error) : '余额响应为空'));
-      applied++;
-    }
-    return applied;
-  }
-
-  // ─── 积分 ──────────────────────────────────
-
-  async function queryUsageFor(id) {
-    // 后端批量接口：给 id 也走同一接口（返回全部，这里按需取用）
-    const data = await api.getAllBalances();
-    const rows = Array.isArray(data?.results) ? data.results : [];
-    const returned = new Set();
-    for (const row of rows) {
-      if (!row?.id) continue;
-      if (id && row.id !== id) continue;
-      returned.add(row.id);
-      usageMap.set(row.id, row.usage ? row.usage : (row.error ? String(row.error) : '余额响应为空'));
-    }
-    if (id) {
-      if (!returned.has(id)) usageMap.set(id, '未返回余额数据');
-    } else {
-      for (const acc of accounts()) if (!returned.has(acc.id)) usageMap.set(acc.id, '未返回余额数据');
-    }
-    render();
-    return data;
-  }
-
-  async function queryAllUsage() {
-    if (usageBusy) return;
-    const all = accounts();
-    if (!all.length) { toast('暂无可查询的账号', 'err'); return; }
-    usageBusy = true;
-    const button = $('btn-query-usage');
-    button.disabled = true;
-    button.textContent = '查询中…';
-    // 已禁用账号不参与批量查询（后端同样会跳过）
-    const targets = all.filter(isEnabled);
-    targets.forEach(a => usageMap.set(a.id, null));
-    // 批量查询是「我要看所有人的余额」，所以顺手把明细展开 —— 否则结果无处可看
-    targets.forEach(a => setPanelOpen(a.id, 'usage', true));
-    render();
-    try {
-      const result = await queryUsageFor(null);
-      const rows = result?.results || [];
-      const ok = rows.filter(r => r.usage).length;
-      toast(ok === rows.length
-        ? `✅ 已更新 ${ok} 个账号的积分`
-        : `已更新 ${ok}/${rows.length} 个账号，部分失败`, ok !== rows.length ? 'err' : 'ok');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      targets.forEach(a => usageMap.set(a.id, `查询失败：${message}`));
-      render();
-      toast(`积分查询失败：${message}`, 'err');
-    } finally {
-      usageBusy = false;
-      button.disabled = false;
-      button.textContent = '查询积分';
-    }
-  }
-
-  // ─── 签到 ──────────────────────────────────
-
-  async function checkinFor(id) {
-    // id 缺省 = 全部账号串行签到；指定 id = 单账号签到
-    const data = await api.checkinAllAccounts(id || null);
-    const rows = Array.isArray(data?.results) ? data.results : [];
-    if (id) {
-      const row = rows.find(r => r.id === id) || rows[0];
-      if (!row) checkinMap.set(id, '未返回签到结果');
-      else if (row.error) checkinMap.set(id, String(row.error));
-      else if (row.claim) checkinMap.set(id, row.claim);
-      else checkinMap.set(id, '签到响应为空');
-    } else {
-      for (const row of rows) {
-        if (!row?.id) continue;
-        if (row.error) checkinMap.set(row.id, String(row.error));
-        else if (row.claim) checkinMap.set(row.id, row.claim);
-        else checkinMap.set(row.id, '签到响应为空');
-      }
-      const returned = new Set(rows.map(r => r.id));
-      for (const acc of checkinableAccounts(accounts())) {
-        if (!returned.has(acc.id)) checkinMap.set(acc.id, '未返回签到结果');
-      }
-    }
-    render();
-    return data;
-  }
-
-  async function checkinAll() {
-    if (checkinBusy) return;
-    const targets = checkinableAccounts(accounts());
-    if (!targets.length) { toast('暂无可签到的账号（国际版无签到活动）', 'err'); return; }
-    if (!confirm(`将对 ${targets.length} 个国内版账号串行签到，可能需要一点时间。继续？`)) return;
-    checkinBusy = true;
-    const button = $('btn-checkin-all');
-    button.disabled = true;
-    button.textContent = '签到中…';
-    targets.forEach(a => checkinMap.set(a.id, null));
-    // 同批量积分：结果要看得见，所以批量签到也把明细展开
-    targets.forEach(a => setPanelOpen(a.id, 'checkin', true));
-    render();
-    try {
-      const data = await checkinFor(null);
-      const succeeded = data?.succeeded ?? 0;
-      const total = data?.total ?? 0;
-      const skipped = Number(data?.skipped) || 0;
-      toast(`签到完成：${succeeded}/${total} 个账号成功领取`
-        + (skipped ? `（跳过 ${skipped} 个已禁用/国际版账号）` : ''), succeeded < total ? 'err' : 'ok');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      targets.forEach(a => checkinMap.set(a.id, `签到失败：${message}`));
-      render();
-      toast(`签到失败：${message}`, 'err');
-    } finally {
-      checkinBusy = false;
-      button.disabled = false;
-      button.textContent = '全部签到';
-    }
-  }
-
-// ─── 事件绑定 ──────────────────────────────
-
-/**
- * 账号行按钮与两级筛选的绑定。
- * 事件绑定与脚本加载顺序绑定（本模块在 app.js 之后加载，wbApp 已就绪），
- * 因此在这里自持注册，而不依赖 app.js 回调过来。
- */
-function bindEvents() {
-  $('account-list').addEventListener('click', async event => {
-    // 明细条上的「收起」按钮
-    const closer = event.target.closest('button[data-panel-close]');
-    if (closer) {
-      const host = closer.closest('.acct-card');
-      setPanelOpen(host?.dataset.id, closer.dataset.panelClose, false);
-      render();
+  async function commitPriority(input) {
+    // 重绘拆掉旧输入框时浏览器补发的那个 focusout 不算用户提交（见 rendering 的说明）
+    if (rendering) return;
+    const id = input.dataset.prio;
+    const account = accounts().find(item => item.id === id);
+    if (!account) return;
+    const current = table.priorityOf(account);
+    const next = readPriorityInput(input);
+    // 非法值 / 未改动：只把显示复原，不发请求（改成同一个值后端也会返回空 changes）
+    if (next === null || next === current) {
+      input.value = String(current);
       return;
     }
-    // ⋯ 菜单里的菜单项（启用/禁用 / 刷新 Token / 删除账号）
-    const menuItem = event.target.closest('button[data-menu-action]');
-    if (menuItem) {
-      const { menuAction, id } = menuItem.dataset;
-      closeMoreMenu();
-      // 启用/禁用在这里自行消化，不交给 app.js 的 runAccountAction ——
-      // 那个入口只处理 switch / refresh / remove，未知 action 会被静默忽略
-      // （不报错也不生效）。走同一套桥接方法 updateAccount（PATCH /api/accounts/<id>），
-      // 与卡片设置弹窗里勾选「启用」保存的是同一条链路，语义一致。
-      if (menuAction === 'enable' || menuAction === 'disable') {
-        await toggleAccountEnabled(id, menuAction === 'enable');
+    input.disabled = true;
+    try {
+      await api.updateAccount(id, { priority: next });
+      input.value = String(next);
+      toast(`✅ 优先级已改为 ${next}`);
+      // 改完顺序会变，必须重拉：只改本地 DOM 的话行不会重排，看起来「没生效」
+      await wbApp.refresh?.();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // 还原成**账号当前的真实值**，不是用户输入的值
+      input.value = String(current);
+      toast(`优先级未保存：${message}`, 'err');
+      // 冲突可能来自别处已经改过的数据（比如另一端刚占了号），补一次刷新让列表回到事实
+      void wbApp.refresh?.();
+    } finally {
+      input.disabled = false;
+    }
+  }
+
+  /** 清除限流标记：单条（model）或全部。后端返回新快照，交给全局刷新对齐。 */
+  async function clearLimits(id, model) {
+    try {
+      await api.clearRateLimits(id, model || null);
+      toast(model ? `✅ 已清除 ${model} 的限流标记` : '✅ 已清除该账号全部限流标记');
+      await wbApp.refresh?.();
+    } catch (error) {
+      toast(`清除失败：${error instanceof Error ? error.message : String(error)}`, 'err');
+    }
+  }
+
+  // ─── ⋯ 菜单（点击才插入 DOM）─────────────────
+
+  let openMenu = null;          // 当前展开的菜单元素
+  let menuScrollHost = null;    // 菜单展开期间挂着 scroll 监听的滚动容器
+  let menuScrollHandler = null; // 与之配对的监听函数，收起时用来摘掉
+
+  function closeMoreMenu() {
+    if (openMenu) { openMenu.remove(); openMenu = null; }
+    if (menuScrollHost && menuScrollHandler) {
+      menuScrollHost.removeEventListener('scroll', menuScrollHandler);
+    }
+    menuScrollHost = null;
+    menuScrollHandler = null;
+  }
+
+  /**
+   * 决定菜单往下弹还是往上弹（加 / 摘 .more-menu.flip）。
+   *
+   * 判定口径：菜单下沿越过「滚动容器可视底」与「视口底」里更靠上的那个即为放不下。
+   * 表格住在 .acct-scroll 这个滚动容器里，列表底部的行下方已没有可视空间，
+   * 固定往下弹会超出容器底部被裁掉（既看不见也点不到）；行在列表顶部时又该正常往下弹
+   * —— 方向只能按当下几何量出来判。
+   */
+  function applyMenuDirection(menu) {
+    // 列表重绘会把菜单连同行一起换掉，此时元素已脱离文档，量不出有意义的值
+    if (!menu.isConnected) return;
+    // 先摘掉翻转态再量：带着 flip 量到的是「向上」的矩形，用它判定会一直得出
+    // 「下方有空间」，下一次滚动就把翻转撤销了 —— 必须量默认的向下位置。
+    menu.classList.remove('flip');
+    const rect = menu.getBoundingClientRect();
+    const scroller = menu.closest('.acct-scroll');
+    const bottomLimit = Math.min(
+      scroller ? scroller.getBoundingClientRect().bottom : Infinity,
+      document.documentElement.clientHeight,
+    );
+    menu.classList.toggle('flip', rect.bottom > bottomLimit);
+  }
+
+  /**
+   * 打开「⋯」菜单：点击时才把菜单项插入 DOM，收起时移除。
+   * 之所以不是常驻隐藏（display:none），是因为布局探针会把「常驻但隐藏」的
+   * 按钮算进行内按钮集合，导致测量结果与实际可见操作不一致。
+   * 菜单项本身由 accounts-model.js 生成（启用/禁用、刷新 Token、删除账号）。
+   *
+   * 宿主是操作单元格 `.cell-actions`（它设了 `position: relative`）：
+   * 菜单贴着按钮组弹出、随列表滚动一起移动。
+   */
+  function toggleMoreMenu(button, account) {
+    const already = openMenu && openMenu.dataset.for === account.id;
+    closeMoreMenu();
+    if (already) return;
+
+    const menu = document.createElement('div');
+    menu.className = 'more-menu';
+    menu.dataset.for = account.id;
+    menu.innerHTML = moreMenuHtml(account);
+
+    const host = button.closest('.cell-actions') || button.closest('tr.acct-row');
+    host.appendChild(menu);
+    openMenu = menu;
+
+    // 插入后立刻按当下几何定一次方向：列表底部的行改用向上弹
+    applyMenuDirection(menu);
+
+    // 菜单开着时盯着滚动：滚动会带着行和菜单一起移动，原本放得下的方向可能变得
+    // 放不下（反之亦然），所以持续重测、只增删 flip 类，不关菜单。监听用 passive 且
+    // 只读几何，不干扰滚动性能；closeMoreMenu 时统一摘掉。
+    menuScrollHost = menu.closest('.acct-scroll');
+    if (menuScrollHost) {
+      menuScrollHandler = () => {
+        // 列表被整体重绘（后台推送刷新等）时，菜单会随旧行一起被换掉。
+        // 这里自行收尾，别把监听留在滚动容器上引用一个已脱离文档的节点。
+        if (!menu.isConnected) { closeMoreMenu(); return; }
+        applyMenuDirection(menu);
+      };
+      menuScrollHost.addEventListener('scroll', menuScrollHandler, { passive: true });
+    }
+  }
+
+  // ─── 事件绑定 ──────────────────────────────
+
+  /**
+   * 账号行按钮与各级筛选的绑定。
+   * 事件绑定与脚本加载顺序绑定（本模块在 app.js 之后加载，wbApp 已就绪），
+   * 因此在这里自持注册，而不依赖 app.js 回调过来。
+   */
+  function bindEvents() {
+    $('account-list').addEventListener('click', async event => {
+      // 明细条上的「收起」按钮
+      const closer = event.target.closest('button[data-panel-close]');
+      if (closer) {
+        setPanelOpen(closer.closest('tr[data-panels-for]')?.dataset.panelsFor, closer.dataset.panelClose, false);
+        render();
         return;
       }
-      window.wbApp.runAccountAction?.(menuAction, id);
-      return;
-    }
-
-    const button = event.target.closest('button[data-action]');
-    if (!button) { closeMoreMenu(); return; }
-    const { action, id } = button.dataset;
-
-    if (action === 'more') {
-      const account = accounts().find(a => a.id === id);
-      if (account) toggleMoreMenu(button, account);
-      return;
-    }
-    closeMoreMenu();
-
-    if (action === 'move-up' || action === 'move-down') {
-      button.disabled = true;
-      try {
-        await api.moveAccount(id, action === 'move-down' ? 'down' : 'up');
-        await wbApp.refresh?.();
-      } catch (error) {
-        toast(`调整顺序失败：${error.message}`, 'err');
-        button.disabled = false;
+      // 限流明细里的「清除标记」（单条 / 全部）
+      const clearAll = event.target.closest('button[data-limit-clear-all]');
+      if (clearAll) {
+        const id = clearAll.closest('tr[data-panels-for]')?.dataset.panelsFor;
+        if (id) await clearLimits(id, '');
+        return;
       }
-      return;
-    }
-    if (action === 'usage') {
-      // 点「积分」即展开明细；已展开时再点则收起（当成开关用）
-      const wasOpen = panelOpen(id, 'usage');
-      setPanelOpen(id, 'usage', !wasOpen);
-      if (wasOpen) { render(); return; }
-      usageMap.set(id, null);
-      render();
-      try {
-        await queryUsageFor(id);
-        const entry = usageMap.get(id);
-        if (typeof entry === 'string') toast(`积分查询失败：${entry}`, 'err');
-        else toast('✅ 已更新积分');
-      } catch (error) {
-        usageMap.set(id, error instanceof Error ? error.message : String(error));
+      const clearOne = event.target.closest('button[data-limit-clear]');
+      if (clearOne) {
+        const id = clearOne.closest('tr[data-panels-for]')?.dataset.panelsFor;
+        if (id) await clearLimits(id, clearOne.dataset.limitClear);
+        return;
+      }
+      // ⋯ 菜单里的菜单项（启用/禁用 / 刷新 Token / 删除账号）
+      const menuItem = event.target.closest('button[data-menu-action]');
+      if (menuItem) {
+        // 置灰项不响应；后端也会拒绝，这里先挡住
+        if (menuItem.disabled) return;
+        const { menuAction, id } = menuItem.dataset;
+        closeMoreMenu();
+        // 启用/禁用在这里自行消化，不交给 app.js 的 runAccountAction ——
+        // 那个入口只处理 switch / refresh / remove，未知 action 会被静默忽略。
+        // 走 updateAccount（PATCH /api/accounts/<id>），与状态列的开关、设置弹窗里
+        // 勾选「启用」保存是同一条链路，语义一致。
+        if (menuAction === 'enable' || menuAction === 'disable') {
+          await toggleAccountEnabled(id, menuAction === 'enable');
+          return;
+        }
+        window.wbApp.runAccountAction?.(menuAction, id);
+        return;
+      }
+
+      const button = event.target.closest('button[data-action]');
+      if (!button) { closeMoreMenu(); return; }
+      const { action, id } = button.dataset;
+
+      if (action === 'more') {
+        const account = accounts().find(a => a.id === id);
+        if (account) toggleMoreMenu(button, account);
+        return;
+      }
+      closeMoreMenu();
+
+      if (action === 'move-up' || action === 'move-down') {
+        button.disabled = true;
+        try {
+          await api.moveAccount(id, action === 'move-down' ? 'down' : 'up');
+          await wbApp.refresh?.();
+        } catch (error) {
+          toast(`调整顺序失败：${error.message}`, 'err');
+          button.disabled = false;
+        }
+        return;
+      }
+      if (action === 'limits') {
+        // 点「限流」徽章即展开明细；已展开时再点则收起（当成开关用）
+        setPanelOpen(id, 'limits', !panelOpen(id, 'limits'));
         render();
-        toast(`积分查询失败：${error.message}`, 'err');
+        return;
       }
-      return;
-    }
-    if (action === 'checkin') {
-      setPanelOpen(id, 'checkin', true);
-      await runCheckin(id);
-      return;
-    }
-    // 切换 / 刷新 / 删除 / 设置：交给 app.js 的统一入口
-    window.wbApp.runAccountAction?.(action, id);
-  });
-
-  /**
-   * 启用 / 禁用单个账号（⋯ 菜单的第一项）。
-   *
-   * 为什么放在这里而不是 app.js 的 runAccountAction：那个入口的 switch 分支只认
-   * switch / refresh / remove，别的 action 会静默走完不做事；本次改动不越界改 app.js，
-   * 于是在菜单的 data-menu-action 分支里先拦下来自行处理。
-   *
-   * 用 updateAccount 走 PATCH —— 与卡片「设置」弹窗里勾选启用保存是同一条桥接方法，
-   * 后端 apply_patch 只改显式传入的字段，这里只传 enabled，别的一概不动。
-   * 成功后 refresh() 会重新拉 getState 并 render()，所以状态徽章（已禁用）、
-   * 行内按钮（签到按启用状态显隐）与下次打开的菜单文案会立即跟着变。
-   */
-  async function toggleAccountEnabled(id, enabled) {
-    try {
-      await api.updateAccount(id, { enabled });
-      await wbApp.refresh?.();
-      toast(enabled ? '✅ 已启用' : '✅ 已禁用');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      toast(`操作失败：${message}`, 'err');
-    }
-  }
-
-  /** 单个账号签到：展开明细 → 串行请求 → 就地刷新结果 */
-  async function runCheckin(id) {
-    checkinMap.set(id, null);
-    render();
-    try {
-      await checkinFor(id);
-      const entry = checkinMap.get(id);
-      if (typeof entry === 'string') toast(`签到失败：${entry}`, 'err');
-      else if (entry?.success) toast('✅ 该账号签到成功');
-      else if (entry?.msg) toast(entry.msg, 'err');
-    } catch (error) {
-      checkinMap.set(id, error instanceof Error ? error.message : String(error));
-      render();
-      toast(`签到失败：${error.message}`, 'err');
-    }
-  }
-
-  // 点击空白处收起 ⋯ 菜单（菜单是动态插入的，所以监听在 document 上）
-  document.addEventListener('click', event => {
-    if (!openMenu) return;
-    if (event.target.closest('.more-menu') || event.target.closest('button[data-action="more"]')) return;
-    closeMoreMenu();
-  });
-
-  // 三级筛选：版本 / 启用状态 / 限额状态，三者独立组合
-  const bindFilter = (containerId, attr, key) => {
-    $(containerId).addEventListener('click', event => {
-      const item = event.target.closest(`.seg-item[data-${attr}]`);
-      if (!item) return;
-      accountFilter[key] = item.dataset[attr];
-      document.querySelectorAll(`#${containerId} .seg-item`).forEach(node => {
-        node.classList.toggle('active', node === item);
-      });
-      render();
+      if (action === 'usage') {
+        // 点「积分」即展开明细；已展开时再点则收起（当成开关用）
+        const wasOpen = panelOpen(id, 'usage');
+        setPanelOpen(id, 'usage', !wasOpen);
+        if (wasOpen) { render(); return; }
+        usageMap.set(id, null);
+        render();
+        try {
+          await actions.queryUsageFor(id);
+          // 缓存的四种形态（见 usage-panel.js）：undefined/null/字符串/对象，
+          // 对象里再分「未配置」与「失败」—— 提示语要跟着这个分叉走
+          const failure = actions.usageFailureOf(usageMap.get(id));
+          if (failure?.notConfigured) toast(failure.message, 'ok');
+          else if (failure) toast(`余额查询失败：${failure.message}`, 'err');
+          else toast('✅ 已更新余额');
+        } catch (error) {
+          usageMap.set(id, `查询失败：${error.message}`);
+          render();
+          toast(`余额查询失败：${error.message}`, 'err');
+        }
+        return;
+      }
+      if (action === 'checkin') {
+        setPanelOpen(id, 'checkin', true);
+        await runCheckin(id);
+        return;
+      }
+      // 切换 / 刷新 / 删除 / 设置：交给 app.js 的统一入口
+      window.wbApp.runAccountAction?.(action, id);
     });
-  };
-  bindFilter('account-edition-filter', 'edition', 'edition');
-  bindFilter('account-enabled-filter', 'enabled', 'enabled');
-  bindFilter('account-limit-filter', 'limit', 'limit');
 
-  // 模型下拉：切换后整个列表按该模型的账号队列重新判定
-  // （限额维度跟着该模型走，首选徽章也标到该模型实际会选中的账号上）
-  $('account-model-filter').addEventListener('change', event => {
-    accountFilter.model = event.target.value;
-    modelPicked = true;   // 用户手动选过，不再自动跟随最近请求的模型
-    render();
-  });
+    /**
+     * 启用 / 禁用单个账号（状态列的开关与 ⋯ 菜单的第一项走同一条链）。
+     *
+     * 为什么放在这里而不是 app.js 的 runAccountAction：那个入口的 switch 分支只认
+     * switch / refresh / remove，别的 action 会静默走完不做事。
+     *
+     * 用 updateAccount 走 PATCH —— 后端 apply_patch 只改显式传入的字段，这里只传
+     * enabled，别的一概不动。成功后 refresh() 会重新拉 getState 并 render()，
+     * 所以状态徽章（已禁用）、行内按钮（签到按启用状态显隐）会立即跟着变。
+     */
+    async function toggleAccountEnabled(id, enabled) {
+      try {
+        await api.updateAccount(id, { enabled });
+        await wbApp.refresh?.();
+        toast(enabled ? '✅ 已启用' : '✅ 已禁用');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        toast(`操作失败：${message}`, 'err');
+        // 失败时把开关拨回去：界面上不能留一个「已改」的假象
+        void wbApp.refresh?.();
+      }
+    }
 
-  // 行首复选框：勾选 / 取消批量选择（就地更新，不重绘列表，避免丢掉滚动位置）
-  $('account-list').addEventListener('change', event => {
-    const box = event.target.closest('input[data-pick]');
-    if (!box) return;
-    const id = box.dataset.pick;
-    if (box.checked) selectedIds.add(id);
-    else selectedIds.delete(id);
-    syncSelectionUi();
-  });
+    /** 单个账号签到：展开明细 → 串行请求 → 就地刷新结果 */
+    async function runCheckin(id) {
+      checkinMap.set(id, null);
+      render();
+      try {
+        await actions.checkinFor(id);
+        const entry = checkinMap.get(id);
+        if (typeof entry === 'string') toast(`签到失败：${entry}`, 'err');
+        else if (entry?.success) toast('✅ 该账号签到成功');
+        else if (entry?.msg) toast(entry.msg, 'err');
+      } catch (error) {
+        checkinMap.set(id, error instanceof Error ? error.message : String(error));
+        render();
+        toast(`签到失败：${error.message}`, 'err');
+      }
+    }
 
-  // 全选 / 全不选：只作用于当前筛选结果
-  $('batch-select-all').addEventListener('change', event => {
-    if (event.target.checked) for (const id of lastVisibleIds) selectedIds.add(id);
-    else for (const id of lastVisibleIds) selectedIds.delete(id);
-    syncSelectionUi();
-  });
+    // 点击空白处收起 ⋯ 菜单（菜单是动态插入的，所以监听在 document 上）
+    document.addEventListener('click', event => {
+      if (!openMenu) return;
+      if (event.target.closest('.more-menu') || event.target.closest('button[data-action="more"]')) return;
+      closeMoreMenu();
+    });
 
-  $('btn-batch-clear').addEventListener('click', () => {
-    selectedIds.clear();
-    syncSelectionUi();
-  });
-  // 单个「批量操作」按钮：打开弹窗，具体动作在弹窗里用单选切换（默认「启用」）
-  $('btn-batch-open').addEventListener('click', () => openBatch());
+    // 优先级输入框：失焦提交。
+    // 用 focusout（冒泡）而不是 blur（不冒泡）：事件委托挂在列表上，一个监听覆盖
+    // 所有行 —— 每渲染一次就逐行绑一次的话，重绘后那些监听就随旧节点一起没了。
+    // 也不监听 change：数字框在「清空后失焦」时不一定派发 change，那样输入框会
+    // 停在一个既没保存、也不是原值的状态上。
+    //
+    // isConnected 这道门是必须的：整张表被 innerHTML 换掉时，被移除的那个输入框
+    // 可能补发一个 focusout（见 rendering 的说明），而它此刻已不在文档里 ——
+    // 那是重绘的副产品，不是用户提交。
+    $('account-list').addEventListener('focusout', event => {
+      const input = event.target.closest?.('input[data-prio]');
+      if (!input || input.disabled || !input.isConnected) return;
+      void commitPriority(input);
+    });
+    // 回车 = 提交（失焦即走上面那条路）；Esc = 放弃这次输入、还原成当前值
+    $('account-list').addEventListener('keydown', event => {
+      const input = event.target.closest?.('input[data-prio]');
+      if (!input) return;
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        input.blur();
+      } else if (event.key === 'Escape') {
+        const account = accounts().find(item => item.id === input.dataset.prio);
+        input.value = String(table.priorityOf(account) ?? DEFAULT_PRIORITY);
+        input.blur();
+      }
+    });
 
-  /** 把当前勾选与动作交给账号面板的批量弹窗；不传动作时默认选中「启用」 */
-  function openBatch(action = 'enable') {
-    if (!selectedIds.size) { toast('请先勾选要操作的账号', 'err'); return; }
-    window.wbAccountPanel?.openBatch([...selectedIds], action);
+    // 版本 / 启用状态 / 限流 / 提供商：筛选维度的绑定在 accounts-filters.js
+    // （状态与它自己的那部分 DOM 都在那边），这里只把「变了要重绘」这件事传过去
+    filters.bind(render);
+
+    // 列宽拖动 / 双击还原：委托在 accounts-columns.js，这里把容器交给它
+    columns.bind($('account-list'));
+
+    // 行首复选框 / 状态开关（change 事件委托）
+    $('account-list').addEventListener('change', event => {
+      const box = event.target.closest('input[data-pick]');
+      if (box) {
+        const id = box.dataset.pick;
+        if (box.checked) selectedIds.add(id);
+        else selectedIds.delete(id);
+        // 就地更新，不重绘整张表，避免丢掉滚动位置
+        syncSelectionUi();
+        return;
+      }
+      const toggle = event.target.closest('input[data-toggle]');
+      if (toggle) void toggleAccountEnabled(toggle.dataset.toggle, toggle.checked);
+    });
+
+    // 全选 / 全不选：只作用于当前筛选结果（批量栏与表头两个入口同一条链）
+    for (const id of ['batch-select-all', 'acct-select-all']) {
+      $(id)?.addEventListener('change', event => {
+        if (event.target.checked) for (const id of lastVisibleIds) selectedIds.add(id);
+        else for (const id of lastVisibleIds) selectedIds.delete(id);
+        syncSelectionUi();
+      });
+    }
+
+    $('btn-batch-clear').addEventListener('click', () => {
+      selectedIds.clear();
+      syncSelectionUi();
+    });
+    // 单个「批量操作」按钮：打开弹窗，具体动作在弹窗里用单选切换（默认「启用」）
+    $('btn-batch-open').addEventListener('click', () => openBatch());
+
+    /** 把当前勾选与动作交给账号面板的批量弹窗；不传动作时默认选中「启用」 */
+    function openBatch(action = 'enable') {
+      if (!selectedIds.size) { toast('请先勾选要操作的账号', 'err'); return; }
+      window.wbAccountPanel?.openBatch([...selectedIds], action);
+    }
+
+    $('btn-query-usage').addEventListener('click', actions.queryAllUsage);
+    $('btn-checkin-all').addEventListener('click', actions.checkinAll);
   }
 
-  $('btn-query-usage').addEventListener('click', queryAllUsage);
-  $('btn-checkin-all').addEventListener('click', checkinAll);
-}
+  // 追加式注入必须在 bindEvents 之前完成：提供商下拉是动态插进工具条的节点，
+  // 它的 change 监听（filters.bind）在 bindEvents 里才挂得上。
+  filters.mount();
+  bindEvents();
 
-bindEvents();
-
-window.wbAccountsView = {
-  render,
-  renderNavCount,
-  refreshCaches,
-  applyBalances,
-  queryUsageFor,
-  queryAllUsage,
-  checkinFor,
-  checkinAll,
-  checkinableAccounts,
-  supportsCheckin,
-  isEnabled,
-  isRateLimited,
-};
+  window.wbAccountsView = {
+    render,
+    renderNavCount,
+    refreshCaches,
+    openPanels: openPanelsFor,
+    // 余额 / 签到的动作与缓存都在 usage-actions.js，这里只做转发：
+    // app.js 与外部仍按原有的 wbAccountsView 名字调用，引用路径一行不用改
+    applyBalances: actions.applyBalances,
+    queryUsageFor: actions.queryUsageFor,
+    queryAllUsage: actions.queryAllUsage,
+    checkinFor: actions.checkinFor,
+    checkinAll: actions.checkinAll,
+    checkinableAccounts,
+    supportsCheckin,
+    supportsUsage,
+    isDesktopAccount: wbAccountsModel.isDesktopAccount,
+    isEnabled: wbAccountsModel.isEnabled,
+    isRateLimited: wbAccountsModel.isRateLimited,
+  };
 })();

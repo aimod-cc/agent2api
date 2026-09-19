@@ -1,53 +1,33 @@
-//! 对话转发的请求构造与上游错误解析。
+//! 对话转发的**传输层**：请求发送、上游错误解析、追踪 id 生成。
 //!
-//! 对照 Node 版 workbuddy-upstream-client.mjs 的 buildHeaders / buildRequestInit /
-//! chatCompletionsUrl / readUpstreamError / ensureLeadingSystemMessage 与几个常量。
+//! ── 本文件为什么只做传输（Agent2API 改造 W2b-T3）────────────
+//! 改造前这里还有头集合、URL 拼接、system 注入与 11128/6004 的判定 ——
+//! 那些全是 **workbuddy 专属知识**（X-IDE-* 头、`/v2/chat/completions`、
+//! 首条消息必须是 system、11128 敏感词拦截码），已整体搬进
+//! `core::providers::workbuddy`。改造后 provider 差异全部收在适配器里，
+//! 本文件对「上游是哪一家」一无所知：它只认 `TransportRequest` 这个
+//! **协议无关**的形态（URL + 头 + 已序列化的 body + 出口）。
 //!
-//! ── 端点（不带 prefixPath）──────────────────────────────────
-//!   POST {endpoint}/v2/chat/completions
+//! 只保留的三件事：
+//!   1. `send_chat_request`：按出口取 reqwest Client 发一次请求，
+//!      不读 body（SSE 需要 `bytes_stream()`）；
+//!   2. `read_upstream_error`：把上游错误响应归一化成 `{code, message}`
+//!      —— 「怎么读一个 HTTP 错误体」是协议层的事，与哪一家无关；
+//!   3. `new_request_id`：一轮对话的追踪 id（适配器拼追踪头时用）。
 //!
-//! ── 鉴权头（对齐桌面端 AuthService.buildHeaders + CLI ModelProviderImpl）──
-//!   Authorization: Bearer <accessToken>
-//!   X-User-Id / X-Enterprise-Id / X-Tenant-Id / X-Domain（企业账号条件头）
-//!   User-Agent / X-IDE-Type / X-IDE-Name / X-IDE-Version / X-Product
-//!   X-Agent-Intent: craft
-//!   X-Conversation-ID / X-Session-ID / X-Request-ID 等会话追踪头
-//!
-//! **注意头集合与 billing/auth 不同**：这里按 Node 的 forwardChatCompletions
-//! 走，多带 X-IDE-* / X-Agent-Intent 与四个追踪头，且 Accept 可被调用方覆盖
-//! （SSE 转发时是 `text/event-stream`）。逐个对照，不要与计费那套混用。
+//! ── 出网 ────────────────────────────────────────────────────
+//! 只走 `core::egress::client_for`：同一出口共用一个连接池，
+//! 客户端上的 connect/read 超时也一并复用（见 egress 头部的旋钮映射）。
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::server::core::auth::AuthService;
 use crate::server::core::egress;
-use crate::server::core::endpoints::{normalize_endpoint, resolve_edition, EditionInfo};
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
 
-/// 上游错误码 11128（历史文案：Illegal API invocation from an unapproved channel）。
-///
-/// 实测语义：多为提示词命中上游敏感词审核而被拦截（并非单纯的频率风控）。
-/// 常量名沿用 Node 版的历史命名，不要据此理解成「频率限制」。
-/// 拦截会持续一小段时间，期间客户端失败自动重试会形成重试风暴并给拦截续期，
-/// 因此命中 11128 时退避间隔必须足够长、仅重试 2 次（见 WAF_RETRY_DELAYS_MS）。
-pub const RATE_LIMIT_CODE: i64 = 11128;
-
-/// 11128 的退避间隔（10 秒、25 秒），照抄 Node 版
-pub const WAF_RETRY_DELAYS_MS: &[u64] = &[10_000, 25_000];
-
-/// 上游要求首条消息必须是 system prompt，否则返回 400
-/// （first message is not system prompt）。客户端没带 system 消息时注入一条兜底系统消息。
-pub const DEFAULT_SYSTEM_PROMPT: &str = "你是一个得力助手";
-
-/// 上游限额码 6004（HTTP 429）：账号×模型维度的用量限额，
-/// msg 形如 `您的使用量已超出频率限制，将在 2026-09-11 19:43:46 UTC+8 重置…`
-/// —— 恢复时间只在文本里，由 errors::parse_quota_reset_at 解析。
-pub const QUOTA_LIMIT_CODE: i64 = 6004;
-
-/// 单次对话请求的总超时（除 WAF 退避外的等待时间）。
+/// 单次对话请求的总超时（除退避重试外的等待时间）。
 ///
 /// 与 Node 版的差别：Node 的 proxyFetch 不设总超时（bodyTimeout: 0），
 /// 完全靠客户端断开与上游主动结束。Rust 侧的 reqwest client 用
@@ -55,104 +35,41 @@ pub const QUOTA_LIMIT_CODE: i64 = 6004;
 /// 这里不再叠加总超时 —— 那会掐断长回答的 SSE 流。
 pub const NO_TOTAL_TIMEOUT: Option<u64> = None;
 
-/// 一次上游请求的全部素材
-pub struct ChatRequestPlan {
+/// 一次上游请求的全部素材（协议无关形态；provider 差异在构造阶段已消解）
+pub struct TransportRequest {
+    /// 上游完整 URL（由适配器给出）
     pub url: String,
+    /// 请求头（由适配器给出；不含出网代理相关）
     pub headers: Vec<(String, String)>,
+    /// 已序列化的请求体（由编排层从适配器的 `plan.body` 序列化而来）
     pub payload: String,
+    /// 出网代理（账号级；与 provider 无关，由编排层解析后带上）
     pub proxy: Option<ResolvedProxy>,
 }
 
-/// 首条消息不是 system 时，在头部补一条系统消息（不改原数组，返回新 body）。
-///
-/// 已经是 system 开头、messages 为空/缺失时原样返回（同一引用，便于调用方
-/// 判断是否改写）—— 空 messages 属客户端异常输入，交给上游按原样报错。
-///
-/// 与 Node 的差异只在**键顺序**：Node 用对象展开、Rust 用 `Map`，
-/// 序列化后的成员顺序不同（严格解析器不关心顺序）。
-pub fn ensure_leading_system_message(body: &Value) -> Option<Value> {
-    let messages = body.get("messages").and_then(Value::as_array)?;
-    if messages.is_empty() {
-        return None;
-    }
-    // Node: `String(body.messages[0]?.role ?? '').toLowerCase()` ——
-    // role 缺失/null 都当空串（不是把整条消息字符串化）
-    let first_role = match messages[0].get("role") {
-        Some(Value::String(text)) => text.to_lowercase(),
-        Some(Value::Null) | None => String::new(),
-        Some(other) => value_text(other).to_lowercase(),
-    };
-    if first_role == "system" {
-        return None;
-    }
-    let mut next = body.clone();
-    let Some(object) = next.as_object_mut() else {
-        return None;
-    };
-    let mut with_system = Vec::with_capacity(messages.len() + 1);
-    with_system.push(json!({ "role": "system", "content": DEFAULT_SYSTEM_PROMPT }));
-    with_system.extend(messages.iter().cloned());
-    object.insert("messages".to_string(), Value::Array(with_system));
-    Some(next)
-}
-
-/// 客户端身份 + 鉴权 + 会话追踪头（对照 Node 的 buildHeaders）。
-///
-/// `request_id` 同时充当 X-Request-ID / X-Conversation-Request-ID /
-/// X-Conversation-ID / X-Session-ID —— Node 在没有 conversationId 时就是
-/// 这四者取同一个值（追踪一轮对话用）。
-pub fn chat_headers(session: &Value, request_id: &str, accept: Option<&str>) -> Vec<(String, String)> {
-    let edition: &'static EditionInfo = resolve_edition(
-        session.get("edition").and_then(Value::as_str),
-    );
-    let mut headers: Vec<(String, String)> = vec![
-        ("Content-Type".to_string(), "application/json".to_string()),
-        // 完整三段 UA（含 CLI 扩展段）：与桌面客户端一致，服务端按此识别通道
-        (
-            "User-Agent".to_string(),
-            crate::server::core::endpoints::user_agent_for_edition(Some(edition.id)),
-        ),
-        // 客户端身份头：服务端按此做客户端识别与白名单校验
-        ("X-IDE-Type".to_string(), edition.ua_platform.to_string()),
-        ("X-IDE-Name".to_string(), edition.product_name.to_string()),
-        ("X-IDE-Version".to_string(), edition.client_version.to_string()),
-        ("X-Product".to_string(), edition.product_name.to_string()),
-        ("X-Agent-Intent".to_string(), "craft".to_string()),
-        // 会话追踪
-        ("X-Request-ID".to_string(), request_id.to_string()),
-        ("X-Conversation-Request-ID".to_string(), request_id.to_string()),
-        ("X-Conversation-ID".to_string(), request_id.to_string()),
-        ("X-Session-ID".to_string(), request_id.to_string()),
-    ];
-    headers.extend(AuthService::build_auth_headers(session));
-    if let Some(accept) = accept {
-        headers.push(("Accept".to_string(), accept.to_string()));
-    }
-    headers
-}
-
-/// 对话接口 URL：`{session.endpoint || 默认端点}/v2/chat/completions`
-pub fn chat_completions_url(session: &Value, fallback_base_url: &str) -> String {
-    let endpoint = session
-        .get("endpoint")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .map(normalize_endpoint)
-        .unwrap_or_else(|| normalize_endpoint(fallback_base_url));
-    format!("{endpoint}/v2/chat/completions")
-}
-
-/// 上游错误响应 → `{code, message}`（对照 Node 的 readUpstreamError）。
+/// 归一化后的上游错误：`{code, message}`
 ///
 /// `message` 的兜底是响应文本的前 500 个字符（Node 的 `text.slice(0, 500)`）。
-/// Node 侧还带一个 `body` 原文，调用方会从里面再解析一次 msg 取恢复时间；
-/// Rust 侧的 `GatewayError.message` 已经是同一份上游文案（见 rotate.rs 的
-/// `mark_account_limited`），不再重复透出原始 body。
+/// 适配器的 `classify_error` 收的就是本结构的 JSON 形态（`to_value`）——
+/// 于是「上游错误怎么读」与「这条错误属于哪一档」彻底分开：
+/// 前者是本文件（协议层），后者是适配器（provider 层）。
 pub struct UpstreamErrorDetail {
     pub code: Option<i64>,
     pub message: String,
 }
 
+impl UpstreamErrorDetail {
+    /// 适配器入参形态：`{code, message}`（键名与上游 JSON 一致，
+    /// 于是适配器可以直接用 `error_body.get("code")` 读，不需要中间结构体）
+    pub fn to_value(&self) -> Value {
+        json!({
+            "code": self.code.map(Value::from).unwrap_or(Value::Null),
+            "message": self.message,
+        })
+    }
+}
+
+/// 上游错误响应 → `{code, message}`（对照 Node 的 readUpstreamError）。
 pub async fn read_upstream_error(response: reqwest::Response) -> UpstreamErrorDetail {
     let text = response.text().await.unwrap_or_default();
     let mut code = None;
@@ -184,20 +101,15 @@ pub async fn read_upstream_error(response: reqwest::Response) -> UpstreamErrorDe
     UpstreamErrorDetail { code, message }
 }
 
-/// 发一次上游请求（不读 body，保留原始响应给流式转发）。
+/// 发一次上游请求（不读 body，保留原始响应给流式转发与错误解析）。
 ///
 /// 与 `core::auth_http::send_raw` 的分工：那个把响应读成文本，用于管理接口；
 /// 这个把 `reqwest::Response` 原样交给调用方，SSE 需要 `bytes_stream()`。
-///
-/// 出网仍然只走 `core::egress::client_for`：同一出口共用一个连接池，
-/// 客户端上的 connect/read 超时也一并复用（见 egress 头部的旋钮映射）。
 pub async fn send_chat_request(
-    plan: &ChatRequestPlan,
+    plan: &TransportRequest,
 ) -> Result<reqwest::Response, UpstreamRequestError> {
     let client = egress::client_for(plan.proxy.as_ref());
-    let mut builder = client
-        .post(&plan.url)
-        .body(plan.payload.clone());
+    let mut builder = client.post(&plan.url).body(plan.payload.clone());
     for (key, value) in &plan.headers {
         builder = builder.header(key, value);
     }
@@ -231,11 +143,6 @@ impl UpstreamRequestError {
     pub fn to_gateway_error(&self) -> GatewayError {
         GatewayError::with_status(502, self.message.clone())
     }
-}
-
-/// 是否为账号限额错误（HTTP 429 或上游 code 6004）—— 照抄 Node 的 isQuotaLimitError
-pub fn is_quota_limit_error(status_code: i32, upstream_code: Option<i64>) -> bool {
-    status_code == 429 || upstream_code == Some(QUOTA_LIMIT_CODE)
 }
 
 /// 生成一轮对话的追踪 id（对应 Node 的 `randomUUID()`）。
@@ -275,15 +182,4 @@ pub fn new_request_id() -> String {
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
     )
-}
-
-/// JS `String(x)`（role 这类字段的容错文本化）
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => String::new(),
-        Value::Number(number) => number.to_string(),
-        Value::Bool(flag) => flag.to_string(),
-        other => other.to_string(),
-    }
 }

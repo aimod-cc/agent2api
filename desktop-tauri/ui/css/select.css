@@ -189,3 +189,34 @@
   background: transparent;
   font-weight: 400;
 }
+
+/* ─── 多选（<select multiple>）───
+   浮层、选项、键盘交互全部复用单选那一套，只有两处不同：
+   点选项是「切换勾选 + 浮层不关」（见 select.js 的 toggle），
+   以及触发器文案是「已勾选的项用顿号连起来」。
+
+   触发器仍按单行省略号收住（不撑成两行）：外壳的高度锚是里面的原生 select，
+   触发器是 inset:0 绝对定位盖在它上面 —— 想让它长高就得同时把锚撑高，
+   那一行控件会比旁边的按钮高出一截，与 .role-picks 里的同类控件不再等高。
+   完整勾选清单在浮层里逐项可见，触发器旁边还有一句摘要（.provider-pick .desc），
+   信息不会丢。 */
+.select-shell-multi > .select-trigger {
+  /* 多选的触发器文案会很长，单选的省略号同样适用（见 .select-value），
+     这里只多给一点内边距：中文名连着排时左右不需要贴边 */
+  padding: 0 10px;
+}
+
+/* 高度必须显式钉住 30px。
+   为什么不能只靠 components.css 的 `select { height: 30px }`：`<select multiple>`
+   不写 size 时是一个**列表框**，浏览器按行数自己算高度（默认显示 4 行）。
+   内核确实认 CSS 的 height（Chromium 的布局测试里就有一条「size=3 但 height 大得多」
+   的用例），所以那条规则在这里是生效的 —— 但这个锚点的高度直接决定整行的版式，
+   靠另一条为**单选**写的规则兜底太隐晦：哪天那边改成 min-height 或按内容撑开，
+   这里会静默变高 4 行。显式写一遍，多选的版式就不依赖别处的实现。 */
+.select-shell-multi > select {
+  height: 30px;
+}
+
+/* 多选的空态（一家都没勾）用占位色，与 input 的 placeholder 同一观感：
+   它是「还没选」而不是「选了一个叫这名字的值」 */
+.select-shell-multi > .select-trigger > .select-value.is-empty { color: var(--text-3); }

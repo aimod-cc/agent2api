@@ -8,7 +8,7 @@
 use serde_json::Value;
 
 /// 默认仓库（本项目的上游）；fork 后可自行覆盖（Node 版 DEFAULT_REPO）
-pub const DEFAULT_REPO: &str = "aimod-cc/workbuddy-proxy";
+pub const DEFAULT_REPO: &str = "aimod-cc/agent2api";
 
 /// GitHub API 根（Node 版 GITHUB_API）
 pub const GITHUB_API: &str = "https://api.github.com";

@@ -1,4 +1,4 @@
-/* WorkBuddy 本地代理 · 设置页「软件更新」卡片 */
+/* Agent2API · 设置页「软件更新」卡片 */
 /* global workbuddyDesktop, wbApp, wbMarkdown */
 
 /**
@@ -174,10 +174,10 @@
       // 就直接弹安装程序，属于用户没有预期的副作用
       if (autoInstall) {
         autoInstall = false;
-        setState('安装包已下载完成，正在启动安装程序…');
+        setState('安装包已下载完成，正在启动安装程序（需要管理员权限，会弹出 UAC 确认框）…');
         void install(task.path);
       } else {
-        setState(`安装包已就绪：${task.filename || task.path}`);
+        setState(`安装包已就绪：${task.filename || task.path}。点击「安装并重启」后需要管理员权限，会弹出 UAC 确认框。`);
         if (button) {
           button.textContent = '安装并重启';
           button.dataset.installPath = task.path;
@@ -207,9 +207,11 @@
   async function install(path) {
     try {
       await api.runInstaller(path, true);
-      setState('安装程序已启动，本程序将退出以便完成覆盖安装。');
+      setState('安装程序已启动，本程序将退出以便完成覆盖安装。安装程序需要管理员权限，会弹出 UAC 确认框，请选择「是」。');
     } catch (error) {
       setBadge('启动失败', 'bad');
+      // UAC 被拒时壳侧返回的提示已经说明「可重新点击安装并重启」，这里原样透出，
+      // 不额外包装 —— 用户照着做就能重试成功
       setState(`启动安装程序失败：${error.message}`, true);
     }
   }
@@ -395,7 +397,7 @@
       autoInstall = true;
       delete button?.dataset.installPath;
       setBadge('下载中', 'warn');
-      setState('正在下载安装包…');
+      setState('正在下载安装包…（下载完成后启动安装程序需要管理员权限，会弹出 UAC 确认框）');
       if (button) button.textContent = '取消下载';
       startPolling();
     } catch (error) {

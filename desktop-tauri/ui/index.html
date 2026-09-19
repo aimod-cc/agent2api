@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>WorkBuddy 本地代理 · 会话与账号管理</title>
+  <title>Agent2API · 多提供商本地网关</title>
   <script>
     // 与主题持久化配合：在 CSS 解析前先贴上 data-theme，避免深色模式首屏闪烁
     (() => {
@@ -14,24 +14,18 @@
       document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
     })();
   </script>
-  <script>
-    // 与「账号列表两侧留白」偏好配合：同样在 CSS 解析前先贴上 data-content，
-    // 避免首屏先按「无留白」渲染、再跳成有留白（未设置按「关闭留白」处理）。
-    // 该属性只影响账号卡片网格（page-accounts.css 的 .acct-grid）：关闭（默认）时保留与
-    // 内容区同源的 --pad 两侧间距、把轨道切成「300 下限 + 1fr 瓜分」（宽屏一行 4 张卡），
-    // 开启时恢复两侧 16px 留白与 340–353px 封顶口径；
-    // 不改变任何页面的内容区限宽。
-    (() => {
-      const margin = localStorage.getItem('workbuddy-desktop-accounts-margin') || 'off';
-      document.documentElement.dataset.content = margin === 'on' ? 'margin' : 'full';
-    })();
-  </script>
   <link rel="stylesheet" href="css/tokens.css">
   <link rel="stylesheet" href="css/layout.css">
   <link rel="stylesheet" href="css/components.css">
   <link rel="stylesheet" href="css/page-accounts.css">
+  <link rel="stylesheet" href="css/page-accounts-providers.css">
+  <!-- 账号页表格化（四家混排的一张表）：排在两个账号页样式之后 ——
+       它要覆盖 page-accounts.css 里 .acct-scroll 的滚动方向等既有声明 -->
+  <link rel="stylesheet" href="css/page-accounts-table.css">
   <link rel="stylesheet" href="css/page-gateway.css">
   <link rel="stylesheet" href="css/page-logs.css">
+  <link rel="stylesheet" href="css/page-tasks.css">
+  <link rel="stylesheet" href="css/page-requests.css">
   <link rel="stylesheet" href="css/page-settings.css">
   <!-- 更新日志（Markdown 正文 / 版本卡片 / 导航更新提示）：排在页面样式之后，
        需要时可覆盖 page-settings.css 里为旧的纯文本说明写的规则 -->
@@ -51,7 +45,7 @@
         <!-- 品牌标由 icons.js 注入（与应用图标 icon.png 同一造型，见 icons.js 的 brand 项） -->
         <div class="brand-logo"></div>
         <div class="brand-text">
-          <h1>WorkBuddy 本地代理</h1>
+          <h1>Agent2API</h1>
           <div class="sub">OpenAI 兼容网关</div>
         </div>
       </div>
@@ -63,11 +57,14 @@
         <button class="nav-item" data-page="accounts" data-icon="accounts"><span class="ico"></span><span class="label">账号</span><span class="count muted" id="nav-count-accounts">0</span></button>
 
         <div class="nav-group-label">转发能力</div>
-        <button class="nav-item" data-page="gateway" data-icon="gateway"><span class="ico"></span><span class="label">网关</span></button>
+        <button class="nav-item" data-page="gateway" data-icon="gateway"><span class="ico"></span><span class="label">模型管理</span></button>
+        <button class="nav-item" data-page="keys" data-icon="key"><span class="ico"></span><span class="label">网关 Key</span></button>
         <button class="nav-item" data-page="desensitize" data-icon="desensitize"><span class="ico"></span><span class="label">脱敏</span></button>
 
         <div class="nav-group-label">诊断</div>
+        <button class="nav-item" data-page="requests" data-icon="requests"><span class="ico"></span><span class="label">请求日志</span></button>
         <button class="nav-item" data-page="logs" data-icon="logs"><span class="ico"></span><span class="label">日志</span><span class="count" id="nav-count-logs" style="display:none">0</span></button>
+        <button class="nav-item" data-page="tasks" data-icon="tasks"><span class="ico"></span><span class="label">定时任务</span></button>
         <button class="nav-item" data-page="settings" data-icon="settings"><span class="ico"></span><span class="label">设置</span><span class="count" id="nav-count-update" style="display:none">新</span></button>
       </nav>
 
@@ -89,7 +86,7 @@
     <main class="main">
       <header class="topbar">
         <div class="crumb">
-          <span>WorkBuddy 本地代理</span>
+          <span>Agent2API</span>
           <span class="sep">/</span>
           <span class="cur" id="crumb-page">报表</span>
         </div>
@@ -154,7 +151,7 @@
               </div>
 
               <p class="hint">
-                「首选」= 转发顺序第一位（账号页 P 值最小的那个启用账号），默认优先用它。限额按<strong>模型</strong>记录，所以换个模型走哪个账号可能不同 —— 账号页顶部的「模型」筛选用来看某个模型的实际队列。此处展示与刷新 Token / 退出登录针对的都是首选账号。
+                「首选」= 下一个请求会先用的账号（按最近一次请求的模型推导，队列里排最前且对该模型未限流的那个）。限额按<strong>模型</strong>记录，所以换个模型走哪个账号可能不同 —— 队列第一位若正对该模型限流，账号页会给它标「队首」而不是「首选」。此处展示与刷新 Token / 退出登录针对的都是首选账号。
               </p>
             </div>
           </section>
@@ -172,6 +169,23 @@
             </div>
           </section>
 
+          <!-- ── Top 提供商占比 ──
+               数据来自 /api/stats/summary 的顶层 providers 数组（契约见架构文档 §5）：
+               `[{id,label,requests,success,tokens}]`，按请求数降序。
+               后端较老 / 该字段缺失时整块隐藏（不给空态、不报错）——
+               「没有这一维数据」与「这一维里没有数据」是两件事，
+               前者是版本落后，摆一个空卡片只会让人以为哪里坏了。 -->
+          <section class="panel" id="report-providers-panel" hidden>
+            <div class="panel-head">
+              <h2>Top 提供商</h2>
+              <span class="tip-q" data-tip="所选范围内每个提供商各承载了多少请求。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。百分比按本区间的总请求数算；「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了（请求体非法、模型不存在、没有可用账号）。此后新产生的请求都会记上具体的提供商。"></span>
+              <span class="panel-sub" id="report-providers-label">—</span>
+            </div>
+            <div class="panel-body">
+              <div class="provider-shares" id="report-providers"></div>
+            </div>
+          </section>
+
           <!-- ── 热力图（固定 365 天，与时间范围筛选解耦）── -->
           <section class="panel">
             <div class="panel-head">
@@ -184,9 +198,8 @@
               </div>
             </div>
             <div class="panel-foot">
-              <span class="heat-scale-label">少</span>
+              <span class="heat-scale-label">请求数</span>
               <span class="heat-legend" id="report-heat-legend"></span>
-              <span class="heat-scale-label">多</span>
               <div class="spacer"></div>
               <span>方格为本地自然日，无请求显示为空槽</span>
             </div>
@@ -209,12 +222,20 @@
           <section class="panel">
             <div class="panel-head">
               <h2>近 24 小时缓存命中率趋势</h2>
-              <span class="panel-sub">按本地整点，无请求的整点为 0%</span>
+              <span class="panel-sub">按本地整点，无请求的整点不标注</span>
             </div>
             <div class="panel-body">
               <div class="chart-wrap" id="report-cache-trend">
                 <div class="empty" style="padding:14px 0">正在加载…</div>
               </div>
+            </div>
+            <!-- 图例：两条线各配一条纵轴（左=命中率，右=总 Token），
+                 颜色是「读数属于哪条轴」的唯一线索，所以必须标出来 -->
+            <div class="panel-foot">
+              <span class="chart-legend"><span class="swatch rate"></span>缓存命中率<span class="axis-hint">左轴</span></span>
+              <span class="chart-legend"><span class="swatch tokens"></span>总 Token<span class="axis-hint">右轴</span></span>
+              <div class="spacer"></div>
+              <span>无请求的整点按 0% 计，但不写读数</span>
             </div>
           </section>
 
@@ -222,6 +243,7 @@
           <section class="panel">
             <div class="panel-head">
               <h2>按天 Token 趋势</h2>
+              <span class="tip-q" data-tip="每天的总 Token 用量（输入 + 输出）。柱顶标出当天的读数；区间很长、柱子挤到放不下时只标最高的那几天，其余悬停柱子即可读到。"></span>
               <span class="panel-sub" id="report-trend-label">—</span>
             </div>
             <div class="panel-body">
@@ -236,19 +258,12 @@
         <section class="page" data-page="accounts">
           <div class="page-head">
             <h2>账号</h2>
-            <p class="intro">先选模型（默认是你最近在用的那个），列表即按该模型的账号队列呈现：限额、首选都按这个模型判定。</p>
+            <p class="intro">所有提供商的账号排在同一条队列里：转发时从队首往下试，跳过已禁用、不支持该模型、或该模型正在限流的账号。</p>
           </div>
 
           <section class="panel account-table">
-            <!-- 工具条：模型 + 三段筛选 + 主操作，收在一行 -->
+            <!-- 工具条：提供商（动态注入）+ 三段筛选 + 主操作，收在一行 -->
             <div class="toolbar">
-              <div class="group">
-                <span class="label">模型</span>
-                <select id="account-model-filter" class="model-select" aria-label="按模型筛选账号队列"></select>
-              </div>
-
-              <div class="divider"></div>
-
               <div class="group">
                 <span class="label">版本</span>
                 <div class="seg" id="account-edition-filter" role="tablist" aria-label="账号版本">
@@ -297,92 +312,115 @@
               </div>
             </div>
 
-            <!-- 卡片网格由 accounts-view.js 渲染（分组标题与卡片共用同一个网格） -->
+            <!-- 账号表由 accounts-view.js 渲染（四家混排的一张表，列结构见 accounts-table.js）。
+                 表格本体整体重建，容器只负责滚动（表头在表格内部用 sticky 吸顶）。 -->
             <div class="acct-scroll" id="account-list">
               <div class="empty"><span class="spinner"></span>正在加载…</div>
             </div>
 
             <div class="table-foot">
-              <span>P 值越小越先用，「★」= 转发顺序第一位</span>
+              <span>优先级是<b>全局</b>唯一的一条队列：数值越小越先用，不分提供商；拖动表头右缘可调列宽，双击还原</span>
               <div class="spacer"></div>
-              <span>「正常」= 该账号可用且未触发限额 · 「限流」= 该模型当日额度用尽，请求自动改用后续账号，到恢复时间自动回归</span>
+              <span>「★ / 首选」= 队首（当前请求先试它；不支持该模型或该模型限流时自动顺延到下一位）</span>
             </div>
           </section>
         </section>
 
-        <!-- ─── 网关 ─── -->
+        <!-- ─── 模型管理（内部标识仍是 gateway：localStorage 记忆与 CSS 选择器都依赖它）─── -->
         <section class="page" data-page="gateway">
           <div class="page-head">
-            <h2>网关</h2>
-            <p class="intro">OpenAI 客户端把 base URL 指到下面的地址即可；SSE 流式透传。</p>
+            <h2>模型管理</h2>
+            <p class="intro">下游请求什么模型就转发什么模型；这里可以禁用、删除不需要的模型，或为上游模型起一个对外的映射名。</p>
           </div>
 
           <section class="panel">
             <div class="panel-head">
-              <h2>网关接口</h2>
-              <span id="default-model-badge" class="badge brand" style="display:none;"></span>
+              <h2>模型管理</h2>
+              <span class="models-count" id="models-count"></span>
+              <div class="head-actions">
+                <button type="button" class="sm" id="btn-add-mapping">＋ 添加映射</button>
+                <!-- 「刷新模型清单」：title 由 models-panel.js 在加载时写入（含
+                     「CatPaw / AutoClaw 用固定清单」那句），只有一处事实来源 -->
+                <button type="button" class="sm" id="btn-refresh-models">刷新模型清单</button>
+              </div>
             </div>
-            <div class="panel-body">
-              <div class="endpoint-grid">
-                <div class="endpoint accent">
-                  <div class="k">对话端点</div>
-                  <div class="v">
-                    <code class="url" id="api-chat">—</code>
-                    <button class="copy-btn" data-copy-from="api-chat" title="复制地址">⧉</button>
-                  </div>
-                </div>
-                <div class="endpoint">
-                  <div class="k">模型列表</div>
-                  <div class="v">
-                    <code class="url" id="api-models">—</code>
-                    <button class="copy-btn" data-copy-from="api-models" title="复制地址">⧉</button>
-                  </div>
-                </div>
-                <div class="endpoint">
-                  <div class="k">默认模型</div>
-                  <div class="v"><code class="url" id="default-model">—</code></div>
-                </div>
+            <div class="panel-body models-tools">
+              <div class="seg" id="models-provider-seg" role="tablist" aria-label="按提供商筛选"></div>
+              <div class="seg" id="models-state-seg" role="tablist" aria-label="按状态筛选">
+                <button class="seg-item active" data-state="all">全部</button>
+                <button class="seg-item" data-state="enabled">已启用</button>
+                <button class="seg-item" data-state="disabled">已禁用</button>
+                <button class="seg-item" data-state="mapped">有映射</button>
+                <button class="seg-item" data-state="hidden">已删除</button>
               </div>
+              <div class="spacer"></div>
+              <span class="input-affix" style="width:240px;flex:0 0 auto">
+                <span class="affix">⌕</span>
+                <input type="search" id="model-search" placeholder="搜索模型 ID / 名称 / 映射名…" autocomplete="off">
+              </span>
+            </div>
+            <div class="models-table-wrap">
+              <table class="models-table">
+                <colgroup><col class="c-model"><col class="c-rate"><col class="c-alias"><col class="c-state"><col class="c-act"></colgroup>
+                <thead><tr>
+                  <th>上游模型</th><th>倍率</th><th>对外映射名（下游可用这些名字请求）</th><th>启用</th><th class="r">操作</th>
+                </tr></thead>
+                <tbody id="models"><tr><td colspan="5" class="empty">暂无模型</td></tr></tbody>
+              </table>
+            </div>
+            <div class="panel-body" style="padding-top:8px">
+              <div class="models-refresh-note" id="models-refresh-hint"></div>
+              <div class="models-refresh-note" id="models-refresh-note"></div>
+            </div>
+            <div class="panel-foot">
+              <span>禁用的模型不会出现在 <code>/v1/models</code>，请求它会返回 404 · 映射名与上游 ID 同时可用，同一映射名只能指向一个上游模型 · 删除只是从清单隐藏，可在「已删除」筛选里恢复</span>
+            </div>
+          </section>
+        </section>
 
-              <div class="banner">
-                <span class="ico">◈</span>
-                <span>base URL：<code id="api-base">—</code>　填进 OpenAI 客户端的 <code>base_url</code> / <code>api_base</code> 即可接入。</span>
-              </div>
+        <!-- ─── 网关 Key ─── -->
+        <section class="page" data-page="keys">
+          <div class="page-head">
+            <h2>网关 Key</h2>
+            <p class="intro">可创建多把 Key 分发给不同客户端，任一启用的 Key 即可通过鉴权；一把启用的都没有时不鉴权（仅监听 127.0.0.1，建议本机使用可不设）。</p>
+          </div>
+
+          <!-- 接口条：一行三段，地址随真实端口刷新（app.js 的 paintGatewayAddress） -->
+          <section class="panel ep-strip">
+            <div class="ep">
+              <span class="k">Base URL</span>
+              <code class="v" id="api-base">—</code>
+              <button class="copy-btn" data-copy-from="api-base" title="复制地址">⧉</button>
+            </div>
+            <div class="ep">
+              <span class="k">对话</span>
+              <code class="v" id="api-chat">—</code>
+              <button class="copy-btn" data-copy-from="api-chat" title="复制地址">⧉</button>
+            </div>
+            <div class="ep">
+              <span class="k">模型列表</span>
+              <code class="v" id="api-models">—</code>
+              <button class="copy-btn" data-copy-from="api-models" title="复制地址">⧉</button>
             </div>
           </section>
 
           <section class="panel">
             <div class="panel-head">
-              <h2>可用模型</h2>
+              <h2>API Key 列表</h2>
+              <span class="badge" id="keys-status">未启用鉴权</span>
               <div class="head-actions">
-                <span class="input-affix" style="width:190px">
-                  <span class="affix">⌕</span>
-                  <input type="search" id="model-search" placeholder="搜索模型…" autocomplete="off">
-                </span>
+                <button type="button" class="sm primary" id="btn-add-key">＋ 新建 Key</button>
               </div>
             </div>
-            <div class="panel-body">
-              <div class="models-toolbar">
-                <span class="models-count" id="models-count"></span>
-                <div class="spacer"></div>
-                <span class="badge">点击芯片复制模型 ID</span>
-              </div>
-              <div class="models" id="models"><div class="empty" style="padding:14px 0">暂无模型</div></div>
+            <div class="models-table-wrap">
+              <table class="models-table keys-table">
+                <colgroup><col class="k-name"><col class="k-key"><col class="k-time"><col class="k-state"><col class="k-act"></colgroup>
+                <thead><tr><th>名称</th><th>Key</th><th>创建时间</th><th>启用</th><th class="r">操作</th></tr></thead>
+                <tbody id="keys-list"><tr><td colspan="5" class="empty">还没有 Key</td></tr></tbody>
+              </table>
             </div>
             <div class="panel-foot">
-              <span>模型清单只收录对话模型，图片、视频等非对话模型不再出现。</span>
-            </div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-head"><h2>网关 API Key（可选）</h2></div>
-            <div class="panel-body">
-              <div class="apikey-row">
-                <input type="password" id="api-key-input" placeholder="留空表示不启用鉴权；至少 8 个字符" autocomplete="off">
-                <button id="btn-save-key" class="primary">保存</button>
-                <button id="btn-clear-key">清除</button>
-              </div>
-              <p class="hint" id="api-key-status">未启用（仅监听 127.0.0.1，建议本机使用）</p>
+              <span>客户端请求需带 <code>Authorization: Bearer &lt;key&gt;</code> 或 <code>x-api-key: &lt;key&gt;</code>；修改后立即生效，本程序自身会自动使用第一把启用的 Key。</span>
             </div>
           </section>
         </section>
@@ -418,6 +456,20 @@
                 <label class="check"><input type="checkbox" value="user"><span>user（用户输入）</span></label>
                 <label class="check"><input type="checkbox" value="assistant"><span>assistant</span></label>
                 <label class="check"><input type="checkbox" value="tool"><span>tool</span></label>
+              </div>
+
+              <!-- 作用提供商：哪些上游的请求要过脱敏。
+                   用自研下拉（select.js 增强出的触发器 + 浮层）呈现多选 —— 选项是
+                   运行时从提供商摘要拿的（新增 provider 自动出现在这里），
+                   与「作用角色」那组写死的复选框不同，不能烤进 HTML。
+                   data-placeholder 是「一项都没勾」时触发器上的文案（写这句的是
+                   select.js 的 selectedText），比留给它一个空框更能说明后果。 -->
+              <div class="provider-pick">
+                <span class="lead">作用提供商：</span>
+                <select id="desensitize-providers" multiple data-placeholder="未选择（不会处理任何请求）"
+                        aria-label="脱敏作用的提供商"></select>
+                <span class="tip-q" data-tip="只对勾选这里的提供商所承载的请求做脱敏，未勾选的上游原样转发。判定在转发之前：同一模型多家都能提供时，只要候选链里有一家需要脱敏，这次请求就会先脱敏再发（保守策略）—— 免得降级换到另一家时把敏感内容发给了不该收到的上游。至少选一家；想整体停用请用上面的「启用脱敏」开关。"></span>
+                <span class="desc" id="desensitize-providers-state">—</span>
               </div>
 
               <div class="term-add">
@@ -457,35 +509,21 @@
               <p class="hint">
                 命中词会在词内插入零宽空格（如 <code>DoS</code> → <code>Do&#8203;S</code>），人眼和模型读到的不变，
                 但上游后端的关键词匹配会失效，从而避免合规模板被内容审核误拦。
-                词表保存在 <code id="desensitize-file">~/.workbuddy-proxy/desensitize.json</code>。
+                词表保存在 <code id="desensitize-file">~/.agent2api/desensitize.json</code>。
               </p>
             </div>
           </section>
         </section>
 
         <!-- ─── 日志 ───
-             页内两个视图（系统事件 / 模型请求明细），同一个 .seg 切换：
-             两边数据源、筛选维度、分页口径都不同，所以各占一个 .panel，
-             靠 hidden 把非当前视图整个摘出布局（tokens.css 的 [hidden] 是 display:none !important）。
-             「自动刷新」在这里而不是某个视图内部：它管的是整个日志页的轮询节奏，
-             放在视图内部会变成「切到另一个视图就没法开关」。
-             当前视图只存在内存里（不落 localStorage）：本次运行内切页回来还停在原处，
-             重启后回到「系统事件」—— 导航未读徽标只统计事件日志，默认落在这里语义更顺。 -->
+             只承载系统事件：网关的模型请求明细已拆到独立的「请求日志」页
+             （两边数据源、筛选维度、分页口径都不同，页内 .seg 切换的形态随拆分取消）。
+             原先页头的「自动刷新」开关已迁到「定时任务」页：它改的是本页轮询的
+             间隔，与那几个后台任务同属「定时」这一类，收在一处才好对照调整。 -->
         <section class="page" data-page="logs">
           <div class="page-head">
             <h2>运行日志</h2>
-            <p class="intro">记录登录、token 刷新、账号切换、模型目录刷新、限额自动切换（429）等系统事件，以及网关每次转发到上游的模型请求明细。</p>
-            <div class="head-actions">
-              <div class="seg" id="logs-view" role="tablist" aria-label="日志视图">
-                <button class="seg-item active" data-view="events">系统事件</button>
-                <button class="seg-item" data-view="requests">模型请求</button>
-              </div>
-              <label class="switch" title="每 10 秒刷新当前视图">
-                <input type="checkbox" id="logs-auto" checked>
-                <span class="track"></span>
-                <span>自动刷新</span>
-              </label>
-            </div>
+            <p class="intro">记录登录、token 刷新、账号切换、模型目录刷新、限额自动切换（429）等系统事件；网关每次转发到上游的请求明细见「请求日志」页。本页的自动刷新间隔在「定时任务」页设置。</p>
           </div>
 
           <!-- ── 视图一：系统事件 ── -->
@@ -532,7 +570,7 @@
             </div>
 
             <div class="panel-foot">
-              <span>日志保存在 <code id="logs-file">~/.workbuddy-proxy/logs.jsonl</code>，保留最近 500 条，重启后仍可查询。</span>
+              <span>日志保存在 <code id="logs-file">~/.agent2api/logs.jsonl</code>，保留最近 500 条，重启后仍可查询。</span>
               <span>429 自动切换会带上「原账号 → 目标账号」</span>
               <div class="spacer"></div>
               <!-- 分页：页脚右侧，与面板头部的操作按钮同侧 -->
@@ -544,15 +582,58 @@
             </div>
           </section>
 
-          <!-- ── 视图二：模型请求日志 ──
-               明细按后端保留期存盘（默认 30 天，可通过 /api/retention 调整），
-               所以这里没有「导出 / 清空」按钮：这两件事不在本视图的需求范围内。
-               列宽交给 CSS Grid 各自定义，行内数值一律等宽，便于竖着比对耗时与 Token。 -->
-          <section class="panel" id="logs-panel-requests" hidden>
+        </section>
+
+        <!-- ─── 定时任务 ───
+             到点自动干活的任务集中在这里：自动签到（每天定点）+ 四条等间隔任务
+             （凭证自动维护 / 模型目录刷新 / 日志页自动刷新 / 请求明细自动刷新）。
+             两类走不同的接口（签到是「每天某时刻」，间隔型是「每 N 分钟 / 秒」），
+             但同属「定时」这一类，收在一页才好对照着调。
+             整个列表由 tasks-panel.js 渲染，这里只留容器。 -->
+        <section class="page" data-page="tasks">
+          <div class="page-head">
+            <h2>定时任务</h2>
+            <p class="intro">网关在后台定期自动执行的任务。可以在这里开关、调整执行间隔，或立即执行一次。关掉某个任务只影响它自己的自动执行，不影响你在别处手动操作。</p>
+            <div class="head-actions">
+              <button id="btn-tasks-refresh">刷新</button>
+            </div>
+          </div>
+
+          <section class="panel">
             <div class="panel-head">
-              <h2>模型请求</h2>
+              <h2>任务清单</h2>
+              <span id="tasks-badge" class="badge">—</span>
+              <span class="panel-sub">状态每 20 秒自动同步</span>
+            </div>
+            <div class="panel-body">
+              <div class="task-list" id="task-list">
+                <div class="log-empty">正在加载定时任务…</div>
+              </div>
+            </div>
+            <div class="panel-foot">
+              <span>任务配置保存在 <code>~/.agent2api/config.json</code> 的 <code>scheduledTasks</code> 字段</span>
+              <span>改动立即生效，不需要重启程序</span>
+            </div>
+          </section>
+        </section>
+
+        <!-- ─── 请求日志 ───
+             网关每次转发到上游的请求明细（后端按保留期存盘，默认 30 天，见 /api/retention）。
+             列形态参考 OmniProxy 的请求日志：时间 / 提供商·账号 / 重试 / 状态 / 模型 /
+             用时 / 用量 / 错误。后端 /api/stats/requests 只支持时间区间、状态与
+             模型名精确匹配，分页是 offset 真分页，条数没有前端上限。
+             没有详情弹层：本页不存请求 / 响应报文，可看的都在列里。 -->
+        <section class="page" data-page="requests">
+          <div class="page-head">
+            <h2>请求日志</h2>
+            <p class="intro">网关每次转发到上游的模型请求：提供商与账号、重试、状态码、模型、用时与 Token 用量，按时间倒序。本页的自动刷新间隔在「定时任务」页设置。</p>
+          </div>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>请求明细</h2>
               <span id="req-badge" class="badge">—</span>
-              <span class="panel-sub">网关每次转发到上游的请求，按时间倒序</span>
+              <span class="panel-sub">按时间倒序，保留期在设置页可调</span>
               <div class="head-actions">
                 <button id="btn-req-refresh">刷新</button>
               </div>
@@ -560,6 +641,8 @@
 
             <div class="panel-body">
               <div class="log-filters">
+                <!-- 时间档位与日志页同一组档位；持久化键沿用拆分前的
+                     workbuddy-desktop-logs-requests-range，用户已选的档位不因拆页丢失 -->
                 <div class="seg" id="req-range" role="tablist" aria-label="请求日志时间范围">
                   <button class="seg-item" data-range="today">今天</button>
                   <button class="seg-item" data-range="7">7 天</button>
@@ -576,7 +659,7 @@
                 <span class="panel-sub" id="req-summary">—</span>
               </div>
 
-              <div class="log-list" id="req-list"><div class="log-empty">正在加载请求明细…</div></div>
+              <div class="log-list" id="req-list"><div class="log-empty">正在加载请求日志…</div></div>
             </div>
 
             <div class="panel-foot">
@@ -596,7 +679,7 @@
         <section class="page" data-page="settings">
           <div class="page-head">
             <h2>设置</h2>
-            <p class="intro">桌面端的启动与托盘行为、账号数据的导入 / 导出，以及自动签到、软件更新与数据保留天数。这些设置保存在本机，重启后依然生效。</p>
+            <p class="intro">桌面端的启动与托盘行为、账号数据的导入 / 导出，以及软件更新与数据保留天数。这些设置保存在本机，重启后依然生效。定时任务（自动签到、凭证维护、页面自动刷新等）在「定时任务」页。</p>
           </div>
 
           <!-- 左侧分类导航 + 右侧内容栏：分类按 data-cat 通用匹配（见 settings-panel.js），
@@ -605,12 +688,12 @@
             <nav class="settings-nav" id="settings-nav">
               <button class="settings-nav-item active" data-cat="general">通用</button>
               <button class="settings-nav-item" data-cat="account">账号</button>
-              <button class="settings-nav-item" data-cat="service">服务</button>
               <button class="settings-nav-item" data-cat="data">数据</button>
+              <button class="settings-nav-item" data-cat="about">关于</button>
             </nav>
 
             <div class="settings-panes">
-              <!-- ── 通用：启动与托盘 + 界面显示 ── -->
+              <!-- ── 通用：启动与托盘 ── -->
               <div class="settings-pane active" data-cat="general">
                 <section class="panel">
                   <div class="panel-head">
@@ -635,19 +718,24 @@
                   </div>
                 </section>
 
+                <!-- ── 通用：计量单位 ──
+                     纯前端偏好（localStorage，键见 units.js）：与主题同类，
+                     不经主进程也不进 desktop-settings.json —— 它只决定读数字怎么显示，
+                     既不改变任何统计值，也不该跟着账号数据迁到别的机器。 -->
                 <section class="panel">
                   <div class="panel-head">
-                    <h2>界面显示</h2>
-                    <span class="tip-q" data-tip="只影响账号页的卡片列表：这里控制的是列表与面板边缘之间的留白。开启后列表两侧留出内边距，卡片不贴着面板边、更透气；关闭（默认）则列表占满面板宽度、仅保留与内容区一致的两侧间距，窗口足够宽时（约 ≥1620px）一行可排下 4 张卡片。内容区整体的居中限宽不受这个开关影响，其它页面也不受影响。这项偏好只记在本机，切换后立即生效，无需重启。"></span>
+                    <h2>计量单位</h2>
+                    <span class="tip-q" data-tip="控制报表与请求日志里 Token 读数的写法：开启后按中文量级显示（1.2亿 / 8400万），关闭则用 k / M 缩写（与上游文档、接口字段的写法一致）。这只影响显示口径，不改变任何统计与存储的数值。"></span>
                   </div>
                   <div class="panel-body">
                     <div class="settings-switches">
                       <label class="switch">
-                        <input type="checkbox" id="settings-content-margin">
+                        <input type="checkbox" id="settings-chinese-units">
                         <span class="track"></span>
-                        <span>账号列表两侧留白</span>
+                        <span>使用中文单位（亿 / 万）</span>
                       </label>
                     </div>
+                    <div class="settings-state" id="units-state">—</div>
                   </div>
                 </section>
               </div>
@@ -668,79 +756,6 @@
                       <strong>导出文件内含 accessToken / refreshToken 等凭证</strong>，可直接用于登录。请妥善保管，不要外传或上传到公共位置。
                     </div>
                     <div class="io-result" id="settings-io-result" style="display:none"></div>
-                  </div>
-                </section>
-              </div>
-
-              <!-- ── 服务：自动签到 + 软件更新 ── -->
-              <div class="settings-pane" data-cat="service">
-                <section class="panel">
-                  <div class="panel-head">
-                    <h2>自动签到</h2>
-                    <span class="tip-q" data-tip="到点后会自动签到全部已启用的国内版账号（国际版没有签到活动，会被跳过）；多个账号串行执行，避免同时请求触发上游风控。若启动时当天的时间点已过且当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。上游签到接口是幂等的，重复执行只会返回「已领取」，不会重复扣减。"></span>
-                    <span id="checkin-badge" class="badge">检测中…</span>
-                    <div class="head-actions">
-                      <button id="btn-checkin-now">立即签到</button>
-                    </div>
-                  </div>
-                  <div class="panel-body">
-                    <div class="settings-switches">
-                      <label class="switch">
-                        <input type="checkbox" id="settings-auto-checkin">
-                        <span class="track"></span>
-                        <span>每天定时执行全部账号签到</span>
-                      </label>
-                      <label class="switch switch-time">
-                        <span>触发时刻</span>
-                        <input type="time" id="settings-auto-checkin-time" value="00:01">
-                      </label>
-                    </div>
-                    <div class="settings-state" id="settings-checkin-state">—</div>
-                  </div>
-                </section>
-
-                <section class="panel">
-                  <div class="panel-head">
-                    <h2>软件更新</h2>
-                    <span class="tip-q" data-tip="更新包从项目的 GitHub Release 下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。若网络访问 GitHub 较慢，会自动尝试通过 Clash Verge 的混合端口重试一次。"></span>
-                    <span id="update-badge" class="badge">未检查</span>
-                    <div class="head-actions">
-                      <button id="btn-update-check">检查更新</button>
-                      <button id="btn-update-download" class="primary" style="display:none">下载并安装</button>
-                    </div>
-                  </div>
-                  <div class="panel-body">
-                    <div class="update-version">
-                      <span class="version-pill">
-                        <span class="k">当前版本</span><span class="v" id="update-current">—</span>
-                      </span>
-                      <span class="version-arrow">→</span>
-                      <span class="version-pill new">
-                        <span class="k">最新版本</span><span class="v" id="update-latest">—</span>
-                      </span>
-                    </div>
-
-                    <div class="detail" id="update-state">点击「检查更新」查询 GitHub 上的最新发布版本。</div>
-                    <div class="progress" id="update-progress" hidden><div class="bar"></div></div>
-
-                    <!-- 关于作者 + 收藏项目：作者主页与仓库地址都从接口返回的 repository 现拼
-                         （fork 后自动指向 fork 者，代码里不写死任何账号），拿到数据前整行隐藏 -->
-                    <div class="update-author" id="update-author" hidden>
-                      <div class="update-author-text"><strong>关于作者</strong><span>本工具由 <a id="update-author-link" target="_blank" rel="noopener">项目作者</a> 个人开发并开源维护，免费使用、不带广告，也不会收集你的账号数据。如果它帮到了你，欢迎到项目仓库点个 Star 支持一下。</span></div>
-                      <div class="update-author-actions">
-                        <button type="button" class="sm" id="btn-update-favorite" title="在浏览器中打开项目仓库，点 Star 支持作者">收藏项目</button>
-                      </div>
-                    </div>
-
-                    <!-- 更新日志：只展示最新一次发布的说明，数据来自「检查更新」的结果
-                         （与上方「最新版本」同源，见 update-panel.js 的 renderChangelog） -->
-                    <div class="update-log" id="update-notes">
-                      <div class="update-log-head">
-                        <span class="update-log-title">更新日志</span>
-                        <span class="update-log-meta" id="update-log-meta"></span>
-                      </div>
-                      <div class="update-log-body" id="update-log-body"></div>
-                    </div>
                   </div>
                 </section>
               </div>
@@ -789,6 +804,57 @@
                   </div>
                 </section>
               </div>
+
+              <!-- ── 关于：软件更新 ──
+                   排在最后：它与其它分类不同，是「看信息 / 升级」而不是「改设置」。
+                   自动签到已迁到「定时任务」页（它与那几个间隔型任务同属
+                   「到点自动干活」这一类，放在设置页的「关于」分类下语义不对）。 -->
+              <div class="settings-pane" data-cat="about">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>软件更新</h2>
+                    <span class="tip-q" data-tip="更新包从项目的 GitHub Release 下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。若网络访问 GitHub 较慢，会自动尝试通过 Clash Verge 的混合端口重试一次。"></span>
+                    <span id="update-badge" class="badge">未检查</span>
+                    <div class="head-actions">
+                      <button id="btn-update-check">检查更新</button>
+                      <button id="btn-update-download" class="primary" style="display:none">下载并安装</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="update-version">
+                      <span class="version-pill">
+                        <span class="k">当前版本</span><span class="v" id="update-current">—</span>
+                      </span>
+                      <span class="version-arrow">→</span>
+                      <span class="version-pill new">
+                        <span class="k">最新版本</span><span class="v" id="update-latest">—</span>
+                      </span>
+                    </div>
+
+                    <div class="detail" id="update-state">点击「检查更新」查询 GitHub 上的最新发布版本。</div>
+                    <div class="progress" id="update-progress" hidden><div class="bar"></div></div>
+
+                    <!-- 关于作者 + 收藏项目：作者主页与仓库地址都从接口返回的 repository 现拼
+                         （fork 后自动指向 fork 者，代码里不写死任何账号），拿到数据前整行隐藏 -->
+                    <div class="update-author" id="update-author" hidden>
+                      <div class="update-author-text"><strong>关于作者</strong><span>本工具由 <a id="update-author-link" target="_blank" rel="noopener">项目作者</a> 个人开发并开源维护，免费使用、不带广告，也不会收集你的账号数据。如果它帮到了你，欢迎到项目仓库点个 Star 支持一下。</span></div>
+                      <div class="update-author-actions">
+                        <button type="button" class="sm" id="btn-update-favorite" title="在浏览器中打开项目仓库，点 Star 支持作者">收藏项目</button>
+                      </div>
+                    </div>
+
+                    <!-- 更新日志：只展示最新一次发布的说明，数据来自「检查更新」的结果
+                         （与上方「最新版本」同源，见 update-panel.js 的 renderChangelog） -->
+                    <div class="update-log" id="update-notes">
+                      <div class="update-log-head">
+                        <span class="update-log-title">更新日志</span>
+                        <span class="update-log-meta" id="update-log-meta"></span>
+                      </div>
+                      <div class="update-log-body" id="update-log-body"></div>
+                    </div>
+                  </div>
+                </section>
+              </div>
             </div>
           </div>
         </section>
@@ -810,45 +876,46 @@
         <div class="modal-section">
           <h3>账号版本</h3>
           <p>国内版走 copilot.tencent.com，国际版走 www.workbuddy.ai，两版账号可同时保存、按账号自动路由。</p>
-          <div class="field-row">
-            <label class="edition-option">
-              <input type="radio" name="account-edition" value="cn" checked>
-              <span>国内版（WorkBuddy）</span>
-            </label>
-            <label class="edition-option">
-              <input type="radio" name="account-edition" value="intl">
-              <span>国际版（WorkBuddy AI）</span>
-            </label>
+          <!-- 分段控件的交互（点击 / 左右方向键 / roving tabindex）由 account-panel.js 的
+               bindSeg 统一绑定，切换后派发 wb-seg-change；这里只声明结构与初始选中项。
+               aria 用 radiogroup/radio：它表达的是「一组互斥取值里选一个」的表单语义，
+               role=tab 那套是切视图页签用的（账号页筛选栏的 tablist 子项并未带 role=tab，
+               照抄会把不完整的 ARIA 复制过来）。 -->
+          <div class="seg add-seg" id="add-edition-seg" role="radiogroup" aria-label="账号版本">
+            <button type="button" class="seg-item active" data-value="cn" role="radio" aria-checked="true" tabindex="0">国内版（WorkBuddy）</button>
+            <button type="button" class="seg-item" data-value="intl" role="radio" aria-checked="false" tabindex="-1">国际版（WorkBuddy AI）</button>
           </div>
         </div>
 
         <div class="modal-section">
           <h3>登录方式</h3>
-          <p>系统浏览器可复用你已有的登录态（国际版推荐）；内嵌窗口与你日常浏览器隔离，更干净。</p>
-          <div class="field-row">
-            <label class="edition-option">
-              <input type="radio" name="login-mode" value="embedded" checked>
-              <span>内嵌窗口</span>
-            </label>
-            <label class="edition-option">
-              <input type="radio" name="login-mode" value="external">
-              <span>系统默认浏览器</span>
-            </label>
+          <p>网页登录是最省事的一条路（账号昵称自动取自上游）；环境里打不开登录窗口时，再改用粘贴登录态 JSON。</p>
+          <div class="seg add-seg" id="add-login-method" role="radiogroup" aria-label="登录方式">
+            <button type="button" class="seg-item active" data-value="web" role="radio" aria-checked="true" tabindex="0">网页登录</button>
+            <button type="button" class="seg-item" data-value="json" role="radio" aria-checked="false" tabindex="-1">粘贴登录态 JSON</button>
+          </div>
+
+          <!-- 第二级：只有第一级选了「网页登录」才显示（显隐见 add-account.js 的 syncLoginMethod） -->
+          <div class="add-sub" id="add-web-login-block">
+            <p>打开官方 WorkBuddy 登录页，完成登录后自动加入账号列表（排在转发顺序最后，不会抢占首选账号）。账号昵称取自上游，无需手动填写。</p>
+            <div class="field-row">
+              <span class="add-seg-label">打开方式</span>
+              <div class="seg add-seg" id="add-login-mode" role="radiogroup" aria-label="网页登录的打开方式">
+                <button type="button" class="seg-item active" data-value="embedded" role="radio" aria-checked="true" tabindex="0">内嵌窗口</button>
+                <button type="button" class="seg-item" data-value="external" role="radio" aria-checked="false" tabindex="-1">系统默认浏览器</button>
+              </div>
+            </div>
+            <p>系统浏览器可复用你已有的登录态（国际版推荐）；内嵌窗口与你日常浏览器隔离，更干净。</p>
+            <div class="field-row">
+              <button id="web-login-button" class="primary">打开网页登录</button>
+              <button id="web-login-cancel" style="display:none">取消等待</button>
+              <span class="detail" id="web-login-hint">将打开内嵌窗口，登录完成后自动加入账号列表；关掉此窗口即取消等待</span>
+            </div>
           </div>
         </div>
 
-        <div class="modal-section">
-          <h3>推荐：网页登录</h3>
-          <p>打开官方 WorkBuddy 登录页，完成登录后自动加入账号列表（排在转发顺序最后，不会抢占首选账号）。账号昵称取自上游，无需手动填写。</p>
-          <div class="field-row">
-            <button id="web-login-button" class="primary">打开网页登录</button>
-            <button id="web-login-cancel" style="display:none">取消等待</button>
-            <span class="detail" id="web-login-hint">将打开内嵌窗口，登录完成后自动加入账号列表；关掉此窗口即取消等待</span>
-          </div>
-        </div>
-
-        <div class="modal-section">
-          <h3>备用：粘贴登录态 JSON</h3>
+        <div class="modal-section" id="add-json-block" hidden>
+          <h3>粘贴登录态 JSON</h3>
           <p>如果当前环境无法打开登录窗口，也可以把已有的 accessToken/refreshToken JSON 粘进来直接启用。</p>
           <div class="field-row">
             <label for="account-name">备注名</label>
@@ -977,6 +1044,68 @@
   </div>
 
   <div id="toast" role="status" aria-live="polite"></div>
+
+  <!-- ─── 添加模型映射弹窗（models-panel.js）─── -->
+  <div id="mapping-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="mapping-modal-title">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="mapping-modal-title">添加模型映射</h2>
+        <button id="mapping-modal-close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-section">
+          <div class="mapping-row">
+            <div class="mapping-col">
+              <label for="mapping-alias">对外映射名（下游请求时用）</label>
+              <input id="mapping-alias" type="text" maxlength="128" placeholder="例如 gpt-4o" autocomplete="off">
+            </div>
+            <div class="mapping-arrow">→</div>
+            <div class="mapping-col">
+              <label for="mapping-target">转发到上游模型</label>
+              <select id="mapping-target"></select>
+            </div>
+          </div>
+          <div class="mapping-preview" id="mapping-preview"></div>
+          <p class="detail">映射名不能与上游模型 ID 或已有映射名重复；支持字母、数字与 <code>- _ . / :</code>。</p>
+        </div>
+        <div class="detail" id="mapping-modal-status" style="min-height:18px"></div>
+      </div>
+      <div class="modal-foot">
+        <div class="spacer"></div>
+        <button id="mapping-modal-cancel">取消</button>
+        <button id="mapping-modal-save" class="primary">保存映射</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── 新建网关 Key 弹窗（keys-panel.js）─── -->
+  <div id="key-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="key-modal-title">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="key-modal-title">新建 API Key</h2>
+        <button id="key-modal-close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-section">
+          <div class="field-row">
+            <label for="key-name">名称</label>
+            <input id="key-name" type="text" maxlength="60" placeholder="例如 Cursor / 公司电脑" autocomplete="off">
+          </div>
+          <div class="field-row" style="margin-top:9px">
+            <label for="key-value">Key</label>
+            <input id="key-value" type="text" placeholder="留空自动生成；手填至少 8 个字符" autocomplete="off" spellcheck="false">
+          </div>
+        </div>
+        <div class="detail" id="key-modal-status" style="min-height:18px"></div>
+      </div>
+      <div class="modal-foot">
+        <div class="spacer"></div>
+        <button id="key-modal-cancel">取消</button>
+        <button id="key-modal-save" class="primary">创建</button>
+      </div>
+    </div>
+  </div>
+
   <script src="icons.js"></script>
   <!-- 下拉控件增强：必须在 app.js 之前 —— 业务模块（accounts-view / logs-panel /
        proxy-form）执行时就会读写原生 select，外壳要在这之前就位。
@@ -986,22 +1115,75 @@
   <!-- 小问号提示增强：与 select.js 同为「自动增强」型组件，扫描 [data-tip] 即可工作，
        业务模块一行都不用改；排在业务脚本之前，页面里的静态问号在这里就完成增强。 -->
   <script src="tooltip.js"></script>
+  <!-- Token 计量单位的展示口径（中文亿/万 ⇄ 英文 M/k）：报表页与请求日志页都读它，
+       设置页的开关写它，所以排在所有业务脚本之前，它们执行时就能用上。 -->
+  <script src="units.js"></script>
   <script src="app.js"></script>
-  <!-- accounts-model 必须在 accounts-view 之前：后者引用它的判定与标签渲染 -->
+  <script src="clipboard.js"></script>
+  <!-- 网关页「可用模型」区块（渲染 / 本地过滤 / 刷新模型清单按钮）：必须排在
+       app.js 之后 —— 它在加载期就从 window.wbApp 取 esc / toast / getState
+       （跨文件引用走 wbApp 是本项目的既有约定，见 usage-panel.js）；
+       又必须在 app.js 末尾那次 refresh() 之前执行完 —— 所有脚本都是同步加载，
+       refresh() 是异步的（首个 await 之后才轮到渲染），排在 app.js 之后即可。
+       同时它自带加载期的 DOM 绑定（搜索框 input、刷新按钮 click），
+       因此必须排在 index.html 里那两个元素之后（本文件底部，天然满足）。 -->
+  <script src="models-panel.js"></script>
+  <!-- 网关 Key 页（多把 Key 的列表 / 新建 / 启停 / 删除）：同样依赖 wbApp，排在 app.js 之后 -->
+  <script src="keys-panel.js"></script>
+  <!-- 网页登录的交互引擎（WorkBuddy 与小浣熊共用）：等待态 / 取消 / 按钮复位 / 成功收尾
+       只实现一次，两家各交一份配置。必须在 add-account.js 之前 —— 后者在加载期就要用它
+       建 WorkBuddy 那一份（DOM 在下面那个弹窗里），也必须在 add-provider-forms.js 之前
+       —— 小浣熊那份由它建。 -->
+  <script src="web-login.js"></script>
+  <script src="add-account.js"></script>
+  <!-- 提供商目录：provider 摘要与「作用提供商」写入的唯一前端入口。
+       必须排在所有消费者（desensitize-panel / accounts-groups / logs-panel）之前 -->
+  <script src="providers.js"></script>
+  <!-- accounts-groups 必须在 accounts-model 之前：后者按名解构它的判定与分组函数
+       （被依赖者先加载）。再往前必须在 providers.js 之后 —— providerSummaries 会问
+       window.wbProviders 要 label（运行期调用，实际顺序不如上面那条硬，但保持同序更稳）。
+       accounts-model 必须在 accounts-view 之前：后者引用它的判定与标签渲染。
+       usage-panel 必须在 accounts-model 之前：后者的 usagePanelHtml 转调它
+       （余额面板的两套形状渲染已拆到那个文件，见它的模块头）。
+       表格化后的三个新文件（顺序都是加载期就要按名解构，不能靠运行期兜底）：
+         usage-actions  余额 / 签到的动作层，必须在 accounts-view 之前
+                        —— 后者在 IIFE 里就解构它的缓存 Map（要的是 Map 本身，不是副本）
+         accounts-table 行渲染，同上
+         accounts-columns 列宽拖动，同上（tableHtml 的入参与委托绑定都要它）
+         accounts-filters 筛选维度，同上
+       四个文件的引用路径与原 wbAccountsModel / wbAccountsView 保持一致
+       （accounts-view.js 末尾把动作层再导出一次），app.js 等消费方一行都不用改。 -->
+  <script src="accounts-groups.js"></script>
+  <script src="usage-panel.js"></script>
   <script src="accounts-model.js"></script>
+  <script src="usage-actions.js"></script>
+  <script src="accounts-table.js"></script>
+  <script src="accounts-columns.js"></script>
+  <script src="accounts-filters.js"></script>
   <script src="accounts-view.js"></script>
   <script src="desensitize-panel.js"></script>
   <script src="logs-panel.js"></script>
+  <script src="requests-panel.js"></script>
+  <!-- 定时任务面板：读写两条接口（/api/scheduled-tasks 与 /api/auto-checkin）。
+       排在 logs-panel / requests-panel 之后：它保存成功后要把新间隔推给那两个面板
+       （走可选链，未就绪时静默跳过），放在它们之后更符合「谁依赖谁」的阅读顺序；
+       反过来那两个面板启动时会自读一次配置，所以顺序其实不是硬要求。 -->
+  <script src="tasks-panel.js"></script>
   <!-- 报表面板：同样依赖 window.wbApp（esc / toast / currentPage），必须排在 app.js 之后；
        图表全部手写 SVG，不依赖任何图形库，故与其它面板并列即可。
        它内部用 ResizeObserver 重绘图表，容器宽度变化（改窗口、切列数）都能自适应。 -->
   <script src="report.js"></script>
   <script src="proxy-form.js"></script>
+  <!-- 「登录 / 添加账号」弹窗的提供商分叉（提供商分段控件 / 三家表单块 / 弹窗内所有
+       .seg 的交互）。必须在 account-panel.js 之前：它自带加载期绑定（mountAddProviderUi
+       等，需要 #add-modal 已解析），且两个「登录 / 添加账号」按钮的监听要按
+       「add-account.js → 本文件 → account-panel.js」的顺序注册（同元素同事件按注册顺序触发）。 -->
+  <script src="add-provider-forms.js"></script>
   <script src="account-panel.js"></script>
   <!-- Markdown 渲染器：更新日志用。纯函数、无依赖，只认白名单语法（见文件头说明）；
        必须在 update-panel.js 之前加载 -->
   <script src="markdown.js"></script>
-  <!-- update-panel 必须在 settings-panel 之前：后者在设置页首持加载时会调它 -->
+  <!-- update-panel 必须在 settings-panel 之前：后者在设置页首持加载时会调它。 -->
   <script src="update-panel.js"></script>
   <script src="settings-panel.js"></script>
 </body>

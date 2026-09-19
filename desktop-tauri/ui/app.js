@@ -1,15 +1,14 @@
-/* WorkBuddy 本地代理 · 桌面端渲染层 */
+/* Agent2API · 桌面端渲染层 */
 /* global workbuddyDesktop */
 
 const api = window.workbuddyDesktop;
 const $ = id => document.getElementById(id);
 let state = null;
-let currentConfig = null;
 // busy 是「全局一次只干一件事」的互斥锁：刷新、切换账号、登录、保存配置等都要先占它。
 // 注意它与 account-panel.js 里的 panelBusy 是两把互不相干的锁：弹窗内的保存不占这把锁。
 let busy = false;
 
-// 3065 是官方默认端口，但主进程可能被 WORKBUDDY_PROXY_PORT 覆盖，
+// 3065 是官方默认端口，但主进程可能被 AGENT2API_PROXY_PORT 覆盖，
 // 所以它只当兜底值：真实端口由 getBackendStatus() 异步补上（见 syncGatewayPort）。
 const PROXY_PORT = 3065;
 const PROXY_BASE = `http://127.0.0.1:${PROXY_PORT}`;
@@ -88,15 +87,18 @@ function applyTheme(mode) {
 // ─── 页面导航 ────────────────────────────────
 
 const PAGE_KEY = 'workbuddy-desktop-page';
-const PAGES = ['overview', 'accounts', 'gateway', 'desensitize', 'logs', 'settings'];
-/** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」（内部标识保持不变：
- *  localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它） */
+const PAGES = ['overview', 'accounts', 'gateway', 'keys', 'desensitize', 'logs', 'tasks', 'requests', 'settings'];
+/** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」、gateway 的是「模型管理」
+ *  （内部标识保持不变：localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它） */
 const PAGE_LABELS = {
   overview: '报表',
   accounts: '账号',
-  gateway: '网关',
+  gateway: '模型管理',
+  keys: '网关 Key',
   desensitize: '脱敏',
   logs: '日志',
+  tasks: '定时任务',
+  requests: '请求日志',
   settings: '设置',
 };
 
@@ -124,9 +126,24 @@ function showPage(name, { persist = true } = {}) {
     clearLogsBadge();
     window.wbLogsPanel?.load?.();
   }
+  // 请求日志页自持数据与筛选，切进去时拉一次最新
+  if (page === 'requests') {
+    window.wbRequestsPanel?.load?.();
+  }
+  // 定时任务页自持清单与编辑态，切进去时拉一次最新
+  if (page === 'tasks') {
+    window.wbTasksPanel?.load?.();
+  }
   // 切到设置页时拉一次启动设置与网关地址（面板内部自持状态，这里只做转发）
   if (page === 'settings') {
     window.wbSettingsPanel?.load?.();
+  }
+  // 模型管理 / 网关 Key 页各自持有数据，切进去时拉一次最新
+  if (page === 'gateway') {
+    window.wbModelsPanel?.load?.();
+  }
+  if (page === 'keys') {
+    window.wbKeysPanel?.load?.();
   }
   renderTopbarStatus();
   // 导航项上的内容随页面变：日志未读徽标交给日志面板，更新提示在这里重画
@@ -162,8 +179,12 @@ function renderTopbarStatus() {
     accounts: () => chip(`${enabled} 个启用`, enabled ? 'ok' : '')
       + (limited ? chip(`${limited} 个已限流`, 'warn') : ''),
     gateway: () => (up ? chip('监听 127.0.0.1', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
+    keys: () => mirror('keys-status'),
     desensitize: () => mirror('desensitize-badge'),
     logs: () => mirror('logs-badge'),
+    requests: () => mirror('req-badge'),
+    // 定时任务页的徽标由 tasks-panel 自己渲染（「N / M 个已开启」），直接镜像
+    tasks: () => mirror('tasks-badge'),
     settings: () => (up ? chip('网关运行中', 'ok', true) : chip('未就绪', 'bad', true))
       + (enabled ? chip(`${enabled} 个账号启用`) : ''),
     overview: () => (up ? chip('网关运行中', 'ok') : chip('未就绪', 'bad'))
@@ -173,45 +194,117 @@ function renderTopbarStatus() {
   box.innerHTML = views[currentPage]?.() ?? views.overview();
 }
 
-// ─── 日志未读徽标 ─────────────────────────────
+// ─── 日志未读徽标（只提示 error） ─────────────
 
-let lastSeenLogId = Number(localStorage.getItem('workbuddy-desktop-log-seen') || 0);
+/**
+ * 已读水位（日志 id）。null 表示「还没有水位」（首次运行），
+ * 必须与 0 区分开：清空日志后水位会合法地落到 0（id 重新从 1 数起），
+ * 那时若按首次运行处理，紧接着发生的错误会被当成已读吞掉。
+ */
+let lastSeenLogId = readSeenLogId();
+/** 未读错误查询是否在飞：日志面板轮询与全局轮询都会触发它，同一时刻只该有一次 */
+let unreadErrorsInFlight = false;
+
+/** 读回持久化的水位；无值 / 值被改坏一律当作「还没有水位」 */
+function readSeenLogId() {
+  try {
+    const raw = localStorage.getItem('workbuddy-desktop-log-seen');
+    if (raw === null || raw.trim() === '') return null;
+    const value = Number(raw);
+    return Number.isInteger(value) && value >= 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 推进已读水位；localStorage 只负责跨次启动恢复，本会话的判断都看内存值 */
+function markLogsSeen(id) {
+  lastSeenLogId = id;
+  try {
+    localStorage.setItem('workbuddy-desktop-log-seen', String(id));
+  } catch {
+    // 存储不可用时只影响下次启动的起点，不影响本次会话
+  }
+}
 
 function clearLogsBadge() {
   const badge = $('nav-count-logs');
   if (badge) badge.style.display = 'none';
   const stats = window.wbLogsPanel?.lastStats?.();
-  if (stats?.lastId) {
-    lastSeenLogId = stats.lastId;
-    localStorage.setItem('workbuddy-desktop-log-seen', String(lastSeenLogId));
+  if (stats?.lastId) markLogsSeen(stats.lastId);
+}
+
+/**
+ * 导航徽标只提示 **error** 级别，数字含义是「已读水位之后新增的错误条数」。
+ *
+ * 为什么不再按日志总数统计：info/warn 是常态（签到、切号、刷新模型目录都写一条），
+ * 按总数统计等于常挂一个红数字，亮久了就没人再看它；只有错误值得主动打断。
+ * 数字口径也要跟着换 —— 显示的是错误条数，不再是「有新日志」的条数。
+ *
+ * 未读条数交给后端算：`GET /api/logs?level=error&sinceId=<水位>` 的 matched
+ * 就是水位之后新增的 error 条数（level 过滤是「该级别及以上」，error 已是最高
+ * 级别，等价于「仅 error」）。日志上限 500 条且全在内存里，这个查询代价可忽略。
+ */
+function updateLogsBadge(stats) {
+  const badge = $('nav-count-logs');
+  // stats 缺失（接口失败）时什么都不做：不能拿默认的 lastId=0 去判断水位，
+  // 否则会被下面「日志被清空」那条分支误判成 id 归零，把水位一起抹掉
+  if (!badge || !stats) return;
+  const lastId = Number(stats.lastId) || 0;
+  // 首次运行：把当前水位记为已读，否则一装上就挂着历史错误
+  if (lastSeenLogId === null) {
+    markLogsSeen(lastId);
+    badge.style.display = 'none';
+    return;
+  }
+  // 日志被清空（id 重新从 1 数起）：水位必须跟着回落，否则新日志的 id
+  // 永远小于水位，徽标从此不再出现
+  if (lastId < lastSeenLogId) {
+    markLogsSeen(lastId);
+    badge.style.display = 'none';
+    return;
+  }
+  // 人就在日志页：等于已经看到，水位推进到最新
+  // （顺带免掉每 10 秒轮询的这一次查询）
+  if (currentPage === 'logs') {
+    markLogsSeen(lastId);
+    badge.style.display = 'none';
+    return;
+  }
+  void refreshUnreadErrors(badge);
+}
+
+/** 查未读错误数并重画徽标。失败静默：查询偶尔失败不该反过来抹掉已有提示 */
+async function refreshUnreadErrors(badge) {
+  if (unreadErrorsInFlight || lastSeenLogId === null) return;
+  unreadErrorsInFlight = true;
+  const from = lastSeenLogId;
+  try {
+    const result = await api.getLogs({ limit: 1, level: 'error', sinceId: from });
+    // 等待期间水位被推进（用户进了日志页），这次结果已过期，别拿旧数覆盖新状态
+    if (from !== lastSeenLogId || currentPage === 'logs') return;
+    const unread = Number(result?.matched) || 0;
+    if (!unread) {
+      badge.style.display = 'none';
+      return;
+    }
+    badge.textContent = unread > 99 ? '99+' : String(unread);
+    badge.title = `${unread} 条错误日志未读，点开「日志」查看`;
+    badge.style.display = '';
+  } catch {
+    // 保持上一次的显示
+  } finally {
+    unreadErrorsInFlight = false;
   }
 }
 
-/** 有新日志时在导航上显示未读数（只在非日志页显示，避免打扰当前阅读） */
-function updateLogsBadge(stats) {
-  const badge = $('nav-count-logs');
-  if (!badge || !stats) return;
-  const lastId = Number(stats.lastId) || 0;
-  const warnCount = (stats.byLevel?.warn || 0) + (stats.byLevel?.error || 0);
-  // 未读 = 上次已读之后新增的条数；首次运行把当前水位记为已读
-  if (!lastSeenLogId) {
-    lastSeenLogId = lastId;
-    localStorage.setItem('workbuddy-desktop-log-seen', String(lastId));
-    badge.style.display = 'none';
-    return;
+/** 拉一次日志统计再重画徽标：挂在 20 秒全局轮询上，非日志页也能及时看到新错误 */
+async function syncLogsBadge() {
+  try {
+    updateLogsBadge(await api.getLogStats());
+  } catch {
+    // 静默：统计拿不到时保持现状
   }
-  const unread = Math.max(0, lastId - lastSeenLogId);
-  if (currentPage === 'logs' || !unread) {
-    badge.style.display = 'none';
-    if (currentPage === 'logs') {
-      lastSeenLogId = lastId;
-      localStorage.setItem('workbuddy-desktop-log-seen', String(lastId));
-    }
-    return;
-  }
-  badge.textContent = unread > 99 ? '99+' : String(unread);
-  badge.title = `${unread} 条新日志（其中警告/错误 ${warnCount} 条）`;
-  badge.style.display = '';
 }
 
 // ─── 新版本可用提示 ───────────────────────────
@@ -262,7 +355,12 @@ function renderSession() {
   const session = state?.session || {};
   const health = state?.health || {};
   const badge = $('session-badge');
-  const currentAccount = state?.accounts?.accounts?.find(a => a.id === state.accounts.currentAccountId);
+  // 本面板是 **workbuddy 语义**（登录态、昵称、UID 都指向上游 WorkBuddy 账号）：
+  // 首选账号优先取会话自己的 currentAccountId。账号优先级是全局一条队列之后，
+  // 它就是全局队首（与列表快照的 currentAccountId 同源同值）；
+  // 会话信息仍只认这个字段，不与账号页的行状态混用。
+  const sessionAccountId = session.currentAccountId || state?.accounts?.currentAccountId;
+  const currentAccount = state?.accounts?.accounts?.find(a => a.id === sessionAccountId);
 
   // title 还被「加载失败」用来挂后端不可达的原因（见 refresh 的 catch），
   // 每次重渲染都先清空：否则恢复后鼠标悬停仍会读到上一次的失败提示
@@ -370,83 +468,6 @@ function renderGateway() {
   void syncGatewayPort();
 }
 
-function renderModels() {
-  const box = $('models');
-  const models = Array.isArray(state?.models) ? state.models : [];
-  if (!models.length) {
-    box.innerHTML = '<div class="empty" style="padding:14px 0">暂无模型</div>';
-    setModelsCount(0, 0);
-    return;
-  }
-  // 倍率统一展示为官方风格 "0.03x"：兼容远程 "x0.03" 与内置 "x0.03 credits" 两种写法
-  const formatCredits = c => {
-    const m = /x\s*([\d.]+)/i.exec(c || '');
-    return m ? `${m[1]}x` : (c || '');
-  };
-  // 芯片整块可点：点击即复制模型 ID（复制逻辑在 initCopyButtons 里统一处理）
-  box.innerHTML = models.map(m => {
-    const cls = m.isDefault ? 'model-chip default' : 'model-chip';
-    const credits = m.credits ? `<span class="credits">${esc(formatCredits(m.credits))}</span>` : '';
-    const name = m.name && m.name !== m.id ? `<span class="name">${esc(m.name)}</span>` : '';
-    return `<button type="button" class="${cls}" data-copy="${esc(m.id)}" title="点击复制模型 ID：${esc(m.id)}">`
-      + `<span class="id">${esc(m.id)}</span>${m.isDefault ? '<span class="name">（默认）</span>' : ''}${name}${credits}</button>`;
-  }).join('');
-
-  applyModelFilter();
-  setModelsCount(models.length, models.length);
-
-  const def = models.find(m => m.isDefault) || models[0];
-  if (def) {
-    const badge = $('default-model-badge');
-    badge.textContent = `默认模型 ${def.id}`;
-    badge.style.display = '';
-    $('default-model').textContent = def.id;
-  }
-}
-
-/** 模型清单计数：搜索时显示「命中 / 全部」 */
-function setModelsCount(shown, total) {
-  const box = $('models-count');
-  if (!box) return;
-  box.textContent = shown === total ? `共 ${total} 个可用模型 · 点击芯片复制 ID` : `匹配 ${shown} / ${total} 个模型`;
-}
-
-/** 按搜索框内容过滤模型芯片（本地过滤，不再请求后端） */
-function applyModelFilter() {
-  const box = $('models');
-  const input = $('model-search');
-  if (!box || !input) return;
-  const keyword = input.value.trim().toLowerCase();
-  const chips = [...box.querySelectorAll('.model-chip')];
-  if (!chips.length) return;
-  let shown = 0;
-  chips.forEach(chip => {
-    const hit = !keyword || chip.textContent.toLowerCase().includes(keyword);
-    chip.classList.toggle('filtered', !hit);
-    if (hit) shown++;
-  });
-  setModelsCount(shown, chips.length);
-  const empty = box.querySelector('.models-empty');
-  if (shown === 0) {
-    if (!empty) {
-      box.insertAdjacentHTML('beforeend', `<div class="empty models-empty" style="padding:14px 0;width:100%">没有匹配「${esc(input.value.trim())}」的模型</div>`);
-    }
-  } else {
-    empty?.remove();
-  }
-}
-
-function renderConfig() {
-  currentConfig = state?.config || { apiKeySet: false, apiKey: null };
-  const { apiKeySet, apiKey } = currentConfig;
-  $('api-key-input').placeholder = apiKeySet
-    ? `当前已设置：${apiKey}（输入新值覆盖）`
-    : '留空表示不启用鉴权；至少 8 个字符';
-  $('api-key-status').textContent = apiKeySet
-    ? `✅ 已启用，客户端请求需带 Authorization: Bearer <key>（当前 ${apiKey}）`
-    : '未启用（仅监听 127.0.0.1，建议本机使用）';
-}
-
 /**
  * 「本地代理状态」卡片已随报表页改造删除（原有信息与侧栏底部的网关状态、
  * 顶栏徽标重复）。这里保留判空只是为了让历史书签 / 旧 DOM 不报错：
@@ -460,9 +481,12 @@ function renderProxyStatus() {
     box.innerHTML = `<span style="color:var(--danger)">不可用：${esc(health?.unavailableReason || '无法连接代理')}</span>`;
     return;
   }
-  // 首选项取自列表的派生值（转发顺序第一位）；具体某次请求走谁还受按模型的限额影响
+  // 首选项与账号页同源：优先用后端按最近一次请求的模型派生的 `routedAccountId`
+  // （已剔除对该模型限流的账号，即「下一个请求真正会先试谁」），没给才回落到
+  // 不限模型的 `currentAccountId`。两处若各取各的，会出现「这一行说 A、账号页说 B」。
   const snapshot = state?.accounts;
-  const current = snapshot?.accounts?.find(a => a.id === snapshot.currentAccountId);
+  const currentId = state?.routedAccountId || snapshot?.currentAccountId;
+  const current = snapshot?.accounts?.find(a => a.id === currentId);
   const who = current ? (current.nickname || current.name || current.uid || current.id) : '—';
   box.textContent = `运行正常 · ${health.upstreamBaseUrl || ''} · 首选账号 ${who}（P${current?.priority ?? '—'}）`;
 }
@@ -472,11 +496,20 @@ function render() {
   renderAccountsView();
   renderGateway();
   renderModels();
-  renderConfig();
   renderProxyStatus();
   renderNavCounts();
   renderTopbarStatus();
   renderSidebarStatus();
+}
+
+/**
+ * 模型管理区块由 models-panel.js 负责（表格渲染 / 筛选 / 启停 / 映射 / 刷新清单）。
+ * 它自持从 /api/models/manage 拉来的数据；这里的调用只在轮询到新状态时提醒它
+ * 「清单可能变了」，由它决定是否重拉。用可选链委托 —— 万一它还没执行完也只是
+ * 本轮不画，不抛错把 render() 拖崩。
+ */
+function renderModels() {
+  window.wbModelsPanel?.render();
 }
 
 /** 账号列表由 accounts-view 模块负责（含优先级/禁用/代理徽章与行内面板） */
@@ -529,8 +562,8 @@ async function refresh() {
   try {
     const next = await api.getState();
     state = next;
-    // 配置面板（apiKey / defaultModel）与词表通过独立接口加载，避免阻塞状态
-    await Promise.all([loadConfig(), loadDesensitize()]);
+    // 词表通过独立接口加载，避免阻塞状态
+    await loadDesensitize();
     // 清掉已删除账号的本地缓存；代理可选项也可能在 Clash 侧改过，下次打开弹窗重读
     const validIds = new Set((state.accounts?.accounts || []).map(a => a.id));
     window.wbAccountsView?.refreshCaches(validIds);
@@ -547,17 +580,6 @@ async function refresh() {
     console.warn('加载状态失败:', error.message);
   } finally {
     releaseBusy();
-  }
-}
-
-async function loadConfig() {
-  try {
-    const cfg = await api.getConfig();
-    // config 里的 desensitize 是精简摘要（无 terms），不要拿它覆盖完整词表状态
-    state = { ...(state || {}), config: cfg };
-    renderConfig();
-  } catch (error) {
-    console.warn('读取配置失败:', error.message);
   }
 }
 
@@ -587,7 +609,7 @@ async function runAccountAction(action, id) {
       toast('✅ Token 已刷新');
     } else if (action === 'remove') {
       const account = state?.accounts?.accounts?.find(a => a.id === id);
-      if (!confirm(`确定删除账号「${account?.nickname || account?.name || id}」？`)) return;
+      if (!confirm(`确定删除账号「${account?.nickname || account?.name || id}」？${window.wbAccountsModel?.isDesktopAccount?.(account) ? '（不会影响客户端登录态）' : ''}`)) return;
       await api.removeAccount(id);
       await refresh();
       toast('账号已删除');
@@ -599,200 +621,8 @@ async function runAccountAction(action, id) {
   }
 }
 
-// ─── 添加账号弹窗 ─────────────────────────────
-
-function openModal() {
-  $('add-modal').classList.add('open');
-  syncLoginModeHint();
-  // 以主进程真实状态复位按钮：上次若在等待中被关窗，这里会重新可用
-  api.getLoginState()
-    .then(state => applyLoginState(state?.active))
-    .catch(() => applyLoginState(false));
-}
-
-function closeModal() {
-  $('add-modal').classList.remove('open');
-  $('auth-json-input').value = '';
-  $('upload-button').disabled = true;
-  $('account-name').value = '';
-  // 关窗即放弃等待：通知主进程中止后端轮询，否则按钮会一直卡在禁用态
-  if (loginActive) {
-    api.cancelLogin()
-      .then(() => toast('已取消登录等待'))
-      .catch(() => {})
-      .finally(() => applyLoginState(false));
-  }
-}
-
-/** 弹窗里选的账号版本（cn=国内版 / intl=国际版） */
-function selectedEdition() {
-  const checked = document.querySelector('input[name="account-edition"]:checked');
-  return checked?.value === 'intl' ? 'intl' : 'cn';
-}
-
-/** 弹窗里选的登录方式（embedded=内嵌窗口 / external=系统默认浏览器） */
-function selectedLoginMode() {
-  const checked = document.querySelector('input[name="login-mode"]:checked');
-  return checked?.value === 'external' ? 'external' : 'embedded';
-}
-
-function setLoginMode(mode) {
-  const input = document.querySelector(`input[name="login-mode"][value="${mode}"]`);
-  if (input) input.checked = true;
-  syncLoginModeHint();
-}
-
-/**
- * 登录状态（由主进程推送）：等待中时按钮显示「取消等待」。
- * 关键点：状态来自主进程而非本地变量，弹窗反复开关也不会把按钮卡在禁用态。
- */
-let loginActive = false;
-
-function applyLoginState(active) {
-  loginActive = Boolean(active);
-  const button = $('web-login-button');
-  const cancel = $('web-login-cancel');
-  if (!button) return;
-  if (loginActive) {
-    button.disabled = true;
-    button.innerHTML = '<span class="spinner"></span>等待登录完成…';
-    if (cancel) cancel.style.display = '';
-  } else {
-    button.disabled = false;
-    if (cancel) cancel.style.display = 'none';
-    syncLoginModeHint();
-  }
-}
-
-/** 登录按钮与提示随登录方式变化（等待中不改文案，交给 applyLoginState） */
-function syncLoginModeHint() {
-  if (loginActive) return;
-  const external = selectedLoginMode() === 'external';
-  $('web-login-button').textContent = external ? '在浏览器中打开登录页' : '打开网页登录';
-  $('web-login-hint').textContent = external
-    ? '将用系统默认浏览器打开，登录完成后自动加入账号列表；关掉此窗口即取消等待'
-    : '将打开内嵌窗口，登录完成后自动加入账号列表；关掉此窗口即取消等待';
-}
-
-async function startWebLogin() {
-  if (busy || loginActive) return;
-  busy = true;
-  const edition = selectedEdition();
-  const mode = selectedLoginMode();
-  const editionLabel = edition === 'intl' ? '国际版' : '国内版';
-  const button = $('web-login-button');
-  button.disabled = true;
-  button.innerHTML = '<span class="spinner"></span>等待网页登录…';
-  try {
-    const result = await api.startLogin(edition, mode);
-    if (result?.canceled) {
-      toast('已取消登录等待');
-      return;
-    }
-    closeModal();
-    await refresh();
-    toast(`✅ 登录成功，${editionLabel}账号已加入列表`);
-  } catch (error) {
-    toast(`登录失败：${error.message}`, 'err');
-  } finally {
-    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
-    // 以主进程状态为准复位按钮，避免这里与真实状态不一致
-    const state = await api.getLoginState().catch(() => null);
-    applyLoginState(state?.active);
-  }
-}
-
-/** 取消等待中的登录（主进程会通知后端中止轮询） */
-async function cancelWebLogin() {
-  try {
-    await api.cancelLogin();
-    toast('已取消登录等待');
-  } catch (error) {
-    toast(`取消失败：${error.message}`, 'err');
-  }
-  applyLoginState(false);
-}
-
-async function uploadAccount() {
-  const text = $('auth-json-input').value.trim();
-  if (!text || busy) return;
-  busy = true;
-  const edition = selectedEdition();
-  const button = $('upload-button');
-  button.disabled = true;
-  try {
-    JSON.parse(text); // 先做本地格式校验，再交给后端
-    await api.uploadAccount($('account-name').value.trim(), text, edition);
-    closeModal();
-    await refresh();
-    toast(`账号已导入（${edition === 'intl' ? '国际版' : '国内版'}）`);
-  } catch (error) {
-    toast(`导入失败：${error.message}`, 'err');
-  } finally {
-    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
-    button.disabled = !$('auth-json-input').value.trim();
-  }
-}
-
-// ─── 复制 ─────────────────────────────────────
-
-/**
- * 复制按钮统一入口。两种用法：
- *   data-copy="文本"          直接复制给定文本（模型芯片）
- *   data-copy-from="元素 id"  复制该元素的当前文本（地址 / UID 等会变的值）
- * 地址类文本带 "POST " / "GET " 前缀，复制时去掉，保证粘出去能直接用。
- */
-function copyTextOf(trigger) {
-  const fromId = trigger.dataset.copyFrom;
-  if (fromId) {
-    const source = $(fromId);
-    if (!source) return '';
-    return source.textContent.replace(/^(POST|GET)\s+/i, '').trim();
-  }
-  return trigger.dataset.copy || '';
-}
-
-async function copyToClipboard(text) {
-  if (!text) return false;
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    // 剪贴板被拒（无权限 / 非安全上下文）时用兜底方案，避免功能静默失效
-    try {
-      const area = document.createElement('textarea');
-      area.value = text;
-      area.style.position = 'fixed';
-      area.style.opacity = '0';
-      document.body.appendChild(area);
-      area.select();
-      const ok = document.execCommand('copy');
-      area.remove();
-      return ok;
-    } catch {
-      return false;
-    }
-  }
-}
-
-document.addEventListener('click', async event => {
-  const trigger = event.target.closest('[data-copy], [data-copy-from]');
-  if (!trigger) return;
-  const text = copyTextOf(trigger);
-  if (!(await copyToClipboard(text))) { toast('复制失败，请手动选择复制', 'err'); return; }
-  toast(`已复制：${text.length > 46 ? `${text.slice(0, 46)}…` : text}`);
-  // 复制按钮给个即时反馈（模型芯片本身是内容，不改它的外观）
-  if (trigger.classList.contains('copy-btn')) {
-    trigger.classList.add('done');
-    trigger.textContent = '✓';
-    setTimeout(() => {
-      trigger.classList.remove('done');
-      trigger.textContent = '⧉';
-    }, 1200);
-  }
-});
-
-$('model-search')?.addEventListener('input', applyModelFilter);
+// 模型搜索框的 `input` 监听不在这里：过滤逻辑（applyModelFilter）已随模型区块
+// 一起搬进 models-panel.js，监听留在原地会让两边各持一半 —— 见该文件的说明。
 
 // ─── 事件绑定 ─────────────────────────────────
 
@@ -832,56 +662,6 @@ $('btn-logout').addEventListener('click', async () => {
     releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
   }
 });
-$('btn-add-account').addEventListener('click', openModal);
-$('btn-add-account-2').addEventListener('click', openModal);
-
-$('btn-save-key').addEventListener('click', async () => {
-  const value = $('api-key-input').value.trim();
-  if (busy) return;
-  busy = true;
-  try {
-    await api.saveConfig({ apiKey: value || null });
-    $('api-key-input').value = '';
-    await loadConfig();
-    toast(value ? '✅ API Key 已保存' : 'API Key 已清除');
-  } catch (error) {
-    toast(`保存失败：${error.message}`, 'err');
-  } finally {
-    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
-  }
-});
-$('btn-clear-key').addEventListener('click', async () => {
-  if (busy) return;
-  busy = true;
-  try {
-    await api.saveConfig({ apiKey: null });
-    $('api-key-input').value = '';
-    await loadConfig();
-    toast('API Key 已清除');
-  } catch (error) {
-    toast(`清除失败：${error.message}`, 'err');
-  } finally {
-    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
-  }
-});
-
-$('close-modal').addEventListener('click', closeModal);
-$('add-modal').addEventListener('click', event => { if (event.target === $('add-modal')) closeModal(); });
-$('web-login-button').addEventListener('click', startWebLogin);
-$('web-login-cancel').addEventListener('click', cancelWebLogin);
-$('upload-button').addEventListener('click', uploadAccount);
-// 登录方式切换：只影响按钮文案与提示
-document.querySelectorAll('input[name="login-mode"]').forEach(input => {
-  input.addEventListener('change', syncLoginModeHint);
-});
-// 版本切换：国际版默认用系统浏览器（可复用已有登录态），国内版默认回到内嵌窗口
-document.querySelectorAll('input[name="account-edition"]').forEach(input => {
-  input.addEventListener('change', () => setLoginMode(selectedEdition() === 'intl' ? 'external' : 'embedded'));
-});
-$('auth-json-input').addEventListener('input', () => {
-  $('upload-button').disabled = !$('auth-json-input').value.trim();
-});
-document.addEventListener('keydown', event => { if (event.key === 'Escape') closeModal(); });
 
 api.onStateChanged(next => {
   if (!next?.accounts && !next?.session && !next?.health) return;
@@ -894,9 +674,6 @@ api.onStateChanged(next => {
   void loadDesensitize();
 });
 
-// 登录进行状态由主进程推送：等待结束（成功/失败/取消）后按钮自动复位
-api.onLoginState?.(payload => applyLoginState(payload?.active));
-
 // ─── 共享给子模块（账号视图 / 词表面板 / 日志面板 / 账号设置面板）───
 window.wbApp = {
   esc,
@@ -907,7 +684,9 @@ window.wbApp = {
   getState: () => state,
   runAccountAction,
   refresh,
+  renderTopbarStatus,
   updateLogsBadge,
+  syncLogsBadge,
   // 软件更新面板在每次检查结束后回调它，把「有新版本」翻译成导航上的提示
   updateUpdateBadge,
 };
@@ -970,4 +749,10 @@ document.addEventListener('DOMContentLoaded', () => {
 }, { once: true });
 
 // 定时轮询：限额标记（429 + 恢复时间）与账号状态变化自动刷新；窗口隐藏时暂停
-setInterval(() => { if (!document.hidden) refresh(); }, 20_000);
+setInterval(() => {
+  if (document.hidden) return;
+  refresh();
+  // 日志未读错误也一起轮询：否则人不在日志页时，只有日志面板那次 10 秒轮询
+  // 才会更新徽标 —— 而那个轮询恰恰只在日志页可见时才发请求（见 logs-panel.js）
+  void syncLogsBadge();
+}, 20_000);

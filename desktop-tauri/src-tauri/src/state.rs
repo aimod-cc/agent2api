@@ -29,6 +29,13 @@ pub struct ActiveLogin {
     pub state: String,
     pub edition: String,
     pub mode: String,
+    /// 这次登录属于哪一家（provider id）。
+    ///
+    /// 壳侧为什么也要记：登录窗口的导航拦截要判断「这个 URL 是不是本家的回调」，
+    /// 而各家的回调协议不同（小浣熊是 `office-raccoon://auth/callback`，
+    /// workbuddy 没有回调 —— 它的凭证由后端轮询上游拿）。把 provider 记在
+    /// 活动登录上，拦截逻辑就不必猜、也不必让前端多传一个参数。
+    pub provider: String,
 }
 
 /// 与窗口生命周期相关的开关。

@@ -89,8 +89,11 @@ pub async fn is_ready(port: u16) -> bool {
 pub async fn ensure_ready(app: &AppHandle) -> Result<(), String> {
     let port = proxy_port();
 
-    // 起服务：日志库与配置在这里初始化（bootstrap 内部完成）
-    let state = server::ServerState::bootstrap(port);
+    // 起服务：日志库与配置在这里初始化（bootstrap 内部完成）。
+    // 失败一律原样返回：`bootstrap` 只在「本该执行的目录迁移没有执行」时返回
+    // Err（防御性校验，见那边的注释）—— 继续下去会把新配置目录建出来，
+    // 让迁移永远无法重试，所以这里必须中断而不是带着错误往下走。
+    let state = server::ServerState::bootstrap(port)?;
 
     // 端口已被占用：唯一合法的占用者是「本产品的旧版 node 网关」（升级场景），
     // 先尝试自动接管；接管不了（别的程序 / 用户手工起的服务）才走报错。
@@ -99,7 +102,8 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), String> {
     if is_ready(port).await && !reclaim_port_from_legacy(port).await {
         return Err(format!(
             "{port} 端口上已有服务在响应：可能是旧版网关（node server.mjs）尚未退出。\
-             请先结束它再启动本程序，或用环境变量 WORKBUDDY_PROXY_PORT 指定其它端口。"
+             请先结束它再启动本程序，或用环境变量 AGENT2API_PROXY_PORT 指定其它端口\
+             （旧名 WORKBUDDY_PROXY_PORT 仍有效）。"
         ));
     }
     let shutdown_tx = server::start(&state)?;

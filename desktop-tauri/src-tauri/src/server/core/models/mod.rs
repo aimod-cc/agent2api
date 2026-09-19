@@ -18,18 +18,46 @@
 //!
 //! ── 并发 ──────────────────────────────────────────────────
 //! 目录是「读多写少」的共享态：句柄内一把 `RwLock`，读路径（/v1/models、
-//! /api/session、/health、聊天路由的模型校验）拿读锁，刷新落地时拿写锁。
+//! /health、聊天路由的模型校验，以及经聚合目录间接读它的 /api/session）
+//! 拿读锁，刷新落地时拿写锁。
 //! 硬约束（与账号存储相同）：**持锁期间绝不做网络请求** —— 刷新先把请求
 //! 发完、解析完，最后才在锁内做一次整体替换。
+//!
+//! ── 多提供商（Agent2API 改造 W2a-T2）后的定位 ──────────────
+//! 本模块**只负责 workbuddy 这一家的清单**（内置清单 + /v3/config 远程刷新），
+//! 它继续是 workbuddy 的清单事实来源。跨 provider 的合并视图在
+//! `core::providers::catalog`（聚合目录），两边共用 `shape.rs` 的「来源无关」
+//! 构造件（条目字段映射、响应信封、相近提示纯函数）——
+//! 于是「单家清单」与「聚合清单」永远不会在字段映射上分叉。
+//!
+//! 词法上本模块是个目录（`models/mod.rs` + `models/shape.rs`）：拆分的唯一
+//! 理由是单文件行数约定（≤800 行），职责边界与拆分前完全一致。
+//!
+//! ── 进程级句柄 ──────────────────────────────────────────────
+//! `global_catalog()` 是聚合层的读取口（`OnceLock` 单例，与
+//! `core::desensitize::global()` 同一模式）：`ServerState::bootstrap` 与聚合层
+//! 拿到的是同一实例，刷新对两边同时可见。
 
-use std::sync::{Arc, RwLock};
+mod shape;
 
-use serde_json::{json, Map, Value};
+use std::sync::{Arc, OnceLock, RwLock};
+
+use serde_json::{json, Value};
 
 use crate::server::core::auth_http::send_raw;
 use crate::server::core::endpoints::{normalize_endpoint, user_agent_for_edition};
+use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::logging;
+
+// 本模块内部用（is_chat_model / apply_filters / get / apply_remote / list_response）
+use shape::{js_truthy, value_text};
+
+// 对外再导出：聚合目录（core::providers::catalog）与排障方从 `core::models`
+// 取这些名字，保持与拆分前同一条导入路径。
+// `shape_value_text` 是 `shape::value_text` 的别名导出：聚合目录要按 `name`
+// 匹配模型（对齐 `ModelCatalog::get` 的第二段），需要与这里同一套 JS 文本化。
+pub use shape::{list_item, list_response_from, model_id, suggest_from, value_text as shape_value_text};
 
 /// 下游可见模型白名单：/v1/models 与路由解析只暴露这些模型。
 ///
@@ -110,7 +138,7 @@ fn builtin_models() -> Vec<Value> {
 }
 
 /// 对话模型判定：网关只服务对话模型，非对话项（补全/内部工具/图像小模型）
-/// 不进目录 —— /v1/models、/api/session 与路由解析三者保持一致。
+/// 不进目录 —— /v1/models、/api/session（经聚合目录）与路由解析三者保持一致。
 pub fn is_chat_model(model: &Value) -> bool {
     let id = model.get("id").map(value_text).unwrap_or_default();
     if CHAT_MODEL_EXCLUDE_PREFIXES
@@ -128,48 +156,6 @@ pub fn is_chat_model(model: &Value) -> bool {
         return false;
     };
     max_output >= 16_000.0
-}
-
-/// 模型 id 归一化：小写 + 去掉非 ASCII 字母数字，`deepseek-v4.1-flash` → `deepseekv41flash`
-fn normalize_model_id(value: &str) -> String {
-    value
-        .to_lowercase()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect()
-}
-
-/// 经典 Levenshtein 距离（模型 id 都很短，O(nm) 足够）
-fn edit_distance(a: &str, b: &str) -> usize {
-    if a == b {
-        return 0;
-    }
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    if a.is_empty() {
-        return b.len();
-    }
-    if b.is_empty() {
-        return a.len();
-    }
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for i in 1..=a.len() {
-        let mut cur: Vec<usize> = vec![i];
-        for j in 1..=b.len() {
-            let substitution = prev[j - 1] + if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur.push((prev[j] + 1).min(cur[j - 1] + 1).min(substitution));
-        }
-        prev = cur;
-    }
-    prev[b.len()]
-}
-
-/// 公共前缀长度（大小写已归一，直接按字符比较）
-fn common_prefix_length(a: &str, b: &str) -> usize {
-    a.chars()
-        .zip(b.chars())
-        .take_while(|(left, right)| left == right)
-        .count()
 }
 
 /// 目录的内部状态：模型清单 + 刷新元信息（对应 Node 版的闭包变量）
@@ -272,7 +258,13 @@ impl ModelCatalog {
             .cloned()
     }
 
-    /// 目录里是否有该模型
+    /// 目录里是否有该模型。
+    ///
+    /// **不再被对话链路调用**（Agent2API 改造 W2b-T3 起模型校验走
+    /// `providers::catalog::providers_for_model`，视图是聚合目录）：这里是
+    /// 「只看 workbuddy 这一家」的判定，排障时与聚合判定对比即可分辨
+    /// 「是清单不对」还是「聚合/去重不对」。
+    #[allow(dead_code)]
     pub fn has(&self, id: &str) -> bool {
         self.get(Some(id)).is_some()
     }
@@ -294,35 +286,23 @@ impl ModelCatalog {
     /// 仅供 400 报错信息用的「你是不是想要」提示：列出目录里与请求名最相近的 id。
     ///
     /// 结果不参与路由 —— 路由永远只认精确存在的模型。
-    /// 过滤与排序规则逐字照抄 Node 版 suggest：
-    ///   ① 归一化后公共前缀 ≥ 4；
-    ///   ② 且（互为前缀 或 编辑距离 ≤ max(3, floor(目标长度 × 0.4))）；
-    ///   ③ 按编辑距离升序、公共前缀降序，取前 limit 个。
+    /// 判定逻辑在 `suggest_from`（聚合目录共用同一份，保证单一来源与聚合两种
+    /// 视角下的提示口径一致）。
+    ///
+    /// **不再被对话链路调用**（Agent2API 改造 W2b-T3 起 400 提示走
+    /// `providers::catalog::suggest_models`，数据源是聚合目录）：这里是
+    /// 「只看 workbuddy 这一家」的视图，排障时与聚合提示对比即可分辨
+    /// 「是清单不对」还是「聚合/去重不对」。对只有 workbuddy 一家的用户，
+    /// 两者结果相同（共用 `suggest_from`）。
+    #[allow(dead_code)]
     pub fn suggest(&self, id: &str, limit: usize) -> Vec<String> {
-        let target = normalize_model_id(id);
-        if target.is_empty() {
-            return Vec::new();
-        }
-        let threshold = 3usize.max((target.chars().count() as f64 * 0.4).floor() as usize);
-        let mut scored: Vec<(String, usize, usize)> = self
+        let ids: Vec<String> = self
             .read()
             .models
             .iter()
-            .filter_map(|model| {
-                let model_id = model.get("id").map(value_text)?;
-                let candidate = normalize_model_id(&model_id);
-                let dist = edit_distance(&target, &candidate);
-                let prefix = common_prefix_length(&target, &candidate);
-                let starts_with = candidate.starts_with(&target) || target.starts_with(&candidate);
-                if prefix < 4 || !(starts_with || dist <= threshold) {
-                    return None;
-                }
-                Some((model_id, dist, prefix))
-            })
+            .filter_map(|model| model.get("id").map(value_text))
             .collect();
-        scored.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)));
-        scored.truncate(limit);
-        scored.into_iter().map(|(id, _, _)| id).collect()
+        suggest_from(ids, id, limit)
     }
 
     /// 当前目录（克隆；调用方不会看到后续刷新）
@@ -330,119 +310,45 @@ impl ModelCatalog {
         self.read().models
     }
 
+    /// 是否曾成功采用远程清单（挂进响应 meta 用；聚合层据此算「来源」）
+    pub fn remote_refreshed(&self) -> bool {
+        self.read().remote_refreshed
+    }
+
+    /// 最后一次成功远程刷新的时间（毫秒，未刷新过为 0）
+    pub fn last_refreshed_at(&self) -> i64 {
+        self.read().last_refreshed_at
+    }
+
     /// 目录条数（/health 的 models 字段）
     pub fn count(&self) -> usize {
         self.read().models.len()
     }
 
-    /// `/api/session` 的 models 字段：`{id, name, isDefault, credits}`
-    ///
-    /// 字段语义照抄 Node 的 `{ id: m.id, name: m.name, isDefault: !!m.isDefault,
-    /// credits: m.credits || '' }`：`name` 缺失时不出这个键（前端用
-    /// `m.name || m.id` 兜底），`credits` 的假值一律给空串。
-    pub fn session_models(&self) -> Vec<Value> {
-        self.read()
-            .models
-            .iter()
-            .map(|model| {
-                let mut item = Map::new();
-                item.insert(
-                    "id".to_string(),
-                    model.get("id").cloned().unwrap_or(Value::String(String::new())),
-                );
-                if let Some(name) = model.get("name") {
-                    if !name.is_null() {
-                        item.insert("name".to_string(), name.clone());
-                    }
-                }
-                item.insert(
-                    "isDefault".to_string(),
-                    Value::Bool(model.get("isDefault").map(js_truthy).unwrap_or(false)),
-                );
-                item.insert(
-                    "credits".to_string(),
-                    match model.get("credits") {
-                        Some(value) if js_truthy(value) => value.clone(),
-                        _ => Value::String(String::new()),
-                    },
-                );
-                Value::Object(item)
-            })
-            .collect()
-    }
-
     /// GET /v1/models 的 OpenAI 风格响应：`{object, data: [...], meta: {...}}`
+    ///
+    /// 响应体本身的拼装走 `list_response_from`（聚合目录共用同一函数，
+    /// 区别只在 data 是合并后的数组）—— 单家与聚合两个视角的信封字段
+    /// 与顺序不可能分叉。
+    ///
+    /// **保留但不再被 /v1/models 调用**（Agent2API 改造 W2a-T2 起该端点走
+    /// `providers::catalog::models_response`）：这里是「只看 workbuddy 这一家」
+    /// 的视图，排障时与聚合输出对比即可立刻分辨「是 workbuddy 清单不对」
+    /// 还是「聚合/过滤逻辑不对」。对只有 workbuddy 一家的用户，
+    /// 它与聚合输出逐字段相同（聚合层复用同一个 list_item / 信封）。
+    #[allow(dead_code)]
     pub fn list_response(&self) -> Value {
         let state = self.read();
         let data: Vec<Value> = state
             .models
             .iter()
-            .map(|model| {
-                // 字段名与顺序照抄 Node 的 listResponse
-                let mut item = Map::new();
-                // 逐个字段复刻 Node 的对象字面量：值为 undefined（键缺失）时
-                // JSON 化会**丢掉这个键**，所以这里也只在存在时插入 ——
-                // 例如图像模型的 maxOutputTokens 缺失，Node 的输出里就没有
-                // `max_output_tokens`，而不是 `null`
-                if let Some(id) = model.get("id").filter(|value| !value.is_null()) {
-                    item.insert("id".to_string(), id.clone());
-                }
-                item.insert("object".to_string(), Value::String("model".to_string()));
-                item.insert("created".to_string(), Value::from(0));
-                item.insert("owned_by".to_string(), Value::String("workbuddy".to_string()));
-                if let Some(name) = model.get("name").filter(|value| !value.is_null()) {
-                    item.insert("name".to_string(), name.clone());
-                }
-                // `credits: m.credits || ''`：假值（含 null/空串/0）一律给空串，
-                // 真值原样透出（数字等非字符串值也照透，与 Node 一致）
-                item.insert(
-                    "credits".to_string(),
-                    match model.get("credits") {
-                        Some(value) if js_truthy(value) => value.clone(),
-                        _ => Value::String(String::new()),
-                    },
-                );
-                if let Some(value) = model.get("maxOutputTokens").filter(|value| !value.is_null()) {
-                    item.insert("max_output_tokens".to_string(), value.clone());
-                }
-                if let Some(value) = model.get("maxInputTokens").filter(|value| !value.is_null()) {
-                    item.insert("max_input_tokens".to_string(), value.clone());
-                }
-                item.insert(
-                    "supports_tool_call".to_string(),
-                    Value::Bool(model.get("supportsToolCall").map(js_truthy).unwrap_or(false)),
-                );
-                item.insert(
-                    "supports_images".to_string(),
-                    Value::Bool(model.get("supportsImages").map(js_truthy).unwrap_or(false)),
-                );
-                item.insert(
-                    "supports_reasoning".to_string(),
-                    Value::Bool(model.get("supportsReasoning").map(js_truthy).unwrap_or(false)),
-                );
-                item.insert(
-                    "is_default".to_string(),
-                    Value::Bool(model.get("isDefault").map(js_truthy).unwrap_or(false)),
-                );
-                item.insert(
-                    "kind".to_string(),
-                    match model.get("kind") {
-                        Some(value) if js_truthy(value) => value.clone(),
-                        _ => Value::String("chat".to_string()),
-                    },
-                );
-                Value::Object(item)
-            })
+            .map(|model| list_item(model, kind_id(ProviderKind::WorkBuddy)))
             .collect();
-        json!({
-            "object": "list",
-            "data": data,
-            "meta": {
-                "source": if state.remote_refreshed { "remote" } else { "builtin" },
-                "lastRefreshedAt": state.last_refreshed_at,
-                "count": state.models.len(),
-            },
-        })
+        list_response_from(
+            data,
+            if state.remote_refreshed { "remote" } else { "builtin" },
+            state.last_refreshed_at,
+        )
     }
 
     /// 是否已采用远程清单（排障用）。
@@ -455,10 +361,11 @@ impl ModelCatalog {
     }
 
     /// 远程配置刷新（与桌面端行为一致）：
+    ///
     ///   1) GET {endpoint}/v3/config  → data.models 为运行时清单
     ///   2) 企业账号再取 /console/enterprises/{id}/config/models
-    /// 两者都不可用时保留内置目录。拉回的清单先过 MODEL_ALLOWLIST 白名单。
     ///
+    /// 两者都不可用时保留内置目录。拉回的清单先过 MODEL_ALLOWLIST 白名单。
     /// 返回 `{refreshed, count, source}` 或 `{refreshed:false, reason}` 语义
     /// 与 Node 版逐字一致 —— 调用方据此决定打 ✅ 还是 verbose。
     pub async fn refresh(&self, params: RefreshParams<'_>) -> RefreshOutcome {
@@ -549,7 +456,8 @@ impl ModelCatalog {
         RefreshOutcome::not_refreshed(REASON_NO_SESSION)
     }
 
-    /// 落地一份远程清单（锁内只做替换，不做任何 IO）
+    /// 落地一份远程清单（锁内只做替换，不做任何 IO；锁外再补一次默认规则
+    /// 种子，见函数尾）
     ///
     /// 默认模型统一为 auto（远程可能把 fast-model 等档位模型标为默认，
     /// 与网关默认不一致）。`enterprise` 为 true 时走企业分支：
@@ -578,23 +486,39 @@ impl ModelCatalog {
                 Value::Object(object)
             })
             .collect();
+        let ids: Vec<String> = mapped
+            .iter()
+            .filter_map(|model| model.get("id").map(value_text))
+            .collect();
         let state = CatalogState {
             models: mapped,
             last_refreshed_at: logging::now_ms(),
             remote_refreshed: true,
         };
         self.write(state);
+        // 远程清单首次落地时补一次 WorkBuddy 默认规则种子（默认只启用白名单内的
+        // 模型，见 model_rules::seed_workbuddy_defaults）。必须放在写锁之外：种子
+        // 要写 config.json，而「持锁期间不做任何 IO」是本目录的硬约束。
+        if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(&ids) {
+            logging::log("[Models]", &summary);
+        }
     }
 
     /// 按当前账号的凭证/端点/UA/出口刷新一次（路由层与启动流程的入口）。
     ///
     /// 「当前账号 = 队首的可用账号」（由 store 派生，与转发默认使用的账号一致），
     /// 这里直接用它的凭证与出口，保证模型目录与转发看到的是同一个账号。
+    ///
+    /// 返回 [`RefreshOutcome`]（本函数内部本来就算出了它，只是过去只用于打日志）：
+    /// 自动路径不看返回值（照旧只写日志），**手动刷新路径**靠它如实汇报
+    /// 「刷到了几个 / 为什么没刷」—— 见 `providers::adapter` 的 `refresh_models`
+    /// 契约。取不到可用登录态、`/v3/config` 失败或返回的清单不含对话模型，
+    /// 都走 `not_refreshed(原因)`，既有行为（保留现有清单 + verbose 日志）不变。
     pub async fn refresh_with_current_account(
         &self,
         store: &crate::server::core::account_store::AccountStore,
         auth: &crate::server::core::auth::AuthService,
-    ) {
+    ) -> RefreshOutcome {
         // 队首账号优先（多账号时与转发一致）；没有账号时回落到默认登录态
         // （环境变量 WORKBUDDY_TOKEN 或单账号 auth.json）
         let (session, proxy) = match store.get_current_entry() {
@@ -606,13 +530,13 @@ impl ModelCatalog {
                 Ok(session) => (session, None),
                 Err(error) => {
                     logging::verbose("[Models]", &format!("模型目录刷新失败: {}", error.message));
-                    return;
+                    return RefreshOutcome::not_refreshed(error.message);
                 }
             },
         };
         let Some(session) = session else {
             logging::verbose("[Models]", &format!("模型目录未更新: {REASON_NO_SESSION}"));
-            return;
+            return RefreshOutcome::not_refreshed(REASON_NO_SESSION);
         };
 
         let endpoint = session
@@ -647,6 +571,7 @@ impl ModelCatalog {
         } else {
             logging::verbose("[Models]", &format!("模型目录未更新: {}", outcome.reason));
         }
+        outcome
     }
 }
 
@@ -689,29 +614,6 @@ impl RefreshOutcome {
     }
 }
 
-/// JS `String(x)`（id/name/credits 这类字段的文本形态）：
-/// 字符串原样、数字按字面量、null/缺失给空串、其余用 JSON 文本近似。
-fn value_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => String::new(),
-        Value::Number(number) => number.to_string(),
-        Value::Bool(flag) => flag.to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// JS 真值判定（`Boolean(x)`）：null/false/0/"" 为假，其余为真
-fn js_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().map(|item| item != 0.0).unwrap_or(false),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
-    }
-}
-
 /// 对照 JS 的 `encodeURIComponent`（企业 id 进 URL 路径前编码）
 fn encode_uri_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
@@ -733,4 +635,25 @@ fn encode_uri_component(value: &str) -> String {
 #[allow(dead_code)]
 pub fn builtin_models_snapshot() -> Value {
     Value::Array(builtin_models())
+}
+
+// ─── 进程级目录句柄（聚合目录的读取口）──────────────────────
+
+/// 进程级 workbuddy 目录句柄。**为什么要全局**：聚合目录
+/// （`core::providers::catalog`）的公开 API 只收 `&AccountStore`（handler 手边
+/// 就有），不该再要求调用方层层传一个 ModelCatalog —— 那会把 `list_models` 与
+/// 将来 chat_completions 的签名都改一遍。全局句柄与 `config::current()` /
+/// `core::desensitize::global()` 是同一模式：启动时装一次，之后所有模块共用。
+///
+/// 取用方式是 `get_or_init`：`ServerState::bootstrap` 与聚合层拿到的是**同一个
+/// 实例**（共享同一把 RwLock），即使 bootstrap 被调用多次（重启路径）也不会
+/// 出现「ServerState 里刷新了、聚合层读的是另一份旧目录」这种分叉。
+static GLOBAL: OnceLock<ModelCatalog> = OnceLock::new();
+
+/// 取进程级目录句柄；首次调用即构造（内置清单，不读盘、不刷新）。
+///
+/// 构造顺序无关：任何模块在启动流程的任何阶段调它都能拿到一个可用的目录
+/// （最坏情况是「还没被 `/v3/config` 刷新过」的内置清单，与改造前的初始态一致）。
+pub fn global_catalog() -> ModelCatalog {
+    GLOBAL.get_or_init(ModelCatalog::new).clone()
 }

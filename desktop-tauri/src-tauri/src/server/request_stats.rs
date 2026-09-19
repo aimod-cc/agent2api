@@ -58,8 +58,9 @@ use crate::server::logging;
 
 use clock::{date_key, day_of, local_midnight_ms, today};
 use report::{
-    build_top_model, cache_rates, cache_trend_24h, daily_trend, heatmap, normalize_range,
-    normalize_status_filter, push_model_accum, range_bounds, range_totals, streak,
+    build_providers, build_top_model, cache_rates, cache_trend_24h, daily_trend, entry_json,
+    heatmap, normalize_range, normalize_status_filter, push_model_accum, push_provider_accum,
+    range_bounds, range_totals, streak,
 };
 use record::{DailyEntry, MAX_DAILY_DAYS, MAX_ENTRIES, COMPACT_STEP};
 
@@ -258,6 +259,16 @@ impl RequestStats {
             day.cache_hit_tokens += cache_read;
             day.cache_input_tokens += prompt;
             push_model_accum(&mut day.model_tokens, &record.model, tokens, 1);
+            // provider 维度与模型维度**并列累计**同一份请求：两者的求和都等于
+            // 当天的 requests / tokens，这是报表之间能对账的前提。
+            // 空 provider 也建组（见 push_provider_accum 的注释）
+            push_provider_accum(
+                &mut day.provider_stats,
+                &record.provider,
+                1,
+                i64::from(success),
+                tokens,
+            );
         }
         guard.daily_changes += 1;
 
@@ -318,6 +329,10 @@ impl RequestStats {
         // overview / dailyTrend / heatmap 走聚合（跨年；明细只有请求天数）
         let totals = range_totals(&guard.daily, &start_date, &end_date);
         let top_model = build_top_model(&totals.model_totals, totals.tokens);
+        // providers 与 topModel **同源同区间**：都从这次的 `range_totals` 出，
+        // 于是「按 provider 的请求数之和」必然等于 overview.requests，
+        // 前端把它们并排显示时不会出现互相对不上的数
+        let providers = build_providers(&totals.provider_totals);
         let trend = daily_trend(&guard.daily, &start_date, &end_date);
         let map = heatmap(&guard.daily, now_day);
         let consecutive = streak(&guard.daily, now_day);
@@ -339,6 +354,10 @@ impl RequestStats {
                 "streak": consecutive,
                 "topModel": top_model,
             },
+            // 按 provider 维度的区间汇总（**新增字段，不改既有字段**）。
+            // 前端按「存在则展示、缺失则隐藏」消费，所以旧前端拿到它只会忽略。
+            // 恒为数组（无数据时是空数组而不是 null）：前端不必判两种空形态
+            "providers": providers,
             "heatmap": map,
             "cacheRates": rates,
             "cacheTrend24h": cache_trend,
@@ -382,12 +401,16 @@ impl RequestStats {
             .collect();
 
         let matched_count = matched.len();
-        let entries: Vec<RequestEntry> = matched
+        // 每行经 `entry_json` 补一个派生字段 `providerLabel`（id → label 的换算；
+        // 换算处与汇总的 providers 数组同一个函数，两处名字必然一致）。
+        // 汇总是**反序列化回 Value**，不是另一套结构：契约字段仍由 record.rs
+        // 的 serde 注解决定，这里只加不删
+        let entries: Vec<Value> = matched
             .into_iter()
             .rev()
             .skip(filter.offset)
             .take(limit)
-            .cloned()
+            .map(entry_json)
             .collect();
 
         json!({
@@ -580,6 +603,17 @@ fn load_daily(path: &Path) -> BTreeMap<String, DailyEntry> {
                 existing.cache_input_tokens += item.cache_input_tokens;
                 for acc in item.model_tokens {
                     push_model_accum(&mut existing.model_tokens, &acc.model, acc.tokens, acc.requests);
+                }
+                // provider 维度同理逐行合并（同一天多行时两组都要合上，
+                // 否则「按 provider 之和 = requests」这条对账关系会破）
+                for acc in item.provider_stats {
+                    push_provider_accum(
+                        &mut existing.provider_stats,
+                        &acc.provider,
+                        acc.requests,
+                        acc.successful,
+                        acc.tokens,
+                    );
                 }
             }
             None => {

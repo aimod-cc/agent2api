@@ -1,5 +1,7 @@
 /* ─────────────────────────────────────────────
-   日志页：两个视图（系统事件时间线 / 模型请求明细）
+   日志页：系统事件时间线
+   （网关转发明细已拆到「请求日志」页，表格样式在 page-requests.css；
+   本文件的 .log-filters / .log-list / .log-pager 等容器声明两页共用。）
    颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
    ───────────────────────────────────────────── */
 
@@ -33,7 +35,7 @@
    不需要 margin-left:auto（那样在输入框被换成更短控件时会把它甩到很远）。 */
 .log-filters .switch { flex: 0 0 auto; }
 
-/* 请求视图筛选行右侧的读数（当前档位 + 状态口径） */
+/* 筛选行右侧的读数（当前档位 + 状态口径；请求日志页的 #req-summary 同用） */
 .log-filters .panel-sub {
   color: var(--text-3);
   font-size: 11.5px;
@@ -247,139 +249,4 @@
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
-}
-
-/* ─── 模型请求明细（第二个视图） ───
-   与事件日志共用 .log-list（同一档边框 / 圆角 / 凹槽底 / 滚动行为）与 .log-empty
-   （空态居中靠的是 .log-list > .log-empty:only-child），这里只补表格本身。
-   为什么用 CSS Grid 而不是 <table>：这一块的每行都要在窄窗口下重排，
-   Grid 的列定义与媒体查询是同一套写法，表格的 colgroup 做不到按断点换列。 */
-
-/* 六列：时间 / 模型 / 账号 / 状态 / 耗时 / Token。
-   时间与耗时、Token 定宽（等宽数字 + tabular-nums，竖着比对才齐），
-   模型与账号各占一份弹性宽度（都是不定长的标识符，给固定宽度会互相挤）；
-   账号列给的是 minmax(0, 0.8fr)：它比模型短，且长昵称要能省略号收住。 */
-.req-row,
-.req-head {
-  display: grid;
-  grid-template-columns: 84px minmax(0, 1.6fr) minmax(0, 0.9fr) 62px 78px minmax(0, 96px);
-  gap: 12px;
-  align-items: center;
-  padding: 10px 14px;
-  /* 列表是 flex 列容器：条目不许被压缩，超出的一律交给列表滚动 */
-  flex: none;
-}
-
-/* 表头：粘在列表顶部。列表自身滚动，滚动条是它自己的（不是页面），
-   sticky 的参照物就是 .log-list，因此顶部偏移写 0。 */
-.req-head {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  padding-top: 8px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface-2);
-  color: var(--text-3);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .02em;
-}
-
-.req-row { border-bottom: 1px solid var(--hairline); transition: background .12s ease; }
-.req-row:last-child { border-bottom: none; }
-.req-row:hover { background: var(--surface-2); }
-
-/* 表头里耗时 / Token 两格跟数值同侧对齐（数值列是右对齐的，见 .req-num） */
-.req-head .req-dur,
-.req-head .req-tok { text-align: right; }
-
-/* 失败行轻微着色，与事件日志 error 行同一手法（不干扰阅读的淡底） */
-.req-row.failed { background: color-mix(in srgb, var(--danger-soft) 45%, transparent); }
-.req-row.failed:hover { background: var(--danger-soft); }
-
-/* 时间列：明细跨天，给到秒 + 月日，用等宽避免每一行的冒号错位 */
-.req-time {
-  color: var(--text-3);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-/* 模型名：标识符用等宽，超长从尾部省略（完整值在 title 里） */
-.req-model {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.req-acct {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text-2);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* 无账号（请求在任何账号接手前就失败）用破折号：空着会被当成渲染缺失 */
-.req-acct.is-empty { color: var(--text-3); }
-
-/* 耗时 / Token：数字用等宽 + 右对齐，相邻两列排下来能直接竖着比大小；
-   附加说明（重试次数 / 缓存读取）在主数字下方，跟随同一边。 */
-.req-num {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 2px;
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-/* 附加说明（重试次数 / 缓存读取）：比主读数小一号、淡一档，
-   不抢主数字但同行可比 */
-.req-sub {
-  color: var(--text-3);
-  font-size: 10.5px;
-}
-
-/* 错误摘要横跨整行：它是失败原因，读的是句子而不是单元格，
-   挤在 84px 的时间列里只能截断；占满一行也让失败行在扫读时先跳出来 */
-.req-error {
-  grid-column: 1 / -1;
-  padding: 5px 9px;
-  border: 1px solid var(--danger-bd);
-  border-radius: var(--r-sm);
-  background: var(--danger-soft);
-  color: var(--danger);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  line-height: 1.5;
-  word-break: break-word;
-}
-
-/* 窄窗口：后三列收纳成第二行，免得每一列都缩成省略号。
-   断点取 1000px 的依据是内容区实际宽度 —— 默认窗口 1060px 时内容区约 772px，
-   六列里模型列还有 250px 左右（够放 `claude-sonnet-4-5` 这种长度的名字），
-   再窄一档模型名与账号名就开始互相挤，此时折成两行更好读。
-   820px 最小窗口下侧栏已收成 68px，四列反而比六列宽松得多。 */
-@media (max-width: 1000px) {
-  .req-row,
-  .req-head {
-    grid-template-columns: 78px minmax(0, 1fr) minmax(0, 0.8fr) 56px;
-    row-gap: 4px;
-  }
-  /* 表头里对应的两格直接隐藏（列数变了，留着会对错位） */
-  .req-head .req-dur,
-  .req-head .req-tok { display: none; }
-  .req-row .req-dur { grid-column: 1 / 3; }
-  .req-row .req-tok { grid-column: 3 / 5; }
 }

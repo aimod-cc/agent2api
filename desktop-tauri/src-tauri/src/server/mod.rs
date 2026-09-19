@@ -38,6 +38,7 @@
 //!     chat.rs       POST /v1/chat/completions、GET /v1/models（对话主链路）
 //!     desensitize.rs /api/desensitize*（词表维护 / 开关 / 角色 / 命中统计）
 //!     auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
+//!     scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务：开关 / 间隔 / 立即执行）
 //!     update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
 //!     endpoints.rs  GET /api/endpoints（接口清单）
 //!   core/
@@ -51,9 +52,13 @@
 //!     clash.rs     Clash Verge 配置读取与快照缓存
 //!     egress.rs    出网点（按出口缓存 reqwest Client）+ 出口连通性测试
 //!     billing/     积分 / 签到（checkin.rs） / 运营活动
-//!     models.rs    模型目录（内置清单 + /v3/config 远程刷新）
+//!     models/      模型目录（workbuddy 单家：内置清单 + /v3/config 远程刷新）
 //!     routing.rs   账号选路（严格优先级 + 限额冷却判定）
 //!     auto_checkin.rs 定时签到调度（30 秒轮询 + 当天去重 + 启动补签）
+//!     credential_maintenance.rs 凭证自动维护（遍历账号 → 刷新临期凭证；
+//!                     调度由 `scheduled_tasks` 按配置的开关与间隔驱动）
+//!     scheduled_tasks.rs 间隔型定时任务注册表与调度循环（凭证维护 / 模型刷新；
+//!                     配置文件在 config.json 的 scheduledTasks，路由见 api::scheduled_tasks）
 //!     update/      软件更新：
 //!       mod.rs       管理器句柄 / 下载状态机 / 进度与取消
 //!       version.rs   版本比较、域名白名单、资产挑选、文件名安全化（纯函数）
@@ -79,6 +84,10 @@
 //!     `api::chat::desensitize_body`，它取 `core::desensitize::global()`。
 //!   - 定时签到：`ServerState::auto_checkin()`；停机清理走
 //!     `core::auto_checkin::stop_global()`（backend::shutdown 里调用）。
+//!   - 间隔型定时任务：`core::scheduled_tasks`（注册表 + 调度循环，循环在
+//!     `bootstrap` 末尾起一次）；开关与间隔来自 `config::scheduled_settings()`
+//!     （内存快照，循环每轮现读 —— 所以改完设置下一轮生效，不重启进程）。
+//!     本模块不再持有那两条任务的间隔常量，加一条新任务只需改注册表。
 //!   - 软件更新：`ServerState::update()`。
 //!   - 请求统计：写入侧是 `api::chat` 的记账点 → `RequestStats::record`；
 //!     读取侧是 `api::stats_api` 的三条路由（报表 / 明细查询 / 清空），
@@ -103,6 +112,7 @@
 
 pub mod api;
 pub mod config;
+pub mod config_migration;
 pub mod core;
 pub mod errors;
 pub mod http;
@@ -135,9 +145,9 @@ use crate::server::request_stats::{RequestStats, Retention};
 /// 这样 handler 拿到状态就能直接用，也不必关心怎么加锁。
 #[derive(Clone)]
 pub struct ServerState {
-    /// 监听端口（默认 3065，可用 WORKBUDDY_PROXY_PORT 覆盖）
+    /// 监听端口（默认 3065，可用 AGENT2API_PROXY_PORT 覆盖；旧名 WORKBUDDY_PROXY_PORT 仍可读）
     pub port: u16,
-    /// 配置目录（`~/.workbuddy-proxy`），与壳侧 gateway::config_dir() 同源
+    /// 配置目录（`~/.agent2api`），与壳侧 gateway::config_dir() 同源
     pub config_dir: PathBuf,
     /// 账号存储句柄（内部一把 Mutex，绝不在持锁时做网络请求）
     store: AccountStore,
@@ -179,11 +189,30 @@ impl ServerState {
     /// 保留天数裁一次，而保留天数来自配置 —— 若配置还没读进来，那次裁剪会退回
     /// 默认 30 天，把用户设了更长保留期的旧日志当场裁掉并落盘（**不可逆的数据丢失**）。
     /// 两个函数都不写日志，交换它们不会让任何一行启动日志丢失。
-    pub fn bootstrap(port: u16) -> Self {
+    ///
+    /// ── 一次性目录迁移（`~/.workbuddy-proxy` → `~/.agent2api`）不在这里 ──
+    /// 它必须早于**任何**会写配置目录的动作，而 `bootstrap` 已经是「桌面设置
+    /// 已读过、窗口已建好、日志库即将装」的阶段 —— 放在这里就晚了：迁移失败
+    /// 后只要有人写一次盘（settings::save / config::save_raw / 日志库），
+    /// 新目录就被建出来，`target.exists()` 从此为真，迁移再也无法重试。
+    /// 因此调用点上移到壳侧 `lib.rs` 的 setup 第一步（`settings::load()` 之前），
+    /// 那里失败会提示用户并结束本次启动，不写任何配置文件。
+    ///
+    /// 这里保留一道**防御性校验**（`config_migration::pending_reason`）：若旧目录
+    /// 仍在、新目录仍不存在，说明本该执行的迁移没有执行（例如后续有人挪动了
+    /// 调用点）。此时直接返回错误、不做任何初始化 —— 继续下去的第一件事
+    /// （`config::init` → 读盘；`logging::init_store` → 建目录）就会把新目录
+    /// 建出来，让迁移永远失去重试机会。失败以 `Err` 往上传（`ensure_ready`
+    /// 原样透给 UI 的 `backend:error`），不 panic、也不静默降级。
+    pub fn bootstrap(port: u16) -> Result<Self, String> {
+        if let Some(reason) = config_migration::pending_reason() {
+            return Err(reason);
+        }
         let config_dir = config::config_dir();
-        // 与 Node 版一致：verbose 由环境变量 WORKBUDDY_VERBOSE=1 打开，
+        // 与 Node 版一致：verbose 由环境变量 AGENT2API_VERBOSE=1 打开
+        // （旧名 WORKBUDDY_VERBOSE 仍可读，新名优先），
         // 决定 debug 级别日志要不要入库（默认只有 info 以上入库，避免刷屏）
-        let verbose = std::env::var("WORKBUDDY_VERBOSE").map(|v| v.trim() == "1").unwrap_or(false);
+        let verbose = env_flag(&["AGENT2API_VERBOSE", "WORKBUDDY_VERBOSE"]);
         let snapshot = config::init();
         logging::init_store(&config_dir, verbose);
 
@@ -193,7 +222,12 @@ impl ServerState {
         let auth = AuthService::new(store.clone(), context);
         let login = LoginService::new(auth.clone(), store.clone());
         let billing = BillingService::new(auth.clone());
-        let models = ModelCatalog::new();
+        // 模型目录：**进程级单例**（Agent2API 改造 W2a-T2）。聚合模型目录
+        // （core::providers::catalog）只收 &AccountStore，不该让调用方层层传目录，
+        // 因此目录自身也做成进程级句柄（与 config / desensitize / auto_checkin
+        // 同一模式）：`core::models::global_catalog()` 与这里的 `models` 是
+        // **同一实例**（共享同一把 RwLock），刷新对两边同时可见。
+        let models = core::models::global_catalog();
         let upstream = UpstreamService::new(store.clone(), auth.clone());
         // 内容脱敏：默认开启，词表与开关持久化在 {config_dir}/desensitize.json
         // （对照 server.mjs 398 行）。WORKBUDDY_DESENSITIZE=1/0 只覆盖**本次运行**，
@@ -252,9 +286,34 @@ impl ServerState {
                 logging::log("[Accounts]", &format!("✅ 旧版登录态已迁移为账号: {name}"));
             }
         }
-        // 优先级去重迁移：历史数据里并列的优先级会被重新编号成连续序号，
-        // 相对顺序保持不变（所以升级后实际转发顺序不变）
-        store.migrate_priorities();
+        // 启动期数据迁移（一次读、一次写，见 store_admin::migrate_startup）：
+        //   ① 历史账号补 `provider: "workbuddy"`（Agent2API 惰性迁移，§3.2）
+        //   ② 优先级去重 —— 逐 provider 分组重编号，相对顺序保持不变
+        //      （所以升级后实际转发顺序不变）
+        store.migrate_startup();
+        // 小浣熊旧数据一次性导入（架构文档 §3.3，W3-T4）：
+        //   `~/.raccoon-proxy/accounts.json`（旧网关多账号）+
+        //   `~/.box-agent/config/auth.json`（桌面端实时登录态）→ raccoon 账号。
+        // 触发条件是「raccoon 账号列表为空 **且** config 里没有 raccoonImported」，
+        // 幂等且失败不阻断启动（两个来源各自缺失就跳过，见该方法的说明）。
+        // 放在 migrate_startup 之后：迁移已把历史账号归好组，导入的新账号
+        // 不会影响这一轮的去重判定（导入本身按 provider 内号段追加）。
+        store.import_legacy_raccoon_data();
+        // CatPaw 旧数据一次性导入（架构文档 §9，W5-T-d4）：
+        //   `~/.meituan-catpaw/catpaw-proxy-accounts.json`（原项目多账号）+
+        //   `~/.meituan-catpaw/auth.json`（桌面端实时登录态）→ catpaw 账号。
+        // 触发条件是「catpaw 账号列表为空 **且** config 里没有 catpawImported」，
+        // 与上面那条同构（标记键、幂等性、失败不阻断启动都一致）。
+        store.import_legacy_catpaw_data();
+        // AutoClaw 旧数据一次性导入（架构文档 §10.2 末条，W4b-T-c2）：
+        //   `~/.autoclaw-proxy/accounts.json`（原项目多账号）+
+        //   `%APPDATA%/AutoClaw/auth.json`（桌面端实时登录态；备来源
+        //   `~/.openclaw-autoclaw/openclaw.json`）→ autoclaw 账号。
+        // 触发条件是「autoclaw 账号列表为空 **且** config 里没有 autoclawImported」，
+        // 与上面两条同构（标记键、幂等性、失败不阻断启动都一致）。
+        // 三条导入**追加式共存**：各看自己那一家的账号列表与自己那个标记键，
+        // 互不影响，先后顺序不改变任何结果（后一条只增不改前面的账号）。
+        store.import_legacy_autoclaw_data();
 
         let state = Self {
             port,
@@ -270,7 +329,7 @@ impl ServerState {
             update,
             request_stats,
         };
-        logging::log("[Server]", "WorkBuddy 本地代理（Rust 进程内服务）启动中…");
+        logging::log("[Server]", "Agent2API 多提供商本地网关（Rust 进程内服务）启动中…");
         logging::log("[Config]", &format!("API 端口: {}", port));
         logging::log("[Config]", "API 监听地址: 127.0.0.1");
         logging::log(
@@ -354,13 +413,11 @@ impl ServerState {
                     ),
                 );
             }
-            // 启动时刷新一次目录：对照 Node 的 `void refreshModelCatalog()`
-            let models = state.models.clone();
-            let store = state.store.clone();
-            let auth = state.auth.clone();
-            tauri::async_runtime::spawn(async move {
-                models.refresh_with_current_account(&store, &auth).await;
-            });
+            // 启动时的模型目录刷新**不在这里**：它已归入定时任务注册表
+            // （`core::scheduled_tasks` 的首轮跑一次），于是「在定时任务页关掉
+            // 模型目录刷新 = 启动也不刷」这条一致性成立。改造前这里是无条件
+            // spawn 一次 `refresh_implemented`（对照 Node 的
+            // `void refreshModelCatalog()`），那个行为在开关默认开启时保持不变。
         } else {
             let reason = summary
                 .get("unavailableReason")
@@ -374,6 +431,9 @@ impl ServerState {
         // 放在 bootstrap 末尾而不是 start() 里：调度循环与 HTTP 监听彼此独立，
         // 且 start() 的调用方（backend::ensure_ready）拿不到「配置里是否开启」的
         // 判定结果；Node 版也是在 server.listen 之前、同一个 main() 里做的。
+        //
+        // 注意它**不在** `scheduled_tasks` 的清单里：自动签到是「每天定点」型，
+        // 与那个模块的「等间隔重复」不是同一个形状（理由见那边的模块头）。
         let checkin_state = state.auto_checkin.state();
         if checkin_state
             .get("enabled")
@@ -387,7 +447,29 @@ impl ServerState {
             logging::log("[Checkin]", &format!("定时签到已启用：每天 {time} 执行"));
             state.auto_checkin.start();
         }
-        state
+
+        // 间隔型定时任务（凭证自动维护 / 模型目录刷新）：
+        // 起一个循环，按各自配置的开关与间隔重复执行。
+        //
+        // ── 改造前后的行为对照 ────────────────────────────────────
+        // 改造前这里是两处硬编码：凭证维护 `loop { 刷; sleep(600s) }`（spawn 出来
+        // 立刻刷一次）、模型目录在「有可用登录态」的分支里 spawn 一次启动刷新。
+        // 现在两者都由注册表驱动，启动时的那一次变成「首轮排期立刻到点」——
+        // 开关默认开启，因此**默认行为一致**，且关掉任务后启动也不刷。
+        //
+        // 一处有意的差异：模型目录的启动刷现在不再被「有无登录态」挡住
+        // （原先写在 `configured` 分支里）。于是全新安装、还没登录时也会拉一次
+        // 各家的清单 —— 小浣熊的公开目录本来就不需要凭证（见其 `refresh_models`
+        // 里空 token 的分支），workbuddy 无登录态则早退返回「缺少登录态」而不打
+        // 网络，CatPaw / AutoClaw 是静态清单直接跳过。代价只是首启多一次
+        // 无害的请求，换来的是「这一页的开关说了算」这条一致性。
+        //
+        // ── 为什么循环里不处理停机信号 ────────────────────────────
+        // 服务器停机时进程会结束，任务随之消失。用 tauri 的 spawn
+        // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
+        core::scheduled_tasks::spawn(state.store.clone());
+
+        Ok(state)
     }
 
     /// 账号存储句柄
@@ -443,6 +525,20 @@ impl ServerState {
     pub fn request_stats(&self) -> Arc<RequestStats> {
         self.request_stats.clone()
     }
+}
+
+/// 读布尔型环境变量开关：**按候选名依次取第一个被设置的**（前一个是新名）。
+///
+/// 口径与 Node 版一致：只有值为 `"1"` 才算开启，其余（含 `"true"`/`"0"`/空串）
+/// 都按关闭处理 —— 这样「设成 0 关掉」与「完全没设」不会分叉。
+/// 一个都没设时返回 false。
+fn env_flag(names: &[&str]) -> bool {
+    for name in names {
+        if let Ok(value) = std::env::var(name) {
+            return value.trim() == "1";
+        }
+    }
+    false
 }
 
 /// 读旧版单账号 auth.json（缺失/损坏都当没有，对应 Node 版 `loadStoredSession`）
@@ -530,7 +626,8 @@ fn describe_bind_error(port: u16, error: &std::io::Error) -> String {
         return format!(
             "{port} 端口被占用：可能有旧版本网关仍在运行\
              （如 node server.mjs 或旧版桌面端），请先结束它再启动。\
-             也可用环境变量 WORKBUDDY_PROXY_PORT 换一个端口。\
+             也可用环境变量 AGENT2API_PROXY_PORT 换一个端口\
+             （旧名 WORKBUDDY_PROXY_PORT 仍有效）。\
              （系统错误: {error}）"
         );
     }

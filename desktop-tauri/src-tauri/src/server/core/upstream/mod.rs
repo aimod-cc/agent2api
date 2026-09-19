@@ -2,18 +2,32 @@
 //!
 //! ── 一次转发的完整流程 ────────────────────────────────────────
 //!   ① 去重排队：相同 body 的快速重试在代理内等前一个完成（防风控）
-//!   ② 选路循环：按优先级选账号 → 发请求（含 11128 退避重试）→
-//!      429/6004 时标记限额并降级到下一个候选
+//!   ② 选谁去发：provider 轮询（候选链）→ 每家内部走账号选路循环
+//!      （优先级 → 429 降级 → 11128 退避）→ 全失败才报错
 //!   ③ 流式：SSE 透传（reasoning 帧合并）；非流式：内部流式聚合成 JSON
 //!
 //! ── 文件分工（单文件行数约定）────────────────────────────
-//!   mod.rs       转发编排：去重槽位、选路循环、SSE 流（ForwardStream）
-//!   rotate.rs    账号选路与 429 轮换：selectTargetAccount / WAF 退避 /
-//!                限额标记 / 429 结构化事件上报
-//!   request.rs   请求构造：头集合、URL、system 注入、上游错误解析
-//!   sse.rs       SSE reasoning 帧合并（跨 chunk 半行缓冲）+ usage 旁路提取
-//!   aggregate.rs 非流式聚合（SSE → 完整 chat.completion）+ usage 旁路提取
-//!   usage.rs     usage 旁路槽：token 用量 / 尝试账号 / 尝试次数的共享记录点
+//!   mod.rs          转发编排入口：去重槽位、SSE 透传流（ForwardStream）、
+//!                   账号/provider 的展示辅助函数
+//!   payload.rs      一次转发的输入（ProviderContext）+ 发送体选择（按 provider
+//!                   的脱敏作用范围逐家决定用原始 body 还是处理副本）
+//!   provider_loop.rs provider 轮询 + 账号选路循环 + 错误分类动作 + 退避重试
+//!   rotate.rs       账号选路与 429 轮换：selectTargetAccount / 限额标记 /
+//!                   429 与 provider 切换的结构化事件上报
+//!   request.rs      传输层：请求发送、上游错误解析、追踪 id（**不认识 provider**）
+//!   sse.rs          SSE reasoning 帧合并（跨 chunk 半行缓冲）+ usage 旁路提取
+//!   aggregate.rs    非流式聚合（SSE → 完整 chat.completion）+ usage 旁路提取
+//!   usage.rs        usage 旁路槽：token 用量 / 承载 provider+账号 / 尝试次数
+//!
+//! ── provider 差异去哪了（Agent2API 改造 W2b-T3）───────────────
+//! 本目录**不含任何 provider 分支**：请求头/URL/system 注入/错误码判定/
+//! token 刷新全在 `core::providers` 的适配器里（`workbuddy.rs`），
+//! 本目录只通过 `ProviderAdapter` 契约（`providers::adapter`）使用它们。
+//! 这里出现的 `ProviderKind` 只作**身份标识**使用（候选链的元素、
+//! 日志里的 provider id、记账槽里的 provider 字段），没有任何
+//! 「如果 provider 是 X 就怎么做」的分支 —— 四家 provider 在 `adapter_for`
+//! 里都已接上真身适配器（那个 match 是穷举的，加新 kind 会在编译期被拦住），
+//! 编排层不需要为任何一家写特判。
 //!
 //! ── 与 Node 版的两处结构差异（都是为了 Rust 的所有权模型）────
 //!   1. Node 是「先 writeHead、再一边读上游一边写 res」的回调推进模式；
@@ -31,6 +45,8 @@
 
 pub mod aggregate;
 pub mod request;
+mod payload;
+mod provider_loop;
 mod rotate;
 pub mod sse;
 pub mod usage;
@@ -44,17 +60,15 @@ use bytes::Bytes;
 use futures::Stream;
 use serde_json::{json, Value};
 
+use axum::http::HeaderMap;
+
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::AuthService;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
-use self::request::{
-    chat_completions_url, chat_headers, ensure_leading_system_message, is_quota_limit_error,
-    new_request_id, ChatRequestPlan, DEFAULT_SYSTEM_PROMPT,
-};
-use self::sse::ReasoningCoalescer;
+use self::sse::{ModelRewrite, ReasoningCoalescer};
 
 /// 去重等待上限（对照 Node 的 INFLIGHT_WAIT_MS）
 const INFLIGHT_WAIT_MS: u64 = 45_000;
@@ -64,7 +78,7 @@ const INFLIGHT_WAIT_MS: u64 = 45_000;
 /// Node 版靠 `pickNextAccount` 返回 null 收尾 —— 每次轮换都会往 triedIds 里
 /// 加一个账号，而账号上限是 20，所以必然收敛。这里额外加一个轮数上限兜底：
 /// 万一账号数据被手工改出「同一个 id 出现两次」之类的怪状，宁可报错也不要空转。
-const MAX_ROUTE_ATTEMPTS: usize = 32;
+pub(super) const MAX_ROUTE_ATTEMPTS: usize = 32;
 
 /// 在途请求的完成信号（去重队列用）。
 ///
@@ -108,7 +122,7 @@ impl InFlight {
 /// 因此这里把「槽位」从选路函数里延长到流本身：流式分支把本凭证交给
 /// `ForwardStream`，流跑完（或客户端断开、流被 drop）时凭证析构，
 /// 槽位才释放。非流式分支的凭证在 `forward()` 返回时析构 —— 与 Node 一致。
-struct InFlightGuard {
+pub(super) struct InFlightGuard {
     table: Arc<Mutex<HashMap<String, Arc<InFlight>>>>,
     key: String,
     signal: Arc<InFlight>,
@@ -133,8 +147,8 @@ impl Drop for InFlightGuard {
 /// 转发器句柄：账号存储 + 鉴权 + 在途请求表。
 #[derive(Clone)]
 pub struct UpstreamService {
-    store: AccountStore,
-    auth: AuthService,
+    pub(super) store: AccountStore,
+    pub(super) auth: AuthService,
     /// 在途请求表：sha256(body) → 完成信号（去重队列，见 `wait_for_in_flight`）
     in_flight: Arc<Mutex<HashMap<String, Arc<InFlight>>>>,
 }
@@ -147,6 +161,8 @@ pub struct ForwardRequest {
     pub stream: bool,
     /// 请求体 sha256（去重键；空串表示不去重）
     pub dedupe_key: String,
+    /// 客户端入站请求头（适配器契约的一部分，见 `ProviderAdapter::build_chat_request`）
+    pub client_headers: HeaderMap,
     /// usage / 尝试次数的旁路槽。
     ///
     /// 为什么走「调用方建好、随请求传进来」而不是由 responder 自己造一个：
@@ -168,12 +184,15 @@ pub enum ForwardOutcome {
 }
 
 /// 一次选路的结果（对应 Node 的 `{ accountId, account, proxy, proxyError }`）
-struct RouteTarget {
-    account_id: Option<String>,
+pub(super) struct RouteTarget {
+    /// 本次要用的 provider id：全局队列里选出来的账号决定这一次发给哪家；
+    /// 没有任何账号记录时是「候选集合里第一家」（回落到它的默认登录态）
+    pub provider: String,
+    pub account_id: Option<String>,
     /// 账号公开形态（限额事件与日志用；无账号列表时为 null）
-    account: Option<Value>,
-    proxy: Option<ResolvedProxy>,
-    priority: Option<i64>,
+    pub account: Option<Value>,
+    pub proxy: Option<ResolvedProxy>,
+    pub priority: Option<i64>,
 }
 
 impl UpstreamService {
@@ -191,14 +210,24 @@ impl UpstreamService {
     ///     一个卡住的前序请求被无限期挂住。
     ///   - **槽位一直占到大半个响应结束**（流式请求也一样，见 InFlightGuard）。
     pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
-        let slot = match self.begin_slot(&request.dedupe_key).await {
-            Some(slot) => Some(slot),
-            None => None,
-        };
-        match self.do_forward(&request, slot).await {
-            Ok(outcome) => Ok(outcome),
-            Err(error) => Err(error),
+        let mut slot = self.begin_slot(&request.dedupe_key).await;
+        // 无论客户端要不要流式，上游都必须以 stream:true 请求
+        let mut upstream_body = request.body.clone();
+        if let Some(object) = upstream_body.as_object_mut() {
+            object.insert("stream".to_string(), Value::Bool(true));
         }
+        // 内容处理的作用范围**按请求取一次快照**：同一次请求里各 provider 的判定
+        // 用同一份范围（请求进行中改设置不会让语义漂移），且这里的 body 始终是
+        // 客户端原始请求体 —— 处理只发生在「某一家即将发送之前」，见 payload.rs。
+        let desensitize_scope = crate::server::core::desensitize::global().provider_scope();
+        let context = payload::ProviderContext {
+            body: &upstream_body,
+            stream: request.stream,
+            client_headers: &request.client_headers,
+            telemetry: &request.telemetry,
+            desensitize_scope: &desensitize_scope,
+        };
+        provider_loop::forward_with_providers(self, context, &mut slot).await
     }
 
     /// 等待同 body 的在途请求完成，然后占住槽位。
@@ -236,233 +265,6 @@ impl UpstreamService {
         }
         let _ = tokio::time::timeout(Duration::from_millis(INFLIGHT_WAIT_MS), notified).await;
     }
-
-    /// 选路循环 + 请求发送（对应 Node 的 doForwardChatCompletions）
-    ///
-    /// `slot` 是在途槽位凭证：流式分支把它交给 `ForwardStream`（流跑完才释放），
-    /// 非流式分支与错误分支在这里自然析构（请求结束即释放）—— 与 Node 的
-    /// promise 生命周期一致。
-    async fn do_forward(
-        &self,
-        request: &ForwardRequest,
-        slot: Option<InFlightGuard>,
-    ) -> Result<ForwardOutcome, GatewayError> {
-        // 无论客户端要不要流式，上游都必须以 stream:true 请求
-        let mut upstream_body = request.body.clone();
-        if let Some(object) = upstream_body.as_object_mut() {
-            object.insert("stream".to_string(), Value::Bool(true));
-        }
-        // 上游要求首条消息是 system prompt：客户端没带时补一条兜底系统消息
-        if let Some(with_system) = ensure_leading_system_message(&upstream_body) {
-            upstream_body = with_system;
-            logging::verbose(
-                "[Upstream]",
-                &format!("首条消息非 system，已注入系统消息：{DEFAULT_SYSTEM_PROMPT}"),
-            );
-        }
-        let model = upstream_body
-            .get("model")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let payload = serde_json::to_string(&upstream_body)
-            .map_err(|error| GatewayError::new(format!("请求体序列化失败: {error}")))?;
-        let model_label = if model.is_empty() { "(默认)".to_string() } else { model.clone() };
-
-        let mut tried_ids: Vec<String> = Vec::new();
-        for _ in 0..=MAX_ROUTE_ATTEMPTS {
-            let target = rotate::select_target_account(self, &model, &tried_ids).await?;
-            let session = rotate::session_for(self, target.account_id.as_deref()).await?;
-            // ── 旁路记账：本账号就是这一轮的承载账号 ──────────────
-            // 每轮选路都记一次，于是 attempts = 本次请求实际用过的账号数
-            // （429 降级会多走几轮，即「换了几个账号」）；同一账号内的 11128
-            // 退避重试不算一轮，故不计入（口径见 usage.rs）。account 取最后
-            // 一轮的值 —— 它才是真正承载本次请求的那个账号。
-            // 只写旁路槽，不改本轮任何控制流：拿不到账号信息时传 None，
-            // 记账点按「无账号记录（默认登录态）」处理。
-            request.telemetry.note_attempt(
-                target.account_id.as_deref(),
-                &account_label(
-                    target.account.as_ref(),
-                    target.account_id.as_deref().unwrap_or(""),
-                    &session,
-                ),
-            );
-            let request_id = new_request_id();
-            let url = chat_completions_url(&session, &self.auth.default_context().base_url);
-            let headers = chat_headers(&session, &request_id, Some("text/event-stream"));
-            logging::verbose(
-                "[Upstream]",
-                &format!(
-                    "POST {url} model={} stream={} uid={} priority={} 出口={} msgs={}",
-                    model_label,
-                    request.stream,
-                    session
-                        .get("account")
-                        .and_then(|account| account.get("uid"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("-"),
-                    target
-                        .priority
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                    describe_proxy(target.proxy.as_ref()),
-                    request
-                        .body
-                        .get("messages")
-                        .and_then(Value::as_array)
-                        .map(|items| items.len().to_string())
-                        .unwrap_or_else(|| "?".to_string()),
-                ),
-            );
-
-            let plan = ChatRequestPlan {
-                url,
-                headers,
-                payload: payload.clone(),
-                proxy: target.proxy.clone(),
-            };
-            let started_at = logging::now_ms();
-            let response = match rotate::request_with_waf_retry(&plan).await {
-                Ok(response) => response,
-                Err(error) => {
-                    if let Some(account_id) = target.account_id.clone() {
-                        if is_quota_limit_error(error.status_code, error.upstream_code)
-                            && !tried_ids.iter().any(|id| *id == account_id)
-                        {
-                            tried_ids.push(account_id.clone());
-                            let reset_text = rotate::mark_account_limited(self, &account_id, &model, &error);
-                            let limit_at = rotate::account_limit_reset_at(self, &account_id, &model);
-                            let from_label = account_label(target.account.as_ref(), &account_id, &session);
-                            match rotate::pick_next_account(self, &model, &tried_ids) {
-                                Some(next) => {
-                                    let next_label = account_display(&next);
-                                    let next_priority = next.get("priority").and_then(Value::as_i64);
-                                    let reset_hint = reset_hint(&reset_text);
-                                    logging::log(
-                                        "[Upstream]",
-                                        &format!(
-                                            "⚠️ 账号 {from_label} 对模型 {model} 已限额{reset_hint}，\
-                                             按优先级降级 → {next_label}（优先级 {}）",
-                                            next_priority
-                                                .map(|value| value.to_string())
-                                                .unwrap_or_else(|| "-".to_string()),
-                                        ),
-                                    );
-                                    rotate::report_limit_event(
-                                        "warn",
-                                        &format!(
-                                            "账号「{from_label}」对模型 {model_label} 已限额{reset_hint}，\
-                                             按优先级降级 → 「{next_label}」",
-                                        ),
-                                        Some(&from_label),
-                                        Some(&next_label),
-                                        &model,
-                                        error.upstream_code,
-                                        error.status_code,
-                                        limit_at,
-                                        next_priority,
-                                    );
-                                    continue;
-                                }
-                                None => {
-                                    let message = format!(
-                                        "{}（所有候选账号对模型 {model} 均已限额或禁用）",
-                                        error.message
-                                    );
-                                    rotate::report_limit_event(
-                                        "error",
-                                        &format!(
-                                            "模型 {model_label} 在所有候选账号均已限额或禁用，\
-                                             无法继续转发（尝试过 {} 个账号）",
-                                            tried_ids.len(),
-                                        ),
-                                        Some(&from_label),
-                                        None,
-                                        &model,
-                                        error.upstream_code,
-                                        error.status_code,
-                                        limit_at,
-                                        None,
-                                    );
-                                    return Err(GatewayError::with_status(
-                                        error.status_code,
-                                        message,
-                                    )
-                                    .with_optional_code(error.upstream_code));
-                                }
-                            }
-                        }
-                    }
-                    return Err(error);
-                }
-            };
-
-            // 请求成功：该账号对该模型的限额标记（如有）已失效，清除
-            if let Some(account_id) = target.account_id.as_deref() {
-                let had_limit = rotate::account_had_limit(self, account_id, &model);
-                self.store.clear_rate_limit(account_id, &model);
-                // 仅当之前确实处于限额状态才记一条，避免每次成功请求都刷日志
-                if had_limit {
-                    let label = account_label(target.account.as_ref(), account_id, &session);
-                    rotate::report_limit_event(
-                        "info",
-                        &format!("账号「{label}」对模型 {model_label} 已恢复可用"),
-                        None,
-                        Some(&label),
-                        &model,
-                        None,
-                        0,
-                        0,
-                        None,
-                    );
-                }
-            }
-            logging::verbose(
-                "[Upstream]",
-                &format!(
-                    "上游响应 HTTP {}（{}ms）",
-                    response.status().as_u16(),
-                    logging::now_ms() - started_at
-                ),
-            );
-
-            if request.stream {
-                let status = response.status().as_u16();
-                return Ok(ForwardOutcome::Stream {
-                    status,
-                    // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者
-                    stream: Box::new(ForwardStream::new(
-                        response,
-                        slot,
-                        request.telemetry.clone(),
-                    )),
-                });
-            }
-            let aggregated =
-                aggregate::aggregate_sse_completion(response, request.telemetry.clone()).await?;
-            let choice = aggregated.body.get("choices").and_then(|value| value.get(0));
-            let content_chars = choice
-                .and_then(|choice| choice.pointer("/message/content"))
-                .and_then(Value::as_str)
-                .map(|text| text.chars().count())
-                .unwrap_or(0);
-            let finish = choice
-                .and_then(|choice| choice.get("finish_reason"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            logging::verbose(
-                "[Upstream]",
-                &format!(
-                    "聚合完成: chunks={} content={content_chars} 字符 finish={finish}",
-                    aggregated.chunk_count
-                ),
-            );
-            return Ok(ForwardOutcome::Completion { body: aggregated.body });
-        }
-        Err(GatewayError::with_status(500, "上游转发重试次数超限"))
-    }
-
 }
 
 /// 取在途表锁；锁中毒不致命（与账号存储同一策略）
@@ -511,14 +313,18 @@ pub struct ForwardStream {
 }
 
 impl ForwardStream {
-    fn new(
+    /// `model_rewrite` 由适配器的 `sse_model_rewrite()` 决定（见 `sse.rs` 模块头）：
+    /// 为 None 时帧的字节与接入前完全一致（workbuddy 的透传逐字节不变）。
+    pub(super) fn new(
         response: reqwest::Response,
         slot: Option<InFlightGuard>,
         telemetry: Arc<usage::RequestTelemetry>,
+        model_rewrite: Option<ModelRewrite>,
     ) -> Self {
         Self {
             inner: Box::pin(response.bytes_stream()),
-            coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone()),
+            coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone())
+                .with_model_rewrite(model_rewrite),
             upstream_done: false,
             pending: std::collections::VecDeque::new(),
             _slot: slot,
@@ -583,7 +389,7 @@ impl Stream for ForwardStream {
 }
 
 /// 会话是否带 accessToken（Node: `session?.auth?.accessToken` 真值判定）
-fn has_access_token(session: &Value) -> bool {
+pub(super) fn has_access_token(session: &Value) -> bool {
     session
         .get("auth")
         .and_then(|auth| auth.get("accessToken"))
@@ -593,7 +399,7 @@ fn has_access_token(session: &Value) -> bool {
 }
 
 /// 账号展示名（Node 的 `account.name || account.id`）
-fn account_display(account: &Value) -> String {
+pub(super) fn account_display(account: &Value) -> String {
     account
         .get("name")
         .and_then(Value::as_str)
@@ -605,7 +411,7 @@ fn account_display(account: &Value) -> String {
 
 /// 限额日志里的账号文案：账号名 → 会话昵称 → 账号 id
 /// （对应 Node 的 `target.account?.name || session.account?.nickname || accountId`）
-fn account_label(account: Option<&Value>, account_id: &str, session: &Value) -> String {
+pub(super) fn account_label(account: Option<&Value>, account_id: &str, session: &Value) -> String {
     account
         .and_then(|account| account.get("name"))
         .and_then(Value::as_str)
@@ -623,7 +429,7 @@ fn account_label(account: Option<&Value>, account_id: &str, session: &Value) -> 
 }
 
 /// 出口的可读描述（日志用）
-fn describe_proxy(proxy: Option<&ResolvedProxy>) -> String {
+pub(super) fn describe_proxy(proxy: Option<&ResolvedProxy>) -> String {
     match proxy {
         Some(proxy) if !proxy.label.is_empty() => proxy.label.clone(),
         Some(proxy) => proxy.host.clone(),
@@ -632,12 +438,12 @@ fn describe_proxy(proxy: Option<&ResolvedProxy>) -> String {
 }
 
 /// 账号公开形态里的优先级（日志里打的 `priority=N`）
-fn priority_of(account: &Value) -> Option<i64> {
+pub(super) fn priority_of(account: &Value) -> Option<i64> {
     account.get("priority").and_then(Value::as_i64)
 }
 
 /// 限额文案里的恢复时间片段：`（<时间> 恢复）`，空串表示没有明确恢复时间
-fn reset_hint(reset_text: &str) -> String {
+pub(super) fn reset_hint(reset_text: &str) -> String {
     if reset_text.is_empty() {
         String::new()
     } else {
@@ -648,7 +454,7 @@ fn reset_hint(reset_text: &str) -> String {
 /// 恢复时间的本地化展示（对应 Node 的 `toLocaleString('zh-CN', { hour12:false })`）。
 /// 与 errors.rs 的 reset_at_text 同口径：统一按 UTC+8 渲染，
 /// 因为上游给的恢复时间本身就是 UTC+8 标定的，用本机时区会让用户对不上原文。
-fn format_reset_text(reset_at: f64) -> String {
+pub(super) fn format_reset_text(reset_at: f64) -> String {
     if !(reset_at > 0.0) {
         return String::new();
     }

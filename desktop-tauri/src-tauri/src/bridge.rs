@@ -11,13 +11,51 @@
 
 pub const BRIDGE_JS: &str = r#"
 (() => {
-  const invoke = (command, args) => {
+  const invokeRaw = (command, args) => {
     const internals = window.__TAURI_INTERNALS__;
     if (!internals || typeof internals.invoke !== 'function') {
       return Promise.reject(new Error('桌面运行时不可用（Tauri 未初始化）'));
     }
     return internals.invoke(command, args);
   };
+
+  /**
+   * 把命令的失败值统一成 Error。
+   *
+   * Tauri 在命令返回 `Err` 时，rejection 携带的是**序列化后的错误值本身**，
+   * 不是 Error 对象 —— 本项目的命令错误类型是 String，于是界面拿到的是一个
+   * 裸字符串，`error.message` 为 undefined，所有 `操作失败：${error.message}`
+   * 都显示成「操作失败：undefined」（真实发生过：小浣熊刷新 token 被上游 401
+   * 拒绝时，界面只显示 undefined，用户看不到「authorization_verify_error」）。
+   *
+   * 界面有 50 多处 `error.message`，逐个改成兼容写法既啰嗦又容易漏；统一在
+   * 桥接层包一次，界面代码与 Electron 时代完全一致（那时 preload 抛的也是 Error）。
+   * 非字符串的失败值（将来若改成结构化错误对象）原样透出，交给界面自己取字段。
+   */
+  const asError = failure => {
+    if (failure instanceof Error) return failure;
+    if (typeof failure === 'string') return new Error(failure);
+    // 结构化错误：尽量取一个可读消息，取不到就整体 JSON 化（总比 undefined 强）
+    if (failure && typeof failure === 'object') {
+      const message = failure.message ?? failure.error ?? failure.msg;
+      if (typeof message === 'string' && message) return new Error(message);
+      try {
+        return new Error(JSON.stringify(failure));
+      } catch {
+        return new Error('操作失败（错误信息无法序列化）');
+      }
+    }
+    return new Error(String(failure ?? '操作失败'));
+  };
+
+  /**
+   * 调用命令并把失败值归一成 Error —— **所有命令都走这里**（定义成 invoke
+   * 而不是让各调用点自己包，避免将来新增方法时漏掉）。
+   */
+  const invoke = (command, args) =>
+    invokeRaw(command, args).catch(failure => {
+      throw asError(failure);
+    });
 
   /** 统一调用管理 API：返回后端 data，失败时抛错（界面按原有 try/catch 处理） */
   const call = (method, path, body) =>
@@ -62,8 +100,14 @@ pub const BRIDGE_JS: &str = r#"
   window.workbuddyDesktop = {
     // ── 会话 ──
     getState: () => call('GET', '/api/session'),
-    startLogin: (edition, mode) =>
-      invoke('start_login', { edition: edition || 'cn', mode: mode || 'embedded' }),
+    startLogin: (edition, mode, provider) =>
+      invoke('start_login', {
+        edition: edition || 'cn',
+        mode: mode || 'embedded',
+        // provider 缺省留给 Rust 侧兜底成 workbuddy：老界面（或将来别处的调用点）
+        // 不传它时必须走原来那条链，这里不做猜测式整形
+        provider: provider || null,
+      }),
     getLoginState: () => invoke('login_state'),
     cancelLogin: () => invoke('cancel_login'),
     onLoginState: callback => on('login:state', callback),
@@ -79,6 +123,24 @@ pub const BRIDGE_JS: &str = r#"
     // ── 配置 ──
     getConfig: () => call('GET', '/api/config'),
     saveConfig: payload => call('POST', '/api/config', payload),
+
+    // ── 模型清单 ──
+    // 手动刷新（网关页「刷新模型清单」按钮）：只刷支持远程目录的家、
+    // 强制绕过缓存，返回 `{results, refreshed, skipped, failed, models}`
+    // —— **带刷新后的聚合清单**，界面就地重绘、不必再拉一次 /api/session
+    // （理由见后端 `api::models` 的模块头）。不传 body：这条无入参
+    refreshModels: () => call('POST', '/api/models/refresh', {}),
+    // 模型管理（启停 / 删除隐藏 / 映射）：写接口都返回最新 {models, mappings}
+    getModelManage: () => call('GET', '/api/models/manage'),
+    setModelState: payload => call('POST', '/api/models/state', payload),
+    addModelMapping: (alias, target) => call('POST', '/api/models/mappings', { alias, target }),
+    removeModelMapping: alias => call('POST', '/api/models/mappings/remove', { alias }),
+
+    // ── 网关 API Key（多把）──
+    getKeys: () => call('GET', '/api/keys'),
+    createKey: payload => call('POST', '/api/keys', payload || {}),
+    updateKey: (id, patch) => call('PATCH', '/api/keys/' + encodeURIComponent(id), patch),
+    deleteKey: id => call('DELETE', '/api/keys/' + encodeURIComponent(id)),
 
     // ── 多账号 ──
     // switchAccount 即「设为当前」：把账号置顶为转发顺序第一位
@@ -104,6 +166,10 @@ pub const BRIDGE_JS: &str = r#"
       call('POST', '/api/accounts/' + encodeURIComponent(id) + '/move', {
         direction: direction === 'down' ? 'down' : 'up',
       }),
+    // 清除限流标记（账号页「限流明细」面板）：model 缺省 = 清掉该账号全部模型的标记
+    clearRateLimits: (id, model) =>
+      call('POST', '/api/accounts/' + encodeURIComponent(id) + '/rate-limits/clear',
+        model ? { model } : {}),
     batchAccounts: payload =>
       call('POST', '/api/accounts/batch', {
         action: String((payload && payload.action) || ''),
@@ -137,6 +203,15 @@ pub const BRIDGE_JS: &str = r#"
     saveAutoCheckin: patch => call('POST', '/api/auto-checkin', patch),
     runAutoCheckinNow: () => call('POST', '/api/auto-checkin/run', {}),
 
+    // ── 间隔型定时任务（凭证自动维护 / 模型刷新 / 两个前端自动刷新）──
+    // 改一条任务用 PATCH（后端同时受理 POST 作别名：CORS 允许方法里没有 PATCH，
+    // 浏览器直连时预检会拦下它；走本桥的调用两种都能用，这里按规范用 PATCH）。
+    getScheduledTasks: () => call('GET', '/api/scheduled-tasks'),
+    saveScheduledTask: (id, patch) =>
+      call('PATCH', '/api/scheduled-tasks/' + encodeURIComponent(String(id || '')), patch),
+    runScheduledTask: id =>
+      call('POST', '/api/scheduled-tasks/' + encodeURIComponent(String(id || '')) + '/run', {}),
+
     // ── 软件更新 ──
     // checkUpdate 走壳命令：当前版本号只有壳知道（后端是独立进程），
     // 由壳把版本带上去交给后端比较
@@ -158,6 +233,13 @@ pub const BRIDGE_JS: &str = r#"
     setDesensitizeRoles: roles =>
       call('POST', '/api/desensitize/roles', {
         roles: Array.isArray(roles) ? roles.filter(role => typeof role === 'string') : [],
+      }),
+    // 作用提供商（Agent2API 改造新增，`PUT` 全量替换语义）：
+    // 与 roles 一样只保留字符串项 —— 界面给的是勾选出来的 provider id 列表，
+    // 非字符串混进来只可能是调用方写错，交给后端校验不如在这里干净地滤掉。
+    setDesensitizeProviders: providers =>
+      call('PUT', '/api/desensitize/providers', {
+        providers: Array.isArray(providers) ? providers.filter(id => typeof id === 'string') : [],
       }),
     saveDesensitizeTerms: terms => call('PUT', '/api/desensitize/terms', { terms }),
     addDesensitizeTerms: terms => call('POST', '/api/desensitize/terms', { terms }),

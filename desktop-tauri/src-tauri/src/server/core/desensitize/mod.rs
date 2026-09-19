@@ -5,8 +5,19 @@
 //!
 //! ── 与 Node 版的数据契约 ────────────────────────────────────
 //! 词表持久化在 `{config_dir}/desensitize.json`，字段顺序与缩进**逐字节对齐**
-//! Node 的 `JSON.stringify({enabled,terms,roles,defaultsVersion}, null, 2) + "\n"`：
-//! 两边写出的文件内容完全一致（serde_json 的 Map 会按字母序输出，所以这里手工拼）。
+//! Node 的 `JSON.stringify({enabled,terms,roles,defaultsVersion}, null, 2) + "\n"`
+//! （Agent2API 改造新增 `providers` 键，见下）：两边写出的文件内容完全一致
+//! （serde_json 的 Map 会按字母序输出，所以这里手工拼）。
+//!
+//! ── providers：脱敏的作用提供商（Agent2API 改造 §3.5）────────
+//! `desensitize.json` 新增 `providers: ["workbuddy"]`，取值为 `core::providers`
+//! 注册表里的 provider id。缺省（旧文件没有这个键）按 `["workbuddy"]` 处理 ——
+//! **读侧兜底、不强制写回**：只在用户真的改了配置（或改了词表触发保存）时
+//! 才把键写进文件，不因为「读到旧格式」就改写用户的文件。
+//!
+//! 「转发前要不要脱敏」的**判定**不在本模块的算法里：转发层在**每家 provider
+//! 真正发送前**按作用范围逐家判定（见 `process_body_for_provider`）——
+//! 在范围内的那一家拿处理副本，不在范围内的拿客户端原始请求体（不处理、不计数）。
 //!
 //! ── 并发模型 ────────────────────────────────────────────────
 //! 句柄内部一把 `RwLock`，克隆共享同一份状态（与 ModelCatalog 同构）。
@@ -22,6 +33,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use serde_json::{json, Value};
 
+use crate::server::core::providers::{DEFAULT_PROVIDER_ID, PROVIDERS};
 use crate::server::logging;
 
 // 只再导出有实际调用点的符号（ZWSP / VALID_ROLES / desensitize_text /
@@ -37,6 +49,42 @@ use engine::js_trim;
 
 /// 统计快照里 topTerms 的默认条数（对应 Node 的 `statsSnapshot({top = 20})`）
 const TOP_TERMS: usize = 20;
+
+/// 脱敏 json 里的作用提供商键（架构文档 §3.5）
+const KEY_PROVIDERS: &str = "providers";
+
+/// 缺省作用提供商（旧文件没有 `providers` 键时按它处理）。
+///
+/// 取值是 `DEFAULT_PROVIDER_ID`（= workbuddy）而不是另写字面量：
+/// 「老数据默认属于 workbuddy」这条口径在账号迁移与脱敏这里必须是同一个字符串。
+pub fn default_provider_scope() -> Vec<String> {
+    vec![DEFAULT_PROVIDER_ID.to_string()]
+}
+
+/// 作用提供商列表归一：按**注册表顺序**取交集（与 `normalize_roles` 同一手法）。
+///
+/// 规则：
+///   - 非数组 / 全部项都不认识 → 回落缺省 `["workbuddy"]`（旧文件兜底）；
+///   - 未知 id 静默丢弃（读侧宽容：手改文件写错一个 id 不该让脱敏整体失效）；
+///   - 去重（手写 `["workbuddy","workbuddy"]` 不产生重复项）。
+///
+/// **写接口（`/api/desensitize/providers`）另做严格校验**：未知 id 给 400
+/// 而不是静默丢弃 —— 走接口的非法值要当场告诉用户（与保留期天数两侧
+/// 口径不同但各有理由的处理方式一致）。
+pub fn normalize_providers(input: Option<&Value>) -> Vec<String> {
+    let Some(Value::Array(items)) = input else {
+        return default_provider_scope();
+    };
+    let providers: Vec<String> = PROVIDERS
+        .iter()
+        .filter(|meta| items.iter().any(|item| item.as_str() == Some(meta.id)))
+        .map(|meta| meta.id.to_string())
+        .collect();
+    if providers.is_empty() {
+        return default_provider_scope();
+    }
+    providers
+}
 
 /// 命中统计（对应 Node 的 stats 闭包变量）。
 ///
@@ -78,6 +126,8 @@ struct Inner {
     enabled: bool,
     terms: Vec<String>,
     roles: Vec<String>,
+    /// 脱敏作用提供商（provider id，注册表顺序；缺省 `["workbuddy"]`）
+    providers: Vec<String>,
     /// 编译后的匹配器；词表为空时为 None（调用方据此跳过脱敏）
     matcher: Option<Arc<TermMatcher>>,
     /// 已合并到的默认词表版本（可能带小数：Node 存的是 Number）
@@ -91,8 +141,8 @@ pub struct ProcessOutcome {
     pub changed: bool,
     pub hits: usize,
     /// 命中的词列表（无计数，保持向后兼容）。
-    /// Node 版 `processBody` 返回的 `matched` 对等物：api 层当前只用 term_counts
-    /// 拼日志，这里保留完整三个字段以便排障时逐个对照 Node 的返回。
+    /// Node 版 `processBody` 返回的 `matched` 对等物：本模块的命中日志只用
+    /// term_counts，这里保留完整三个字段以便排障时逐个对照 Node 的返回。
     #[allow(dead_code)]
     pub matched: Vec<String>,
     /// 按命中次数降序的每词次数
@@ -121,6 +171,9 @@ impl Desensitizer {
                 enabled: true,
                 terms,
                 roles: DEFAULT_ROLES.iter().map(|role| role.to_string()).collect(),
+                // 全新用户（还没有 desensitize.json）：作用范围就是 workbuddy
+                // （等于改造前的实际行为 —— 那时只有 workbuddy 一个上游）
+                providers: default_provider_scope(),
                 matcher,
                 // 已合并到的默认词表版本：无配置文件（新用户）时直接视为最新，无需迁移
                 defaults_version: DEFAULT_TERMS_VERSION as f64,
@@ -186,6 +239,10 @@ impl Desensitizer {
             if let Some(items) = parsed.get("roles") {
                 guard.roles = normalize_roles(Some(items));
             }
+            // providers：旧文件没有这个键 → normalize_providers 回落缺省
+            // （**读侧兜底、不写回**：不因为读到旧格式就改写用户的文件，
+            //  见模块头「providers」一节）
+            guard.providers = normalize_providers(parsed.get(KEY_PROVIDERS));
             // 老版本写出的文件没有该字段，视为版本 1（只有初版默认词表）
             let version = js_number(parsed.get("defaultsVersion").unwrap_or(&Value::Null));
             guard.defaults_version = if version >= 1.0 { version } else { 1.0 };
@@ -193,9 +250,13 @@ impl Desensitizer {
             (guard.terms.len(), guard.enabled)
         };
         self.migrate_defaults();
+        let provider_scope = self.with_read(|guard| guard.providers.join("、"));
         logging::log(
             "[Desensitize]",
-            &format!("已加载词表：{count} 个词，{}", if enabled { "启用" } else { "停用" }),
+            &format!(
+                "已加载词表：{count} 个词，{}（作用提供商 {provider_scope}）",
+                if enabled { "启用" } else { "停用" }
+            ),
         );
     }
 
@@ -277,6 +338,7 @@ impl Desensitizer {
             inner.enabled,
             &inner.terms,
             &inner.roles,
+            &inner.providers,
             inner.defaults_version,
         );
         if let Err(error) = std::fs::write(&inner.file, text) {
@@ -332,6 +394,38 @@ impl Desensitizer {
         ProcessOutcome { changed: true, hits, matched, term_counts }
     }
 
+    /// 转发前的**按 provider 作用范围**处理：本模块对外的转发期入口。
+    ///
+    /// 调用方在**某一家 provider 真正要发送之前**调用（凭证已就绪），于是：
+    ///   - provider 不在作用范围内 → 返回 None：调用方用**客户端原始请求体**，
+    ///     既不处理也不计数（未勾选的提供商不会多记命中）；
+    ///   - 在范围内 → 用现有 [`Self::process_body`] 处理**副本**并打命中日志，
+    ///     返回处理后的副本（原始 body 不被改动）。
+    ///
+    /// `scope` 是**本次请求**的作用范围快照（调用方在请求开始时用
+    /// [`Self::provider_scope`] 取一次），于是同一次请求里各家 provider 的判定
+    /// 用的是同一份范围，不会因为请求进行中改设置而漂移。
+    ///
+    /// 本方法只做「范围判定 + 调用现有处理 + 打日志」这三件事：词表、匹配与
+    /// 改写算法全在 engine.rs，未做任何改动。
+    pub fn process_body_for_provider(
+        &self,
+        provider_id: &str,
+        scope: &[String],
+        body: &Value,
+    ) -> Option<Value> {
+        // 作用范围是 provider id 的精确匹配（与注册表里的 id 同一字符串）
+        if !scope.iter().any(|item| item == provider_id) {
+            return None;
+        }
+        let mut processed = body.clone();
+        let outcome = self.process_body(&mut processed);
+        if outcome.changed {
+            logging::log("[Desensitize]", &hit_log_line(&outcome));
+        }
+        Some(processed)
+    }
+
     /// 累加一次请求的统计（对应 Node 里 `stats.*` 的几处自增）
     fn record(
         &self,
@@ -363,18 +457,23 @@ impl Desensitizer {
 
     // ─── 状态与变更 ─────────────────────────────────────────
 
-    /// 完整状态（对应 Node 的 getState）
+    /// 完整状态（对应 Node 的 getState）。
+    ///
+    /// `providers` 是 Agent2API 改造新增的字段（作用提供商，架构文档 §3.5）：
+    /// 与 terms/roles 同级透出，前端设置页的「作用提供商」多选直接读它。
     pub fn state(&self) -> Value {
         self.with_read(|guard| {
             json!({
                 "enabled": guard.enabled,
                 "terms": guard.terms.clone(),
                 "roles": guard.roles.clone(),
+                "providers": guard.providers.clone(),
                 "termCount": guard.terms.len(),
                 "defaults": {
                     "enabled": true,
                     "terms": DEFAULT_TERMS.iter().map(|term| term.to_string()).collect::<Vec<_>>(),
                     "roles": DEFAULT_ROLES.iter().map(|role| role.to_string()).collect::<Vec<_>>(),
+                    "providers": default_provider_scope(),
                     "version": DEFAULT_TERMS_VERSION,
                 },
                 "file": guard.file.to_string_lossy(),
@@ -384,15 +483,41 @@ impl Desensitizer {
     }
 
     /// 精简摘要（/api/config 与 /api/session 用）：
-    /// `{enabled, termCount, roles}` —— 形状照抄 server.mjs 806/924 行
+    /// `{enabled, termCount, roles, providers}` —— 形状照抄 server.mjs 806/924 行，
+    /// `providers` 是 Agent2API 改造新增的一维（任务书要求摘要里带上它）。
     pub fn summary(&self) -> Value {
         self.with_read(|guard| {
             json!({
                 "enabled": guard.enabled,
                 "termCount": guard.terms.len(),
                 "roles": guard.roles.clone(),
+                "providers": guard.providers.clone(),
             })
         })
+    }
+
+    /// 脱敏作用提供商（provider id 列表）。
+    ///
+    /// 消费方：`upstream` 转发层在**请求开始时**取一次快照（同一次请求内各家
+    /// provider 用同一份范围），随后每家即将发送前交给
+    /// [`Self::process_body_for_provider`] 判定。本模块只提供数据，
+    /// 判定与调用时机在转发层。
+    pub fn provider_scope(&self) -> Vec<String> {
+        self.with_read(|guard| guard.providers.clone())
+    }
+
+    /// 作用提供商（对应 setRoles 的同款写盘语义）：入参须已由路由层校验过。
+    pub fn set_providers(&self, providers: &[String]) -> Value {
+        {
+            let Ok(mut guard) = self.inner.write() else {
+                return self.state();
+            };
+            guard.providers = normalize_providers(Some(&Value::Array(
+                providers.iter().cloned().map(Value::String).collect(),
+            )));
+            self.save_locked(&guard);
+        }
+        self.state()
     }
 
     /// 当前词条数（路由日志里的 `before → after` 需要）
@@ -485,11 +610,25 @@ impl Desensitizer {
     }
 }
 
+/// 命中日志文案（照抄 Node 的 `已脱敏命中 N 处：词×次数、…`）。
+///
+/// 与 `provider_scope` 一样，这里只做**展示**：命中统计仍由 `process_body`
+/// 里的 `record` 合并，文案与改造前逐字一致。
+fn hit_log_line(outcome: &ProcessOutcome) -> String {
+    let per_term = outcome
+        .term_counts
+        .iter()
+        .map(|(term, count)| format!("{term}×{count}"))
+        .collect::<Vec<_>>()
+        .join("、");
+    format!("已脱敏命中 {} 处：{per_term}", outcome.hits)
+}
+
 // ─── 进程级句柄 ────────────────────────────────────────────
 
 /// 进程级脱敏器。**为什么不用 ServerState 而是全局**：
-/// 对话链路的脱敏钩子 `api::chat::desensitize_body(&mut Value)` 是不带 state 的
-/// 纯签名（切片 4 定下的接入点，本切片不改调用点），它要拿到的就是「当前生效的
+/// 转发层的处理调用点（`upstream::provider_loop` 在每家 provider 发送前调
+/// [`Desensitizer::process_body_for_provider`]）要拿到的就是「当前生效的
 /// 那一份词表」。全局句柄与 `config::current()` / `logging` 是同一个模式：
 /// 启动时装一次，之后所有模块共用，避免为了传一个句柄把签名层层改一遍。
 /// 句柄本身是 `Clone` 的轻量 Arc，ServerState 里那份与全局这份是**同一实例**。
@@ -549,16 +688,25 @@ fn js_number(value: &Value) -> f64 {
 
 /// 按 JS `JSON.stringify(value, null, 2)` 的格式序列化词表文件。
 ///
-/// 手工拼而不是用 serde_json：Map 会按字母序输出，而 Node 的顺序是
-/// `enabled / terms / roles / defaultsVersion` —— 文件会被用户与排障脚本
-/// 直接打开看，字段顺序与缩进必须逐字节一致才能叫「格式兼容」。
-fn serialize_state(enabled: bool, terms: &[String], roles: &[String], version: f64) -> String {
+/// 手工拼而不是用 serde_json：Map 会按字母序输出，而文件顺序是
+/// `enabled / terms / roles / providers / defaultsVersion`（`providers` 是
+/// Agent2API 改造新增的键，插在 roles 之后、版本号之前）—— 文件会被用户与
+/// 排障脚本直接打开看，字段顺序与缩进必须逐字节一致才能叫「格式兼容」。
+fn serialize_state(
+    enabled: bool,
+    terms: &[String],
+    roles: &[String],
+    providers: &[String],
+    version: f64,
+) -> String {
     let mut out = String::with_capacity(64 + terms.len() * 16);
     out.push_str("{\n");
     out.push_str(&format!("  \"enabled\": {enabled},\n"));
     push_string_array(&mut out, "terms", terms);
     out.push_str(",\n");
     push_string_array(&mut out, "roles", roles);
+    out.push_str(",\n");
+    push_string_array(&mut out, KEY_PROVIDERS, providers);
     out.push_str(",\n");
     out.push_str(&format!(
         "  \"defaultsVersion\": {}\n",

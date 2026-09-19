@@ -1,0 +1,133 @@
+/* Agent2API · 账号页「多提供商」增量样式（1.x 之后新增的那一层）
+
+   与 page-accounts.css 的分工：那个文件是账号页原有的卡片 / 分组 / 批量栏骨架，
+   本文件只装 Agent2API 改造新增的部分 —— 提供商组头与路由徽标、提供商下拉、
+   桌面端账号徽标、添加账号弹窗的提供商分叉与分段选择器。
+   拆分方式：原 page-accounts.css 第 717 行起整段搬出（逐字未改），
+   两个文件都必须在 components.css 之后引入（见 index.html）。 */
+
+/* ═══ Agent2API 多提供商（账号页）══════════════════════════════════════
+   顶层分组由「版本」改为「提供商」（accounts-model.js 的 buildGroups）：workbuddy
+   组内保留国内 / 国际二级分组（.acct-group-title.sub），其余家组内直接平铺。
+   .acct-group-title 仍是网格横跨整行那个类，只是内容从「国内账号 · 3」变成
+   「WorkBuddy 14 个账号 路由 10」。
+
+   ── 表格化之后的引用情况 ──────────────────────────────────────
+   列表改成「四家混排的一张表」后，**组头行整个下线了**（行首不再插分界行，
+   见 accounts-view.js 的 render 注释）。于是本段里三条规则没有引用了：
+     .acct-group-title .pgroup-label
+     .acct-group-title .pgroup-count
+     .acct-group-title .pgroup-route
+   三条都**保留未删** —— 它们与 page-accounts.css 里的 .acct-group-title 是一套，
+   要恢复卡片视图就一起恢复。表格里「这一行属于哪家」改由 .pbadge（表格样式文件）
+   的彩色标签表达，那枚标签的悬浮说明里保留了「路由 N」这条信息。
+   注意 providers.js 的摘要（label / routePriority / count）照旧在用，
+   只是不再画成组头，而是画进每一行的提供商列。 */
+
+/* 提供商组头：主色比二级组头重一档，让「换了一家」一眼可见 */
+.acct-group-title .pgroup-label {
+  color: var(--text-2);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  text-transform: none;
+}
+
+.acct-group-title .pgroup-count {
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* 路由优先级徽标：中性形制（不与「限流 / 代理异常」那类告警色抢注意力）。
+   它回答「同一模型多家可提供时谁先试」，是偶尔查一次的配置值，不是要盯的状态，
+   所以右推到组头末端、字号再收一号。 */
+.acct-group-title .pgroup-route {
+  margin-left: auto;
+  font-size: 10px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--text-3);
+}
+
+/* 二级（国内 / 国际）组头：字号更小、分隔线更淡，表达「这是上一级的细分」 */
+.acct-group-title.sub { margin-top: -4px; font-size: 10px; color: var(--text-3); }
+.acct-group-title.sub::after { background: var(--hairline); }
+
+/* 桌面端实时登录态徽标：品牌浅底（中性偏冷色）。它表达的是一项**属性**
+   （凭证不落盘、实时读客户端文件），既不是故障也不是健康状态，所以既不用红黄
+   也不用绿。禁用卡片的既有压灰规则会一并命中它 —— 符合预期：停用的账号连
+   属性标记一起变灰，读起来才是「整块已停用」。 */
+.card-state .badge.desktop-tag {
+  background: var(--primary-soft);
+  border-color: var(--primary-bd);
+  color: var(--primary-fg);
+  font-weight: 500;
+}
+
+/* ⋯ 菜单里的置灰项（桌面端账号的「删除账号」）：保留可见但不可点，把「不可删除」
+   显式呈现出来（悬浮有 title 说明原因），而不是让这一项凭空消失 —— 入口消失只会
+   让人以为菜单坏了或功能丢了。 */
+.more-menu button:disabled { color: var(--text-3); opacity: .55; cursor: not-allowed; }
+.more-menu button:disabled:hover { background: transparent; color: var(--text-3); }
+
+/* 批量栏的「按提供商计数」摘要（`WorkBuddy 14 · 小浣熊 3`）：紧跟在「共 N 个」
+   之后，同色系；窄窗口允许省略 —— 它只是补充信息，完整分组在列表组头里。 */
+.provider-summary {
+  max-width: 40%;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 工具条里注入的提供商下拉：模型下拉才需要「重一档」（它决定队列口径），
+   这里只给最小宽度，免得 label 被压成一两个字 */
+#account-provider-filter { min-width: 132px; }
+
+/* ─── 添加账号弹窗的提供商分叉（结构由 account-panel.js 注入）─── */
+.add-provider-block[hidden] { display: none; }
+.add-provider-block { display: flex; flex-direction: column; gap: 16px; }
+
+/* ─── 添加账号弹窗：统一用分段选择器（结构与样式见 index.html / 本文件）───
+   .seg / .seg-item 的既有规则在 components.css（账号页筛选栏在用，不动它），
+   这里只做弹窗内的尺寸微调与层级补充。 */
+
+/* 弹窗里的分段控件与账号页筛选栏同一套视觉，只是弹窗更宽、点选更从容，
+   项高从 24 放到 28；提供商那一行家数多了要能换行。
+   align-self 只对「直接挂在 .modal-section 下」的那些生效 —— .modal-section 是
+   flex 列容器，不顶到起始边就会被拉成整行宽（两个选项配一条通栏边框很难看）；
+   挂在 .field-row 里的（打开方式）则要保持行内联排。 */
+#add-modal .add-seg { flex-wrap: wrap; max-width: 100%; }
+#add-modal .modal-section > .add-seg { align-self: flex-start; }
+#add-modal .add-seg .seg-item { height: 28px; padding: 0 12px; font-size: 12.5px; }
+
+/* 分段控件前的行内标签（如「打开方式」）：与 .field-row > label 同形制 */
+#add-modal .add-seg-label { color: var(--text-2); font-size: 12.5px; white-space: nowrap; }
+
+/* 第二级（打开方式 + 登录按钮）挂在第一级所在段内：缩进 + 左侧竖线，
+   让「这是上一级选出来的子项」一眼可见，而不是与第一级并列的另一块 */
+#add-modal .add-sub {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding-left: 11px;
+  border-left: 2px solid var(--border);
+}
+
+/* .modal-section 自带 display:flex，会盖掉浏览器默认的 [hidden]{display:none}
+   （作者样式优先于 UA 样式），所以显隐必须显式压回来 —— 弹窗里靠 hidden
+   控制显隐的有：粘贴 JSON 段、WorkBuddy 的第二级、三家的方式分段各段。 */
+#add-modal .modal-section[hidden],
+#add-modal .add-sub[hidden] { display: none; }
+
+/* 纵向表单行（token / refreshToken / auth.json）：标签在上、输入框占满整宽 ——
+   这些值很长，横排会把输入框压成一条缝 */
+.field-row.stack { flex-direction: column; align-items: stretch; gap: 6px; }
+.field-row.stack > label { color: var(--text-2); font-size: 12.5px; }
+.field-row.stack textarea { width: 100%; min-height: 0; font-family: var(--font-mono); font-size: 11.5px; }
+
+/* 行内文字链接（「小浣熊客户端登录态文件」）：点了在弹窗里显示完整路径 */
+.raccoon-hint-link { color: var(--primary-fg); text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }

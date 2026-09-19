@@ -1,13 +1,21 @@
 //! 敏感词脱敏 — 词表维护路由（对照 src/workbuddy-desensitize-routes.mjs 逐条实现）。
 //!
-//!   GET    /api/desensitize              当前状态（开关 / 词表 / 角色 / 命中统计）
+//!   GET    /api/desensitize              当前状态（开关 / 词表 / 角色 / 作用提供商 / 命中统计）
 //!   POST   /api/desensitize/enabled      开关 { enabled }
 //!   POST   /api/desensitize/roles        作用角色 { roles: ['system','user'] }
+//!   PUT    /api/desensitize/providers    作用提供商 { providers: ['workbuddy'] }（Agent2API 新增）
+//!   POST   /api/desensitize/providers    （同上；幂等全量替换）
 //!   PUT    /api/desensitize/terms        全量替换词表 { terms: [...] }
 //!   POST   /api/desensitize/terms        追加词 { terms: [...] | term: '...' }
 //!   DELETE /api/desensitize/terms        删除词 { terms: [...] } 或 ?term=xxx
 //!   POST   /api/desensitize/reset        恢复默认词表
 //!   POST   /api/desensitize/stats/reset  清空命中统计
+//!
+//! ── providers 与 roles 的区别（别混）─────────────────────────
+//! `roles` = 消息里的**哪些角色**参与脱敏（system/user/…），`providers` =
+//! **哪些上游**的请求需要脱敏（架构文档 §3.5）。前者是报文维度的选择，
+//! 后者是路由维度的选择；判定时机在转发前（候选链与作用集合有交集即脱敏），
+//! 由 W2b 在 chat_completions 里接。
 //!
 //! ── 分发方式：与 Node 版同构的「一个入口 + 按剩余段判定」────────
 //! Node 是 `tryHandle(req,res,path,url)`：前缀命中后按 `action` 逐条判方法 + 路径。
@@ -117,6 +125,32 @@ async fn dispatch(
             })
             .unwrap_or_default();
         logging::log("[Desensitize]", &format!("作用角色: {roles}"));
+        return ok_json(next);
+    }
+
+    // 作用提供商（Agent2API 改造 §3.5）：全量替换语义。
+    // 两条路径都收：
+    //   PUT /api/desensitize            { providers: ["workbuddy"] }（架构文档 §5 的
+    //                                    「GET/PUT /api/desensitize*」字面形态）
+    //   PUT/POST /api/desensitize/providers（与同组的 roles/terms 一致的子路径形态）
+    // 两者走同一段逻辑。基础路径**只**接受 providers 字段（其余键忽略）：
+    // 它原先对 PUT 是 404，新增这条分支不改动任何既有行为。
+    let base_put = method == Method::PUT && action.is_empty();
+    let sub_path = (method == Method::PUT || method == Method::POST) && action == "providers";
+    if base_put || sub_path {
+        let payload = match read_json(body) {
+            Ok(payload) => payload,
+            Err(response) => return response,
+        };
+        let providers = match validate_providers(payload.get("providers")) {
+            Ok(providers) => providers,
+            Err(response) => return response,
+        };
+        let next = desensitizer.set_providers(&providers);
+        logging::log(
+            "[Desensitize]",
+            &format!("作用提供商: {}", providers.join("、")),
+        );
         return ok_json(next);
     }
 
@@ -292,6 +326,54 @@ fn percent_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).to_string()
+}
+
+/// 作用提供商校验（Agent2API 改造 §3.5）：数组元素必须是注册表里的已知 id。
+///
+/// 与词表校验同款「严格写侧」：**未知项一律 400**，不静默丢弃 —— 用户点了保存
+/// 却没生效（因为拼错了一个 id）是最难排查的一类问题。读侧（手改 desensitize.json）
+/// 则是宽容的（`normalize_providers` 丢弃未知项、空则回落缺省），两侧口径不同
+/// 各有理由，与保留期天数的处理一致。
+///
+/// 空数组也拒绝：`normalize_providers` 对空数组会回落成缺省 `["workbuddy"]`，
+/// 若在这里放行，用户写 `{"providers": []}` 会得到 200 但配置变成 workbuddy ——
+/// 「停用脱敏」应当用 `enabled` 开关（那个语义准确且立即生效）。
+///
+/// ── W4a：白名单口径改为注册表（本函数一行判定都没改）──────────
+/// 「已知 id」判定走 `providers::is_known_provider_id`（= `kind_from_id(id).is_some()`，
+/// 唯一事实来源是 `PROVIDERS` 注册表）。于是 CatPaw / AutoClaw 一进注册表就
+/// **自动**成为合法的脱敏作用提供商，本函数与配置层都不用改 —— 这正是当初
+/// 把 id 白名单收敛到注册表的理由（旧写法会在这里漏掉新 provider，
+/// 用户看到的是「未知的提供商: catpaw」这种莫名其妙的 400）。
+fn validate_providers(value: Option<&Value>) -> Result<Vec<String>, Response> {
+    let items = match value {
+        Some(Value::Array(items)) => items,
+        _ => {
+            return Err(management_error(
+                400,
+                "缺少提供商列表：请提供 { providers: [\"workbuddy\"] }",
+            ))
+        }
+    };
+    if items.is_empty() {
+        return Err(management_error(
+            400,
+            "提供商列表为空：至少需要一个（要停用脱敏请用开关）",
+        ));
+    }
+    let mut providers: Vec<String> = Vec::new();
+    for item in items {
+        let Some(id) = item.as_str() else {
+            return Err(management_error(400, "提供商只接受字符串"));
+        };
+        if !crate::server::core::providers::is_known_provider_id(id) {
+            return Err(management_error(400, format!("未知的提供商: {id}")));
+        }
+        if !providers.iter().any(|known| known == id) {
+            providers.push(id.to_string());
+        }
+    }
+    Ok(providers)
 }
 
 /// 词表校验（对应 validateTerms）：缺参、空表、空串、长度、上限。

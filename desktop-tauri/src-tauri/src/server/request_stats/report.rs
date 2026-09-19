@@ -17,7 +17,11 @@ use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
 use serde_json::{json, Value};
 
 use super::clock::{date_key, hour_floor, hour_key, ms_to_local};
-use super::record::{DailyEntry, ModelAccum, RequestEntry};
+use super::record::{DailyEntry, ModelAccum, ProviderAccum, RequestEntry};
+
+/// 未知 provider 的展示名（`id` 为空串的那一组：旧版本写出的明细、
+/// 以及「一次都没发出去就失败」的请求）。前端也会用同样的文案做降级显示。
+pub(super) const UNKNOWN_PROVIDER_LABEL: &str = "未知";
 
 /// 热力图固定返回的天数（与 range 解耦）
 pub(super) const HEATMAP_DAYS: i64 = 365;
@@ -73,13 +77,14 @@ pub(super) fn range_bounds(
     (date_key(start), date_key(end))
 }
 
-/// 区间内的总量与按模型累计（overview 的原料）
+/// 区间内的总量与按模型 / 按 provider 累计（overview 的原料）
 pub(super) struct RangeTotals {
     pub requests: i64,
     pub successful: i64,
     pub tokens: i64,
     pub active_days: i64,
     pub model_totals: Vec<ModelAccum>,
+    pub provider_totals: Vec<ProviderAccum>,
 }
 
 /// 按区间累计聚合行。`BTreeMap::range` 直接按日期键取闭区间 ——
@@ -95,6 +100,7 @@ pub(super) fn range_totals(
         tokens: 0,
         active_days: 0,
         model_totals: Vec::new(),
+        provider_totals: Vec::new(),
     };
     // 闭区间 [start, end]：定长日期串的字典序即时间序，所以直接按键取范围。
     // 这里构造两个 String 边界是有意的取舍 —— 报表调用频率是「用户点一下」级别，
@@ -110,7 +116,38 @@ pub(super) fn range_totals(
         for acc in &day.model_tokens {
             push_model_accum(&mut totals.model_totals, &acc.model, acc.tokens, acc.requests);
         }
+        for acc in &day.provider_stats {
+            push_provider_accum(
+                &mut totals.provider_totals,
+                &acc.provider,
+                acc.requests,
+                acc.successful,
+                acc.tokens,
+            );
+        }
     }
+
+    // ── 旧聚合行的余量归属 ──────────────────────────────────────
+    // 升级前写出的聚合行没有 `providerStats` 键（读入后是空表），那些天的请求
+    // 因此没有任何 provider 组覆盖。这里把「未被任何组覆盖的余量」补进空 id 组：
+    //   ① 各 provider 之和恒等于区间总量 —— 报表之间能对账，前端把
+    //      `providers` 与 `overview.requests` 并排显示时不会出现对不上的数；
+    //   ② 旧数据落进「未知」组而不是被静默丢掉 —— 契约要求不得给旧数据
+    //      **猜**值（不许补 workbuddy），但「未知」正是它的真实归属，不是猜。
+    // 先求和再借用 `&mut`：闭包持着不可变借用时不能同时改这张表。
+    let covered_requests: i64 = totals.provider_totals.iter().map(|item| item.requests).sum();
+    let covered_successful: i64 = totals.provider_totals.iter().map(|item| item.successful).sum();
+    let covered_tokens: i64 = totals.provider_totals.iter().map(|item| item.tokens).sum();
+    // `max(0)` 兜住手改文件造成的「拆分比总量还多」；余量全零时这里仍会建出
+    // 一个空组，但 `build_providers` 会把全零的组滤掉（见那边的 `requests > 0
+    // || tokens > 0`），所以不会凭空冒出空的「未知」项
+    push_provider_accum(
+        &mut totals.provider_totals,
+        "",
+        (totals.requests - covered_requests).max(0),
+        (totals.successful - covered_successful).max(0),
+        (totals.tokens - covered_tokens).max(0),
+    );
     totals
 }
 
@@ -128,6 +165,121 @@ pub(super) fn push_model_accum(list: &mut Vec<ModelAccum>, model: &str, tokens: 
             tokens,
         }),
     }
+}
+
+/// 把一批（一条或一天的）请求并进按 provider 的累计表。
+///
+/// 与 `push_model_accum` 同一取舍：provider 数量是个位数，线性查找比 HashMap
+/// 更快也更省（不必分配键）。`provider` 为空串时**照常建组**，不丢弃 ——
+/// 旧数据与「转发前失败」的请求都落在这一组里，丢掉它们会让
+/// 「各 provider 之和」对不上区间总量。
+pub(super) fn push_provider_accum(
+    list: &mut Vec<ProviderAccum>,
+    provider: &str,
+    requests: i64,
+    successful: i64,
+    tokens: i64,
+) {
+    match list.iter_mut().find(|item| item.provider == provider) {
+        Some(item) => {
+            item.requests += requests;
+            item.successful += successful;
+            item.tokens += tokens;
+        }
+        None => list.push(ProviderAccum {
+            provider: provider.to_string(),
+            requests,
+            successful,
+            tokens,
+        }),
+    }
+}
+
+/// provider id → 展示 label（中文名）。
+///
+/// 走 `providers::meta` 的注册表换算，**不在这里维护第二份 id→label 映射**：
+/// 注册表是 provider 身份的唯一事实来源，两处映射迟早漂移，而这类漂移不会报错，
+/// 只会让报表里的名字与账号页对不上。
+///
+/// 未注册的 id（前端比后端新、或手改文件塞进来的值）**原样返回**：
+/// 显示一个陌生的英文 id 好过显示空白，至少能提示「这是谁」。
+/// 空串同样原样返回（空 label），由展示层决定用什么占位（当前约定是「—」）——
+/// 这一层只回答「id 对应什么名字」，不做展示决策。
+pub(super) fn provider_label(id: &str) -> String {
+    if id.is_empty() {
+        return String::new();
+    }
+    match crate::server::core::providers::kind_from_id(id) {
+        Some(kind) => crate::server::core::providers::meta(kind).label.to_string(),
+        None => id.to_string(),
+    }
+}
+
+/// 区间级的按 provider 汇总 → `/api/stats/summary` 的 `providers` 数组。
+///
+/// 排序：`requests` 降序（契约要求）；并列时按 `totalTokens` 降序、
+/// 再并列按 id 升序 —— 后两级纯粹为了让结果稳定（同一份数据多次调用顺序一致），
+/// 前端做「只显示前 N 家」的截断时不会每次截到不同的行。
+///
+/// 空 id 那一组的 label 用「未知」而不是空串：这份数组是**给图表用的**，
+/// 每段都要有可显示的图例名；空 label 在图例里就是个看不见的空白项。
+/// （明细行那边的空 provider 反而保持空 label，好让展示层用「—」占位 ——
+/// 两边形态不同是因为用途不同，不是遗漏。）
+pub(super) fn build_providers(totals: &[ProviderAccum]) -> Vec<Value> {
+    // 全零的组不返回：它只会出现在手改过的文件里，展示一个「0 次请求」的
+    // 图例项没有意义（正常写入路径不会造出这种组）
+    let mut rows: Vec<&ProviderAccum> = totals
+        .iter()
+        .filter(|item| item.requests > 0 || item.tokens > 0)
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .requests
+            .cmp(&left.requests)
+            .then(right.tokens.cmp(&left.tokens))
+            .then(left.provider.cmp(&right.provider))
+    });
+    rows.into_iter()
+        .map(|item| {
+            json!({
+                "id": item.provider,
+                "label": if item.provider.is_empty() {
+                    UNKNOWN_PROVIDER_LABEL.to_string()
+                } else {
+                    provider_label(&item.provider)
+                },
+                "requests": item.requests,
+                // failures 由减法得出而不是另存一列：见 record::ProviderAccum 的注释。
+                // max(0) 兜住手改文件造成的负数
+                "success": item.successful,
+                "failures": (item.requests - item.successful).max(0),
+                "totalTokens": item.tokens,
+            })
+        })
+        .collect()
+}
+
+/// 明细行 → 响应 JSON：在序列化结果上补一个**派生字段** `providerLabel`。
+///
+/// 为什么不在 `RequestEntry` 上加一个字段：契约里 `providerLabel` 是给前端直接
+/// 显示的（§6「记账展示的 provider 用 label」），它由 id 换算而来、会随注册表
+/// 变化，而 `RequestEntry` 是**落盘格式**——把派生值写进文件会让
+/// 「以后改了 label，历史行仍是旧名字」。
+///
+/// 序列化失败理论上不可能（字段全是 i64 / String / Option<String>），但仍然
+/// 不做 unwrap（panic=abort 下会带走整个应用）：退化成一个空对象，
+/// 前端那一行显示空白，比进程消失好。
+pub(super) fn entry_json(entry: &RequestEntry) -> Value {
+    let Ok(mut value) = serde_json::to_value(entry) else {
+        return Value::Object(serde_json::Map::new());
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "providerLabel".to_string(),
+            Value::String(provider_label(&entry.provider)),
+        );
+    }
+    value
 }
 
 /// 区间级 topModel：按 `tokens` 降序，并列比 `requests`，再并列比名字
@@ -255,34 +407,40 @@ fn cache_rate(entries: &[RequestEntry], since_ms: i64, now: i64) -> Value {
     json!({ "hitTokens": hit, "inputTokens": input, "rate": safe_rate(hit, input) })
 }
 
-/// 近 24 个**本地整点**的命中率趋势（无数据的整点补零）。
+/// 近 24 个**本地整点**的命中率与用量趋势（无数据的整点补零）。
 ///
 /// 按本地时区切整点：先把时间戳还原成 `DateTime<Local>` 再取 `%H`，
 /// 于是「14 点」就是用户时钟上的 14 点，不是 UTC 的 14 点。
+///
+/// 每个整点同时给出 `totalTokens`：前端那一张图要画**两条线**
+/// （命中率 + 总 Token），两段数据必须同源同桶 —— 分成两次请求会让两条线
+/// 在「这一小时算不算」上出现分歧，看起来像其中一条错位了一格。
 pub(super) fn cache_trend_24h(entries: &[RequestEntry], now: i64) -> Vec<Value> {
     let start = hour_floor(ms_to_local(now)) - ChronoDuration::hours(23);
     let start_ms = start.timestamp_millis();
 
     // 先把窗口内的条目按整点键归桶，再按 24 个整点取值 ——
     // 逐个整点扫一遍明细是 24×N，这样只需一次遍历
-    let mut buckets: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut buckets: HashMap<String, (i64, i64, i64)> = HashMap::new();
     for item in entries {
         if item.ts < start_ms || item.ts > now {
             continue;
         }
-        let slot = buckets.entry(hour_key(ms_to_local(item.ts))).or_insert((0, 0));
+        let slot = buckets.entry(hour_key(ms_to_local(item.ts))).or_insert((0, 0, 0));
         slot.0 += item.cache_read_tokens;
         slot.1 += item.prompt_tokens;
+        slot.2 += item.total_tokens;
     }
 
     let mut out = Vec::with_capacity(24);
     for step in 0..24 {
         let key = hour_key(start + ChronoDuration::hours(step));
-        let (hit, input) = buckets.get(&key).copied().unwrap_or((0, 0));
+        let (hit, input, total) = buckets.get(&key).copied().unwrap_or((0, 0, 0));
         out.push(json!({
             "hour": key,
             "hitTokens": hit,
             "inputTokens": input,
+            "totalTokens": total,
             "rate": safe_rate(hit, input),
         }));
     }

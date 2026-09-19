@@ -28,6 +28,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde_json::Value;
 
+use crate::server::logging;
+
 /// 一次上报的用量（四种 token 计数，字段名对应存储契约）
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UsageTokens {
@@ -86,10 +88,31 @@ pub struct TelemetrySnapshot {
     /// 账号展示名，取值顺序与限额日志一致：账号名 → 会话昵称 → 账号 id
     /// （所以账号 id 为空但会话带昵称时，这里仍可能非空）
     pub account_name: String,
+    /// 最终承载本次请求的 **provider id**（Agent2API W2b-T3 新增；
+    /// `None` = 还没走到选路就失败了，例如请求体非法 / 模型不存在）。
+    ///
+    /// 为什么存 id 字符串而不是 `ProviderKind`：这个值要跨模块交给记账点
+    /// （`api::chat` → `request_stats`），落进请求明细的 `provider` 字段，
+    /// 最终出现在报表与前端 —— 契约里它就是 id 字符串（architecture §3.6）。
+    /// 存字符串省掉一次「kind → id」的转换与两处枚举依赖。
+    pub provider: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    /// 上游首帧到达的**绝对时刻**（毫秒 Unix 时间戳；None = 全程没有帧到达，
+    /// 例如转发前就失败 / 请求尚未开始下发）。
+    ///
+    /// 为什么存绝对时刻而不是相对耗时：采集点（响应流）与记账点（请求收尾）
+    /// 分布在两处，「请求开始时刻」只有记账点知道 —— 存绝对值让采集点完全
+    /// 不需要知道口径，减法在记账点做一次（`record_entry`），与 durationMs
+    /// 用同一个 `started_at`，两列的参考点不可能各说各话。
+    ///
+    /// 对应 OmniProxy 请求日志的 `ttfb_ms`（time to first byte）：它回答
+    /// 「上游多久开始吐内容」，把「等上游出首字」与「生成完整段内容」两段
+    /// 耗时分开 —— 只有 durationMs 时，一个 30 秒的请求看不出是上游慢
+    /// 还是内容长。
+    pub first_response_at: Option<i64>,
     /// 中断 / 异常原因（成功为 None）
     pub error: Option<String>,
 }
@@ -119,11 +142,16 @@ impl RequestTelemetry {
     /// 账号取**最后一次**：429 轮换后真正承载请求的是最后那个账号，
     /// 报表里「这条请求算在谁头上」应该跟着实际承载者走。
     /// attempts 是累计值 —— 它要回答的是「这条请求换了几个账号才发出」。
-    pub fn note_attempt(&self, account_id: Option<&str>, account_name: &str) {
+    ///
+    /// `provider` 同样是**最后一次**（多提供商轮询后真正承载请求的那家）。
+    pub fn note_attempt(&self, account_id: Option<&str>, account_name: &str, provider: &str) {
         let mut guard = self.lock();
         guard.attempts += 1;
         guard.account_id = account_id.unwrap_or("").to_string();
         guard.account_name = account_name.to_string();
+        if !provider.is_empty() {
+            guard.provider = Some(provider.to_string());
+        }
     }
 
     /// 上报一次 usage（覆盖式，最后一次为准；字段名兼容见 `extract_usage`）。
@@ -136,6 +164,19 @@ impl RequestTelemetry {
         guard.completion_tokens = tokens.completion;
         guard.total_tokens = tokens.total;
         guard.cache_read_tokens = tokens.cache_read;
+    }
+
+    /// 记一次「上游首帧已到达」。
+    ///
+    /// **首次为准**（与 note_error 相同、与 report_usage 相反）：首帧只有一次，
+    /// 重跑计数只会把「第一个字节什么时候到的」改写成「后来某次调用的时刻」。
+    /// 采集点在响应流上（Streaming 的 RecordingStream / 聚合的第一个 chunk），
+    /// 同一条流上会被反复调用，幂等性由这里的 None 判断保证。
+    pub fn note_first_frame(&self) {
+        let mut guard = self.lock();
+        if guard.first_response_at.is_none() {
+            guard.first_response_at = Some(logging::now_ms());
+        }
     }
 
     /// 记一条中断 / 异常原因（成功请求不会被调用）。

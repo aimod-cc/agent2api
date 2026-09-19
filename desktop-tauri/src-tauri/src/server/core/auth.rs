@@ -21,7 +21,7 @@
 //! 登录流程（login.rs）没有账号上下文，因此固定直连 —— 与 Node 版一致。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
@@ -45,15 +45,34 @@ pub use crate::server::core::auth_http::{
 
 /// 鉴权服务句柄：账号存储 + 默认上下文 + 刷新防重表。
 ///
-/// 防重表 `inflight` 记录「正在刷新的账号 id」：Node 版的刷新是「读账号 →
+/// 防重表记录「正在刷新的账号 id」：Node 版的刷新是「读账号 →
 /// 发请求 → 写回」，两个并发请求会各自发一次上游刷新、后写的覆盖先写的；
 /// 更糟的是部分上游会对同一 refreshToken 的并发使用做失效处理。
 /// 因此这里用一张占位表把并发收敛成一次真实刷新（后到者拿到同一个结果）。
+///
+/// ── 防重表为什么是**进程级**（Agent2API 改造 W2b-T3）─────────
+/// 改造前刷新只从 `ServerState` 那一份 AuthService 发起（克隆共享同一个 Arc
+/// 表，等价于进程级）。W2b 之后 provider 适配器的 `ensure_access_token`
+/// 与 `refresh_access_token` 也会触发刷新，而适配器契约只拿得到 `&AccountStore`
+/// （见 `core::providers::adapter`），于是它必须能自己构造一个 AuthService
+/// （`for_store`）。若防重表仍挂在实例上，适配器构造出的那份就与
+/// `/api/accounts/refresh` 那份**各有一张表** —— 用户点「刷新」的同一瞬间
+/// 恰好有转发在刷新同一账号时，两次真实刷新会并发打出去，
+/// 正是这张表要防的事。挪成静态表后，所有实例天然共享同一份占位状态，
+/// 行为与改造前（单实例）逐字一致。
 #[derive(Clone)]
 pub struct AuthService {
     store: AccountStore,
     context: Context,
-    inflight: Arc<Mutex<HashMap<String, ()>>>,
+}
+
+/// 进程级刷新占位表（见 `AuthService` 的说明）。
+///
+/// 用 `OnceLock` 而不是 `lazy_static`/`std::sync::LazyLock`：
+/// 前者无需新依赖，后者在 1.77 的 MSRV 上还不可用（`LazyLock` 稳定于 1.80）。
+fn inflight_table() -> &'static Mutex<HashMap<String, ()>> {
+    static TABLE: std::sync::OnceLock<Mutex<HashMap<String, ()>>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// 刷新结果（供路由层与登录流程共用）
@@ -67,7 +86,21 @@ pub struct RefreshedAuth {
 
 impl AuthService {
     pub fn new(store: AccountStore, context: Context) -> Self {
-        Self { store, context, inflight: Arc::new(Mutex::new(HashMap::new())) }
+        Self { store, context }
+    }
+
+    /// 用「与默认上下文同源」的上下文构造（Agent2API W2b-T3）。
+    ///
+    /// provider 适配器与模型目录刷新只拿得到 `&AccountStore`，而 `AuthService`
+    /// 还需要一个 `Context`。这里用的就是 `ServerState::bootstrap` 里那份
+    /// `endpoints::default_context()` —— 同一进程内两条构造路径的默认上下文
+    /// 因此完全一致（token 刷新本身走的是**账号自己的** endpoint，
+    /// 这个 context 只用于「账号记录里没有端点时的兜底」）。
+    pub fn for_store(store: AccountStore) -> Self {
+        Self {
+            store,
+            context: crate::server::core::endpoints::default_context(),
+        }
     }
 
     /// 默认上下文（未登录态展示与 /api/endpoints 用）
@@ -112,11 +145,49 @@ impl AuthService {
     ///
     /// 优先级：环境变量 WORKBUDDY_TOKEN > 账号存储当前账号。
     /// 返回 None 表示没有任何可用凭证（未登录）。
+    ///
+    /// 多提供商（W2b-T3）后本函数是 `scope = None` 的薄封装：语义与改造前
+    /// 逐字一致（全局派生的当前账号，供 /api/session、计费、模型目录使用）。
+    /// **转发链路不用它** —— 转发必须只看目标 provider 的账号，
+    /// 走 `get_current_session_for`。
     pub async fn get_current_session(&self) -> Result<Option<Value>, WorkBuddyAuthError> {
-        if let Some(session) = Self::env_session() {
-            return Ok(Some(session));
+        self.session_with_refresh(None).await
+    }
+
+    /// 指定 provider 的当前可用凭证（临期自动刷新并回写）。
+    ///
+    /// 「当前账号」在该 provider 的账号组内派生（`current_entry_for_provider`），
+    /// 而不是全局队首 —— 否则「只有 raccoon 账号」的机器上，
+    /// workbuddy 的默认登录态会借到 raccoon 账号的凭证（发出去必然 401）。
+    ///
+    /// 环境变量旁路（`WORKBUDDY_TOKEN`）是 **workbuddy 专属**：只有 scope 是
+    /// workbuddy 时才认它（see `env_session`）。
+    pub async fn get_current_session_for(
+        &self,
+        provider: &str,
+    ) -> Result<Option<Value>, WorkBuddyAuthError> {
+        self.session_with_refresh(Some(provider)).await
+    }
+
+    /// 会话读取 + 临期刷新的共用内核；`scope` 为 None 表示全局当前账号。
+    async fn session_with_refresh(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Option<Value>, WorkBuddyAuthError> {
+        // 环境变量凭证只属于 workbuddy（WORKBUDDY_TOKEN）
+        let env_applies = scope
+            .map(|provider| provider == crate::server::core::providers::DEFAULT_PROVIDER_ID)
+            .unwrap_or(true);
+        if env_applies {
+            if let Some(session) = Self::env_session() {
+                return Ok(Some(session));
+            }
         }
-        let Some(entry) = self.store.get_current_entry() else {
+        let entry = match scope {
+            Some(provider) => self.store.current_entry_for_provider(provider),
+            None => self.store.get_current_entry(),
+        };
+        let Some(entry) = entry else {
             return Ok(None);
         };
         let expires_at = entry
@@ -404,8 +475,11 @@ impl AuthService {
         // 不做「等前一个完成再复用结果」的复杂等待：这里用占位表把重复请求
         // 快速拒掉（返回明确错误），因为刷新本身很快，重复触发通常来自
         // 用户连点或启动维护，报错比静默复用更利于定位问题。
+        // 表是**进程级**的（见 `AuthService` 的说明）：本实例、适配器构造的
+        // 实例、`/api/accounts/refresh` 共用同一份占位状态。
         {
-            let mut guard = match self.inflight.lock() {
+            let table = inflight_table();
+            let mut guard = match table.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
@@ -418,7 +492,7 @@ impl AuthService {
             guard.insert(id.to_string(), ());
         }
         let result = self.refresh_account_inner(id).await;
-        if let Ok(mut guard) = self.inflight.lock() {
+        if let Ok(mut guard) = inflight_table().lock() {
             guard.remove(id);
         }
         result
@@ -581,8 +655,9 @@ impl AuthService {
 /// 把路径分隔符统一成 Windows 形态（`C:/a/b` → `C:\a\b`）。
 ///
 /// `PathBuf::to_string_lossy` 在 Windows 上给的是 `C:\a\b`，但 config_dir 可能是
-/// 从环境变量（WORKBUDDY_PROXY_HOME）拼出来的正斜杠形式。这个串会显示给用户、
-/// 也会被壳侧用来打开目录，统一成 Node 的 `path.join` 输出形态最不容易出错。
+/// 从环境变量（AGENT2API_PROXY_HOME，旧名 WORKBUDDY_PROXY_HOME 仍可读）拼出来的
+/// 正斜杠形式。这个串会显示给用户、也会被壳侧用来打开目录，统一成 Node 的
+/// `path.join` 输出形态最不容易出错。
 fn normalize_display_path(path: &str) -> String {
     if cfg!(windows) {
         path.replace('/', "\\")

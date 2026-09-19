@@ -1,4 +1,4 @@
-/* WorkBuddy 本地代理 · 极简 Markdown 渲染器（设置页「更新日志」专用） */
+/* Agent2API · 极简 Markdown 渲染器（设置页「更新日志」专用） */
 /* global window */
 
 /**

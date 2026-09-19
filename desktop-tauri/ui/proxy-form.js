@@ -1,4 +1,4 @@
-/* WorkBuddy 本地代理 · 出网代理表单（可复用组件） */
+/* Agent2API · 出网代理表单（可复用组件） */
 /* global workbuddyDesktop, wbApp */
 
 /**

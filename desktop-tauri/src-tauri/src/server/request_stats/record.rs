@@ -75,6 +75,20 @@ pub struct RequestEntry {
     pub status: i64,
     #[serde(rename = "durationMs", default)]
     pub duration_ms: i64,
+    /// 上游首帧到达相对请求开始的耗时（毫秒）。
+    ///
+    /// 与 OmniProxy 请求日志的 `ttfb_ms` 同义：把「等上游出首字」与「生成
+    /// 完整段内容」两段耗时分开 —— 只有 durationMs 时，一个 30 秒的请求
+    /// 看不出是上游慢还是内容长。
+    ///
+    /// ── 为什么是 `Option`（null）而不是 0 ─────────────────────────
+    /// 「没测到」与「测到了 0ms」是两回事。None 只出现在「全程没有任何帧
+    /// 到达」的请求上（转发前就失败）；中途断流的失败请求**照记** ——
+    /// 它确实收到过首帧，首响与「这条是不是失败」无关（首响是计时，
+    /// 不是消耗，与「失败清零 token」的口径不同）。
+    /// 旧版本写出的行没有这个键，`default` 读成 None，前端显示「-」。
+    #[serde(rename = "firstResponseMs", default)]
+    pub first_response_ms: Option<i64>,
     /// 尝试次数（含首次），恒 ≥1
     #[serde(default = "one")]
     pub attempts: i64,
@@ -89,6 +103,23 @@ pub struct RequestEntry {
     pub total_tokens: i64,
     #[serde(rename = "cacheReadTokens", default)]
     pub cache_read_tokens: i64,
+    /// 实际承载本次请求的 provider id（架构文档 §3.6）。
+    ///
+    /// ── 为什么是 `String` + 空串而不是 `Option<String>` ─────────
+    /// 与 `accountId` / `accountName` 同一套「空串就是没有」的存储契约：
+    /// 「旧版本写出的行没有这个键」「转发链一次都没发出去（选路前就失败）」
+    /// 这两种情况在语义上都是「不知道是哪家承载的」，让它们收敛成同一个值，
+    /// 下游（按 provider 聚合、API 透出、前端降级）就不必分三路判断。
+    /// 空串在聚合层归入「未知」组，展示层显示「—」，**不给旧数据猜值**
+    /// （旧数据全部来自单上游时代也不许补 workbuddy：那是猜，不是事实）。
+    ///
+    /// ── 为什么没有 `rename` 而只加 `default` ────────────────────
+    /// 落盘的键名就是 `provider`，与字段名相同（本文件的 `rename` 都出现在
+    /// 两者不一致的字段上）。`default` 保证缺键的旧行照常读入；空值**照写**
+    /// （与 `accountId` / `accountName` 同一形态：键恒在、空串表示没有），
+    /// 于是「有没有这个键」不再是前端要判的第三种情况。
+    #[serde(default)]
+    pub provider: String,
 }
 
 /// `attempts` 的 serde 默认值（载入缺该字段的旧行时按 1 次算）
@@ -97,9 +128,19 @@ fn one() -> i64 {
 }
 
 impl RequestEntry {
-    /// 是否成功（2xx）—— 统计口径里 `successful` 用它判定
+    /// 是否成功 —— 2xx **且**没有错误摘要。
+    ///
+    /// ── 为什么不能只看状态码 ───────────────────────────────────
+    /// 流式请求的 HTTP 200 在「响应头已就绪」时就发出去了，之后上游断流、
+    /// 上游错误帧、翻译失败都发生在响应体里（协议层把原因写进
+    /// `RequestTelemetry::error`）。只按 2xx 判定会把这一类请求记成成功，
+    /// 报表的成功率与按 provider 的成功数随之虚高 —— 这正是 CatPaw 有状态
+    /// 流式分支暴露出来的问题。有错误摘要 = 这次请求没有完整成功。
+    ///
+    /// 非流式失败（4xx/5xx）状态码本身就不是 2xx，两条判定都命中，不冲突。
+    /// 旧数据里没有 error 字段的行按 None 载入，2xx 仍算成功（口径不变）。
     pub(super) fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
+        (200..300).contains(&self.status) && self.error.is_none()
     }
 }
 
@@ -116,12 +157,21 @@ pub struct NewRequestEntry {
     pub account_name: String,
     pub status: i64,
     pub duration_ms: i64,
+    /// 上游首帧到达相对请求开始的耗时（采集点记绝对时刻，记账点做减法；
+    /// `None` = 全程没有帧到达）。见 `RequestEntry::first_response_ms`。
+    pub first_response_ms: Option<i64>,
     pub attempts: i64,
     pub error: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
+    /// 实际承载本次请求的 provider id（Agent2API 改造 W2b-T3 新增填入，
+    /// W4 接上落盘：见 `normalize` 末尾的透传）。
+    ///
+    /// `None` = 一次都没发出去就失败了（请求体非法 / 模型不存在 / 无可用账号），
+    /// 落盘时归一成空串，聚合层归入「未知」组。
+    pub provider: Option<String>,
 }
 
 impl NewRequestEntry {
@@ -135,12 +185,14 @@ impl NewRequestEntry {
             account_name: String::new(),
             status,
             duration_ms: 0,
+            first_response_ms: None,
             attempts: 1,
             error: None,
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
             cache_read_tokens: 0,
+            provider: None,
         }
     }
 
@@ -154,8 +206,22 @@ impl NewRequestEntry {
     /// 「失败暴增」看起来像「用量暴增」。
     pub(super) fn normalize(self) -> RequestEntry {
         let ts = self.ts.unwrap_or_else(super::clock::now_ms);
-        let failed = !(200..300).contains(&self.status);
+        // 「失败」= 非 2xx **或**带了错误摘要（与 `RequestEntry::is_success` 同一
+        // 口径）：流式请求的 HTTP 200 在响应头阶段就发出去了，之后的上游断流/
+        // 错误帧只能靠 `error` 表达。空串摘要按没有错误算（下面 filter 同口径）。
+        let failed = !(200..300).contains(&self.status)
+            || self.error.as_deref().is_some_and(|text| !text.is_empty());
         let token = |value: i64| if failed { 0 } else { value.max(0) };
+        // provider 从入参透传到落盘条目（W2b 留的丢弃点在此接上）。
+        // `None`（转发链没走到选路就失败）与空串（上游返回了空 id）都归一成
+        // **空串**：两者在报表语义上都是「未知承载者」，多一种表示只会让
+        // 聚合与前端各写一遍「None 也算空」。trim 一下，避免手改文件或异常
+        // 写入带进来的空白造出一个看不见的独立分组。
+        let provider = self
+            .provider
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_default();
         RequestEntry {
             ts,
             model: self.model,
@@ -163,12 +229,16 @@ impl NewRequestEntry {
             account_name: self.account_name,
             status: self.status,
             duration_ms: self.duration_ms.max(0),
+            // 首响透传：负值（时钟回拨造成的理论值）夹成 0 在记账点已做，
+            // 这里只管「有没有」，None（没测到）原样保留
+            first_response_ms: self.first_response_ms,
             attempts: self.attempts.max(1),
             error: self.error.filter(|text| !text.is_empty()),
             prompt_tokens: token(self.prompt_tokens),
             completion_tokens: token(self.completion_tokens),
             total_tokens: token(self.total_tokens),
             cache_read_tokens: token(self.cache_read_tokens),
+            provider,
         }
     }
 }
@@ -200,6 +270,18 @@ pub struct DailyEntry {
     /// 让文件在只有零散请求时也保持紧凑。
     #[serde(rename = "modelTokens", default, skip_serializing_if = "Vec::is_empty")]
     pub model_tokens: Vec<ModelAccum>,
+    /// 当天的按 provider 累计（**契约之外的补充字段**，W4 新增）。
+    ///
+    /// 为什么不复用 `modelTokens` 的容器：provider 维度要多两个列
+    /// （成功数 / 失败数），塞进 `ModelAccum` 会让模型那侧多出两个永远没人读的
+    /// 字段，也让「模型累计」这个概念的读者要自己分辨哪几个字段有意义。
+    ///
+    /// 与 `modelTokens` 同理，这份累计必须存在：`topModel` 之外的任何区间级
+    /// 分组统计都要跨过明细的 30 天保留期（`all` / `month` 可能跨年），
+    /// 只靠明细算会在明细到期后突然少掉一大段。
+    /// 键名不沿用 `*Tokens` 是因为它承载的语义比 tokens 宽（请求数与成功数）。
+    #[serde(rename = "providerStats", default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_stats: Vec<ProviderAccum>,
 }
 
 impl DailyEntry {
@@ -213,6 +295,7 @@ impl DailyEntry {
             cache_hit_tokens: 0,
             cache_input_tokens: 0,
             model_tokens: Vec::new(),
+            provider_stats: Vec::new(),
         }
     }
 }
@@ -223,6 +306,26 @@ pub struct ModelAccum {
     pub model: String,
     #[serde(default)]
     pub requests: i64,
+    #[serde(default)]
+    pub tokens: i64,
+}
+
+/// 单个 provider 在某天的累计（聚合行的组成部分，W4 新增）。
+///
+/// 只存「成功数」而**不存失败数**：失败数 = `requests - successful`，
+/// 存两份会出现「对手改过的文件，两列对不上账」这种无法判定的状态，
+/// 而报表要输出的 `failures` 由一次减法得出，没有信息损失。
+///
+/// `provider` 为空串表示当天有「未知承载者」的请求（旧版本写出的明细、
+/// 或转发前就失败的请求）—— 与 `RequestEntry.provider` 同一口径。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProviderAccum {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub requests: i64,
+    #[serde(default)]
+    pub successful: i64,
     #[serde(default)]
     pub tokens: i64,
 }

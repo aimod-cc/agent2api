@@ -39,6 +39,10 @@ use crate::server::core::auth::{
     with_expires_at, AuthService, WorkBuddyAuthError, SERVER_CODE_RETRY_FETCH_TOKEN,
 };
 use crate::server::core::endpoints::{resolve_edition, Context, DEFAULT_EDITION};
+use crate::server::core::providers::adapter::adapter_for;
+use crate::server::core::providers::raccoon::oauth;
+use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, DEFAULT_PROVIDER_ID};
+use crate::server::errors::GatewayError;
 use crate::server::logging;
 
 /// 登录轮询间隔与总超时（桌面端 SIGN_IN_FETCH_INTERVAL / SIGN_IN_PENDING_TIMEOUT）
@@ -59,6 +63,16 @@ pub struct LoginTaskState {
     /// 成功后的会话摘要 `{ accountUid, nickname, edition }`
     pub session: Option<Value>,
     pub edition: String,
+    /// 这次登录属于哪一家（provider id）。
+    ///
+    /// 为什么必须记在任务上：`/wait` 只按 state 查任务，而**回调换凭证**那一步
+    /// （`submit_login_callback`）必须知道该调哪家的 `exchange_login_code`。
+    /// 换凭证是网络动作，不能靠调用方再传一次 provider —— 那等于让客户端
+    /// 决定「用哪家的协议解释这个 state」，把一条内部契约暴露成入参。
+    ///
+    /// 缺省（default）为空串，`new_handle_for_provider` 会写上一家；
+    /// 空串在回调侧按「不认识」拒绝，不会静默落到某一家。
+    pub provider: String,
     pub canceled: bool,
     finished_at: Option<i64>,
 }
@@ -250,6 +264,15 @@ impl LoginService {
     /// 建一个任务句柄但不启动后台任务（`/auth/login` 的同步登录用它 ——
     /// 那条路径自己 await 登录流程，不能再起一个后台任务重复登录）
     fn new_handle(&self, info: &'static crate::server::core::endpoints::EditionInfo) -> LoginTaskHandle {
+        self.new_handle_for_provider(info, DEFAULT_PROVIDER_ID)
+    }
+
+    /// 同上，但显式指定 provider（网页登录的任务表要记住它，见 `LoginTaskState::provider`）。
+    fn new_handle_for_provider(
+        &self,
+        info: &'static crate::server::core::endpoints::EditionInfo,
+        provider: &str,
+    ) -> LoginTaskHandle {
         let ticket = {
             let mut guard = self.tasks.lock();
             LoginTasks::next_ticket(&mut guard)
@@ -262,11 +285,45 @@ impl LoginService {
                 error: None,
                 session: None,
                 edition: info.id.to_string(),
+                provider: provider.to_string(),
                 canceled: false,
                 finished_at: None,
             })),
             ticket,
         }
+    }
+
+    /// 发起一次「网页登录」任务（trait 扩展 7 的入口，小浣熊走这条）。
+    ///
+    /// 与 [`Self::start`] 的区别：这条**不碰上游** —— authUrl 与 state 都由
+    /// provider 适配器自己拼（小浣熊的授权页地址是静态的，state 本地生成），
+    /// 拿到回调里的 code 之前没有任何网络动作。因此没有后台任务、没有轮询，
+    /// 任务句柄登记进表后等着 `submit_login_callback` 来收尾（或等 `cancel`）。
+    ///
+    /// 返回 `Err(原因)` 表示这家不支持网页登录（调用方据此报 400，文案原样透出）。
+    pub fn start_web_login(&self, kind: ProviderKind) -> Result<LoginTaskHandle, String> {
+        let label = crate::server::core::providers::meta(kind).label;
+        let adapter = adapter_for(kind);
+        // 先问能力再问地址：两个方法各有分工（`supports_web_login` 是恒定能力，
+        // `build_login_url` 是这次的地址）。分开问才能把「这家没有这条协议」
+        // 与「这家有协议但这次拼不出地址」在日志和文案里区分开。
+        if !adapter.supports_web_login() {
+            return Err(format!(
+                "{label}不支持网页登录，请改用「填写凭证」或「导入桌面端登录态」添加账号"
+            ));
+        }
+        let Some((auth_url, state)) = adapter.build_login_url() else {
+            return Err(format!("{label}未能生成网页登录授权地址，请重试"));
+        };
+        let info = resolve_edition(Some(DEFAULT_EDITION));
+        let handle = self.new_handle_for_provider(info, kind_id(kind));
+        handle.update(|task| {
+            task.state = Some(state.clone());
+            task.auth_url = Some(auth_url);
+        });
+        self.tasks.register(&state, handle.clone());
+        logging::log("[Login]", &format!("发起{label}网页登录（等待浏览器回调…）"));
+        Ok(handle)
     }
 
     /// 等 authUrl（对应 Node 版 `/api/session/login/start` 的 15 秒等待）。
@@ -345,6 +402,90 @@ impl LoginService {
             }
         }
         session
+    }
+
+    /// 收一次**网页登录回调**：校验 state → 换凭证 → 落账号 → 标记任务完成。
+    ///
+    /// ── 为什么回调要由登录窗口提交进来 ──────────────────────────
+    /// 小浣熊的官方回调是自定义协议 `office-raccoon://auth/callback`。Electron
+    /// 版能在会话内 `protocol.handle('office-raccoon', …)` 接管它，Tauri/WebView2
+    /// **没有等价物**：WebView2 的 NavigationStarting 只是「导航前问一句要不要
+    /// 拦」，而自定义协议导航一旦放行就会交给系统处理（本机没注册该协议时是
+    /// 一个失败页）。因此壳侧的做法是：**在导航拦截里认出回调 URL、拦下导航、
+    /// 把 URL 原样 POST 到本接口**（见 `src-tauri/src/login.rs`）。
+    ///
+    /// ── state 校验（安全口径）───────────────────────────────────
+    /// 这一步是整条链路上**唯一**能确认「这个 code 是本次登录的回调」的地方：
+    /// 任务表按 state 索引，且 state 是本进程刚生成的不可预测随机串。少了它，
+    /// 任何本机程序都能构造一个回调 URL 让网关用**别人的** code 换凭证并落进
+    /// 本机账号库（等于把陌生人的登录态塞给用户）。因此：
+    ///   1. 任务必须存在（不存在 → 404「请重新发起」）；
+    ///   2. 回调里的 state 必须与任务里的逐字一致（`parse_callback_code`）；
+    ///   3. 任务必须还没结束（重复提交同一个回调 → 直接返回成功，不重复换码，
+    ///      因为授权码是一次性的：重复调用只会拿到 200035「已失效」的错误，
+    ///      把一次成功登录变成一次失败）。
+    ///
+    /// 返回成功时的账号 id（前端不用它，留给日志与将来可能的「登录后高亮新账号」）。
+    pub async fn submit_login_callback(
+        &self,
+        state: &str,
+        callback_url: &str,
+    ) -> Result<String, GatewayError> {
+        let state = state.trim();
+        if state.is_empty() {
+            return Err(GatewayError::with_status(400, "缺少 state，无法确认这次回调归属"));
+        }
+        let Some(handle) = self.tasks.get(state) else {
+            return Err(GatewayError::with_status(
+                404,
+                "登录任务不存在或已过期，请重新发起网页登录",
+            ));
+        };
+        let task = handle.snapshot();
+        if task.canceled {
+            return Err(GatewayError::with_status(400, "登录已取消，请重新发起"));
+        }
+        if task.done {
+            // 幂等：同一个回调被送来两次（深链 + 导航各触发一次）不是错误
+            return Ok(String::new());
+        }
+        // provider 由任务记着，不由调用方决定（见 LoginTaskState::provider）
+        let Some(kind) = kind_from_id(&task.provider) else {
+            return Err(GatewayError::with_status(
+                500,
+                format!("登录任务记录的提供商「{}」无法识别", task.provider),
+            ));
+        };
+        let code = match oauth::parse_callback_code(callback_url, state) {
+            Ok(code) => code,
+            Err(error) => {
+                // 校验失败也要落定任务：否则前端会一直等到 5 分钟超时
+                finish_task_error(&handle, &error.message);
+                logging::log("[Login]", &format!("❌ 网页登录回调校验失败: {}", error.message));
+                return Err(error);
+            }
+        };
+        match adapter_for(kind).exchange_login_code(&self.store, &code, state).await {
+            Ok(account_id) => {
+                let session = json!({
+                    "accountUid": account_id,
+                    "nickname": Value::Null,
+                    "edition": task.edition,
+                    "provider": task.provider,
+                });
+                handle.update(|task| {
+                    task.done = true;
+                    task.session = Some(session);
+                    task.finished_at = Some(logging::now_ms());
+                });
+                Ok(account_id)
+            }
+            Err(error) => {
+                finish_task_error(&handle, &error.message);
+                logging::log("[Login]", &format!("❌ 网页登录换取凭证失败: {}", error.message));
+                Err(error)
+            }
+        }
     }
 
     /// 后台起一个登录任务，并把「失败/完成」写回任务句柄。

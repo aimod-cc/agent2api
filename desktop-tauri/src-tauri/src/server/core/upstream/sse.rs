@@ -29,6 +29,14 @@
 //! （`handle_line` 里那一段）：只读一眼 JSON 的 `usage` 成员、写进
 //! `usage::RequestTelemetry`，完全不参与帧的构造 —— 帧内容与不接钩子时
 //! 逐字节一致（详见该处的注释）。
+//!
+//! ── model 名回写（Agent2API W3-T4）────────────────────────────
+//! 小浣熊上游会把响应 chunk 的 `model` 换成它自己的内部名，而客户端认的是自己
+//! 请求时给的名字（源实现 `raccoon-sse-pipe.mjs` 的 `rewriteSseLine`）。
+//! 「要不要改写」由**适配器**回答（`ProviderAdapter::sse_model_rewrite`），
+//! 本状态机只是唯一的下发出口，因此改写动作落在这里。
+//! **默认关闭**：`rewrite` 为 None 时，帧的字节与接入前完全一致
+//! （workbuddy 的透传逐字节不变是硬要求）。
 
 use std::sync::Arc;
 
@@ -44,6 +52,13 @@ pub const REASONING_COALESCE_CHARS: usize = 60;
 
 /// 一帧的输出：`Bytes` 已经是完整的 `data: ...\n\n` 字节串
 pub type Frame = Bytes;
+
+/// model 名回写的参数（见模块头；只有声明了 `sse_model_rewrite()` 的适配器才有）
+#[derive(Clone, Debug)]
+pub struct ModelRewrite {
+    /// 客户端请求的模型名（回写值）
+    pub requested: String,
+}
 
 /// 帧元数据（对应 Node 的 `meta = { id, model, created }`）
 #[derive(Default, Clone, Debug)]
@@ -70,6 +85,8 @@ pub struct ReasoningCoalescer {
     /// `data:` 帧都会经过 `handle_line`，顺手读一眼 `usage` 不需要再插一层
     /// 转发器，也就不会给透传路径增加任何中间结构。
     telemetry: Option<Arc<RequestTelemetry>>,
+    /// model 名回写参数（可选；见模块头）。None = 原样透传上游的 model 字段
+    rewrite: Option<ModelRewrite>,
 }
 
 impl Default for ReasoningCoalescer {
@@ -80,12 +97,25 @@ impl Default for ReasoningCoalescer {
 
 impl ReasoningCoalescer {
     pub fn new() -> Self {
-        Self { acc: String::new(), meta: FrameMeta::default(), tail: Vec::new(), telemetry: None }
+        Self {
+            acc: String::new(),
+            meta: FrameMeta::default(),
+            tail: Vec::new(),
+            telemetry: None,
+            rewrite: None,
+        }
     }
 
     /// 带 usage 旁路槽的合并器（流式转发用；`new()` 保留给无统计需求的调用点）
     pub fn with_telemetry(telemetry: Arc<RequestTelemetry>) -> Self {
         Self { telemetry: Some(telemetry), ..Self::new() }
+    }
+
+    /// 设置 model 名回写（转发链路按适配器的 `sse_model_rewrite()` 决定是否调用）。
+    /// 未被调用时行为与接入前逐字节一致。
+    pub fn with_model_rewrite(mut self, rewrite: Option<ModelRewrite>) -> Self {
+        self.rewrite = rewrite;
+        self
     }
 
     /// 吃一段上游字节，吐出要下发给客户端的帧（0..n 个）
@@ -208,12 +238,53 @@ impl ReasoningCoalescer {
             }
             return;
         }
-        // 非纯 reasoning 事件：先冲刷累积，再原样透传
+        // 非纯 reasoning 事件：先冲刷累积，再透传（可回写 model，见模块头）
         if !self.acc.is_empty() {
             out.push(self.coalesced_frame());
             self.acc.clear();
         }
-        out.push(plain_frame(line));
+        out.push(self.rewritten_frame(line, &chunk));
+    }
+
+    /// 透传一帧，必要时把 `model` 改写成客户端请求的名字。
+    ///
+    /// ── 为什么只改 model、不做别的 ─────────────────────────────
+    /// 回写是**客户端可见语义**的修正（客户端按自己给的名字识别响应），
+    /// 因此值得做；帧里的其它字段一律原样透传 —— 上游的异常/噪声字段
+    /// （空 tool_calls 数组之类）即便看起来像是 bug，也不该由网关擅自删除，
+    /// 那会让「代理看到的内容」与「上游发的」出现无从解释的差异。
+    /// 未配置回写（workbuddy）时返回**原行的字节**，透传逐字节不变。
+    ///
+    /// 序列化用 `serde_json::to_string`（紧凑、无空格），与源实现
+    /// `JSON.stringify(parsed)` 同形；失败时退回原行（宁可少一次改写，
+    /// 也不要下发一条拼坏的帧）。
+    fn rewritten_frame(&self, line: &str, chunk: &Value) -> Frame {
+        let Some(rewrite) = &self.rewrite else {
+            return plain_frame(line);
+        };
+        let Some(object) = chunk.as_object() else {
+            return plain_frame(line);
+        };
+        // 上游没带 model 时**不补**：源实现同样只在 `'model' in parsed` 时才改写
+        // （补一个客户端自己会填的字段没有意义，反而给「上游到底回了什么」加噪音）
+        if !object.contains_key("model") {
+            return plain_frame(line);
+        }
+        let current = object.get("model").and_then(Value::as_str).unwrap_or("");
+        if current == rewrite.requested {
+            return plain_frame(line);
+        }
+        let mut next = chunk.clone();
+        if let Some(map) = next.as_object_mut() {
+            map.insert(
+                "model".to_string(),
+                Value::String(rewrite.requested.clone()),
+            );
+        }
+        match serde_json::to_string(&next) {
+            Ok(text) => Bytes::from(format!("data: {text}\n\n")),
+            Err(_) => plain_frame(line),
+        }
     }
 
     /// 合并帧：`{id, object:'chat.completion.chunk', created, model, choices:[...]}`
@@ -239,6 +310,14 @@ impl ReasoningCoalescer {
             _ => Value::from(logging::now_ms() / 1000),
         };
         let model = match &self.meta.model {
+            // 配置了回写时，合并帧也用客户端请求的名字（源实现 takeFrame 就是
+            // 用 requestedModel 拼这一帧）；未配置回写时沿用上游最近一帧的值
+            _ if self.rewrite.is_some() => Value::String(
+                self.rewrite
+                    .as_ref()
+                    .map(|rewrite| rewrite.requested.clone())
+                    .unwrap_or_default(),
+            ),
             Some(value) if is_truthy(value) => value.clone(),
             _ => Value::String(String::new()),
         };

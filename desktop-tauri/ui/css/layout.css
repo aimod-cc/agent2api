@@ -374,11 +374,7 @@
 }
 
 /* 注意：这里不按页面覆盖 --content-max。内容区宽度是全站统一的版式基线，
-   任何页面（含账号页）都沿用 tokens.css 的默认限宽居中；
-   设置页「账号列表两侧留白」开关作用在账号卡片网格自身上，分两层：关闭（默认）
-   时保留与内容区同源的 --pad 两侧间距、轨道切 1fr 瓜分剩余宽度且下限降 300px（为四列），
-   列表占满面板宽度、卡片随宽；
-   见 page-accounts.css 中 .acct-grid 上的 :root[data-content='full'] 规则。 */
+   任何页面（含账号页）都沿用 tokens.css 的默认限宽居中。 */
 
 .page { display: none; }
 
@@ -484,10 +480,11 @@
 
 .page[data-page="accounts"] .account-table { flex: 1; min-height: 120px; }
 
-/* 日志页：与账号页同一套范式 —— 页面占满剩余高度，滚动只发生在日志列表内部。
-   720 行日志整页滚动时，筛选行和分页栏会跟着滚出视野，翻页要来回滚，
+/* 日志页 / 请求日志页：与账号页同一套范式 —— 页面占满剩余高度，滚动只发生在列表内部。
+   几百条日志整页滚动时，筛选行和分页栏会跟着滚出视野，翻页要来回滚，
    「第几页」也看不见，所以这里必须锁死外框、只让列表滚。 */
-.page.active[data-page="logs"] {
+.page.active[data-page="logs"],
+.page.active[data-page="requests"] {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -498,9 +495,11 @@
   padding-bottom: var(--pad);
 }
 
-.page[data-page="logs"] .page-head { flex: none; }
+.page[data-page="logs"] .page-head,
+.page[data-page="requests"] .page-head { flex: none; }
 
-.page[data-page="logs"] .panel {
+.page[data-page="logs"] .panel,
+.page[data-page="requests"] .panel {
   flex: 1;
   min-height: 0;
   display: flex;
@@ -510,6 +509,9 @@
 
 /* 页头 / 筛选行 / 分页栏都不参与伸缩，只有列表吃掉剩余高度 */
 .page[data-page="logs"] .panel-head,
-.page[data-page="logs"] .panel-foot { flex: none; }
+.page[data-page="logs"] .panel-foot,
+.page[data-page="requests"] .panel-head,
+.page[data-page="requests"] .panel-foot { flex: none; }
 
-.page[data-page="logs"] .panel-body { flex: 1; min-height: 0; }
+.page[data-page="logs"] .panel-body,
+.page[data-page="requests"] .panel-body { flex: 1; min-height: 0; }

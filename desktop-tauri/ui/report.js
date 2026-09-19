@@ -1,4 +1,4 @@
-/* WorkBuddy 本地代理 · 报表页（时间范围 / 统计概览 / 热力图 / 缓存命中率 / 两个趋势图） */
+/* Agent2API · 报表页（时间范围 / 统计概览 / Top 提供商 / 热力图 / 缓存命中率 / 两个趋势图） */
 /* global workbuddyDesktop, wbApp */
 
 /**
@@ -97,16 +97,15 @@
   }
 
   /**
-   * Token 数：一万以内给精确千分位，超过才缩写成 k / M。
-   * 理由是分布 —— 本工具多数日子只有几千 Token，精确值比「8.4k」好读；
-   * 而上万以后数字会开始撑破概览小格子，缩写换来的是版式稳定。
+   * Token 读数与纵轴刻度都交给 `units.js`：
+   * 中文量级（亿 / 万）与英文缩写（M / k）的差别、以及设置页那个开关的读写
+   * 全在那边一处，这里只管「用哪个函数画在哪」。
+   * 本模块另外十来处读数（概览、tooltip、柱顶标注）也都走它 —— 口径一致，
+   * 用户拨一下开关就是整页一起变。
    */
-  function formatTokens(value) {
-    const num = Number(value) || 0;
-    if (num < 10_000) return num.toLocaleString('zh-CN');
-    if (num < 1_000_000) return `${Number((num / 1000).toFixed(1))}k`;
-    return `${Number((num / 1_000_000).toFixed(2))}M`;
-  }
+  const units = window.wbUnits || {};
+  const formatTokens = value => (units.formatTokens ? units.formatTokens(value) : String(Number(value) || 0));
+  const axisText = (value, max) => (units.formatAxis ? units.formatAxis(value, max) : String(value));
 
   /** 命中率保留一位小数：整数百分比看不出 87.5% 与 87.9% 的差别 */
   function formatPercent(rate) {
@@ -116,25 +115,33 @@
   /** 坐标保留一位小数即可，串更短、指纹比对也更稳 */
   const round1 = value => Math.round(value * 10) / 10;
 
-  /** 纵轴上限抬到「好读」的档位（1/2/5 × 10^n）：刻度才不会出现 37213 这种数 */
-  function niceCeil(value) {
+  /**
+   * 每格步长取「好读」的档位（1 / 1.5 / 2 / 2.5 / 3 / 4 / 5 / 6 / 8 × 10^n）。
+   *
+   * ── 为什么不是先定上限再四等分 ───────────────────────────────
+   * 对峰值直接取 niceCeil（1/2/5×10^n）再四等分，刻度常落在「1.25亿」这类
+   * 值上（2.16亿的峰值 → 上限 5亿 → 每格 1.25亿）。刻度是拿来读的，遇到
+   * 1.25 亿还得在心里换算一遍才敢用。改成先定每格再乘 4 段：峰值 2.16亿
+   * 时每格 6000万、上限 2.4亿，五个刻度就是 0 / 6000万 / 1.2亿 / 1.8亿 / 2.4亿，
+   * 每一个都是能一眼读出来的数。
+   *
+   * 档位里带上 1.5 / 2.5 / 3 / 6 / 8 而不是只留 1/2/5：只留三档时，
+   * 峰值稍高于 2×10^n 就会跳到 5×10^n，柱子高度从 90% 掉到 40%，
+   * 白白浪费半张图。档位密一点，柱子始终撑得住画布。
+   */
+  const STEP_LADDER = [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+
+  function niceStep(value) {
     if (!(value > 0)) return 1;
     const pow = 10 ** Math.floor(Math.log10(value));
     const norm = value / pow;
-    const step = norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10;
+    const step = STEP_LADDER.find(item => item >= norm - 1e-9) ?? 10;
     return step * pow;
   }
 
-  /**
-   * 纵轴刻度文案：单位由**上限**一次性定下，整条轴才统一。
-   * 若按每个刻度的数值各自决定（3,437.5 / 13.8k 混排），
-   * 同一条轴上会同时出现千分位与 k，看着像两套坐标。
-   */
-  function axisText(value, max) {
-    if (max >= 1_000_000) return `${Number((value / 1_000_000).toFixed(2))}M`;
-    if (max >= 10_000) return `${Number((value / 1000).toFixed(1))}k`;
-    // 小量级下刻度多是整数；上限只有个位数时可能出现 .5，保留一位即可
-    return Number.isInteger(value) ? formatInt(value) : value.toFixed(1);
+  /** 纵轴上限 = 好读的每格步长 × 4 段（刻度线固定 5 条，见各图表的网格循环） */
+  function axisMax(peak) {
+    return niceStep(peak / 4) * 4;
   }
 
   /** 量容器宽度；页面还没显示时是 0，用一个兜底宽度先画出来，
@@ -188,15 +195,128 @@
       </div>`).join('');
   }
 
-  // ─── 板块二：热力图 ────────────────────────
+  // ─── 板块二：Top 提供商占比 ────────────────
+
+  /**
+   * 数据来自 summary.providers（`[{id,label,requests,success,tokens}]`，按请求数降序）。
+   *
+   * 整块的可见性由 providersHtml 的返回值决定：**契约里没有这个字段就整块隐藏**
+   * （旧后端 / 该维度还没接上），与「字段在但为空数组」不同 —— 后者是「这段时间
+   * 一条明细都没记 provider」（例如全部请求都没走到转发），此时给一句空态即可。
+   * 两者混在一起会让「版本落后」看起来像「今天没用量」。
+   *
+   * 展示上只取前 5 家（超过就并进「其它」）：这块是概览不是明细表，家数一多
+   * 每行的条就细到看不出差别；完整数据本来也能在模型请求里按 provider 列核对。
+   */
+  const PROVIDER_TOP = 5;
+
+  function providersHtml(list) {
+    const rows = (Array.isArray(list) ? list : [])
+      .map(item => ({
+        id: String(item?.id ?? '').trim(),
+        // label 缺省用 id 兜底；两者都空的那一组是后端的「未知」（请求未走到转发）
+        label: String(item?.label ?? '').trim(),
+        requests: Number(item?.requests) || 0,
+        success: Number(item?.success) || 0,
+        tokens: Number(item?.totalTokens ?? item?.tokens) || 0,
+      }))
+      .filter(item => item.requests > 0 || item.tokens > 0);
+
+    if (!rows.length) return placeholder('所选范围内还没有请求记录');
+
+    const total = rows.reduce((sum, item) => sum + item.requests, 0);
+    // 总量为 0（只有 token 没有请求，理论上不该出现）时不给百分比：0/0 没有意义
+    const share = count => (total ? (count / total) * 100 : 0);
+
+    // 按请求数排序后截断，溢出的合并成「其它」一行 —— 合并后的条仍然按真实
+    // 总量画，所以所有条加起来始终是 100%，不会因为截断而看起来缺一截
+    const sorted = [...rows].sort((left, right) => right.requests - left.requests);
+    const head = sorted.slice(0, PROVIDER_TOP);
+    const rest = sorted.slice(PROVIDER_TOP);
+    if (rest.length) {
+      head.push({
+        id: '',
+        label: `其它 ${rest.length} 家`,
+        requests: rest.reduce((sum, item) => sum + item.requests, 0),
+        success: rest.reduce((sum, item) => sum + item.success, 0),
+        tokens: rest.reduce((sum, item) => sum + item.tokens, 0),
+      });
+    }
+
+    const items = head.map(item => {
+      const percent = share(item.requests);
+      // 成功率只在有请求时给（0/0 没有意义），与概览里的口径一致
+      const rate = item.requests ? `${((item.success / item.requests) * 100).toFixed(1)}%` : '—';
+      const name = item.label || item.id || '未知';
+      // 条宽用百分比：容器宽度变化时条跟着伸缩，不必像 SVG 那样量宽度重绘
+      const tip = `${name}：${formatInt(item.requests)} 次请求 · 占 ${percent.toFixed(1)}%`
+        + ` · 成功率 ${rate} · ${formatTokens(item.tokens)} tokens`;
+      return `<div class="provider-share" data-tip="${esc(tip)}">
+          <span class="name" title="${esc(item.id ? `${name}（${item.id}）` : name)}">${esc(name)}</span>
+          <span class="track"><span class="bar" style="width:${percent.toFixed(1)}%"></span></span>
+          <span class="num">${formatInt(item.requests)}</span>
+          <span class="pct">${percent.toFixed(1)}%</span>
+        </div>`;
+    }).join('');
+
+    return items;
+  }
+
+  /**
+   * 写入 Top 提供商区块，并决定整块的显隐。
+   *
+   * `summary.providers` 缺失（`undefined`）→ 整块隐藏：这是「这份后端还没有这一维」，
+   * 不是「这一维没数据」。面板与页头的小标题一起藏，避免页面上留一个空卡片。
+   */
+  function paintProviders(list) {
+    const panel = $('report-providers-panel');
+    if (!panel) return;
+    const has = Array.isArray(list);
+    panel.hidden = !has;
+    if (!has) return;
+    paint('report-providers', providersHtml(list));
+    paint('report-providers-label', esc(`${formatInt(
+      list.reduce((sum, item) => sum + (Number(item?.requests) || 0), 0))} 次请求`));
+  }
+
+  // ─── 板块三：热力图 ────────────────────────
+
+  /**
+   * 热力图分档：0 / 1-2 / 3-5 / 6-10 / 10+ 五档。
+   *
+   * 用**固定阈值**而不是分位数：本工具的日请求量普遍是个位数，分位数会把
+   * 「那天只有 1 次请求」也涂成最深一档，颜色就不再表示「多少」，
+   * 只剩「相对排名」，反而看不出使用强度。
+   *
+   * 阈值只在这里定义一次：格子着色（levelOf）与图例上的说明文字都读它，
+   * 改一个数两处一起变 —— 否则会出现「图例写着 ≤5，实际 ≤7 才不变深」这种
+   * 谁也发现不了的漂移。
+   */
+  const HEAT_LEVELS = [0, 2, 5, 10, Infinity];
+
+  /** 每一档的说明文字（图例用） */
+  function heatLevelText(level) {
+    if (level === 0) return '0';
+    const lower = HEAT_LEVELS[level - 1];
+    const upper = HEAT_LEVELS[level];
+    if (!Number.isFinite(upper)) return `>${lower}`;
+    // 上一档的上限 +1 才是本档起点（档与档之间是闭区间，不能重叠）
+    return lower === 0 ? `≤${upper}` : `${lower + 1}–${upper}`;
+  }
 
   /**
    * GitHub 贡献图布局：53 列（周）× 7 行（星期）。
    * 首列用空格补齐到周一、末列不满也留空，与 GitHub 观感一致。
    *
-   * 分档（0 / 1-2 / 3-5 / 6-10 / 10+）用**固定阈值**而不是分位数：
-   * 本工具的日请求量普遍是个位数，分位数会把「那天只有 1 次请求」也涂成最深一档，
-   * 颜色就不再表示「多少」，只剩「相对排名」，反而看不出使用强度。
+   * ── 为什么要横向铺满容器 ─────────────────────────────────────
+   * 一年固定 53 列，格子边长若按「下限 7px、上限 13px」夹取，在常见窗口宽度
+   * （内容区 1000px 上下）里算出来会停在下限附近，整块图只占容器三分之二宽、
+   * 右边空一大截，看着像一个没对齐的残缺块。这里改成**按容器宽度反推格子边长**
+   * （夹取区间放宽到 7–26px）：算出来的边长让 53 列恰好填满可用宽度，
+   * 于是图形左右两边与面板边框对齐。
+   *
+   * 夹取区间仍然必要：窗口极窄时不能让格子小到看不清（此时交给 .heat-wrap
+   * 横向滚动），窗口极宽时也不能让格子大到一格占满屏幕（此时整块居中留白）。
    */
   function heatmapHtml(days) {
     const list = Array.isArray(days) ? days : [];
@@ -208,21 +328,27 @@
 
     const gap = 3;
     const labelW = 20;    // 左侧星期标签
-    const topH = 14;      // 顶部月份标签
-    // 格子边长随宽度自适应，但夹在 7–13px：再小看不清、再大就不像贡献图了
-    const size = Math.max(7, Math.min(13, Math.floor((widthOf($('report-heatmap')) - labelW - gap * (cols - 1)) / cols)));
+    // 顶部要给月份标签留位置；格子边长变大时标签也跟着长，所以这里按算出来的
+    // 边长放大留白（否则宽窗口下月份标签会贴到第一行格子上）
+    const boxWidth = widthOf($('report-heatmap'));
+    // 反推：53 列连同列间隙要刚好填满可用宽度（见函数头「为什么要横向铺满」）。
+    // 上限取 26px 而不是原来的 13px —— 13px 时 53 列只占住 700 多像素，
+    // 在常见窗口里永远填不满，那正是「偏左留白」的来源。26px 是「再大就不像
+    // 贡献图了」的观感上限，只有超宽窗口才会碰到它。
+    // 可用宽度可能为 0（页面还没显示），此时 widthOf 的兜底值会给出一个正常尺寸
+    const available = boxWidth - labelW;
+    const fit = Math.floor((available - gap * (cols - 1)) / cols);
+    const size = Math.max(7, Math.min(26, fit));
+    const topH = size + 3;
+    // 夹取后（窗口极宽 / 极窄）图形不再等于容器宽度，改为居中：两边留白对称，
+    // 不会像现在这样只往左边挤
     const step = size + gap;
+    const gridW = labelW + cols * step - gap;
+    const offsetX = Math.max(0, Math.round((boxWidth - gridW) / 2));
     const height = topH + 7 * step - gap + 2;
-    const svgW = labelW + cols * step - gap;
+    const svgW = Math.max(gridW, Math.round(boxWidth));
 
-    const levelOf = requests => {
-      const num = Number(requests) || 0;
-      if (num <= 0) return 0;
-      if (num <= 2) return 1;
-      if (num <= 5) return 2;
-      if (num <= 10) return 3;
-      return 4;
-    };
+    const levelOf = requests => HEAT_LEVELS.findIndex(limit => Number(requests) <= limit);
 
     let rects = '';
     for (let col = 0; col < cols; col += 1) {
@@ -236,14 +362,14 @@
         // 预置 tabindex="-1"：tooltip.js 只在元素**不**匹配 [tabindex] 时才补 tabIndex=0，
         // 这样 365 个格子不进 Tab 序列（否则键盘用户要按几百次 Tab 才能走到下一个控件），
         // 同时仍然享受 data-tip 的气泡。
-        rects += `<rect class="hm-cell l${levelOf(requests)}" x="${round1(labelW + col * step)}"`
+        rects += `<rect class="hm-cell l${levelOf(requests)}" x="${round1(offsetX + labelW + col * step)}"`
           + ` y="${round1(topH + row * step)}" width="${size}" height="${size}" rx="2"`
           + ` tabindex="-1" data-tip="${esc(tip)}"></rect>`;
       }
     }
 
     const weekday = WEEKDAY_ROWS.map(([row, text]) =>
-      `<text class="hm-axis" x="${labelW - 6}" y="${round1(topH + row * step + size / 2)}"`
+      `<text class="hm-axis" x="${offsetX + labelW - 6}" y="${round1(topH + row * step + size / 2)}"`
       + ` text-anchor="end" dominant-baseline="middle">${text}</text>`).join('');
 
     // 月份标签落在「该列最早一天所属月份」与上一列不同的那一列，
@@ -259,17 +385,24 @@
       lastMonth = month;
       if (col - lastLabelCol < 3) continue;
       lastLabelCol = col;
-      months += `<text class="hm-axis" x="${round1(labelW + col * step)}" y="10">${month + 1}月</text>`;
+      months += `<text class="hm-axis" x="${round1(offsetX + labelW + col * step)}" y="10">${month + 1}月</text>`;
     }
 
-    return `<svg class="report-svg" width="${round1(svgW)}" height="${height}"`
-      + ` viewBox="0 0 ${round1(svgW)} ${height}" role="img" aria-label="近 365 天活跃热力图">`
+    return `<svg class="report-svg" width="${svgW}" height="${height}"`
+      + ` viewBox="0 0 ${svgW} ${height}" role="img" aria-label="近 365 天活跃热力图">`
       + `${months}${weekday}${rects}</svg>`;
   }
 
-  /** 图例：五档色块，与格子共用 --hm-* 变量，色值只定义一处 */
+  /**
+   * 图例：五档色块 + 每档的请求数范围，与格子共用 --hm-* 变量与 HEAT_LEVELS
+   * 阈值，色值与档位都只定义一处。
+   *
+   * 档位说明是必要的：本工具多数日子的请求数落在 0–5 之间，只给一个渐变色阶
+   * 看不出「这几格的颜色差一档到底差多少请求」，而它是这张图的全部信息量。
+   */
   function heatLegendHtml() {
-    return [0, 1, 2, 3, 4].map(level => `<span class="l${level}"></span>`).join('');
+    return [0, 1, 2, 3, 4].map(level =>
+      `<span class="heat-legend-item"><span class="l${level}"></span>${esc(heatLevelText(level))}</span>`).join('');
   }
 
   // ─── 板块三：缓存命中率四窗口 ──────────────
@@ -296,41 +429,133 @@
 
   // ─── 板块四：近 24 小时命中率折线 ──────────
 
+  /**
+   * 双轴折线：命中率（左轴，蓝）与总 Token（右轴，琥珀）。
+   *
+   * ── 为什么两条线画在一张图里 ─────────────────────────────────
+   * 命中率与用量是本工具最需要对照着看的一对：用量突然拔高时命中率有没有塌，
+   * 是判断「钱花得冤不冤」最直接的一眼。分两张图就得来回扫两遍横轴。
+   * 两者的量纲差着好几个数量级（0–100% vs 上亿 Token），所以各自一条纵轴 ——
+   * 共用一条轴时要么 Token 线压平在底部、要么命中率线贴着顶边。
+   *
+   * ── 读数为什么直接写在点上 ───────────────────────────────────
+   * 悬停气泡只能读一个点，而这张图的常态用法是「扫一眼看出哪几个小时爆了量」。
+   * 命中率与 Token 各用自己那条线的颜色标在点的上下两侧；无请求的整点
+   * （补零出来的 0%）不标注，否则会连成一排毫无信息量的「0%」。
+   *
+   * 标注会互相避让：放不下就整条跳过（宁可少标一个，也不让两串数字叠成一团）。
+   * 跳过的点仍能用悬停气泡读到完整数值，所以信息没有损失。
+   */
   function cacheTrendHtml(series) {
     const list = Array.isArray(series) ? series : [];
     if (!list.length) return placeholder('暂无缓存趋势数据');
 
     const width = widthOf($('report-cache-trend'));
-    const height = 190;
-    const pad = { left: 44, right: 14, top: 12, bottom: 24 };
+    // 比单轴版高一档：点的上方要放 Token 标注、下方要放命中率标注
+    const height = 230;
+    const pad = { left: 44, right: 56, top: 26, bottom: 24 };
     const plotW = Math.max(40, width - pad.left - pad.right);
     const plotH = height - pad.top - pad.bottom;
 
     const rates = list.map(item => Number(item.rate) || 0);
-    // 纵轴上限按真实峰值抬：上游把缓存读取与输入分开上报时命中率会合法地超过 100%，
-    // 夹到 100% 等于谎报数据，抬上限只是让曲线留在画布里
-    const yMax = Math.max(1, niceCeil(Math.max(...rates)));
-    const xAt = index => pad.left + (list.length > 1 ? (plotW * index) / (list.length - 1) : plotW / 2);
-    const yAt = rate => pad.top + plotH - (plotH * rate) / yMax;
-    const pointAt = index => `${round1(xAt(index))},${round1(yAt(rates[index]))}`;
+    const tokens = list.map(item => Number(item.totalTokens) || 0);
+    // 命中率的纵轴上限按真实峰值抬：上游把缓存读取与输入分开上报时命中率会
+    // 合法地超过 100%，夹到 100% 等于谎报数据，抬上限只是让曲线留在画布里。
+    // 下限仍是 1（=100%）：峰值不高时也给它一条完整的百分比轴，
+    // 否则「今天命中率普遍 60%」会被画成顶满，看着像 100%
+    const rateMax = Math.max(1, axisMax(Math.max(...rates)));
+    // 用量轴同样按峰值定上限；整段区间一条用量都没记（老后端没给 totalTokens、
+    // 或这些请求全失败被清零）时不画这条线也不画右侧刻度 —— 画一条贴地的直线
+    // 会让人以为「用量就是 0」，而事实是「这份数据里没有」
+    const tokenPeak = Math.max(...tokens);
+    const tokenMax = axisMax(tokenPeak);
+    const hasTokens = tokenPeak > 0;
 
-    // 网格线同时当刻度用：等分 4 段，标签按是否整百分比决定小数位
+    const xAt = index => pad.left + (list.length > 1 ? (plotW * index) / (list.length - 1) : plotW / 2);
+    const yRate = rate => pad.top + plotH - (plotH * rate) / rateMax;
+    const yTokens = value => pad.top + plotH - (plotH * value) / tokenMax;
+
+    // ── 网格与两侧刻度 ──
+    // 网格线跟着命中率的 5 等分走（左轴是主读数），右侧用量刻度贴在同一批
+    // 横线上：两条轴都被等分 4 段，所以同一根线在两边各有各的读数
     let grid = '';
     for (let i = 0; i <= 4; i += 1) {
-      const value = (yMax * i) / 4;
-      const y = round1(yAt(value));
+      const value = (rateMax * i) / 4;
+      const y = round1(yRate(value));
       const pct = value * 100;
       grid += `<line class="chart-grid" x1="${pad.left}" y1="${y}" x2="${round1(pad.left + plotW)}" y2="${y}"></line>`
         + `<text class="chart-axis" x="${pad.left - 8}" y="${y}" text-anchor="end" dominant-baseline="middle">`
         + `${Number.isInteger(pct) ? pct : pct.toFixed(1)}%</text>`;
+      if (hasTokens) {
+        grid += `<text class="chart-axis" x="${round1(pad.left + plotW + 8)}" y="${y}"`
+          + ` text-anchor="start" dominant-baseline="middle">`
+          + `${esc(axisText((tokenMax * i) / 4, tokenMax))}</text>`;
+      }
     }
 
+    // ── 折线 ──
     // 点也要画，而且单点时要画得更醒目：polyline 只有一个点时连不出线段
     // （SVG 折线至少要两个点才有笔画），此时「整张图」就剩这一个圆点，
     // 半径还按常态的 2.5 会小到像渲染失败。
+    // 线色由 cls 对应的 CSS 规则决定（.chart-line.rate / .tokens 与
+    // .chart-dot.rate / .tokens），两条线的颜色因此只在 CSS 里各定义一次。
     const dotR = list.length === 1 ? 4.5 : 2.5;
-    const dots = list.map((_, index) =>
-      `<circle class="chart-dot" cx="${round1(xAt(index))}" cy="${round1(yAt(rates[index]))}" r="${dotR}"></circle>`).join('');
+    const lineOf = (values, yOf, cls) =>
+      `<polyline class="chart-line ${cls}" points="${values.map((value, index) => `${round1(xAt(index))},${round1(yOf(value))}`).join(' ')}"></polyline>`
+      + values.map((value, index) =>
+        `<circle class="chart-dot ${cls}" cx="${round1(xAt(index))}" cy="${round1(yOf(value))}" r="${dotR}"></circle>`).join('');
+
+    // ── 点上的读数标注 ──
+    // 宽度按字宽粗估（中日韩字符占满格、数字与 % 只有半格）：这是给避让用的
+    // 近似值，不必精确 —— 差几像素只会让一两处标注多留一点余量。
+    const textW = text => [...text].reduce((sum, ch) => sum + (/[\u2e80-\u9fff]/.test(ch) ? 9.7 : 5.4), 0);
+    const boxes = [];
+    const label = (x, y, text, cls, anchor = 'middle') => {
+      const w = textW(text);
+      const left = anchor === 'middle' ? x - w / 2 : anchor === 'end' ? x - w : x;
+      const box = { left, right: left + w, top: y - 8.5, bottom: y + 2.5 };
+      // 留 2px 横向、1px 纵向的呼吸：贴着不重叠也算「挤在一起」，一样难认
+      if (boxes.some(item => box.left < item.right + 2 && box.right > item.left - 2
+        && box.top < item.bottom + 1 && box.bottom > item.top - 1)) return '';
+      boxes.push(box);
+      return `<text class="chart-label ${cls}" x="${round1(x)}" y="${round1(y)}" text-anchor="${anchor}">${esc(text)}</text>`;
+    };
+
+    /** 首尾两点的标注贴到画布边缘就会被裁掉一半，这里按「会不会越界」改对齐方式：
+     *  居中的串若往左探出绘图区，就改成左对齐；往右探出就改成右对齐。
+     *  中间的点永远居中（居中最好读，右边那条轴线也不必跟着它移动）。 */
+    const anchorFor = (x, text) => {
+      const half = textW(text) / 2;
+      if (x - half < pad.left - 6) return 'start';
+      if (x + half > pad.left + plotW + 6) return 'end';
+      return 'middle';
+    };
+
+    // 先标用量（字宽、更易被挤掉），再标命中率（短、多半放得下）——
+    // 顺序反过来的话，长串数字会因为先被短标签占位而大面积消失
+    let tokenLabels = '';
+    if (hasTokens) {
+      list.forEach((item, index) => {
+        if (!(Number(item.totalTokens) > 0)) return;
+        // 点的上方；顶到画布边时翻到点下方（最高那个点的标注只能这么安放）
+        const y = yTokens(tokens[index]);
+        const above = y - 12 >= pad.top - 10;
+        const text = formatTokens(tokens[index]);
+        tokenLabels += label(xAt(index), above ? y - 12 : y + 13, text, 'tokens', anchorFor(xAt(index), text));
+      });
+    }
+
+    let rateLabels = '';
+    list.forEach((item, index) => {
+      // 无请求的整点不标：它是补零出来的 0%，标出来只会连成一排 0%
+      const used = (Number(item.inputTokens) || 0) + (Number(item.hitTokens) || 0) > 0;
+      if (!used) return;
+      const y = yRate(rates[index]);
+      // 点的下方；贴到横轴时翻到点上方，避免和刻度文字叠在一起
+      const below = y + 15 <= pad.top + plotH + 8;
+      const text = formatPercent(rates[index]);
+      rateLabels += label(xAt(index), below ? y + 13 : y - 7, text, 'rate', anchorFor(xAt(index), text));
+    });
 
     // 热区按「整点带宽」铺满，鼠标落在两个点之间也能读到最近的那个点的数值。
     // 左右两端各会超出半个带宽，这里夹回绘图区：越界的那半截会盖住 Y 轴标签，
@@ -344,7 +569,8 @@
     const hits = list.map((item, index) => {
       const tip = `${dayLabel(String(item.hour).slice(0, 10))} ${hourText(item.hour)}`
         + ` · 命中率 ${formatPercent(item.rate)}`
-        + ` · 命中 ${formatTokens(item.hitTokens)} / 输入 ${formatTokens(item.inputTokens)}`;
+        + ` · 总 ${formatTokens(item.totalTokens)} tokens`
+        + `（命中 ${formatTokens(item.hitTokens)} / 输入 ${formatTokens(item.inputTokens)}）`;
       const left = Math.max(plotLeft, xAt(index) - band / 2);
       const right = Math.min(plotRight, xAt(index) + band / 2);
       return tips
@@ -363,27 +589,37 @@
     }
 
     return `<svg class="report-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"`
-      + ` role="img" aria-label="近 24 小时缓存命中率趋势">${grid}`
-      + `<polyline class="chart-line" points="${list.map((_, index) => pointAt(index)).join(' ')}"></polyline>`
-      + `${dots}${ticks}</svg>${hits ? `<svg class="report-svg chart-hit-layer" width="${width}" height="${height}"`
-      + ` viewBox="0 0 ${width} ${height}" aria-hidden="true">${hits}</svg>` : ''}`;
+      + ` role="img" aria-label="近 24 小时缓存命中率与总 Token 趋势">${grid}`
+      + (hasTokens ? lineOf(tokens, yTokens, 'tokens') : '')
+      + lineOf(rates, yRate, 'rate')
+      + `${tokenLabels}${rateLabels}${ticks}</svg>`
+      + (hits ? `<svg class="report-svg chart-hit-layer" width="${width}" height="${height}"`
+        + ` viewBox="0 0 ${width} ${height}" aria-hidden="true">${hits}</svg>` : '');
   }
 
   // ─── 板块五：按天 Token 柱状图 ─────────────
 
+  /**
+   * 按天 Token 柱状图。柱顶直接标出当天的用量。
+   *
+   * 标注的取舍与折线图一致（见 cacheTrendHtml 的说明）：给的是「扫一眼看量级」
+   * 的读数，所以不必每根柱子都标 —— 柱子密到标注必然重叠时，只标当区间里
+   * 最大的那几根，其余靠悬停气泡读。这样图始终是干净的，而峰值一眼可见。
+   */
   function dailyTrendHtml(series) {
     const list = Array.isArray(series) ? series : [];
     if (!list.length) return placeholder('暂无趋势数据');
 
     const width = widthOf($('report-daily-trend'));
-    const height = 210;
-    const pad = { left: 50, right: 14, top: 12, bottom: 26 };
+    // 比不带标注的版本高一档：柱顶要留出写读数的位置（见 pad.top）
+    const height = 240;
+    const pad = { left: 50, right: 14, top: 26, bottom: 26 };
     const plotW = Math.max(40, width - pad.left - pad.right);
     const plotH = height - pad.top - pad.bottom;
 
     const values = list.map(item => Number(item.tokens) || 0);
     const peak = Math.max(...values);
-    const yMax = niceCeil(peak);
+    const yMax = axisMax(peak);
     const step = plotW / list.length;
     // 极长区间（手改保留期才会出现）下柱子只剩一两像素：此时不再压窄，保证看得见
     const barW = Math.max(1, Math.min(28, step * 0.68));
@@ -400,10 +636,10 @@
       for (let i = 0; i <= 4; i += 1) {
         const value = (yMax * i) / 4;
         const y = round1(yAt(value));
-        // 刻度文案按上限统一单位（见 axisText 的取舍说明）
+        // 刻度文案交给 units.js（中文档按各刻度自己的量级，英文档按整条轴统一）
         grid += `<line class="chart-grid" x1="${pad.left}" y1="${y}" x2="${round1(pad.left + plotW)}" y2="${y}"></line>`
           + `<text class="chart-axis" x="${pad.left - 8}" y="${y}" text-anchor="end" dominant-baseline="middle">`
-          + `${axisText(value, yMax)}</text>`;
+          + `${esc(axisText(value, yMax))}</text>`;
       }
     }
 
@@ -419,6 +655,38 @@
         ? `<rect class="bar" ${attrs}></rect>`
         : `<rect class="bar" ${attrs}><title>${esc(tip)}</title></rect>`;
     }).join('');
+
+    // 柱顶读数：每根柱子都要放得下才逐一标注（区间一长、柱子一密就必然重叠）。
+    // 放不下时退成「只标最大的那几根」—— 峰值是最该一眼看到的那个数
+    // （哪天的用量最高、比次高的高出多少），而每一根的具体值仍能从气泡读到。
+    const labelWidth = text => [...text].reduce(
+      (sum, ch) => sum + (/[\u2e80-\u9fff]/.test(ch) ? 9.7 : 5.4), 0);
+    const texts = list.map(item => (Number(item.tokens) > 0 ? formatTokens(item.tokens) : ''));
+    const widest = Math.max(0, ...texts.map(labelWidth));
+    const allFit = texts.every(text => !text) || widest + 4 <= step;   // +4：相邻标注之间留一点缝
+
+    // 退让模式下取用量最高的前几名；并列多少就取多少（上限只是防极端区间
+    // 标出一大串，正常区间里这个数远不到）
+    const marked = new Set();
+    if (!allFit) {
+      const ranked = list
+        .map((item, index) => ({ index, value: Number(item.tokens) || 0 }))
+        .filter(item => item.value > 0)
+        .sort((left, right) => right.value - left.value)
+        .slice(0, 8);
+      ranked.forEach(item => marked.add(item.index));
+    }
+
+    let barLabels = '';
+    list.forEach((item, index) => {
+      if (!texts[index]) return;
+      if (!allFit && !marked.has(index)) return;
+      const y = yAt(Number(item.tokens) || 0) - 6;
+      // 顶到画布边（柱子接近 100%）时翻到柱子内侧，免得文字被裁掉
+      const inside = y - 9 < pad.top - 10;
+      barLabels += `<text class="chart-label tokens" x="${round1(pad.left + step * index + step / 2)}"`
+        + ` y="${round1(inside ? y + 13 : y)}" text-anchor="middle">${esc(texts[index])}</text>`;
+    });
 
     // 热区整列铺满（含零值日），鼠标扫过任何一列都能读到当天读数
     const hits = tips ? list.map((item, index) => {
@@ -450,14 +718,14 @@
       : '';
 
     return `<svg class="report-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"`
-      + ` role="img" aria-label="按天 Token 趋势">${grid}${bars}${ticks}${empty}</svg>`
+      + ` role="img" aria-label="按天 Token 趋势">${grid}${bars}${barLabels}${ticks}${empty}</svg>`
       + (hits ? `<svg class="report-svg chart-hit-layer" width="${width}" height="${height}"`
         + ` viewBox="0 0 ${width} ${height}" aria-hidden="true">${hits}</svg>` : '');
   }
 
   // ─── 统一渲染 ──────────────────────────────
 
-  /** 五块一起画。宽度变化不必额外传参：三张图的 HTML 里已经写了按宽度算出的
+  /** 各板块一起画。宽度变化不必额外传参：三张图的 HTML 里已经写了按宽度算出的
    *  坐标，宽度真变了 HTML 自然不同，paint 的指纹比对就会重绘；
    *  宽度只是被拖动改了一点点、算出来的整数尺寸没变时，它自然什么也不做。 */
   function renderAll() {
@@ -466,6 +734,8 @@
     const rangeKey = RANGES.includes(summary.range) ? summary.range : range;
 
     paint('report-overview', overviewHtml(summary.overview, rangeKey, trend.length));
+    // Top 提供商：整块的显隐由 paintProviders 自己判断（字段缺失就藏起来）
+    paintProviders(summary.providers);
     paint('report-heatmap', heatmapHtml(summary.heatmap));
     paint('report-cache-rates', cacheRatesHtml(summary.cacheRates));
     paint('report-cache-trend', cacheTrendHtml(summary.cacheTrend24h));
@@ -475,19 +745,30 @@
   }
 
   /**
-   * 加载失败：五个板块各自显示错误态，而不是整页崩掉。
+   * 加载失败：各板块各自显示错误态，而不是整页崩掉。
    * 每块都写、而不是只弹一个 toast —— 用户需要知道的是「这些数字现在不可信」。
+   * Top 提供商不在此列：它本来就要按「有没有这一维数据」决定显隐，
+   * 整页读取失败时留着上一轮的条反而会让人以为它还是可信的，所以一并藏起来。
    */
   function renderFailure(message) {
     const html = placeholder(`读取报表失败：${message}`, 'empty report-error');
     ['report-overview', 'report-heatmap', 'report-cache-rates', 'report-cache-trend', 'report-daily-trend']
       .forEach(id => paint(id, html));
+    const panel = $('report-providers-panel');
+    if (panel) panel.hidden = true;
   }
 
   function render(data) {
     if (data !== undefined) summary = data || null;
     renderAll();
   }
+
+  /**
+   * 单位口径变了就原地重绘：手里那份 summary 不用重取（数值一个都没变，
+   * 变的只是「怎么写成字」），所以拨一下开关是瞬时的 —— 不必重新拉一次报表，
+   * 也不会因为重取期间的延迟让人以为开关没生效。
+   */
+  window.addEventListener('wb-units-changed', renderAll);
 
   /** silent：只压掉控制台噪音（首屏自持加载用），错误态照常显示 */
   async function load({ silent = false } = {}) {

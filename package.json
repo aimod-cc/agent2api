@@ -1,7 +1,7 @@
 {
-  "name": "workbuddy-local-proxy",
-  "version": "1.2.0",
-  "description": "WorkBuddy Local Proxy - OpenAI-compatible API via 腾讯 WorkBuddy 登录态，附带积分/签到与桌面端账号管理",
+  "name": "agent2api",
+  "version": "2.0.0",
+  "description": "Agent2API - 多提供商本地网关：把 WorkBuddy / 小浣熊 / CatPaw / AutoClaw 等客户端登录态包装成 OpenAI 兼容接口，附带账号管理、内容脱敏与请求报表",
   "type": "module",
   "private": true,
   "scripts": {
@@ -11,20 +11,23 @@
     "tauri:build": "npm --prefix desktop-tauri run build"
   },
   "keywords": [
+    "agent2api",
     "workbuddy",
+    "raccoon",
+    "catpaw",
+    "autoclaw",
     "codebuddy",
     "tencent",
     "api",
     "proxy",
     "openai",
     "sse",
-    "llm",
-    "checkin"
+    "llm"
   ],
   "author": "aimod-cc",
   "repository": {
     "type": "git",
-    "url": "https://github.com/aimod-cc/workbuddy-proxy.git"
+    "url": "https://github.com/aimod-cc/agent2api.git"
   },
   "license": "SEE LICENSE IN LICENSE",
   "engines": {

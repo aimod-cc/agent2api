@@ -1,4 +1,4 @@
-//! GET/POST /api/config —— 网关配置（API Key 与语言）。
+//! GET/POST/PUT /api/config —— 网关配置（API Key、语言）。
 //!
 //! 逐条对齐 Node 版 server.mjs 913-954 行：
 //!
@@ -7,14 +7,18 @@
 //!     desensitize:{enabled,termCount,roles}}`
 //!   掩码格式沿用 Node 版第 920 行：`前6字符...后4字符`。
 //!
-//! POST 接受 `{apiKey?, locale?}`：
+//! POST / PUT 接受 `{apiKey?, locale?}`（两者行为完全一致，PUT 是别名，
+//! 见 `http::router` 的登记处）；
 //!   - apiKey 非字符串、或长度 < 8 → 400 `{"success":false,"error":"API Key 至少需要 8 个字符"}`
 //!   - apiKey 为 null → 删除 key
 //!   - locale 非空字符串 → 更新语言
-//!   - 写盘后返回 `{success:true,data:{apiKeySet,locale}}`
+//!   - 写盘后返回 `{success:true,data:{apiKeySet,locale,defaultModel}}`
+//!
+//! 曾经的 `providerRoute`（provider 路由优先级）已随「账号全局一条队列」下线：
+//! 先用哪一家由账号优先级决定，配置里不再有这一项（文件里残留的键原样保留、忽略）。
 //!
 //! 「运行中立即生效」：Node 版改的是内存里的 opts 对象；这里改的是
-//! `server::config` 的 RwLock 快照，鉴权中间件每个请求读它 —— 不用重启。
+//! `server::config` 的 RwLock 快照，鉴权中间件每请求读它 —— 不用重启。
 //!
 //! `desensitize` 子对象是**精简摘要**（`{enabled, termCount, roles}`，对照
 //! server.mjs 924 行）—— 完整词表与命中统计在 GET /api/desensitize。
@@ -48,10 +52,10 @@ pub async fn get_config(State(state): State<ServerState>) -> Response {
     }))
 }
 
-/// POST /api/config
+/// POST /api/config（`PUT /api/config` 走同一处理函数，见模块头说明）
 ///
 /// 校验顺序与 Node 版一致：先校验 apiKey（非法直接 400，locale 的改动也不落盘），
-/// 再处理 locale，最后返回当前值。
+/// 再处理 locale。
 pub async fn post_config(State(_state): State<ServerState>, body: Bytes) -> Response {
     // 空 body 视为 {}（Node 版 `|| '{}'`）；非法 JSON 给 400 而不是让它冒成 500
     let payload = match parse_body(&body) {
@@ -95,5 +99,7 @@ pub async fn post_config(State(_state): State<ServerState>, body: Bytes) -> Resp
     ok_json(json!({
         "apiKeySet": snapshot.api_key_set(),
         "locale": snapshot.locale(),
+        "defaultModel": snapshot.default_model(),
     }))
 }
+

@@ -1,4 +1,4 @@
-/* WorkBuddy 本地代理 · 下拉控件增强（原生 select → 触发器 + 浮层） */
+/* Agent2API · 下拉控件增强（原生 select → 触发器 + 浮层） */
 
 /**
  * 把页面上的原生 <select> 就地增强成「触发器 + 浮层选项列表」的现代下拉。
@@ -39,8 +39,20 @@
   /** 浮层 id 生成器：给 role="listbox" 一个唯一 id，供触发器的 aria-controls 指向 */
   const uid = () => `wbsel-${++seq}`;
 
-  /** 取 select 的当前显示文本：优先 selectedOptions，保证和原生观感一字不差 */
+  /**
+   * 取 select 的当前显示文本：优先 selectedOptions，保证和原生观感一字不差。
+   *
+   * 多选（`<select multiple>`）没有「当前项」这个概念，把已勾选项的文案用顿号连起来；
+   * 一个都没勾时退回 `data-placeholder`（设置页的「作用提供商」用它说明空选的含义）。
+   * 不直接写「未选择」这种硬编码文案：占位语是要与业务语义对齐的，交给页面声明。
+   */
   function selectedText(select) {
+    if (select.multiple) {
+      const labels = [...select.selectedOptions]
+        .map(option => option.textContent.trim())
+        .filter(Boolean);
+      return labels.length ? labels.join('、') : (select.dataset.placeholder || '');
+    }
     const option = select.selectedOptions?.[0] || select.options[select.selectedIndex];
     if (!option) return '';
     return option.textContent.trim();
@@ -49,6 +61,12 @@
   /** 取 select 的当前选中值（无选中项时按原生语义回落到空串） */
   function selectedValue(select) {
     return select.value ?? '';
+  }
+
+  /** 当前已勾选的 value 集合：单选回落到「只有一个成员的集合」，两处判定共用一份逻辑 */
+  function selectedSet(select) {
+    if (!select.multiple) return new Set([selectedValue(select)]);
+    return new Set([...select.selectedOptions].map(option => option.value ?? ''));
   }
 
   /**
@@ -119,8 +137,12 @@
 
   function enhance(select) {
     if (registry.has(select)) return;
-    // 只处理标准下拉；size>1 的列表选择框（列表框）不适用这套外壳
-    if (select.multiple || Number(select.size) > 1) return;
+    // `size>1` 的列表选择框（列表框）不适用这套「触发器 + 浮层」外壳，直接跳过；
+    // 多选（`multiple`）走另一条路 —— 浮层形态一样，但点选项是切换勾选（见 toggle）。
+    // 判定顺序有讲究：`<select multiple>` 不写 size 时，size **属性**的默认值是 4，
+    // 而 DOM 的 `size` 访问器出于兼容返回 0（MDN 明确记了这条差异），
+    // 所以必须先判 multiple，否则一个显式写了 `size="4"` 的多选会被 size 这条误伤。
+    if (!select.multiple && Number(select.size) > 1) return;
     // 已经被别处包过壳的跳过，避免嵌套
     if (select.parentElement?.classList.contains('select-shell')) return;
 
@@ -172,10 +194,17 @@
 
     const ctx = {
       select, shell, trigger, valueEl, popover,
+      // multiple 的判定在增强时就固定下来（DOM 属性不会中途改），后面各分支都读它，
+      // 不必反复查 select.multiple
+      multi: select.multiple === true,
       highlight: -1, optionEls: [], sig: '',
       pendingSync: false, writing: false,
     };
     registry.set(select, ctx);
+    if (ctx.multi) {
+      shell.classList.add('select-shell-multi');
+      popover.setAttribute('aria-multiselectable', 'true');
+    }
 
     bindTrigger(ctx);
     bindKeyboard(ctx);
@@ -263,10 +292,10 @@
     // 浮层要跟着收起来，否则会留一个点不动的浮层挂在屏幕上
     if (select.disabled && openInstance === ctx) close(ctx);
 
-    const selected = selectedValue(select);
+    const selected = selectedSet(select);
     let selectedIndex = -1;
     ctx.optionEls.forEach((el, index) => {
-      const match = el.dataset.value === selected;
+      const match = selected.has(el.dataset.value ?? '');
       el.classList.toggle('is-selected', match);
       el.setAttribute('aria-selected', match ? 'true' : 'false');
       const check = el.querySelector('.select-option-check');
@@ -292,11 +321,17 @@
   /**
    * 当前内容指纹：值 + 禁用态 + 每个 option 的 value/文本/禁用态。
    * 用来判断界面上显示的东西是否还是最新的 —— 见 refreshIfStale。
+   *
+   * 多选下 `select.value` 只是**第一个**选中项的 value，改别的项时它可能一动不动，
+   * 所以这里改把每个 option 的 selected 也编进指纹：业务代码写
+   * `option.selected = true`（多选回填的常见写法，不动 value 属性节点）时，
+   * 打开浮层前的那一次指纹比对才能发现界面是旧的。
    */
   function signature(select) {
     let sig = `${select.value}\u0001${select.disabled ? 1 : 0}\u0001${select.options.length}`;
     for (const option of select.options) {
-      sig += `\u0001${option.value}\u0002${option.textContent}\u0002${option.disabled ? 1 : 0}`;
+      sig += `\u0001${option.value}\u0002${option.textContent}\u0002${option.disabled ? 1 : 0}`
+        + `\u0002${option.selected ? 1 : 0}`;
     }
     return sig;
   }
@@ -511,7 +546,10 @@
     scrollHighlightIntoView(ctx.popover, ctx.optionEls[index]);
   }
 
-  /** 确认高亮项：写值 + 派发 change，剩下的交给业务监听 */
+  /**
+   * 确认高亮项：单选写值 + 关浮层 + 派发 change；多选只切换勾选、不关浮层
+   * （见 pick 的说明），剩下的交给业务监听。
+   */
   function confirm(ctx) {
     const el = ctx.optionEls[ctx.highlight];
     if (!el || el.classList.contains('is-disabled')) {
@@ -521,7 +559,39 @@
     pick(ctx, el);
   }
 
+  /**
+   * 多选：切换某一项的勾选态（不关浮层、不改别的项）。
+   *
+   * 与单选「点一下就定」不同，多选的浮层必须留着 —— 用户要连着勾好几家，
+   * 点一下就关等于每选一项都要重新打开一次。也因此**不**在这里 close(ctx)。
+   *
+   * 写值走原生 option.selected：`select.value = x` 在多选下的语义是「只留这一项」，
+   * 会静默清掉其它勾选，正是这里要避免的。
+   *
+   * 这里显式调一次 syncState（而不是等那个 MutationObserver）：改 option.selected
+   * 确实会让 observer 收到通知，但它的回调是**微任务**，而紧随其后的
+   * dispatchEvent 是同步的 —— 业务监听读到的会是没同步过的界面。
+   */
+  function toggle(ctx, el) {
+    const { select } = ctx;
+    const option = [...select.options].find(item => (item.value ?? '') === (el.dataset.value ?? ''));
+    if (!option || option.disabled) return;
+
+    ctx.writing = true;
+    try {
+      option.selected = !option.selected;
+    } finally {
+      ctx.writing = false;
+    }
+    syncState(ctx);
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
   function pick(ctx, el) {
+    if (ctx.multi) {
+      toggle(ctx, el);
+      return;
+    }
     const value = el.dataset.value ?? '';
     const { select } = ctx;
     // 先关浮层再改值：业务监听里通常会整块重绘（列表 / 表格），
@@ -619,11 +689,26 @@
     });
     observer.observe(document.body, { childList: true, subtree: true });
 
-    // 对外只暴露增强入口与状态查询，方便排查；业务不需要（也不应该）手动调用
+    // 对外只暴露排查 / 兜底入口，业务不需要（也不应该）手动调用
     window.wbSelect = {
       enhance: select => { scan(select); return select; },
       enhanced: select => registry.has(select),
       close: () => { if (openInstance) close(openInstance); },
+      /**
+       * 立即把界面同步到 select 的当前状态。
+       *
+       * 给「直接改 option.selected / 重建 option 而不经过 value 赋值器」的业务用 ——
+       * 多选的回填就是这种写法（`select.value = x` 在多选下只会留下 x 一项）。
+       * 两个 MutationObserver 其实都会收到通知，但它们的回调跑在微任务里，
+       * 同一轮同步代码里接着读界面还是旧的；这里同步跑一次补上这个空档。
+       */
+      sync: select => {
+        const ctx = registry.get(select);
+        if (!ctx) return false;
+        renderOptions(ctx);
+        syncState(ctx);
+        return true;
+      },
     };
   }
 

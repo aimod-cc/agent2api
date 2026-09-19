@@ -310,6 +310,77 @@
   .retention-row { grid-template-columns: max-content 1fr; }
 }
 
+/* ─── 转发路由（provider 路由优先级） ───
+   与 .retention-list 同一套版式（容器内嵌凹槽底 + 每行「标签定宽 + 输入紧随」+
+   说明另起一行），两处都是「一列同类数字框」，观感一致才好一起读。
+   标签列宽取 150px 而不是保留期那边的 118px：这里的标签是提供商名 + 账号数 +
+   「先试」标记，中文名最长到「CatPaw」这一档仍能一行放下，再长就折行，
+   不会叠到输入框上（与那边同样的取舍）。 */
+.route-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+}
+
+.route-row {
+  display: grid;
+  grid-template-columns: 150px auto;
+  align-items: center;
+  gap: 5px 10px;
+}
+
+.route-row > label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+/* 账号数：跟在提供商名后面的一句小字，比标签淡一档，不和名字抢视线 */
+.route-accounts {
+  flex: 0 0 auto;
+  color: var(--text-3);
+  font-size: 11px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 「先试」标记：只有排第一的那家挂，是本页唯一需要一眼看到的结论 */
+.route-first {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--r-xs);
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+/* 覆盖 components.css 的 input[type=number]{max-width:130px}：与保留期同理，
+   各家等宽、左对齐，改位数时数字不左右跳 */
+.route-input input[type="number"] {
+  flex: 0 0 auto;
+  width: 92px;
+  max-width: 92px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 说明另起一行、占满整行（从标签左边缘开始，不必再缩进） */
+.route-row > .hint { grid-column: 1 / -1; }
+
+/* 窄窗口：与保留期同样放宽标签列，避免中文名挤成两行 */
+@media (max-width: 900px) {
+  .route-row { grid-template-columns: max-content 1fr; }
+}
+
 /* ─── 保留期改小确认弹窗 ───
    复用 .modal 外壳（components.css），只覆盖宽度：
    确认框只有一句话加两个按钮，620px 太宽、文字会散开，收窄到 440px 更聚拢。

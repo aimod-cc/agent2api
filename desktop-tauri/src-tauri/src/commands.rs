@@ -46,10 +46,19 @@ pub async fn backend_status() -> Result<Value, String> {
     Ok(json!({ "ready": ready, "port": port }))
 }
 
-/// 发起登录；阻塞到完成/失败/取消/超时
+/// 发起登录；阻塞到完成/失败/取消/超时。
+///
+/// `provider` 是 Option：老版本界面不会传它，缺省（None）按 workbuddy 处理 ——
+/// 那条链的行为必须逐字保持。`Option<String>` 在 Tauri 命令里就是「可以不传」，
+/// 比给一个空串默认值更贴实地表达「老客户端没有这个概念」。
 #[tauri::command]
-pub async fn start_login(app: AppHandle, edition: String, mode: String) -> Result<Value, String> {
-    login::start(&app, edition, mode).await
+pub async fn start_login(
+    app: AppHandle,
+    edition: String,
+    mode: String,
+    provider: Option<String>,
+) -> Result<Value, String> {
+    login::start(&app, edition, mode, provider.unwrap_or_default()).await
 }
 
 #[tauri::command]
@@ -59,8 +68,9 @@ pub fn login_state(app: AppHandle) -> LoginState {
             active: true,
             mode: Some(active.mode),
             edition: Some(active.edition),
+            provider: Some(active.provider),
         },
-        None => LoginState { active: false, mode: None, edition: None },
+        None => LoginState { active: false, mode: None, edition: None, provider: None },
     }
 }
 
@@ -365,46 +375,35 @@ fn timestamp_for_filename() -> String {
     format!("{year:04}-{month:02}-{day:02}-{hour:02}-{minute:02}-{second:02}")
 }
 
-/// 启动维护：临期 token 自动刷新一次，再批量查询余额，结果推给渲染层。
+/// 启动维护：让网关刷新一遍临期凭证，再批量查询余额，结果推给渲染层。
 /// 任一环节失败只记日志，不影响窗口使用（与原 Electron 版行为一致）。
 pub async fn startup_maintenance(app: AppHandle) {
-    /// 与后端 PROACTIVE_REFRESH_MARGIN_MS 对齐：5 分钟内到期即视为临期
-    const REFRESH_MARGIN_MS: f64 = 5.0 * 60.0 * 1000.0;
-
-    let snapshot = match gateway::call("GET", "/api/accounts", None).await {
-        Ok(value) => value,
+    // 临期凭证的刷新**交给网关自己**（POST /api/accounts/refresh-expiring）：
+    // 「哪个账号该刷」是各家 provider 的知识（过期时间字段名、临期窗口四家
+    // 各不相同），壳侧按字段名判断会漏（曾漏掉小浣熊的 `tokenExpiresAt`）。
+    // 网关那边同时还有每 10 分钟的周期维护，这里这一次调用是为了让**刚启动的
+    // 这一轮**尽快把状态刷对，而不是等第一个周期。
+    //
+    // 保留 `refreshed` 的语义（本次实际刷新成功的账号 id 列表）：渲染层的
+    // `accounts:auto-maintained` 事件按它的长度决定要不要提示用户。
+    let refreshed = match gateway::call("POST", "/api/accounts/refresh-expiring", None).await {
+        Ok(report) => report
+            .get("results")
+            .and_then(Value::as_array)
+            .map(|results| {
+                results
+                    .iter()
+                    .filter(|item| item.get("status").and_then(Value::as_str) == Some("refreshed"))
+                    .filter_map(|item| item.get("id").and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default(),
         Err(error) => {
-            eprintln!("[startup] 读取账号列表失败: {error}");
-            return;
+            eprintln!("[startup] 自动刷新临期凭证失败: {error}");
+            Vec::new()
         }
     };
-    let accounts = snapshot
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as f64)
-        .unwrap_or(0.0);
-
-    let mut refreshed = Vec::new();
-    for account in &accounts {
-        let available = account.get("available").and_then(Value::as_bool).unwrap_or(true);
-        let has_refresh = account.get("hasRefreshToken").and_then(Value::as_bool).unwrap_or(false);
-        let expires_at = account.get("expiresAt").and_then(Value::as_f64).unwrap_or(0.0);
-        if !available || !has_refresh || expires_at <= 0.0 {
-            continue;
-        }
-        if expires_at - now_ms >= REFRESH_MARGIN_MS {
-            continue;
-        }
-        let Some(id) = account.get("id").and_then(Value::as_str) else { continue };
-        match gateway::call("POST", "/api/accounts/refresh", Some(&json!({ "id": id }))).await {
-            Ok(_) => refreshed.push(id.to_string()),
-            Err(error) => eprintln!("[startup] 自动刷新 token 失败 {id}: {error}"),
-        }
-    }
 
     let balances = match gateway::call("GET", "/api/accounts/usage", None).await {
         Ok(value) => Some(value),

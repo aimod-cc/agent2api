@@ -1,0 +1,625 @@
+/* Agent2API · 账号页「四家混排的一张表」（表格化改造新增的那一层）
+
+   与 page-accounts.css / page-accounts-providers.css 的分工：
+   那两个文件是账号页原有的**卡片**骨架与多提供商增量，本次改造把列表从「按 provider
+   分组的卡片网格」换成「四家混排的一张表」后，卡片那一套规则就不再被引用了 ——
+   但**一条都没有删**（见 page-accounts.css 末尾的说明与本次改造的报告）：
+   行内明细面板 .row-panel 的形制、⋯ 菜单 .more-menu、.seg / .toolbar / .batch-bar
+   都还在用其中一部分，逐条甄别「哪条还活着」的成本远高于留着它们的成本，
+   而且将来若要恢复卡片视图，删掉就得重写一遍。
+   本文件只装**表格独有的**规则，排在 page-accounts-providers.css 之后引入。
+
+   ── 列宽的分配原则（这些数字是逆推出来的，不是随手取的）──────
+   固定宽的列全部写死像素，「账号」列吃掉剩余宽度。理由：表格的价值在于纵向对齐，
+   让浏览器按内容自动分配会把同一列在不同行里挤出不同的宽（某一行的账号名一长，
+   状态列就被推走）；而账号列是唯一内容长度不可控的（昵称 / uid / 邮箱），
+   只有它该参与伸缩。
+
+   预算（默认窗口 1060px）：侧栏 216 + 内容区左右留白 40 + 面板边框 2 +
+   滚动条常驻槽 11 ≈ 269，列表可用宽度约 791px。七个固定列合计 642px
+   （26 + 92 + 106 + 76 + 72 + 84 + 186），账号列因此拿到约 149px ——
+   昵称（5 个汉字 65px）与 uid（`uid 1234567890` 约 110px）都放得下，
+   更长的串按下面的 ellipsis 收口、完整值在 title 里。
+
+   固定列里最贵的是操作列 186px：那是「设为首选 / 设置 / 签到 / ⋯」四颗按钮
+   并排的最坏情况（4 字 58 + 2 字 36 + 2 字 36 + ⋯ 26 + 间距 12 = 168，
+   加单元格左右内边距 16）。它排在最后一列、右侧没有别的列要抢位，
+   宽度可以放心给 —— 省下来的都归账号列。
+   次贵的是优先级列 106px（输入框 44 + 间距 3 + ↑/↓ 两枚 42 = 89），
+   这是把「改成具体数值」与「挪一位」两种操作都留在行上的代价。
+   两处「宁可竖着放也不要横着挤」的取舍：
+     · 状态列：开关一行、健康徽章一行。并排放不下（开关 36 + 徽章 ≥45 >
+       内容盒 60），而两行的高度与相邻的账号列（名字 + 明细行）相当，
+       整行不会有一列明显空着。
+     · 提供商列：展示名与版本徽章同样竖排 —— 「WorkBuddy」（66px）
+       后面再跟一枚「国内版」必然超宽，而这一列是整张表里唯一区分
+       「换了一家」的线索，被省略号砍成「Work…」就失去意义了。
+     · 余额列：按钮一行、结果摘要一行。摘要「可用 4300 积分」这类文案长度不可控，
+       横排只能给它几十像素、几乎必然被砍成「可用 4…」，竖着放反而读得全。
+
+   最小窗口 820px 时（侧栏已收到 68px）可用宽度约 699px，按 760px 的最小宽度横向
+   滚动约 61px —— 表格**不压缩列宽**，压缩会把「设为首选」折成两行、
+   把优先级输入框挤到点不准，而横滚只是滑一下，信息一个不少。 */
+
+.acct-table {
+  width: 100%;
+  min-width: 900px;
+  border-collapse: separate;
+  /* 列间距归零：border-collapse: separate 是给行首竖条留出绘制空间的
+     （border-collapse: collapse 下单元格的定位上下文会被合并掉） */
+  border-spacing: 0;
+  font-size: 12.5px;
+  table-layout: fixed;
+  box-sizing: border-box;
+}
+
+/* 表头：粘在滚动容器顶部。
+   列表可能很长（十几家账号），滚下去以后「哪一列是什么」会看不见 ——
+   账号表不像日志表有工具栏分组可以当参照，列头必须一直可读。
+   底色用 --surface-2 与批量栏同一档：它俩是列表上下两条「带」，
+   浅色下与列表底 --surface-well 同值（都是 0.97），靠 --hairline 划界。 */
+.acct-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .05em;
+  text-align: left;
+  white-space: nowrap;
+}
+
+/* 表头文字：主标签 + 小注（优先级「全局队列」/ 限流「按模型」）。
+   小注用同色弱化：它只解释口径，不该抢列名的注意力。 */
+.acct-table thead th .th-label { display: inline-flex; align-items: center; gap: 4px; }
+.acct-table thead th .th-hint { font-weight: 400; letter-spacing: 0; opacity: .7; }
+
+/* ─── 列宽拖动把手 ───
+   每个可拖列的 th 右缘一枚：平时隐形，悬停浮出 1px 竖线，按住时变主色加粗。
+   th 是 position: sticky（本身就是定位元素），把手直接绝对定位在它内側右缘。 */
+.col-grip {
+  position: absolute;
+  top: 0;
+  right: -4px;
+  width: 9px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 3;
+}
+
+.col-grip::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 6px;
+  bottom: 6px;
+  width: 1px;
+  background: var(--border-strong);
+  opacity: 0;
+  transition: opacity .12s;
+}
+
+th:hover .col-grip::after { opacity: 1; }
+.col-grip.active::after { left: 3.5px; width: 2px; background: var(--primary); opacity: 1; }
+
+/* 拖动中：全局换光标并禁用选中（拖过文本会触发原生的拖选，把手就「断」了） */
+body.col-resizing { cursor: col-resize; user-select: none; }
+
+/* 单元格：上下内边距压到 7px，让一行落在一个接近 40px 的高度上 ——
+   这是「能舒服点到里面的按钮」与「一屏多放几行」之间的折中
+   （卡片时代单卡约 96px，同屏显然放不下几个账号）。
+   左右只给 8px（卡片时代的 12px 是按卡片内边距定的）：八列一共省下 64px，
+   这些宽度全部让给了账号列。 */
+.acct-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: middle;
+}
+
+/* 列宽（与 accounts-table.js 的 COLUMNS 键一一对应）。
+   勾选列贴着行首竖条、左右不留内边距 —— 勾选框本来就窄，
+   省下的 16px 让它与账号名靠得更近（读起来是「这一行的选择框」）。 */
+.cell-pick { width: 26px; }
+.acct-table th.cell-pick,
+.acct-table td.cell-pick { padding-inline: 0; text-align: center; }
+.cell-priority { width: 132px; }
+.cell-provider { width: 132px; }
+.cell-status { width: 80px; }
+.cell-limits { width: 148px; }
+.cell-expiry { width: 80px; }
+.cell-usage { width: 100px; }
+.cell-actions { width: 190px; }
+/* .cell-account 不写宽度：table-layout: fixed 下它会自动吃掉剩下的全部。
+   用户拖过的列由 accounts-columns.js 生成的 colgroup inline style 覆盖这里的默认值。 */
+
+/* ─── 行状态 ─── */
+
+.acct-row .cell-account,
+.acct-row .cell-priority,
+.acct-row .cell-usage,
+.acct-row .cell-actions { min-width: 0; }
+
+.acct-row:hover { background: var(--surface-well); }
+
+/* 勾选中的行：与批量栏的 .active 同一套主色柔底，视觉上呼应 */
+.acct-row.selected,
+.acct-row.selected:hover { background: var(--primary-soft); }
+
+/* 已禁用：整行压灰。不做成整行半透明 —— 那一行里的开关与菜单还要能点、要能看清 */
+.acct-row.disabled .acct-name .name { color: var(--text-3); }
+.acct-row.disabled .acct-sub { opacity: .75; }
+
+/* ─── 「当前使用中」（本家的队首）行 ───
+   ★ 与「首选」实心块回答「是谁」，这一条底色／竖条负责「在一屏里被扫到」。
+   两种表达缺一不可：只有文字标记时，一屏二十行里找队首要逐行读；
+   只有底色时，又说不清它到底代表什么（限流？勾选？）。
+   底色用 --primary-soft（与勾选态同色）—— 但勾选态另有勾选框，且竖条只在队首行出现，
+   两个语义在同一行上同时成立时也不冲突（队首被勾选是常态，不是异常）。 */
+.acct-row.is-first { background: var(--primary-soft); }
+.acct-row.is-first:hover { background: color-mix(in srgb, var(--primary) 15%, var(--surface)); }
+
+/* 行首竖条：画在第一个单元格的左内边距上（box-shadow 内阴影不受 border-collapse
+   影响，比 ::before 绝对定位更省事，也不会被表格的边界裁掉） */
+.acct-row.is-first > td:first-child {
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
+/* 组首行（换了一家）：上边框重一档，把「这一段的提供商变了」显出来。
+   不打组头行 —— 那会把一张表重新切回四块（见 accounts-view.js 的说明）。 */
+.acct-row.pgroup-start > td { border-top: 1px solid var(--border); }
+
+/* ─── 勾选列 ─── */
+
+.acct-table input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+/* ─── 提供商标签 ───
+   四家各一色，未登记的家落中性兜底（GENERIC）。为什么不给四家都用中性款：
+   这是整张表里唯一区分「换了一家」的视觉线索（组头行已随卡片网格下线），
+   全部同色时连续十行「小浣熊」与「WorkBuddy」读起来是一条。
+   色板刻意都取「浅底 + 深字」的同一强度 —— 不能一家浓一家淡，
+   那会读成「这家有告警」。 */
+.pbadge {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pbadge.p-workbuddy { background: var(--primary-soft); border-color: var(--primary-bd); color: var(--primary-fg); }
+.pbadge.p-raccoon { background: var(--cn-soft); border-color: var(--cn-bd); color: var(--cn); }
+.pbadge.p-catpaw { background: var(--warn-soft); border-color: var(--warn-bd); color: var(--warn); }
+.pbadge.p-autoclaw { background: var(--intl-soft); border-color: var(--intl-bd); color: var(--intl); }
+
+/* 提供商列：徽章与版本竖排两行。
+   「WorkBuddy」「小浣熊」「CatPaw」这些展示名长度不可控，横排时后面还跟着一枚
+   「国内版」，两者相加必然超出列宽、名字被省略号砍成「Work…」——
+   而这一列正是整张表里唯一区分「换了一家」的线索，砍不得。
+   竖排后每个都独占整列宽度，两行的高度也与相邻账号列（名字 + 明细）相当。 */
+/* 提供商名与版本徽章**默认同一行**，列宽不够才整体折行（flex-wrap）——
+   曾经强制竖排（column），结果是「WorkBuddy」右边空着一整块、「国内版」
+   也掉到第二行，两枚徽章明明放得下。折行是整块下移，badge 内文字不会被截断。 */
+.cell-provider .pv { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 4px; }
+.cell-provider .badge {
+  font-size: 10.5px;
+  padding-inline: 6px;
+  /* 优先保持内容宽度（放不下时整块换行），单枚比整列还宽才允许截断兜底 */
+  flex: 0 0 auto;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── 账号列 ─── */
+
+.acct-name {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+/* 队首的 ★：只在这一列出现（操作列那个实心块是同一个事实的另一种读法） */
+.acct-name .star { flex: 0 0 auto; color: var(--primary); font-size: 11px; line-height: 1; }
+
+/* 名称：单行省略。min-width: 0 是必须的 —— flex 项默认 min-width: auto
+   会以「内容最小宽度」为底线，长邮箱会把它撑破、把后面的一切挤出去 */
+.acct-name .name {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-weight: 650;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acct-sub {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 1px;
+  min-width: 0;
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.acct-sub > span { flex: 0 0 auto; }
+/* 代理名长度不可控（用户在设置里自由填），由它参与收缩并加省略号；
+   uid / 尾号是定长标识，压窄了反而读不全 */
+.acct-sub .proxy { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--info); }
+.acct-sub .sep { opacity: .5; }
+
+/* 健康说明（限流恢复时间 / 代理不可用）：只在异常时出现，正常行不留空行 */
+.acct-note {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acct-note.warn { color: var(--warn); }
+.acct-note.bad { color: var(--danger); }
+
+/* ─── 优先级列（全局队列：序号 + 可直接编辑）─── */
+
+.prio { display: flex; align-items: center; gap: 3px; }
+
+/* 全局序号：#N 是队列位置（与后端选路同构），数值输入框是队列值。
+   两个都要 —— 序号便于扫读「我的账号在第几位」，数值便于精确定位与跨行对齐。 */
+.prio .seat {
+  flex: 0 0 auto;
+  min-width: 22px;
+  color: var(--text-3);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* 输入框 44 + 间距 3 + ↑/↓ 两枚 42 + 序号 22 ≈ 111，落在 132px 的列里（内容盒 116）。
+   44 这个宽度是按最长的值反推的：0–9999 四位数字在 11.5px 等宽字体下约 31px，
+   加左右各 4px 内边距与 2px 描边正好 41，取 44 留一点余量。 */
+.prio-input {
+  width: 44px;
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  /* 数字框的上下箭头在 24px 高里会把数字挤成半截，去掉；改值用键盘或 ↑/↓ 按钮 */
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+.prio-input::-webkit-outer-spin-button,
+.prio-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+
+.prio-input:hover { border-color: var(--border-strong); }
+.prio-input:focus { border-color: var(--primary); background: var(--surface); }
+.prio-input:disabled { opacity: .5; }
+
+/* ↑/↓ 拼成一组（与卡片时代的 .order-btns 同一形制，只是尺寸收小到表格行的尺度）。
+   这两枚按钮必须留着：它们是最直观的「换顺序」方式，尤其面对「把第 7 位挪到第 3 位」
+   时，改优先级要同时改另一行的号（同家唯一），点两下 ↑ 则不必知道任何一个号码。 */
+.order-btns { display: inline-flex; flex: 0 0 auto; }
+
+.order-btns button {
+  width: 21px;
+  height: 24px;
+  padding: 0;
+  border-radius: 0;
+  color: var(--text-2);
+  font-size: 10.5px;
+  line-height: 1;
+}
+
+.order-btns button:first-child { border-radius: var(--r-sm) 0 0 var(--r-sm); }
+.order-btns button:last-child { border-radius: 0 var(--r-sm) var(--r-sm) 0; }
+.order-btns button + button { margin-left: -1px; }
+.order-btns button:hover:not(:disabled) { position: relative; z-index: 1; }
+.order-btns button:disabled { opacity: .3; }
+
+/* ─── 状态列 ───
+   开关在上、健康徽章在下，两行竖排。并排放不下：开关的轨道 36px，
+   「正常」这枚 .badge.tag 约 40px（2 字 22 + 左右内边距 16 + 描边 2），
+   两者相加 76px 正好吃掉整列（内容盒只有 60px）。
+   竖排后高度与相邻的账号列（名字 + 明细行）相当，整行不会有一列明显空着。
+   开关沿用 components.css 的既有形制（36×21 轨道 + 近白滑块），不改尺寸。 */
+.cell-status .status-tags { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 3px; }
+.cell-status .badge {
+  font-size: 10.5px;
+  padding-inline: 6px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 已禁用行的徽章退成中性档（保留徽章形制，只把语义色换灰） */
+.acct-row.disabled .cell-status .badge {
+  background: var(--surface-3);
+  border-color: var(--border);
+  color: var(--text-3);
+  font-weight: 500;
+}
+
+/* ─── 限流列 ───
+   限额按「账号 × 模型」记（四家通用）。「正常」是绿点静态文本；
+   有限流时是一枚可点的黄色徽章（点开行下的明细面板），下面一行小字给
+   「最早恢复」。竖排的理由与余额列相同：徽章与恢复文案横排必然超出列宽。 */
+.cell-limits { white-space: nowrap; }
+
+.lim {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--warn-bd);
+  border-radius: var(--r-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.lim:hover:not(:disabled) { border-color: var(--warn); background: var(--warn-soft); color: var(--warn); }
+.lim.open { border-color: var(--warn); box-shadow: 0 0 0 2px var(--warn-soft); }
+.lim .caret { font-size: 9px; opacity: .7; }
+
+.lim-sub {
+  display: block;
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lim-none { display: inline-flex; align-items: center; gap: 5px; color: var(--ok); font-size: 11.5px; }
+.lim-none i { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
+
+/* ─── 有效期列 ─── */
+.cell-expiry { color: var(--text-2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.cell-expiry .muted { color: var(--text-3); }
+
+/* ─── 余额 / 积分列 ───
+   「积分」按钮在上（这一列唯一可点的控件）、结果摘要在下。
+   摘要不横排的原因见文件头的列宽预算：84px 的列宽横排放不下
+   「可用 4300 积分」这类长度不可控的文案，竖着放（整列宽度都归它）才读得全。
+
+   注意：这一格**不能**写成 display: flex。给 <td> 改 display 会让它不再是
+   table-cell，浏览器只能把它包进匿名单元格里 —— table-layout: fixed 的列宽
+   与 vertical-align 都会跟着失效（不同内核表现还不完全一致）。
+   按钮与摘要是行内元素，靠 .usage-sum 的 display: block 自然换到第二行。 */
+.cell-usage { white-space: nowrap; }
+
+.usage-btn {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  font-size: 11.5px;
+}
+
+.usage-btn:hover:not(:disabled) {
+  border-color: var(--primary-bd);
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+}
+
+.usage-btn.open { border-color: var(--primary-bd); background: var(--primary-soft); color: var(--primary-fg); }
+
+/* 结果摘要：单行省略，完整文案在 title 里（余额数字长度不可控） */
+.usage-sum {
+  display: block;
+  margin-top: 3px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-sum.ok { color: var(--ok); font-weight: 600; }
+.usage-sum.bad { color: var(--danger); }
+.usage-sum.muted { color: var(--text-3); }
+
+/* ─── 操作列 ─── */
+
+/* 定位祖先：⋯ 菜单挂在它下面（菜单仍是「点击才插入 DOM」，见 accounts-view.js） */
+.cell-actions { position: relative; }
+
+.acct-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.acct-actions button,
+.acct-actions .is-current,
+.acct-actions .is-head {
+  height: 25px;
+  padding: 0 8px;
+  border-radius: var(--r-sm);
+  font-size: 11.5px;
+}
+
+.acct-actions button:hover:not(:disabled) {
+  border-color: var(--primary-bd);
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+}
+
+/* 「首选」：不是可点的操作，而是「这行就是本家队首」的状态声明。
+   做成整排按钮里唯一的实心块 —— 一屏二十行里，实心块是唯一能一眼扫到的形状。
+   （底色与前景派生手法与全局 button.primary 一致：深色主题下 --surface 是近黑，
+   直接用它会变成蓝底黑字，故取「表面色向白提亮」的近白。） */
+.acct-actions .is-current {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--primary);
+  border: 1px solid var(--primary);
+  color: color-mix(in srgb, var(--surface) 8%, white);
+  font-weight: 600;
+  box-shadow: var(--shadow-1);
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* 「队首」：它确实是队列第一位，但对最近使用的模型正限流，请求会顺延到下一位。
+   与实心「首选」块同形（同为状态声明、不可点），但用描边而非实心 + 告警色，
+   读起来是「排在前面、此刻却被跳过」—— 实心蓝表示「就是它」，
+   一个词只配一种视觉。同样不能放「设为首选」按钮：它已经在最前，
+   点了不会改变任何事（promote_to_front 返回 changed:false）。*/
+.acct-actions .is-head {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-bd);
+  color: var(--warn);
+  font-weight: 600;
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* ─── 展开的明细行（积分 / 签到）───
+   整宽一行，内容由 usage-panel.js / accounts-model.js 生成（.row-panel）。
+   明细行自带浅凹底：它是「附属于上一行」的补充信息，不该与账号行同权重。
+
+   面板自身的外观在 page-accounts.css 里**是按 .acct-card 限定**的
+   （`.acct-card .row-panel { … }`），那份选择器在表格里不命中 ——
+   这里补一套同等形制的规则（含右上角的「收起」按钮），而不是去改那个文件里
+   仍然服务于卡片视图的选择器：两处各写一份，改卡片那边不会悄悄改到表格。 */
+.acct-panels > td {
+  padding: 0 10px 8px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface-well);
+}
+
+.acct-panels .row-panel {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  position: relative;
+  margin: 0;
+  /* 右侧多留 30px 给绝对定位的「收起」按钮，内容不会压到它下面 */
+  padding: 10px 30px 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-size: 11.5px;
+}
+
+.acct-panels .row-panel.error { border-color: var(--danger-bd); background: var(--danger-soft); color: var(--danger); }
+
+/* 「收起」按钮固定到右上角（面板是 flex 容器，跟着内容排会被挤到文字后面） */
+.acct-panels .row-panel .panel-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-color: transparent;
+  border-radius: var(--r-xs);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.acct-panels .row-panel .panel-close:hover { background: var(--surface-3); border-color: transparent; color: var(--text); }
+
+.acct-panels .row-panel .big { color: var(--ok); font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.acct-panels .row-panel b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* ─── 限流明细面板 ───
+   与余额 / 签到的 .row-panel 同形制；这里要的是块状逐行布局，覆盖它的 flex 换行。 */
+.acct-panels .row-panel.limit-panel { display: block; padding-right: 34px; }
+
+.limit-panel .lp-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+
+.limit-panel .lp-head .muted { color: var(--text-3); font-weight: 400; }
+.limit-panel .lp-head button { margin-left: auto; height: 24px; font-size: 11.5px; }
+
+.limit-panel .lp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--hairline);
+  font-size: 11.5px;
+}
+
+.limit-panel .lp-model {
+  flex: 0 1 auto;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.limit-panel .lp-reset { flex: 0 0 auto; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.limit-panel .lp-reason {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
+}
+.limit-panel .lp-row button { flex: 0 0 auto; height: 22px; padding: 0 7px; font-size: 11px; }
+
+/* ─── 窄窗口 ───
+   表格有最小宽度（760px），更窄时按列宽原样横滚 —— 滚动行为本身在
+   page-accounts.css 的 .acct-scroll 上（那里已改成 overflow-x: auto）。 */
+
+/* 滚动条常驻槽在横滚时会让表头右端与行右端差一像素，这里让表格自己吃掉这个盒子 */
+.acct-table { box-sizing: border-box; }
+
+/* ─── 批量栏与表脚：随表格化一并微调 ───
+   批量栏沿用 page-accounts.css 的骨架，这里只补一条：表格化之后
+   「全选」有两个入口（批量栏 + 表头），表头的那个需要一点可点区域 */
+#acct-select-all { cursor: pointer; }

@@ -13,11 +13,17 @@
 //! 优先级：配置文件的值 > 环境变量 > 内置默认值。
 //! 注意 `WORKBUDDY_PROXY_API_KEY` 是「启动时注入」语义 —— 它会写进内存快照，
 //! 但 POST /api/config 传 null 可以把它清掉（对应 Node 版 `opts.apiKey = null`）。
+//!
+//! 配置目录本身（`~/.agent2api`）的事实来源在 `crate::gateway::config_dir`，
+//! 本模块只做转发；从 1.x 升级上来的一次性目录迁移在 `config_migration`，
+//! 这里只保留旧目录名常量与旧目录路径访问器（`LEGACY_DIR_NAME` 仍是全仓
+//! 唯一的字面量）。
 
 use std::path::PathBuf;
 use std::sync::RwLock;
 
 use serde_json::{Map, Value};
+
 
 /// 默认模型：客户端未指定模型时使用（对应 Node 版 `--default-model` 默认值）
 pub const DEFAULT_MODEL: &str = "auto";
@@ -40,6 +46,14 @@ pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyRetentionDays";
 pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
 pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 30;
 pub const DEFAULT_DAILY_RETENTION_DAYS: i64 = 365;
+
+/// **历史**路由优先级键：`{"workbuddy": 10, "raccoon": 20}`。
+///
+/// provider 路由优先级已随「账号全局一条队列」下线（先用哪一家由账号优先级
+/// 决定）。这个键只在账号存储的启动迁移里读一次（`legacy_provider_route`），
+/// 用来把旧版「按家分队」的号码按旧的实际顺序合并成全局队列；不再有写侧，
+/// 文件里残留的值也不会被抹掉（未知字段全量保留）。
+pub const KEY_PROVIDER_ROUTE: &str = "providerRoute";
 
 /// 天数的合法范围：下限 1 天（保留 0 天等于什么都不存，不是有效配置），
 /// 上限 10 年（防手改 config.json 写个天文数字让裁剪逻辑空转）。
@@ -84,6 +98,97 @@ pub struct RetentionPatch {
     pub daily_days: Option<i64>,
 }
 
+// ─── 定时任务设置的键名与边界（config.json 里的字段名**就是契约**）─────
+//
+// 间隔型任务（凭证维护 / 模型刷新 / 两个前端自动刷新）打包在 `scheduledTasks`
+// 对象下；自动签到不在其中 —— 它是**每天定点**型，时刻与上次执行结果由
+// `core::auto_checkin` 自己管（`autoCheckin` 字段），本模块不重复持有。
+// 页面上的四条间隔型任务是「同一个形状」，所以配置也写成同一形状，
+// 免得读侧要按任务名各写一套解析。
+
+/// 间隔型任务的配置对象键
+pub const KEY_SCHEDULED_TASKS: &str = "scheduledTasks";
+/// 凭证自动维护在 `scheduledTasks` 下的子键
+pub const KEY_CREDENTIAL_MAINTENANCE: &str = "credentialMaintenance";
+/// 模型目录定时刷新在 `scheduledTasks` 下的子键
+pub const KEY_MODEL_REFRESH: &str = "modelRefresh";
+/// 日志页自动刷新在 `scheduledTasks` 下的子键（**前端**定时器，后端只存配置）
+pub const KEY_LOGS_AUTO_REFRESH: &str = "logsAutoRefresh";
+/// 请求明细页自动刷新在 `scheduledTasks` 下的子键（同上）
+pub const KEY_REQUESTS_AUTO_REFRESH: &str = "requestsAutoRefresh";
+
+/// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
+pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
+/// 模型目录定时刷新默认间隔（分钟）。
+///
+/// 保守取值：WorkBuddy 的 `/v3/config` 拉取**没有 TTL 早退**，每一轮都是真打
+/// 上游（见 `providers::workbuddy` 的 `refresh_models`），间隔太密等于给上游
+/// 添无谓的负载。一小时的粒度对「模型清单变了没」这个问题足够。
+pub const DEFAULT_MODEL_REFRESH_MINUTES: i64 = 60;
+/// 两个前端自动刷新的默认间隔（秒）：与改造前页内硬编码的 10 秒一致
+pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 10;
+pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 10;
+
+/// 间隔型任务的取值范围。上下限分两套（分钟 / 秒），因为两类任务的合理区间
+/// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（5 秒～10 分钟）。
+///
+/// 与保留期同样：**写侧（`scheduled_tasks::parse_interval`）与读侧
+/// （`interval_field`）共用这些常量**，否则会出现「接口拒绝 60 而手改文件接受它」。
+pub const INTERVAL_MIN_MINUTES: i64 = 1;
+pub const INTERVAL_MAX_MINUTES: i64 = 1440;
+pub const INTERVAL_MIN_SECONDS: i64 = 5;
+pub const INTERVAL_MAX_SECONDS: i64 = 600;
+
+/// 一个间隔型任务的配置：开关 + 间隔（单位由任务定义决定）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntervalTask {
+    pub enabled: bool,
+    /// 间隔值，单位见任务定义（分钟或秒）
+    pub interval: i64,
+}
+
+/// 四条间隔型任务的配置（设置页「定时任务」区域）。
+///
+/// 与 `RetentionSettings` 同一取舍：几个值总是一起用（GET 一次返回、各自循环
+/// 各取所需），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledSettings {
+    pub credential_maintenance: IntervalTask,
+    pub model_refresh: IntervalTask,
+    pub logs_auto_refresh: IntervalTask,
+    pub requests_auto_refresh: IntervalTask,
+}
+
+impl Default for ScheduledSettings {
+    fn default() -> Self {
+        Self {
+            credential_maintenance: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES,
+            },
+            model_refresh: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_MODEL_REFRESH_MINUTES,
+            },
+            logs_auto_refresh: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_LOGS_AUTO_REFRESH_SECONDS,
+            },
+            requests_auto_refresh: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS,
+            },
+        }
+    }
+}
+
+/// 一条间隔型任务的**部分**更新入参（`None` = 该项不动）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IntervalTaskPatch {
+    pub enabled: Option<bool>,
+    pub interval: Option<i64>,
+}
+
 /// 运行期生效的配置快照。
 ///
 /// 字段是「本切片真正会用到的」子集，其余未知字段留在 `raw` 里原样保留，
@@ -100,19 +205,26 @@ pub struct RuntimeConfig {
     /// 取用（回调形式），从 `Value` 里逐个取值要处理类型不符、缺字段、范围夹紧，
     /// 放在这里解析一次即可；`raw` 仍是写盘时的唯一底稿。
     retention: RetentionSettings,
+    /// 四条间隔型定时任务的开关与间隔（设置页「定时任务」区域）。
+    ///
+    /// 与保留期同一理由：凭证维护与模型刷新的循环**每一轮都要重读**它
+    /// （改完设置下一轮生效，不重启进程），从 `Value` 里翻一次要处理一堆
+    /// 类型与范围判定，解析一次存下来最省事。
+    scheduled: ScheduledSettings,
     /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
     raw: Map<String, Value>,
 }
 
 impl RuntimeConfig {
-    /// 当前生效的 API Key；未配置返回 None
-    pub fn api_key(&self) -> Option<&str> {
-        self.api_key.as_deref()
+    /// 是否启用了鉴权：`apiKeys` 里有启用的 Key、或旧字段 / 环境变量给了 Key
+    /// （多 Key 的解析见 `core::api_keys`）
+    pub fn api_key_set(&self) -> bool {
+        !self.active_api_keys().is_empty()
     }
 
-    /// 是否配置了 API Key（对应 Node 版 `!!opts.apiKey`）
-    pub fn api_key_set(&self) -> bool {
-        self.api_key.as_ref().is_some_and(|key| !key.is_empty())
+    /// 当前**启用**的全部明文 Key（鉴权中间件逐把比对）；空 = 免鉴权
+    pub fn active_api_keys(&self) -> Vec<String> {
+        crate::server::core::api_keys::active_keys_from(&self.raw)
     }
 
     /// 计费接口语言（Accept-Language）
@@ -147,6 +259,7 @@ impl RuntimeConfig {
 }
 
 /// 配置目录：复用壳侧实现，保证「壳读 key」与「服务端读 key」指向同一个目录
+/// （唯一事实来源在 `crate::gateway::config_dir`，改路径只需改那一处）
 pub fn config_dir() -> PathBuf {
     crate::gateway::config_dir()
 }
@@ -155,6 +268,25 @@ pub fn config_dir() -> PathBuf {
 pub fn config_file() -> PathBuf {
     config_dir().join("config.json")
 }
+
+/// 旧版配置目录名（仅用于一次性目录迁移）。
+///
+/// **这是全仓唯一一处允许出现 `.workbuddy-proxy` 字面量的地方** ——
+/// 别处的路径一律走 `config_dir()`（事实来源在 `gateway::config_dir`），
+/// 否则改名会出现两套口径。
+const LEGACY_DIR_NAME: &str = ".workbuddy-proxy";
+
+/// 旧版配置目录的完整路径（`{用户主目录}/.workbuddy-proxy`），供迁移使用。
+pub(crate) fn legacy_config_dir() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(LEGACY_DIR_NAME)
+}
+
+// 迁移本身（唯一入口 `config_migration::migrate_config_dir`）在
+// `server/config_migration.rs`；本模块只提供上面这个旧目录路径，
+// 保证 `.workbuddy-proxy` 字面量全仓只有一处。
 
 /// 环境变量里的 API Key（去空白，空串当未配置）
 fn env_api_key() -> Option<String> {
@@ -215,6 +347,117 @@ fn retention_from(map: &Map<String, Value>) -> RetentionSettings {
     }
 }
 
+// ─── 间隔型定时任务的解析（scheduledTasks.*）──────────────────
+
+/// 从 `scheduledTasks` 里取一条任务的原始子对象；缺失 / 类型不符当空对象
+/// （于是 `enabled` 用默认值、`interval` 也用默认值，与「用户没配过」等价）。
+fn task_object(map: &Map<String, Value>, key: &str) -> Map<String, Value> {
+    map.get(KEY_SCHEDULED_TASKS)
+        .and_then(Value::as_object)
+        .and_then(|tasks| tasks.get(key))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// 从一条任务的子对象里取间隔值。
+///
+/// 与 `days_field` 同一口径（**越界回落而非夹紧**、接受整值浮点、只在
+/// `min..=max` 内才采纳），只是范围由调用方给：两类任务的合理区间差着量级
+/// （后端维护按分钟、前端刷新按秒），共用一份范围常量会逼其中一类放宽边界。
+fn interval_field(task: &Map<String, Value>, default: i64, min: i64, max: i64) -> i64 {
+    let parsed = task.get("interval").and_then(|value| match value {
+        Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|raw| raw.is_finite() && raw.fract() == 0.0)
+                .map(|raw| raw as i64)
+        }),
+        _ => None,
+    });
+    parsed.filter(|value| (min..=max).contains(value)).unwrap_or(default)
+}
+
+/// 从一条任务的子对象里取开关。
+///
+/// **缺字段按开启**：这四条任务在本次改造前都是无条件运行的（凭证维护每 10 分钟、
+/// 两个前端面板每 10 秒、模型刷新随 /v1/models 触发），升级上来的 config.json
+/// 里没有 `scheduledTasks` —— 若把「没配过」读成「关闭」，用户什么也没动，
+/// 凭证却不再自动续期了。写侧（`PUT /api/scheduled-tasks`）则要求显式布尔值。
+fn task_enabled(task: &Map<String, Value>, default: bool) -> bool {
+    task.get("enabled").and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// 由原始 JSON 解析四条间隔型任务（缺字段各自用默认值）
+fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
+    let defaults = ScheduledSettings::default();
+    let task = |key: &str, interval: i64, min: i64, max: i64| {
+        let object = task_object(map, key);
+        IntervalTask {
+            enabled: task_enabled(&object, true),
+            interval: interval_field(&object, interval, min, max),
+        }
+    };
+    ScheduledSettings {
+        credential_maintenance: task(
+            KEY_CREDENTIAL_MAINTENANCE,
+            defaults.credential_maintenance.interval,
+            INTERVAL_MIN_MINUTES,
+            INTERVAL_MAX_MINUTES,
+        ),
+        model_refresh: task(
+            KEY_MODEL_REFRESH,
+            defaults.model_refresh.interval,
+            INTERVAL_MIN_MINUTES,
+            INTERVAL_MAX_MINUTES,
+        ),
+        logs_auto_refresh: task(
+            KEY_LOGS_AUTO_REFRESH,
+            defaults.logs_auto_refresh.interval,
+            INTERVAL_MIN_SECONDS,
+            INTERVAL_MAX_SECONDS,
+        ),
+        requests_auto_refresh: task(
+            KEY_REQUESTS_AUTO_REFRESH,
+            defaults.requests_auto_refresh.interval,
+            INTERVAL_MIN_SECONDS,
+            INTERVAL_MAX_SECONDS,
+        ),
+    }
+}
+
+// ─── 历史路由优先级（providerRoute，只读，供账号迁移）───────────
+
+/// 读磁盘上残留的 `providerRoute` 覆盖值：`[(providerId, 优先级)]`，只含文件里
+/// 写了合法数字的那些键。账号存储把「按家分队」的旧号码合并成全局队列时，
+/// 用它还原旧版的实际跨家顺序（缺省的家按注册表顺序，见 `store_admin`）。
+///
+/// 直接读盘而不走内存快照：这是启动期一次性的低频调用，且账号迁移可能早于
+/// `config::init`，读盘最不依赖初始化顺序。
+pub fn legacy_provider_route() -> Vec<(String, u32)> {
+    let raw = read_raw();
+    let Some(Value::Object(table)) = raw.get(KEY_PROVIDER_ROUTE) else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .filter_map(|(id, value)| number_u32(value).map(|rank| (id.clone(), rank)))
+        .collect()
+}
+
+/// JSON 值 → u32：数字（含整值浮点）/ 数字字符串，负数与非有限值不认。
+fn number_u32(value: &Value) -> Option<u32> {
+    let number = match value {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(text) => text.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    Some(number.min(u32::MAX as f64) as u32)
+}
+
 /// 读磁盘上的 config.json（缺失/损坏都当空对象，对应 Node 版 catch 分支）
 fn read_raw() -> Map<String, Value> {
     let Ok(text) = std::fs::read_to_string(config_file()) else {
@@ -229,6 +472,7 @@ fn read_raw() -> Map<String, Value> {
 /// 由磁盘内容 + 环境变量构造运行期配置（对应 Node 版 applyConfig 的优先级）
 fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let retention = retention_from(&raw);
+    let scheduled = scheduled_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）
         api_key: string_field(&raw, "apiKey").or_else(env_api_key),
@@ -238,6 +482,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         default_model: env_text("WORKBUDDY_DEFAULT_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string()),
         last_request_model: string_field(&raw, "lastRequestModel"),
         retention,
+        scheduled,
         raw,
     }
 }
@@ -284,6 +529,21 @@ pub fn retention_settings() -> RetentionSettings {
         }
     }
     RetentionSettings::default()
+}
+
+/// 只取定时任务设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retention_settings()` 同一取舍：凭证维护与模型刷新的循环**每一轮**都要
+/// 问一次「现在开着吗、间隔多久」（这正是「改完设置下一轮生效」的实现方式），
+/// 而 `current()` 每次都会克隆整个 `raw` Map —— 循环里没必要。
+/// 读锁取一个 `Copy` 值即可。未初始化时给默认值。
+pub fn scheduled_settings() -> ScheduledSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.scheduled;
+        }
+    }
+    ScheduledSettings::default()
 }
 
 /// 用一个变换函数原子地更新配置（读 → 改 → 落盘 → 回写内存）。
@@ -339,6 +599,18 @@ pub fn set_api_key(api_key: Option<String>) -> bool {
             config.raw.remove("apiKey");
             config.api_key = None;
         }
+    })
+}
+
+/// 整份替换 `apiKeys` 列表，并删掉旧的单 Key 字段 `apiKey`（从此只有一份真相；
+/// 环境变量注入的 Key 不在文件里，`active_api_keys` 仍会把它算进去）。
+pub fn replace_api_keys(list: Value) -> bool {
+    update(move |config| {
+        config
+            .raw
+            .insert(crate::server::core::api_keys::KEY_API_KEYS.to_string(), list.clone());
+        config.raw.remove("apiKey");
+        config.api_key = None;
     })
 }
 
@@ -405,5 +677,69 @@ pub fn set_retention(patch: RetentionPatch) -> bool {
         );
         apply(KEY_DAILY_RETENTION_DAYS, patch.daily_days, &mut next.daily_days);
         config.retention = next;
+    })
+}
+
+/// 更新一条间隔型任务（`None` = 该项不动），返回是否写盘成功。
+///
+/// `key` 必须是本模块的 `KEY_CREDENTIAL_MAINTENANCE` 等四个常量之一 ——
+/// 它们是 `scheduledTasks` 下的子键，**不在这里做白名单校验**：调用方
+/// （`scheduled_tasks::configure`）已经按任务 id 查过注册表，认不出的 id
+/// 在那一层就被拒了。
+///
+/// 调用方**必须先校验间隔范围**（与 `set_retention` 同一约定）：本函数按
+/// 「已合法」处理，越界值会被 `interval_field` 的回读逻辑丢弃。
+///
+/// 与 `set_retention` 同一模式：内存快照与 raw 底稿一起改 —— 前者让正在跑的
+/// 循环下一轮就用新间隔（不必重启进程），后者保证写盘时不吃掉兄弟字段
+/// （只改一条任务时，`scheduledTasks` 下其余三条必须原样保留）。
+pub fn set_scheduled_task(
+    key: &str,
+    patch: IntervalTaskPatch,
+    min: i64,
+    max: i64,
+) -> bool {
+    let key = key.to_string();
+    update(move |config| {
+        // 先在 raw 里把这条任务的子对象取出来（不存在就建一个），再逐项写入。
+        // 用 `entry` 形态而不是「重建整个 scheduledTasks」：后者会抹掉其它三条
+        // 任务的设置，以及将来可能加进去的兄弟字段。
+        let root = config
+            .raw
+            .entry(KEY_SCHEDULED_TASKS.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !root.is_object() {
+            // 文件里被手改成了非对象（如字符串）：整块替换成对象。
+            // 不静默忽略 —— 那会让保存「成功」但值没落盘，比覆盖更糟。
+            *root = Value::Object(Map::new());
+        }
+        let Some(tasks) = root.as_object_mut() else {
+            return;
+        };
+        let entry = tasks
+            .entry(key.clone())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        let Some(task) = entry.as_object_mut() else {
+            return;
+        };
+        if let Some(enabled) = patch.enabled {
+            task.insert("enabled".to_string(), Value::Bool(enabled));
+        }
+        if let Some(interval) = patch.interval {
+            // 写入前按范围收口：调用方已校验过，这里再夹一次只是防御
+            //（手改文件与接口两条路径都不该把越界值落到盘上）
+            task.insert(
+                "interval".to_string(),
+                Value::from(interval.clamp(min, max)),
+            );
+        }
+        // 关键一步：重解析内存快照。**不能**只改 raw ——
+        // 循环读的是 `scheduled_settings()` 里的解析结果，不同步刷新的后果是
+        // 「界面上改完、循环还是按旧间隔跑」（且要等下次重启才生效），
+        // 与保留期那套「改完立刻生效」的承诺不一致。
+        config.scheduled = scheduled_from(&config.raw);
     })
 }

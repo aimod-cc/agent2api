@@ -29,6 +29,18 @@
 //! ── 与既有 API 的关系 ───────────────────────────────────────
 //! 全部是**新增**端点与新增可选查询参数：`/api/logs` 只多认 `start` / `end`
 //! 两个可选参数，不传时行为与以前完全一致（见 `logs_api::query_logs`）。
+//!
+//! ── provider 维度（Agent2API W4：T-e1）──────────────────────
+//! 两条报表路由的响应各多一处 **provider 维度**，都由存储层组装完再透传
+//! （路由层不加工，理由同上）：
+//!   - `/api/stats/requests`：每行含 `provider`（id，旧行/未承载为空串）
+//!     与派生的 `providerLabel`（id → 中文展示名；未知 id 原样回显 id，
+//!     空 id 回显空串，由展示层用「—」占位）。
+//!   - `/api/stats/summary`：新增顶层 `providers` 数组
+//!     `[{id,label,requests,success,failures,totalTokens}]`，按 requests 降序，
+//!     统计区间与 `overview` / `topModel` 完全一致；空 id 的组 label 为「未知」。
+//! 两者都是**新增键**，既有字段的键名、类型、语义一个都没动
+//! （前端按「providers 存在则展示、缺失则隐藏」消费）。
 
 use std::collections::HashMap;
 
@@ -113,12 +125,17 @@ pub async fn stats_summary(State(state): State<ServerState>, Query(params): Quer
             format!("range 取值非法: {requested}（合法值: {}）", RANGES.join("、")),
         );
     }
-    // 原样透传存储层的报表结果（`{range, startDate, endDate, overview, heatmap,
-    // cacheRates, cacheTrend24h, dailyTrend}`），路由层不加工，避免两处口径
+    // 原样透传存储层的报表结果（`{range, startDate, endDate, overview, providers,
+    // heatmap, cacheRates, cacheTrend24h, dailyTrend}`），路由层不加工，避免两处口径。
+    // `providers` 是 W4 新增的 provider 维度汇总（见文件头的说明）
     ok_json(state.request_stats().usage_summary(&requested))
 }
 
 /// GET /api/stats/requests?offset=&limit=&model=&status=&start=&end=
+///
+/// 每行含 `provider`（id）与 `providerLabel`（展示名），由存储层的 `entry_json`
+/// 在序列化后派生填入；**不新增查询参数**（按 provider 筛选不在本期契约里，
+/// 前端要筛就在本地按 id 过滤已有的 `provider` 字段）。
 pub async fn stats_requests(State(state): State<ServerState>, Query(params): Query<Params>) -> Response {
     let filter = RequestQuery {
         offset: parse_offset(params.get("offset")),

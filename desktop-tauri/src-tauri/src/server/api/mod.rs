@@ -15,8 +15,11 @@
 //!   proxies.rs    /api/proxies*（Clash 读取 + 出口测试）
 //!   billing.rs    积分 / 签到 / 运营活动（对照 workbuddy-billing.mjs + server.mjs 871-911 行）
 //!   chat.rs       POST /v1/chat/completions、GET /v1/models（对话主链路）
+//!   models.rs     POST /api/models/refresh（手动刷新模型清单；管理 API，
+//!                 与上一条的对外只读探针是两个分组，见该文件模块头）
 //!   desensitize.rs /api/desensitize*（词表维护 / 开关 / 角色 / 命中统计）
 //!   auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
+//!   scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务的开关 / 间隔 / 立即执行）
 //!   update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
 //!   endpoints.rs  GET /api/endpoints（接口清单）
 //!
@@ -25,6 +28,9 @@
 //! 并保持与 Node 版一致的分组（需鉴权的一律挂 `protected`）。
 
 pub mod accounts;
+// `/api/accounts/usage` 的查询与结果组装（从 accounts.rs 拆出：余额能力从
+// 「只服务 workbuddy」扩到四家混查时新增，见该文件模块头）
+pub mod accounts_usage;
 pub mod auto_checkin;
 pub mod billing;
 pub mod chat;
@@ -32,8 +38,12 @@ pub mod config_api;
 pub mod desensitize;
 pub mod endpoints;
 pub mod health;
+pub mod keys_api;
 pub mod logs_api;
+pub mod model_manage;
+pub mod models;
 pub mod proxies;
+pub mod scheduled_tasks;
 pub mod session;
 pub mod stats_api;
 pub mod update;

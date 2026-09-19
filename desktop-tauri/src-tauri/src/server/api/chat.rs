@@ -12,18 +12,19 @@
 //!   ⑤ 模型校验：未指定 → defaultModel → 目录 isDefault → 首项；
 //!      点名的模型不在目录 → 400（带相近模型提示）
 //!   ⑥ rememberRequestModel（默认值已填充完毕）
-//!   ⑦ 脱敏钩子（切片 5 的接入点，见 `desensitize_body`）
-//!   ⑧ 转发：流式透传 / 非流式聚合
+//!   ⑦ 转发：流式透传 / 非流式聚合
 //!
 //! ── 错误中途写出 ────────────────────────────────────────────
 //! 转发失败时：headers 还没发出 → errorPayload（OpenAI 风格 + 429 的 reset_at）；
 //! headers 已发出（流式已开始）→ 由响应流自身报错终止连接（Node 版是补写
 //! `data: {"error":...}` + `data: [DONE]`，Rust 侧的等价语义见 forward 模块注释）。
 //!
-//! ── 脱敏钩子（切片 5 已接入）────────────────────────────────
-//! `desensitize_body` 对 `body.messages` 里命中角色的文本插零宽空格，
-//! 命中时调用点会打 `[Desensitize] 已脱敏命中 N 处：词×次数、…`（文案与
-//! server.mjs 528 行一致）。实现在 `core::desensitize`，本文件只是接入点。
+//! ── 内容处理（脱敏）的接入位置 ──────────────────────────────
+//! 本文件**不做内容处理**：请求体按客户端原样交给转发层，去重键也取自原始
+//! 请求体。处理发生在**每家 provider 即将发送前**，按 `desensitize.json` 的
+//! `providers` 作用范围逐家判定（见 `core::upstream::payload` 的 `send_body`）
+//! —— 未勾选的提供商，无论首选还是故障转移，拿到的都是未修改的请求体；
+//! 命中日志与统计也只由在范围内的那一家产生。
 //!
 //! ── 请求记账（本切片接入）──────────────────────────────────
 //! 本文件是 `RequestStats::record` 的**唯一调用方**（见 `record_entry`）：
@@ -41,6 +42,9 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
 use crate::server::config;
+use crate::server::core::providers::catalog::{
+    default_model_catalog, default_model_usable, providers_for_model, suggest_models,
+};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
 use crate::server::errors::GatewayError;
@@ -126,22 +130,35 @@ pub async fn chat_completions(
     // ④ 调试落盘：保存最近一次入站请求体，供重放分析（覆盖写）
     write_debug_files(&body, method, path, &user_agent);
 
-    // ⑤ 模型路由：点名的模型必须是上游目录里真实存在的 id。
-    // 不做任何静默改写/回退 —— 请求 4.1 就必须路由到 4.1，
-    // 不存在就 400 报错（附近似名提示），让下游自己改配置。
-    let catalog = state.models();
+    // ⑤ 模型路由：点名的模型必须是**聚合目录**里真实存在的 id（Agent2API §4.4）。
+    // 判定走 `providers::catalog` 的能力判定（各家清单的合并视图），
+    // 与 `/v1/models` 的输出同源 —— 只认 workbuddy 单家清单会让「清单里有、
+    // 校验说没有」这种自相矛盾出现。不做任何静默改写/回退：请求 4.1 就必须
+    // 路由到 4.1，不存在就 400 报错（附近似名提示），让下游自己改配置。
     if model_field.is_empty() {
         // 客户端没点名 → 网关默认；默认值不可用时落到目录里 isDefault 的模型，
         // 再不行取目录首项（三者的判定顺序照抄 Node 的
         // `has(defaultModel) ? defaultModel : list().find(isDefault)?.id ?? list()[0]?.id`）
         //
+        // ── defaultModel 的 provider 语义（§4.4 末句）──────────────
+        // `defaultModel` 是 config.json 里的**workbuddy 语义**（默认 auto），
+        // `isDefault` / 首项这两级同样来自清单 —— 三者都只有「认默认模型概念」
+        // 的 provider 才认（本期只有 workbuddy）。所以回落链的候选集合走
+        // `catalog::default_model_catalog()`（按能力收窄后的聚合清单）：
+        //   - 有认这个概念的家 → 回落链与改造前**逐字相同**（单家时就是
+        //     原目录，既有用户的默认模型不变）；
+        //   - 一家都不认 → 不注入 model，按「未指定」处理（让上游用它自己的
+        //     默认模型），符合 §4.4「命中 provider 无默认概念时不注入」。
+        //
         // 注意目录为空时 Node 会把 body.model 置成 undefined 并**跳过**下面的
         // 校验（`if (body.model && ...)`），请求照样往上游发 —— 上游会自己报错。
         // 这里保持同一行为：拿不到兜底值就什么都不填。
         let snapshot = config::current();
-        let models = catalog.list();
-        let fallback = if catalog.has(snapshot.default_model()) {
-            Some(snapshot.default_model().to_string())
+        let default_model = snapshot.default_model();
+        let models = default_model_catalog();
+        // 第一级：config 的 defaultModel（只有认「默认模型」概念的家才认它）
+        let fallback = if default_model_usable(default_model) {
+            Some(default_model.to_string())
         } else {
             models
                 .iter()
@@ -162,9 +179,28 @@ pub async fn chat_completions(
     }
     // 校验用的是**客户端原样给出的值**（真值化后的文本形态）：非字符串的真值
     // （数字/对象）也被字符串化后参与比对，与 Node 的 `has(body.model)` 一致
-    let requested_model = model_field_text(&payload);
-    if !requested_model.is_empty() && !catalog.has(&requested_model) {
-        let hint = catalog.suggest(&requested_model, 5);
+    let mut requested_model = model_field_text(&payload);
+    // 模型映射：下游用映射名请求时改写成目标上游模型，后续校验 / 转发 / 记账
+    // 都按改写后的真实模型进行
+    let rules = crate::server::core::model_rules::current();
+    if let Some(target) = rules.resolve_alias(&requested_model) {
+        let target = target.to_string();
+        logging::verbose("[Model]", &format!("映射 {requested_model} → {target}"));
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("model".to_string(), Value::String(target.clone()));
+        }
+        requested_model = target;
+    }
+    if !requested_model.is_empty() && rules.is_blocked(&requested_model) {
+        let error = GatewayError::bad_request(format!(
+            "模型已在网关中禁用: {requested_model}。完整列表见 GET /v1/models"
+        ))
+        .with_code("model_not_found");
+        record_early_failure(&state, started_at, &requested_model, &error);
+        return error.payload_response();
+    }
+    if !requested_model.is_empty() && providers_for_model(&requested_model).is_empty() {
+        let hint = suggest_models(&requested_model, 5);
         let message = format!(
             "模型不存在: {requested_model}{}。完整列表见 GET /v1/models",
             if hint.is_empty() {
@@ -185,13 +221,9 @@ pub async fn chat_completions(
         config::remember_request_model(&requested_model);
     }
 
-    // ⑦ 内容脱敏钩子：切片 5 在这里替换实现（当前恒为「未改动」）
-    let desensitized = desensitize_body(&mut payload);
-    if desensitized.changed {
-        logging::log("[Desensitize]", &desensitized.log_line());
-    }
-
-    // ⑧ 转发：请求体哈希作为去重键（相同 body 的快速重试在代理内排队）
+    // ⑦ 转发：请求体原样交给转发层（内容处理在每家 provider 发送前按作用范围
+    // 逐家判定，见 `core::upstream::payload` 的 `send_body`）；去重键取**客户端
+    // 原始请求体**的哈希，与「某一家是否被处理」无关。
     let dedupe_key = sha256_hex(&body);
     // usage / 尝试次数的旁路槽：本函数持有一份，另一份随请求进转发链路。
     // 流式请求的收尾在响应流里发生（那时本函数早就返回了），两份克隆指向
@@ -203,6 +235,7 @@ pub async fn chat_completions(
             body: payload,
             stream,
             dedupe_key,
+            client_headers: headers,
             telemetry: telemetry.clone(),
         })
         .await;
@@ -321,6 +354,8 @@ fn record_early_failure(
 ///   ts          请求**开始**时刻（不是记账时刻）：趋势图要按「用户什么时候
 ///               发的请求」归日，长请求若按收尾时刻归档会落到错误的日期
 ///   durationMs  收尾 - 开始（含排队、选路、上游等待、流下发）
+///   firstResponseMs  上游/下发首帧到达 - 开始（见 first_response_ms 的赋值处）；
+///               全程没有帧到达（转发前就失败）时为 null，前端显示「-」
 ///   attempts    旁路槽里累计的上游请求数；一次都没发出去（400/裸错误）时才回落 1
 ///   error       旁路槽里的原因优先（更接近根因），否则用调用方给的兜底文案；
 ///               成功请求两者都没有 → 落盘为 null
@@ -330,6 +365,13 @@ fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // （取两次会让两处偶尔差 1ms，排障时看着像对不上账）
     let finished_at = logging::now_ms();
     let duration_ms = finished_at - context.started_at;
+    // 首响：采集点记的是绝对时刻，这里换算成相对请求开始的耗时 ——
+    // 与 durationMs 用同一个 `started_at` 作参考点，两列不会各说各话。
+    // None（全程没有帧到达，例如转发前就失败）原样落盘为 null，
+    // 前端显示「-」；负值（时钟回拨的理论值）夹成 0。
+    let first_response_ms = snapshot
+        .first_response_at
+        .map(|at| (at - context.started_at).max(0));
     let error = snapshot
         .error
         .or(fallback_error)
@@ -338,11 +380,15 @@ fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     let mut entry = NewRequestEntry::new(context.model.clone(), context.status);
     entry.ts = Some(context.started_at);
     entry.duration_ms = duration_ms;
+    entry.first_response_ms = first_response_ms;
     entry.attempts = attempts;
     // 存储契约里这两个字段是 String（不是 Option），空串就是「没有账号」的表示
     // —— 未配置账号列表、走默认登录态转发时就是这种情况
     entry.account_id = snapshot.account_id;
     entry.account_name = snapshot.account_name;
+    // 实际承载的 provider（转发链路填；None = 一次都没发出去就失败了）。
+    // 本波只带到记账点，落盘与接口透出归 W4（见 NewRequestEntry::provider）
+    entry.provider = snapshot.provider;
     entry.error = error;
     // 失败请求的 token 由存储层归一成 0（见 NewRequestEntry::normalize），
     // 这里照抄上游上报的原值即可，不必自己判成功与否
@@ -354,9 +400,12 @@ fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     logging::verbose(
         "[Stats]",
         &format!(
-            "记一条请求: model={} status={} {duration_ms}ms attempts={attempts} tokens={}+{}（缓存 {}）",
+            "记一条请求: model={} status={} {duration_ms}ms 首响={} attempts={attempts} tokens={}+{}（缓存 {}）",
             if context.model.is_empty() { "(未指定)" } else { &context.model },
             context.status,
+            first_response_ms
+                .map(|value| format!("{value}ms"))
+                .unwrap_or_else(|| "-".to_string()),
             snapshot.prompt_tokens,
             snapshot.completion_tokens,
             snapshot.cache_read_tokens,
@@ -426,6 +475,16 @@ impl futures::Stream for RecordingStream {
             return std::task::Poll::Ready(None);
         }
         let polled = this.inner.poll_next_unpin(cx);
+        // 首响采集：**下发的第一个字节**到达时记一次（OmniProxy 的 logTtfb 同款
+        // 挂位 —— 挂在透传流上而不是上游字节流上，于是四条转发路径（无状态流式 /
+        // 聚合 / CatPaw 流式 / CatPaw 聚合）在此收敛为同一处，不需要每家适配器
+        // 各自埋点）。绝对时刻进旁路槽，相对耗时由记账点统一计算。
+        // `note_first_frame` 首次为准：之后每次 poll 都会走到这里，是空操作。
+        if let std::task::Poll::Ready(Some(_)) = &polled {
+            if let Some(context) = &this.context {
+                context.telemetry.note_first_frame();
+            }
+        }
         if matches!(polled, std::task::Poll::Ready(None)) {
             // 正常收尾：此刻记账，durationMs 就是真实的下发耗时
             this.settle(None);
@@ -522,9 +581,20 @@ fn sse_response(
     response
 }
 
-/// GET /v1/models —— 免鉴权（Node 版这条没调 checkApiKey）
+/// GET /v1/models —— 免鉴权（Node 版这条没调 checkApiKey）。
+///
+/// 响应体来自**聚合模型目录**（Agent2API 改造 §4.4）：合并「当前有可用账号」
+/// 的各 provider 清单，同名去重（保留注册表顺序靠前的那家），OpenAI 响应结构不变。
+/// 对只有 workbuddy 一家且有账号的用户，输出与改造前逐字段相同
+/// （见 `core::providers::catalog` 模块头）。
+///
+/// 聚合查询需要账号存储判断「哪几家可用」，所以这里用 `state.store()` ——
+/// 句柄是 `Clone` 的轻量 Arc，且绝不在持锁时做网络请求（这是本项目的硬约束，
+/// 聚合层只调 `accounts_for_provider` 做一次文件读取）。
 pub async fn list_models(State(state): State<ServerState>) -> Response {
-    let response = raw_json(state.models().list_response());
+    let response = raw_json(crate::server::core::providers::catalog::models_response(
+        state.store(),
+    ));
     // 异步刷新模型目录，不阻塞响应（对照 Node 的 `void refreshModelCatalog()`）
     spawn_catalog_refresh(&state);
     response
@@ -532,69 +602,19 @@ pub async fn list_models(State(state): State<ServerState>) -> Response {
 
 /// 起一个后台任务刷新模型目录（不阻塞当前响应）。
 ///
+/// 刷新走**适配器注册表**（`providers::adapter::refresh_implemented`）：
+/// 每个已实现的 provider 自己决定去哪儿拉清单（workbuddy 是 /v3/config），
+/// 本函数不认识任何一家。W3 加上小浣熊适配器后这里一行都不用改。
+///
 /// 必须用 `tauri::async_runtime::spawn` 而不是 `tokio::spawn`：
 /// 本函数在 axum handler 里调用（运行时上下文已成立），但显式选择项目里
 /// 统一的 spawn 入口，避免以后有人把它挪到非 Tokio 上下文时 panic
 /// （release 是 panic=abort，那会带走整个桌面应用）。
 pub fn spawn_catalog_refresh(state: &ServerState) {
-    let models = state.models().clone();
     let store = state.store().clone();
-    let auth = state.auth().clone();
     tauri::async_runtime::spawn(async move {
-        models.refresh_with_current_account(&store, &auth).await;
+        crate::server::core::providers::adapter::refresh_implemented(&store).await;
     });
-}
-
-/// ─── 脱敏钩子（切片 5 的唯一接入点）──────────────────────────
-
-/// 脱敏处理结果（对应 Node 版 `desensitizer.processBody` 的返回）
-pub struct DesensitizeResult {
-    pub changed: bool,
-    /// 命中总次数
-    pub hits: usize,
-    /// 每个词各自的命中次数（按次数降序）
-    pub term_counts: Vec<(String, usize)>,
-}
-
-impl DesensitizeResult {
-    /// 未改动（当前空实现的返回值，也是无命中时的形态）
-    pub fn unchanged() -> Self {
-        Self { changed: false, hits: 0, term_counts: Vec::new() }
-    }
-
-    /// 运行日志文案（照抄 Node 的 `已脱敏命中 N 处：词×次数、…`）
-    pub fn log_line(&self) -> String {
-        let per_term = self
-            .term_counts
-            .iter()
-            .map(|(term, count)| format!("{term}×{count}"))
-            .collect::<Vec<_>>()
-            .join("、");
-        format!("已脱敏命中 {} 处：{per_term}", self.hits)
-    }
-}
-
-/// 内容脱敏钩子：对 `body.messages` 里命中角色的文本插零宽空格（原地改写 body）。
-///
-/// 对照 Node 版 server.mjs 520-530 行：
-/// ```js
-/// const result = desensitizer.processBody(body);
-/// if (result.changed) { body = result.body; log('[Desensitize]', `已脱敏命中 ${result.hits} 处：…`); }
-/// ```
-/// 这里把「处理 + 统计」都交给 `core::desensitize`，本函数只负责把请求体递进去、
-/// 把命中统计转成调用点要的形状。hook 之所以不带 state：脱敏处理器是进程级单例
-/// （`core::desensitize::global()`，与 `config::current()` 同一模式），
-/// 保持这个签名不变才能让切片 4 定下的调用点一行不动。
-pub fn desensitize_body(body: &mut Value) -> DesensitizeResult {
-    let outcome = crate::server::core::desensitize::global().process_body(body);
-    if !outcome.changed {
-        return DesensitizeResult::unchanged();
-    }
-    DesensitizeResult {
-        changed: true,
-        hits: outcome.hits,
-        term_counts: outcome.term_counts,
-    }
 }
 
 /// ─── 杂项 ───────────────────────────────────────────────────

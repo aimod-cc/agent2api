@@ -1,74 +1,62 @@
-/* WorkBuddy 本地代理 · 账号领域判定与标签渲染 */
+/* Agent2API · 账号标签与行内面板渲染（provider 维度的判定与队列已拆到 accounts-groups.js） */
 /* global wbApp */
 
 /**
- * 从 accounts-view.js 抽出的「纯逻辑 + 标签 HTML」层：
- * 判定账号是否可用 / 是否限流、生成状态标签与第二行小字。
- * 这些函数不读写模块状态、不碰事件，只依赖 window.wbApp 的 esc / formatTime，
- * 因此单独成文件，让账号视图聚焦在渲染与交互上。
+ * 账号的「标签 + 行内面板」渲染层：状态标签、版本徽章、⋯ 菜单、行内限流 / 积分 / 签到面板。
  *
- * 通过 window.wbAccountsModel 暴露；accounts-view.js 与 app.js（顶栏状态）都会用到。
+ * ── 与 accounts-groups.js 的分工（按职责拆分后）─────────────────
+ * provider 能力表与摘要归一化、可用性 / 限流判定、筛选口径与分段计数、全局队列的
+ * 位置表与队首派生 —— 这些**纯逻辑**在 accounts-groups.js（挂 window.wbAccountsGroups），
+ * 本文件按名解构回来，并在文件末尾**原样再导出**。于是 window.wbAccountsModel 的
+ * 公开面与拆分前同构，消费方（accounts-view.js / app.js）不必改引用路径 ——
+ * 与本项目既有的转发做法一致（accounts-view.js 也把 accounts-model 的函数再导出给
+ * app.js）。加载顺序由 index.html 保证：accounts-groups.js 必须先于本文件加载。
+ *
+ * 卡片时代的渲染函数（单卡 HTML / 卡片提示条 / 组头等）已随卡片视图一起删除：
+ * 表格化之后它们不再被任何调用方引用，留着只会让人误改到一份死代码。
+ *
+ * 这些函数不读写模块状态、不碰事件，只依赖 window.wbApp 的 esc / formatTime。
  */
 (() => {
   const { esc, formatTime } = wbApp;
 
-  // ─── 基础判定 ──────────────────────────────
-
-  function typeLabel(type) {
-    if (type === 'enterprise') return '企业';
-    if (type === 'ultimate') return '旗舰';
-    return '个人';
-  }
-
   /**
-   * 转发顺序排序键：优先级升序，并列时按加入时间。
-   * 与后端 src/workbuddy-account-store.mjs 的 byPriorityOrder 保持一致
-   * （渲染层无法 import 后端 ESM，只能同构实现；改一处必须同步另一处）。
-   * 优先级在写入侧强制唯一，并列只会出现在手工编辑的账号文件里。
+   * 纯逻辑与分组全部来自 accounts-groups.js（index.html 保证它先于本文件加载）。
+   * 按名解构而不是每次写 window.wbAccountsGroups.xxx：调用点保持拆分前的裸函数名，
+   * 搬移后函数体一行未改；万一该文件没加载，这里会直接抛错（首屏即暴露），
+   * 比静默少一个按钮更容易发现。
    */
-  function byPriorityOrder(a, b) {
-    const diff = Number(a?.priority ?? 100) - Number(b?.priority ?? 100);
-    if (diff !== 0) return diff;
-    return (Number(a?.addedAt) || 0) - (Number(b?.addedAt) || 0);
-  }
-
-  /** 账号是否启用（禁用账号不参与转发） */
-  function isEnabled(account) {
-    return account?.enabled !== false;
-  }
-
-  /**
-   * 账号是否处于限流状态（存在未到恢复时间的限额记录）。
-   * 传入 model 时只判定该模型 —— 限额是按模型记的，这是「模型筛选」的核心：
-   * 一个账号可能对 A 模型限额、对 B 模型完全正常。
-   */
-  function isRateLimited(account, model = '') {
-    const limits = account?.rateLimits || {};
-    const now = Date.now();
-    if (model) return Number(limits[model]?.resetAt) > now;
-    return Object.values(limits).some(info => Number(info?.resetAt) > now);
-  }
-
-  /** 该账号此刻能否承接指定模型的请求（与后端 accountUsability 同构） */
-  function usableForModel(account, model) {
-    if (!isEnabled(account)) return false;
-    return !isRateLimited(account, model);
-  }
-
-  /** 账号所属版本：cn=国内 / intl=国际（缺省视为国内，兼容旧账号记录） */
-  function accountEdition(account) {
-    return account?.edition === 'intl' ? 'intl' : 'cn';
-  }
-
-  /** 国际版没有签到活动，签到相关入口对其隐藏 */
-  function supportsCheckin(account) {
-    return accountEdition(account) !== 'intl';
-  }
-
-  /** 可参与签到的账号（一键签到只用这批：启用 + 国内版） */
-  function checkinableAccounts(list) {
-    return (list || []).filter(account => isEnabled(account) && supportsCheckin(account));
-  }
+  const {
+    DEFAULT_PROVIDER_ID,
+    RACCOON_PROVIDER_ID,
+    providerOf,
+    providerFeatures,
+    providerSummaries,
+    identifierOf,
+    tokenExpiryOf,
+    supportsUsage,
+    isDesktopAccount,
+    byPriorityOrder,
+    typeLabel,
+    isEnabled,
+    isRateLimited,
+    usableForModel,
+    hasCredentials,
+    accountEdition,
+    supportsCheckin,
+    checkinableAccounts,
+    matchProvider,
+    matchEdition,
+    matchEnabled,
+    matchLimit,
+    visibleAccounts,
+    filterCounts,
+    positionMap,
+    pickForModel,
+    pickQueueHead,
+    routedId,
+    activeLimits,
+  } = window.wbAccountsGroups;
 
   // ─── 状态标签 ───────────────────────────────
 
@@ -78,98 +66,29 @@
   }
 
   /**
-   * 限额标签：表面只写「限流」（多个模型同时限额时标「限流 +N」），
-   * 各模型的状态码与恢复时间留在 title 悬浮详情里。
-   *
-   * 为什么把「状态码 · 恢复时间」从徽章表面收进悬浮层：卡片右上角是「哪个账号有问题」的
-   * 扫读位，「429 · 09-11 18:00 恢复」这种长文案在窄卡片上会被省略号截断，
-   * 反而连「限流」两个字都看不全；恢复时间点开卡片提示条也能看到（见 cardNoteHtml）。
-   *
-   * 选了模型时只看该模型的限额（列表已是该模型的队列，别的模型的限额与本视图无关，
-   * 显示出来只会造成「标着限流却还能用」的困惑）；未选模型时汇总展示。
-   */
-  function rateLimitTag(account, model = '') {
-    const limits = account.rateLimits || {};
-    const now = Date.now();
-    const active = Object.entries(limits)
-      .map(([id, info]) => ({ model: id, ...info }))
-      .filter(item => Number(item.resetAt) > now)
-      .filter(item => !model || item.model === model)
-      .sort((a, b) => a.resetAt - b.resetAt);
-    if (!active.length) return '';
-    const extra = active.length > 1 ? ` +${active.length - 1}` : '';
-    const title = [
-      '已达上限的模型（其它模型不受影响）：',
-      ...active.map(item => `${item.model}: ${item.status}，${formatTime(item.resetAt)} 恢复`),
-    ].join('\n');
-    return statusTag(`限流${extra}`, 'warn', title);
-  }
-
-  /**
    * 状态标签集合：这一区只表达**健康状态**。
    *
    * 「首选」不在这里 —— 它表达的是转发顺序（队首），不是账号健康状况。
-   * 卡片底部已有 ★ 与「首选」实心块表达同一件事，再在状态区重复一遍
-   * 只会让这一列没法收窄，也混淆「正常 / 限流 / 禁用」的语义。
-   *
+   * 「限流」也不在这里 —— 限额按模型记，它有自己的一列（点开看具体模型），
+   * 挤在状态列里只能给一个没有信息量的「限流」两个字。
    * 只标「需要关注的状态」；一切正常时给一个「正常」标签 ——
    * 否则整片都是空占位，反而看不出这个账号到底能不能用。
    */
-  function accountTags(account, currentAccountId, model = '') {
+  function accountTags(account) {
     const enabled = isEnabled(account);
     const tags = [
       enabled ? '' : statusTag('已禁用', 'bad', '该账号已禁用，不参与转发'),
       // 代理配了解析不出来时明确标出：转发会回退直连，属于需要留意的情况
       account.proxy?.error ? statusTag('代理异常', 'bad', `${account.proxy.error}（转发时会回退直连）`) : '',
       account.available === false ? statusTag('不可用', 'bad', account.reason || '账号不可用') : '',
-      rateLimitTag(account, model),
     ].filter(Boolean);
     if (!tags.length) return statusTag('正常', 'ok', '该账号可用，未触发限额');
     return tags.join('');
   }
 
-  // ─── 单元格内容 ─────────────────────────────
-
-  /**
-   * 有效期文案（第二行小字用）。
-   * 返回纯文本而不是徽章 —— 有效期不是「需要盯」的状态，
-   * 做成徽章只会和真正重要的状态标签抢注意力。
-   */
-  function expiryText(expiresAt) {
-    if (!expiresAt) return '未提供过期时间';
-    const left = Number(expiresAt) - Date.now();
-    if (left <= 0) return '已过期';
-    if (left < 3600e3) return `${Math.max(1, Math.round(left / 60e3))} 分钟后过期`;
-    if (left < 48 * 3600e3) return `${(left / 3600e3).toFixed(1)} 小时后过期`;
-    return `${Math.floor(left / 24 / 3600e3)} 天后过期`;
-  }
-
-  /**
-   * 第二行小字：额度类型 · 有效期 · 代理。
-   *
-   * 尾号（account.tokenTail）已按需求下线：它是导入时的辅助标识，账号名/uid 已经能
-   * 唯一认出账号，多一项只是占宽度 —— 窄卡片上它正好把最先被挤掉的位置留给了更有用的代理。
-   * 代理项只在「配了且没解析出错」时出现：没配代理不显示（显示「直连」等于给绝大多数
-   * 账号都加一项噪音），代理异常也不在这里显示 —— 那属于必须处理的故障，
-   * 已经由状态徽章（代理异常）与卡片提示条（cardNoteHtml）专门说明，这里再写一遍是重复。
-   * 该 span 是明细行的可收缩项，长代理名由 CSS 加省略号收尾（见 page-accounts.css 的 .who-meta）。
-   */
-  function metaLine(account) {
-    const parts = [
-      `<span title="该账号的额度类型">${esc(typeLabel(account.type))}</span>`,
-      // 也带 title：没配代理时这一项就是明细行的末项，会被 CSS 当作可收缩项，
-      // 极端窄卡片下加省略号后仍能悬浮看到完整文案（与代理项同一口径）
-      `<span title="Token 有效期">${esc(expiryText(account.expiresAt))}</span>`,
-    ];
-    if (account.proxy && !account.proxy.error) {
-      // title 保留：代理名被省略号截断后，悬浮仍能看到完整值
-      parts.push(`<span class="proxy" title="该账号经此代理访问上游">代理 ${esc(account.proxy.label || '已设置')}</span>`);
-    }
-    return parts.join('<span class="sep">·</span>');
-  }
-
   /** 版本徽章：国内 / 国际，配色固定（类名 edition-* 被样式与批量徽章共用） */
   function editionCell(account) {
+    if (!providerFeatures(providerOf(account)).edition) return '';
     const edition = accountEdition(account);
     const label = account.editionLabel || (edition === 'intl' ? '国际版' : '国内版');
     return `<span class="badge edition-${edition}">${esc(label)}</span>`;
@@ -180,36 +99,63 @@
   // 面板按需展开：调用方只在用户点过「积分」/「签到」后才渲染。
   // 这里的函数是纯展示，不判断展开状态 —— entry 由调用方从缓存里取：
   //   undefined = 尚未查询，null = 查询中，string = 出错，对象 = 结果
+  //
+  // 余额面板（usage）的实现搬到了 `usage-panel.js`：它现在要渲染**两套形状**
+  // （workbuddy 既有形状 + 三家统一形状）与「未配置查询」的中性态，篇幅放不进
+  // 本文件（见那个文件的模块头）。这里按名转调，消费方拿到的还是同一个
+  // `wbAccountsModel.usagePanelHtml`。
 
   /** 明细条右上角的关闭按钮 */
   const panelClose = kind =>
     `<button class="panel-close" data-panel-close="${kind}" title="收起">✕</button>`;
 
-  function usagePanelHtml(account, entry) {
-    if (entry === undefined) {
-      return `<div class="row-panel">积分尚未查询，请点击该卡片上的「积分」按钮。${panelClose('usage')}</div>`;
+  /**
+   * 限流明细面板：这个账号**当前限流中的模型**逐行列出 —— 模型名、恢复时间、
+   * 上游给的原因，以及「清除标记」动作（单条）与「全部清除」。
+   *
+   * 为什么值得一整块面板而不是悬浮提示：限流是「按模型」的（一个账号完全可能
+   * A 模型限流、B 模型正常），把模型名列出来才能回答「到底是谁把我限了」；
+   * 而「清除标记」是真实动作，悬浮层里放不下也点不稳。
+   *
+   * 「清除标记」只作用于本机这份冷却标记：下一次请求若上游仍限流会再次被标记，
+   * 所以它是安全且可逆的，不需要二次确认。已展开但记录恰好全部过期时给一句
+   * 中性说明 —— 数据是两次读盘之间变了的，不该渲染成一块空面板。
+   */
+  function limitPanelHtml(account) {
+    const close = panelClose('limits');
+    const entries = activeLimits(account);
+    if (!entries.length) {
+      return `<div class="row-panel limit-panel">当前没有限流中的模型。${close}</div>`;
     }
-    if (entry === null) {
-      return `<div class="row-panel"><span class="badge warn">正在查询积分…</span>${panelClose('usage')}</div>`;
-    }
-    if (typeof entry === 'string') {
-      return `<div class="row-panel error"><span class="badge bad">查询失败</span> ${esc(entry)}${panelClose('usage')}</div>`;
-    }
-    // 三字段简报：总剩余 / 套餐基础 / 平台奖励（企业账号后两项为 null）
-    const totalLeft = entry.unlimited ? '∞' : (entry.totalLeft ?? '—');
-    const planLeft = entry.planLeft ?? '—';
-    const bonusLeft = entry.bonusLeft ?? '—';
-    const kindTag = entry.kind === 'enterprise' ? '<span>（企业账号）</span>' : '';
-    return `<div class="row-panel">`
-      + `<span>总剩余 <b class="big">${esc(totalLeft)}</b></span>`
-      + `<span>套餐 <b>${esc(planLeft)}</b></span>`
-      + `<span>奖励 <b>${esc(bonusLeft)}</b></span>`
-      + kindTag + panelClose('usage')
+    const rows = entries.map(entry => {
+      const reset = formatResetText(entry.resetAt);
+      const resetText = reset === RESET_UNKNOWN ? '恢复时间未知' : `${reset} 恢复`;
+      const reason = entry.message || (entry.status ? `上游返回 ${entry.status}` : '');
+      return `<div class="lp-row">`
+        + `<span class="lp-model" title="${esc(entry.model)}">${esc(entry.model)}</span>`
+        + `<span class="badge tag warn">限流中</span>`
+        + `<span class="lp-reset" title="到恢复时间后自动解除，无需手动操作">${esc(resetText)}</span>`
+        + `<span class="lp-reason" title="${esc(reason)}">${esc(reason)}</span>`
+        + `<button data-limit-clear="${esc(entry.model)}" title="清掉本机的限流标记，立刻重新尝试该模型（上游若仍在限流会再次被标记）">清除标记</button>`
+        + `</div>`;
+    }).join('');
+    return `<div class="row-panel limit-panel">${close}`
+      + `<div class="lp-head"><b>${esc(account.nickname || account.name || account.id)}</b>`
+      + `<span class="muted">${entries.length} 个模型限流中 · 记录来自上游 429 / 限额码，到恢复时间自动解除</span>`
+      + `<button data-limit-clear-all title="清掉该账号全部模型的限流标记">全部清除</button></div>`
+      + rows
       + `</div>`;
   }
 
+  /** 余额 / 积分明细（实现见 usage-panel.js；两套形状的渲染与判据在那里） */
+  const usagePanelHtml = (account, entry) =>
+    window.wbUsagePanel.usagePanelHtml(account, entry);
+
   function checkinPanelHtml(account, entry) {
     const close = panelClose('checkin');
+    if (!providerFeatures(providerOf(account)).checkin) {
+      return `<div class="row-panel">该提供商没有签到活动，此账号不参与签到。${close}</div>`;
+    }
     if (!supportsCheckin(account)) {
       return `<div class="row-panel">国际版暂无签到活动，该账号不参与签到。${close}</div>`;
     }
@@ -217,7 +163,7 @@
       return `<div class="row-panel">账号已禁用，不参与批量签到；如需签到请先启用。${close}</div>`;
     }
     if (entry === undefined) {
-      return `<div class="row-panel">签到状态未查询，请点击该卡片上的「签到」按钮。${close}</div>`;
+      return `<div class="row-panel">签到状态未查询，请点击该行的「签到」按钮。${close}</div>`;
     }
     if (entry === null) {
       return `<div class="row-panel"><span class="badge warn">正在签到…</span>${close}</div>`;
@@ -240,21 +186,121 @@
       + `<span>code=${esc(entry.code ?? '?')}</span>${close}</div>`;
   }
 
+  // ─── 卡片 ──────────────────────────────────
+
+  /**
+   * ⋯ 菜单项（点击时才插入 DOM，这里只生成 HTML）。
+   *
+   * 菜单按「影响面」从大到小排：启用/禁用会改变这个账号是否参与转发，
+   * 是最重的一项，故放在最前；删除账号同理，排在最后并由 <hr> 隔开。
+   * 两项都标 danger：它们会立刻改变转发可用性。
+   *
+   * 「桌面端实时登录态」账号**也可以删除**了（曾经置灰不可删，现已放开）：
+   * 它是「导入桌面端登录态」建出来的一条账号记录，删除只作用于这条记录 ——
+   * 客户端的登录态文件我们从不去写、也不会删，因此安全且可逆（想再用，
+   * 重新导入一次就加回来）。置灰挡掉的其实是用户「我不要这条」的正当选择：
+   * 禁用后记录仍占着列表与优先级序号，等于把人锁死。菜单项保留一句 title
+   * 说明「删的是这条记录、不是客户端里的登录态」，免得误以为删掉就是退登。
+   *
+   * 「刷新 Token」仍按 `hasRefreshToken` 决定（数据驱动，与改造前一致）：
+   * 桌面端账号的记录里不落 refreshToken（凭证在客户端文件里、转发时临期会自动刷新），
+   * 所以这一项对它不出现 —— 手动刷新走的是「不过期就原样返回」的路径，
+   * 点了只会得到一句「已刷新」而实际什么都没做，不如不给这个入口。
+   */
+  function moreMenuHtml(account) {
+    const items = [];
+    items.push(isEnabled(account)
+      ? { action: 'disable', label: '禁用', danger: true }
+      : { action: 'enable', label: '启用', danger: true });
+    if (account.hasRefreshToken) {
+      items.push({ action: 'refresh', label: '刷新 Token' });
+    }
+    items.push(isDesktopAccount(account)
+      ? { action: 'remove', label: '删除账号', danger: true, title: '删除这条账号记录（不会影响客户端自己的登录态；之后可再点「导入桌面端登录态」加回来）' }
+      : { action: 'remove', label: '删除账号', danger: true });
+    // 菜单内不再重复行内已有的操作（设置/积分/设为首选都留在行上）
+    return items.map((item, index) => {
+      const hr = item.danger && index > 0 ? '<hr>' : '';
+      const attrs = [
+        `data-menu-action="${item.action}"`,
+        `data-id="${esc(account.id)}"`,
+        item.danger ? 'class="danger"' : '',
+        item.disabled ? 'disabled' : '',
+        item.title ? `title="${esc(item.title)}"` : '',
+      ].filter(Boolean).join(' ');
+      return `${hr}<button ${attrs}>${esc(item.label)}</button>`;
+    }).join('');
+  }
+
+  /** 无有效恢复时间时的退化文案：它本身就是完整一句，调用方据此不再拼「，恢复时间：」 */
+  const RESET_UNKNOWN = '已限流';
+
+  /** 某时刻所在自然日的零点（本地时区），用于按「日历天」计算今天 / 明天 */
+  const startOfDay = value => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+
+  /**
+   * 限流恢复时间文案：今天 HH:mm / 明天 HH:mm / M月d日 HH:mm。
+   *
+   * 为什么带「今天 / 明天」而不是相对毫秒数或完整时间戳：限流是自动解除的，
+   * 用户扫过卡片时最关心「到点了没、还要等多久」——「明天 01:04」比
+   * 「09-19 01:04」少一步换算，也不会像「6 小时后」那样一过夜就说不清是哪天。
+   *
+   * 无有效时间戳（缺失 / 非法 / 已过，后者说明数据异常）时返回 RESET_UNKNOWN，
+   * 由调用方退化成只输出这一句。
+   */
+  function formatResetText(resetAt) {
+    const time = Number(resetAt);
+    if (!Number.isFinite(time) || time <= 0 || time <= Date.now()) return RESET_UNKNOWN;
+    const date = new Date(time);
+    const clock = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    // 按自然日求差而不是按 24 小时：今晚 23:50 到明天 00:10 只差 20 分钟，
+    // 但用户嘴里它就是「明天」，按毫秒差算会显示成「今天」，与直觉相反。
+    const days = Math.round((startOfDay(date) - startOfDay(new Date())) / 86400e3);
+    if (days === 0) return `今天 ${clock}`;
+    if (days === 1) return `明天 ${clock}`;
+    return `${date.getMonth() + 1}月${date.getDate()}日 ${clock}`;
+  }
+
   window.wbAccountsModel = {
+    // provider 维度
+    DEFAULT_PROVIDER_ID,
+    RACCOON_PROVIDER_ID,
+    providerOf,
+    providerFeatures,
+    providerSummaries,
+    identifierOf,
+    tokenExpiryOf,
+    supportsUsage,
+    isDesktopAccount,
+    // 基础判定
     byPriorityOrder,
     typeLabel,
     isEnabled,
     isRateLimited,
     usableForModel,
+    hasCredentials,
     accountEdition,
     supportsCheckin,
     checkinableAccounts,
+    // 筛选与队列
+    matchProvider,
+    matchEdition,
+    matchEnabled,
+    matchLimit,
+    visibleAccounts,
+    filterCounts,
+    positionMap,
+    pickForModel,
+    pickQueueHead,
+    routedId,
+    activeLimits,
+    // 标签与面板
     statusTag,
-    rateLimitTag,
     accountTags,
-    expiryText,
-    metaLine,
     editionCell,
+    moreMenuHtml,
+    limitPanelHtml,
+    formatResetText,
     usagePanelHtml,
     checkinPanelHtml,
   };
