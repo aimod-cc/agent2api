@@ -262,8 +262,8 @@ pub fn default_model_catalog() -> Vec<Value> {
         }
         for entry in manifest_for(kind) {
             let id = model_id(&entry);
-            // 被禁用 / 隐藏的名字不进回落候选（理由见函数头说明）
-            if !id.is_empty() && rules.is_blocked(&id) {
+            // 被禁用 / 隐藏的名字不进回落候选（按提供商判定，理由见函数头说明）
+            if !id.is_empty() && rules.is_blocked(kind_id(kind), &id) {
                 continue;
             }
             if !id.is_empty() {
@@ -328,29 +328,29 @@ fn aggregated_model_ids() -> Vec<String> {
     ids
 }
 
-/// 合并后的清单条目 `(provider id, /v1/models 条目)` —— **唯一一处合并逻辑**。
+/// 合并各家的清单：**先剔除该家自己禁用 / 隐藏的条目，再做跨提供商去重**。
 ///
-/// 入参是 `active_manifests` 的结果（调用方各取一次，本函数不自己再查一遍：
-/// 查一次就要克隆一遍各家的清单，两条出口各调一次会白干一倍的活）。
-/// 同名模型去重（先合并者胜 = 路由优先级小的那家），条目构造走
-/// `models::list_item`（`owned_by` 记为实际承载该模型的那家 provider id）。
-/// 两条出口都从这里取数据：`models_response` 拼信封，`session_models` 补
-/// provider 归属后交前端 —— 去重口径、条目字段、顺序三者只有这一份实现。
+/// 与 `merged_items` 的差别就在先后顺序：按提供商区分启停后，同一模型 id
+/// 可能 A 家被禁、B 家可用 —— 若沿用「先认领再过滤」，A 家会先把名字认领掉
+/// 然后被过滤，B 家的可用模型就从对外视图里凭空消失。这里改成「可用的先认领」：
+/// 只要还有一家提供且未禁用，名字就对外存在（由那家承载）。
 ///
-/// 条目里没有 provider id 的独立字段（`owned_by` 就是它）：多一个同义字段
-/// 就多一处可能与 `owned_by` 不一致的写法，而下游要的就是这个 id。
-fn merged_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(&'static str, Value)> {
+/// 去重只跨 provider 做（同一家内部的重复条目原样保留），与 `merged_items`
+/// 同一取向。
+fn merged_items_available(
+    active: &[(ProviderKind, Vec<Value>)],
+    rules: &model_rules::ModelRules,
+) -> Vec<(&'static str, Value)> {
     let mut items: Vec<(&'static str, Value)> = Vec::new();
-    // 已被**更早（优先级更小）的 provider** 认领的模型名。去重只跨 provider 做：
-    // 同一家清单内部若出现重复条目（远程下发的脏数据），原样全部保留 ——
-    // 改造前 `ModelCatalog::list_response` 就是逐条映出去，顺手去重会让
-    // 「单家用户的输出」与改造前产生差异，那是本任务明令禁止的。
     let mut claimed: Vec<String> = Vec::new();
     for (kind, manifest) in active {
         let provider_id = kind_id(*kind);
         for model in manifest {
             let id = model_id(model);
-            // 没有 id 的条目无法参与去重（现实中不存在），原样保留
+            // 该家自己禁用 / 隐藏 → 这一家不参与（名字可能由别家继续承载）
+            if !id.is_empty() && rules.is_blocked(provider_id, &id) {
+                continue;
+            }
             if !id.is_empty() {
                 let key = id.to_lowercase();
                 if claimed.iter().any(|known| known == &key) {
@@ -362,6 +362,43 @@ fn merged_items(active: &[(ProviderKind, Vec<Value>)]) -> Vec<(&'static str, Val
         }
     }
     items
+}
+
+/// 请求名是否在**所有**能承载它的提供商上都被禁用 / 隐藏。
+///
+/// 按提供商区分启停后，chat 入口的 404 校验不能再用「名字在 blocked 列表里」
+/// 判定：只要还有一家提供且可用就应放行（转发候选链自己会跳过被禁的家），
+/// 只有全部承载家都被禁用时才返回 model_not_found。判定需要每家的清单来把
+/// 请求名解析成条目 id（**先 id 后 name、忽略大小写**，与 `providers_for_model`
+/// 同口径），所以放在目录模块而不是 model_rules。
+///
+/// 名字在所有家都不存在时返回 false —— 那由调用方的「模型不存在」分支处理，
+/// 错误文案应区分「没这个模型」与「被禁用了」。
+pub fn model_blocked_everywhere(model: &str) -> bool {
+    let rules = model_rules::current();
+    let providers = providers_for_model(model);
+    if providers.is_empty() {
+        return false;
+    }
+    let target = model.trim().to_lowercase();
+    providers.iter().all(|kind| {
+        let entry_id = manifest_for(*kind)
+            .iter()
+            .find(|entry| {
+                model_id(entry).to_lowercase() == target
+                    || entry
+                        .get("name")
+                        .map(crate::server::core::models::shape_value_text)
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        == target
+            })
+            .map(model_id);
+        match entry_id {
+            Some(id) => rules.is_blocked(kind_id(*kind), &id),
+            None => false,
+        }
+    })
 }
 
 /// 聚合结果的来源元信息 `(meta.source, meta.lastRefreshedAt)`。
@@ -411,11 +448,10 @@ pub fn models_response(store: &AccountStore) -> Value {
     // 让客户端能在 /v1/models 里发现它们
     let mut data: Vec<Value> = Vec::new();
     let mut aliases: Vec<Value> = Vec::new();
-    for (_, item) in merged_items(&active) {
+    // 「可用的先认领」：某家禁用的模型由仍提供的另一家继续对外暴露（见
+    // merged_items_available 的说明）；映射条目同样只在目标模型仍可用时追加
+    for (_, item) in merged_items_available(&active, &rules) {
         let id = model_id(&item);
-        if rules.is_blocked(&id) {
-            continue;
-        }
         for alias in rules.aliases_of(&id) {
             let mut copy = item.clone();
             if let Some(object) = copy.as_object_mut() {
@@ -442,18 +478,26 @@ pub fn models_response(store: &AccountStore) -> Value {
 /// 曾因此被 WorkBuddy 认领而不显示）。管理页的职责是管理**每家上游的真实
 /// 清单**，所以这里每家各列各的，同名模型在每家各占一行。
 ///
-/// 禁用 / 删除规则本身仍按**模型 id 全局生效**（modelRules 的键就是 id）：
-/// 同名模型在哪家停用，对所有家一起停用 —— 与 /v1/models「一个名字一个
-/// 条目」的对外语义一致。
+/// 禁用 / 删除规则按 **(提供商, 模型 id)** 生效（modelRules 的键带 provider）：
+/// 管理页里关掉某一家的模型，只是这一家不再接收该模型的请求，别家照常 ——
+/// 与 /v1/models「可用的先认领」的对外语义一致（见 `merged_items_available`）。
 pub fn manage_view(store: &AccountStore) -> Value {
     let rules = model_rules::current();
     let models: Vec<Value> = manage_entries(store, &rules)
         .into_iter()
         .map(|mut entry| {
             let id = model_id(&entry);
+            let provider =
+                entry.get("provider").and_then(Value::as_str).unwrap_or("").to_string();
             if let Some(object) = entry.as_object_mut() {
-                object.insert("enabled".to_string(), Value::Bool(!rules.is_disabled(&id)));
-                object.insert("hidden".to_string(), Value::Bool(rules.is_hidden(&id)));
+                object.insert(
+                    "enabled".to_string(),
+                    Value::Bool(!rules.is_disabled(&provider, &id)),
+                );
+                object.insert(
+                    "hidden".to_string(),
+                    Value::Bool(rules.is_hidden(&provider, &id)),
+                );
                 object.insert(
                     "aliases".to_string(),
                     Value::Array(rules.aliases_of(&id).into_iter().map(|a| Value::String(a.to_string())).collect()),
@@ -489,19 +533,12 @@ pub fn manage_view(store: &AccountStore) -> Value {
 /// 只能回落到数组首项 —— 路由优先级一改就指到别家的模型上）。取值则从
 /// `/v1/models` 的条目里读，默认/倍率的判定规则与对外接口同源，两处不可能各说各话。
 pub fn session_models(store: &AccountStore) -> Vec<Value> {
-    // 与 /v1/models 同一过滤：禁用 / 隐藏的模型不出现在界面的「可用模型」里
+    // 与 /v1/models 同一过滤（按提供商判定 + 可用的先认领）：某家禁用的模型
+    // 由仍提供的另一家继续出现在界面的「可用模型」里
     let rules = model_rules::current();
-    session_entries(store)
+    merged_items_available(&active_manifests(store), &rules)
         .into_iter()
-        .filter(|entry| !rules.is_blocked(&model_id(entry)))
-        .collect()
-}
-
-/// `session_models` 的未过滤版本（管理页要看到禁用 / 隐藏的条目）
-fn session_entries(store: &AccountStore) -> Vec<Value> {
-    merged_items(&active_manifests(store))
-        .into_iter()
-        .map(|(provider_id, item)| manage_entry_json(provider_id, &item))
+        .map(|(_, item)| item)
         .collect()
 }
 
@@ -525,7 +562,8 @@ fn manage_entries(store: &AccountStore, rules: &model_rules::ModelRules) -> Vec<
     for (kind, manifest) in active_manifests(store) {
         let provider_id = kind_id(kind);
         let mut items = manifest;
-        items.sort_by_key(|item| rules.is_disabled(&model_id(item)));
+        // 组内排序：启用的排前（同一家内按该家自己的启停状态）
+        items.sort_by_key(|item| rules.is_disabled(provider_id, &model_id(item)));
         for item in items {
             entries.push(manage_entry_json(provider_id, &item));
         }

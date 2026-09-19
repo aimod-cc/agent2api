@@ -66,7 +66,30 @@ pub async fn set_state(State(state): State<ServerState>, body: Bytes) -> Respons
     if enabled.is_none() && hidden.is_none() {
         return errors::management_error(400, "enabled / hidden 至少给一项");
     }
-    model_rules::set_state(&id, enabled, hidden);
+    // 目标提供商：新版前端总是带着（启停粒度是「提供商 × 模型 id」）；
+    // 缺省走旧版全局语义 —— 只有旧版前端（升级前）会这么传
+    let provider = text_field(&object, "provider");
+    let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
+    // 启用某一家时可能要把旧版的全局条目展开成「其余各家」，这里给出当前
+    // 清单里同样承载该模型的其他提供商（目录的匹配口径：先 id 后 name）
+    let others: Vec<String> = if enabled == Some(true) {
+        crate::server::core::providers::catalog::providers_for_model(&id)
+            .into_iter()
+            .map(crate::server::core::providers::kind_id)
+            .filter(|kind_provider| {
+                Some(*kind_provider) != provider_opt.map(str::to_string).as_deref()
+            })
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    model_rules::set_state(provider_opt, &id, enabled, hidden, &others);
+    // 日志里把提供商带上：同名模型在多家同时存在时，单看 id 分不清动的是哪家
+    let subject = match provider_opt {
+        Some(name) => format!("[{name}] {id}"),
+        None => id.clone(),
+    };
     let what = match (enabled, hidden) {
         (_, Some(true)) => "已删除（隐藏）",
         (_, Some(false)) => "已恢复",
@@ -74,7 +97,7 @@ pub async fn set_state(State(state): State<ServerState>, body: Bytes) -> Respons
         (Some(false), _) => "已禁用",
         _ => "已更新",
     };
-    logging::log("[Models]", &format!("模型 {id} {what}"));
+    logging::log("[Models]", &format!("模型 {subject} {what}"));
     ok_json(catalog::manage_view(state.store()))
 }
 

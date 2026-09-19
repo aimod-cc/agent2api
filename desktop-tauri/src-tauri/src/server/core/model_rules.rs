@@ -3,23 +3,35 @@
 //! 形状：
 //! ```json
 //! "modelRules": {
-//!   "disabled": ["deepseek-v3-2-volc"],
-//!   "hidden":   ["sn-glm-5-3"],
-//!   "mappings": [{ "alias": "gpt-4o", "target": "deepseek-v4-pro" }]
+//!   "disabled": [{ "provider": "catpaw", "id": "kimi-k3" }],
+//!   "hidden":   [{ "provider": "raccoon", "id": "sn-glm-5-3" }],
+//!   "mappings": [{ "alias": "gpt-4o", "target": "deepseek-v4-pro" }],
+//!   "seeded":   ["workbuddy:hy3"]
 //! }
 //! ```
-//! - **禁用**：模型仍在管理页里可见（开关关着），但不出现在 `/v1/models`，
+//! - **禁用**：模型在管理页里仍可见（开关关着），但不出现在 `/v1/models`，
 //!   请求它返回 404 model_not_found；
 //! - **隐藏**（管理页的「删除」）：从清单里拿掉，管理页可在「已删除」筛选里恢复；
 //!   对外效果与禁用相同；
 //! - **映射**：下游用 `alias` 请求时改写成 `target` 再转发；alias 同时出现在
 //!   `/v1/models` 里。同一 alias 只能指向一个 target；alias 不得与任何上游模型 id 同名。
 //!
-//! - **seeded**：已经做过「默认规则种子」的模型 id（小浣熊清单见
-//!   `seed_raccoon_defaults`，WorkBuddy 清单见 `seed_workbuddy_defaults`）。
-//!   种子只在模型**首次出现**时生效一次：
-//!   之后用户在管理页的手动调整（重新启用、删除映射）不会被下一次清单刷新
-//!   悄悄改回去 —— 「默认值」只该决定初始状态，不该决定 forever。
+//! ── 启停粒度是「提供商 × 模型 id」，不再是全局 id ─────────────
+//! 同一个模型 id（或对外名）常被多家同时提供（如 `kimi-k3`：CatPaw 的上游 id
+//! 与小浣熊经去前缀映射暴露的对外名同名）。规则按 `(provider, id)` 存放，
+//! 关掉某一家只是这一家不再接收该模型的请求，别家照常。
+//!
+//! ── 历史条目的兼容（不要「顺手迁移」）─────────────────────────
+//! 旧版把 disabled / hidden 存成**纯 id 字符串数组**（全局生效）。读取时兼容：
+//! 字符串条目解析成 `provider: None`，对**任何提供商**都命中 —— 升级后用户
+//! 之前做的全局启停保持原样，直到他在管理页里对某一家重新启停（那时写侧会
+//! 按「展开为其余各家」的语义把它替换掉，见 `set_state`）。
+//!
+//! - **seeded**：已经做过「默认规则种子」的 (provider, id)，写成
+//!   `"provider:id"` 字符串（旧版是纯 id，读取时对任何 provider 都算已种 ——
+//!   只影响「要不要再种一次默认值」，保守方向是正确的）。
+//!   种子只在模型**首次出现**时生效一次：之后用户在管理页的手动调整
+//!   （重新启用、删除映射）不会被下一次清单刷新悄悄改回去。
 //!
 //! 所有比对忽略大小写（与 `catalog::providers_for_model` 同口径）。
 
@@ -36,34 +48,86 @@ pub struct Mapping {
     pub target: String,
 }
 
+/// 一条启停规则的键：`(provider, id)`。
+///
+/// `provider` 为 `None` 的条目来自旧版配置（纯 id 字符串），语义是
+/// 「对所有提供商生效」；新版写侧永远带 provider。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuleEntry {
+    pub provider: Option<String>,
+    pub id: String,
+}
+
+impl RuleEntry {
+    fn new(provider: Option<&str>, id: &str) -> Self {
+        Self { provider: provider.map(str::to_string), id: id.to_string() }
+    }
+
+    fn to_value(&self) -> Value {
+        match &self.provider {
+            Some(provider) => json!({ "provider": provider, "id": self.id }),
+            None => Value::String(self.id.clone()),
+        }
+    }
+
+    /// 条目是否命中 `(provider, id)`：id 同（忽略大小写），且 provider 为
+    /// None（全局条目）或与目标一致。
+    fn matches(&self, provider: &str, id: &str) -> bool {
+        self.id.eq_ignore_ascii_case(id)
+            && self.provider.as_deref().map_or(true, |p| p.eq_ignore_ascii_case(provider))
+    }
+}
+
 /// 解析后的规则快照
 #[derive(Clone, Debug, Default)]
 pub struct ModelRules {
-    pub disabled: Vec<String>,
-    pub hidden: Vec<String>,
+    pub disabled: Vec<RuleEntry>,
+    pub hidden: Vec<RuleEntry>,
     pub mappings: Vec<Mapping>,
     pub seeded: Vec<String>,
+}
+
+/// 从规则数组的 JSON 形态还原条目列表（兼容旧版纯 id 字符串）
+fn entries_from(value: Option<&Value>) -> Vec<RuleEntry> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    // 旧形态：纯 id 字符串 = 全局规则
+                    Value::String(id) => {
+                        let id = id.trim();
+                        if id.is_empty() {
+                            None
+                        } else {
+                            Some(RuleEntry::new(None, id))
+                        }
+                    }
+                    // 新形态：{provider, id}
+                    Value::Object(object) => {
+                        let id = object.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+                        if id.is_empty() {
+                            return None;
+                        }
+                        let provider = object
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|provider| !provider.is_empty());
+                        Some(RuleEntry::new(provider, id))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl ModelRules {
     pub fn from_raw(raw: &Map<String, Value>) -> Self {
         let Some(object) = raw.get(KEY_MODEL_RULES).and_then(Value::as_object) else {
             return Self::default();
-        };
-        let list = |key: &str| -> Vec<String> {
-            object
-                .get(key)
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default()
         };
         let mappings = object
             .get("mappings")
@@ -86,33 +150,50 @@ impl ModelRules {
             })
             .unwrap_or_default();
         Self {
-            disabled: list("disabled"),
-            hidden: list("hidden"),
+            disabled: entries_from(object.get("disabled")),
+            hidden: entries_from(object.get("hidden")),
             mappings,
-            seeded: list("seeded"),
+            seeded: object
+                .get("seeded")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 
     fn to_value(&self) -> Value {
         json!({
-            "disabled": self.disabled,
-            "hidden": self.hidden,
+            "disabled": self.disabled.iter().map(RuleEntry::to_value).collect::<Vec<_>>(),
+            "hidden": self.hidden.iter().map(RuleEntry::to_value).collect::<Vec<_>>(),
             "mappings": self.mappings.iter().map(|m| json!({"alias": m.alias, "target": m.target})).collect::<Vec<_>>(),
             "seeded": self.seeded,
         })
     }
 
-    pub fn is_disabled(&self, id: &str) -> bool {
-        self.disabled.iter().any(|item| item.eq_ignore_ascii_case(id))
+    /// 单条列表（disabled / hidden）上「按 id 取条目」的匹配判定
+    fn hit(list: &[RuleEntry], provider: &str, id: &str) -> bool {
+        list.iter().any(|entry| entry.matches(provider, id))
     }
 
-    pub fn is_hidden(&self, id: &str) -> bool {
-        self.hidden.iter().any(|item| item.eq_ignore_ascii_case(id))
+    pub fn is_disabled(&self, provider: &str, id: &str) -> bool {
+        Self::hit(&self.disabled, provider, id)
     }
 
-    /// 禁用或隐藏 → 对外不可用
-    pub fn is_blocked(&self, id: &str) -> bool {
-        self.is_disabled(id) || self.is_hidden(id)
+    pub fn is_hidden(&self, provider: &str, id: &str) -> bool {
+        Self::hit(&self.hidden, provider, id)
+    }
+
+    /// 禁用或隐藏 → 该提供商对该模型对外不可用
+    pub fn is_blocked(&self, provider: &str, id: &str) -> bool {
+        self.is_disabled(provider, id) || self.is_hidden(provider, id)
     }
 
     /// alias → target（忽略大小写）
@@ -131,6 +212,16 @@ impl ModelRules {
             .map(|m| m.alias.as_str())
             .collect()
     }
+
+    /// 该 (provider, id) 是否已做过默认规则种子。
+    /// 新条目按 `provider:id` 精确匹配；旧版纯 id 条目对任何 provider 都算已种
+    /// （旧种子是全局动作，重种一遍只是把同样的默认值再写一次，没必要）。
+    fn is_seeded(&self, provider: &str, id: &str) -> bool {
+        let key = format!("{provider}:{id}");
+        self.seeded.iter().any(|item| {
+            item.eq_ignore_ascii_case(&key) || item.eq_ignore_ascii_case(id)
+        })
+    }
 }
 
 /// 当前生效的规则
@@ -142,24 +233,71 @@ fn save(rules: &ModelRules) -> bool {
     config::update_raw_field(KEY_MODEL_RULES, rules.to_value())
 }
 
-fn set_membership(list: &mut Vec<String>, id: &str, present: bool) {
-    list.retain(|item| !item.eq_ignore_ascii_case(id));
-    if present {
-        list.push(id.to_string());
+/// 把 `(provider, id)` 的**启用**落到列表上。
+///
+/// 启用某一家时，直接移除该家的条目就够；但如果存在旧版的**全局条目**
+/// （provider=None，对所有提供商生效），只移除它会把其他家也一并放开 ——
+/// 那不是用户的意图。此时把全局条目替换为「其余当前也提供该模型的家」的
+/// 精确条目：它们的禁用状态原样保留，目标家则恢复可用。其余各家取自
+/// `other_providers`（调用方从当前清单里取，见 `api::model_manage`）。
+fn enable_on(list: &mut Vec<RuleEntry>, provider: &str, id: &str, other_providers: &[String]) {
+    let had_global = list
+        .iter()
+        .any(|entry| entry.provider.is_none() && entry.id.eq_ignore_ascii_case(id));
+    list.retain(|entry| !entry.matches(provider, id));
+    if had_global {
+        // 全局条目展开：其他家逐家补条目（已有的保持原样，不重复加）
+        for other in other_providers {
+            if other.eq_ignore_ascii_case(provider) {
+                continue;
+            }
+            if !ModelRules::hit(list, other, id) {
+                list.push(RuleEntry::new(Some(other), id));
+            }
+        }
     }
 }
 
-/// 设置某模型的启用 / 隐藏状态（`None` = 该项不动）
-pub fn set_state(id: &str, enabled: Option<bool>, hidden: Option<bool>) -> ModelRules {
+/// 设置某模型的启用 / 隐藏状态（`None` = 该项不动）。
+///
+/// `provider` 是规则的目标提供商；`None` 走**旧版全局语义**（只有旧前端会
+/// 这么传），enabled=false 等价于「对所有提供商禁用」，enabled=true 等价于
+/// 「清掉该 id 的全部条目」—— 与升级前行为完全一致。
+///
+/// `other_providers`：当前清单里同样提供该模型的其他提供商（启用分支展开
+/// 全局条目时用）；调用方从 catalog 取，这里不回头依赖目录模块。
+pub fn set_state(
+    provider: Option<&str>,
+    id: &str,
+    enabled: Option<bool>,
+    hidden: Option<bool>,
+    other_providers: &[String],
+) -> ModelRules {
     let mut rules = current();
     if let Some(enabled) = enabled {
-        set_membership(&mut rules.disabled, id, !enabled);
+        if enabled {
+            enable_on(&mut rules.disabled, provider.unwrap_or(""), id, other_providers);
+        } else {
+            set_membership(&mut rules.disabled, provider, id, true);
+        }
     }
     if let Some(hidden) = hidden {
-        set_membership(&mut rules.hidden, id, hidden);
+        if !hidden {
+            enable_on(&mut rules.hidden, provider.unwrap_or(""), id, other_providers);
+        } else {
+            set_membership(&mut rules.hidden, provider, id, true);
+        }
     }
     save(&rules);
     rules
+}
+
+/// 把 `(provider, id)` 的**禁用 / 隐藏**落到列表上（幂等；provider=None = 全局）
+fn set_membership(list: &mut Vec<RuleEntry>, provider: Option<&str>, id: &str, present: bool) {
+    list.retain(|entry| !(entry.provider == provider.map(str::to_string) && entry.id.eq_ignore_ascii_case(id)));
+    if present {
+        list.push(RuleEntry::new(provider, id));
+    }
 }
 
 /// alias 允许的字符：字母 / 数字 / `- _ . / :`
@@ -216,7 +354,7 @@ fn is_opaque_raccoon_id(id: &str) -> bool {
 ///     客户端用两种名字都行；去前缀后的名字若已被映射占用、或与小浣熊自己的
 ///     另一个上游模型 id 撞名，则跳过（照常记入 seeded，不再反复尝试）。
 ///
-/// 处理过的 id 记入 `seeded`（持久化在 modelRules 里）：之后用户手动启用某个
+/// 处理过的 (provider, id) 记入 `seeded`（持久化在 modelRules 里）：之后用户手动启用某个
 /// 内部模型、或删掉某条自动映射，清单刷新都不会把它们改回去；上游将来新增的
 /// `sn-` 模型因为 id 没种过，会在下一次种子时自动获得映射。
 ///
@@ -228,16 +366,14 @@ pub fn seed_raccoon_defaults(ids: &[String]) -> Option<String> {
     let mut mappings_added: Vec<String> = Vec::new();
     for id in ids {
         let id = id.trim();
-        if id.is_empty()
-            || rules.seeded.iter().any(|seeded| seeded.eq_ignore_ascii_case(id))
-        {
+        if id.is_empty() || rules.is_seeded("raccoon", id) {
             continue;
         }
-        rules.seeded.push(id.to_string());
+        rules.seeded.push(format!("raccoon:{id}"));
         if is_opaque_raccoon_id(id) {
             // 已在 disabled 里就不重复计数（set_membership 本身幂等）
-            if !rules.is_disabled(id) {
-                set_membership(&mut rules.disabled, id, true);
+            if !rules.is_disabled("raccoon", id) {
+                set_membership(&mut rules.disabled, Some("raccoon"), id, true);
                 disabled_added.push(id.to_string());
             }
         } else if let Some(alias) = id.strip_prefix("sn-") {
@@ -294,17 +430,15 @@ pub fn seed_workbuddy_defaults(ids: &[String]) -> Option<String> {
     let mut disabled_added: Vec<String> = Vec::new();
     for id in ids {
         let id = id.trim();
-        if id.is_empty()
-            || rules.seeded.iter().any(|seeded| seeded.eq_ignore_ascii_case(id))
-        {
+        if id.is_empty() || rules.is_seeded("workbuddy", id) {
             continue;
         }
-        rules.seeded.push(id.to_string());
+        rules.seeded.push(format!("workbuddy:{id}"));
         let default_enabled = WORKBUDDY_DEFAULT_ENABLED
             .iter()
             .any(|name| name.eq_ignore_ascii_case(id));
-        if !default_enabled && !rules.is_disabled(id) {
-            set_membership(&mut rules.disabled, id, true);
+        if !default_enabled && !rules.is_disabled("workbuddy", id) {
+            set_membership(&mut rules.disabled, Some("workbuddy"), id, true);
             disabled_added.push(id.to_string());
         }
     }

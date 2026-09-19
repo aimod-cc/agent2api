@@ -347,7 +347,62 @@ function syncUpdateBadge() {
 function updateUpdateBadge(info) {
   lastUpdateInfo = info || null;
   syncUpdateBadge();
+  maybeShowUpdateModal(info);
 }
+
+// ─── 「检测到更新」弹窗 ────────────────────────
+
+/** 「跳过此次更新」记在 localStorage 的键（值 = 跳过的版本号） */
+const UPDATE_SKIP_KEY = 'workbuddy-desktop-update-skip';
+/** 本会话内已弹过提示的版本号：用户选「取消」后，同一版本不再连着弹
+ *  （后端的定时检查每 5 分钟就会再次发现它，弹一次/轮是预期节奏） */
+let promptedUpdateVersion = '';
+
+function closeUpdateModal() {
+  $('update-modal')?.classList.remove('open');
+}
+
+/**
+ * 检测到新版本时弹出提示弹窗（标题「检测到更新」+ Markdown 更新日志）。
+ *
+ * 弹与不弹的判定：
+ *   - 「跳过此次更新」记的是**版本号**：该版本不再弹，将来更新的版本照常弹；
+ *   - 「取消」什么都不记：下一次检测到（定时任务的下一轮）还会再弹；
+ *   - 人已经在设置页时不弹 —— 软件更新面板就在眼前，再盖一层弹窗纯属打扰
+ *     （与 syncUpdateBadge 的取向一致）。
+ */
+function maybeShowUpdateModal(info) {
+  const mask = $('update-modal');
+  if (!mask || !info || info.hasUpdate !== true) return;
+  const latest = String(info.latestVersion || '').trim();
+  if (!latest || wbApp.currentPage === 'settings') return;
+  let skipped = '';
+  try { skipped = localStorage.getItem(UPDATE_SKIP_KEY) || ''; } catch { /* 隐私模式等：当作没跳过 */ }
+  if (latest === skipped || latest === promptedUpdateVersion) return;
+  promptedUpdateVersion = latest;
+
+  $('update-modal-version').textContent = latest;
+  $('update-modal-current').textContent = info.currentVersion || '未知';
+  const notes = String(info.notes || '').trim();
+  $('update-modal-notes').innerHTML = notes
+    ? (window.wbMarkdown?.render?.(notes) || `<p>${esc(notes)}</p>`)
+    : '<p>这个版本没有填写发布说明。</p>';
+  mask.classList.add('open');
+}
+
+$('update-modal-go')?.addEventListener('click', () => {
+  closeUpdateModal();
+  showPage('settings');
+});
+$('update-modal-skip')?.addEventListener('click', () => {
+  try { localStorage.setItem(UPDATE_SKIP_KEY, promptedUpdateVersion); } catch { /* 忽略：下次照常弹 */ }
+  closeUpdateModal();
+});
+$('update-modal-cancel')?.addEventListener('click', closeUpdateModal);
+$('update-modal-close')?.addEventListener('click', closeUpdateModal);
+$('update-modal')?.addEventListener('click', event => {
+  if (event.target === $('update-modal')) closeUpdateModal();
+});
 
 // ─── 渲染：会话状态 ────────────────────────────
 

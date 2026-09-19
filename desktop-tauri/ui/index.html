@@ -1046,6 +1046,31 @@
   <div id="toast" role="status" aria-live="polite"></div>
 
   <!-- ─── 添加模型映射弹窗（models-panel.js）─── -->
+  <!-- 检测到更新弹窗：定时版本检查发现新版本时弹出。
+       「跳过此次更新」按版本号记在 localStorage；「取消」只是关掉，
+       下一次检测到（定时任务下一轮）还会再弹。 -->
+  <div id="update-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="update-modal-title">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="update-modal-title">检测到更新</h2>
+        <button id="update-modal-close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <p class="update-modal-intro">
+          新版本 <b id="update-modal-version">—</b> 已发布（当前
+          <span id="update-modal-current">—</span>），更新日志如下：
+        </p>
+        <div class="update-modal-notes md-body" id="update-modal-notes"></div>
+      </div>
+      <div class="modal-foot">
+        <button id="update-modal-skip">跳过此次更新</button>
+        <div class="spacer"></div>
+        <button id="update-modal-cancel">取消</button>
+        <button id="update-modal-go" class="primary">去更新</button>
+      </div>
+    </div>
+  </div>
+
   <div id="mapping-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="mapping-modal-title">
     <div class="modal">
       <div class="modal-head">

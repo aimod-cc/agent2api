@@ -290,3 +290,15 @@
   border-bottom: 1.5px solid var(--ok);
   transform: rotate(45deg);
 }
+
+/* ─── 检测到更新弹窗 ────────────────────────────────────────
+   正文复用 .md-body 的 Markdown 渲染样式；限高 + 滚动，长日志不再把弹窗撑到
+   超出一屏。按钮布局沿用 .modal-foot（跳过 | spacer | 取消 + 去更新）。 */
+.update-modal-intro { margin: 0; color: var(--text-2); font-size: 12.5px; line-height: 1.6; }
+.update-modal-intro b { color: var(--text); }
+.update-modal-notes {
+  margin-top: 10px;
+  max-height: 46vh;
+  overflow-y: auto;
+  padding-right: 6px;
+}

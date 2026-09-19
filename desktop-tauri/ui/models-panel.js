@@ -108,19 +108,24 @@
   }
 
   function row(m) {
-    const busyRow = pending.has(m.id);
+    const busyRow = pending.has(rowKey(m));
     const name = m.name && m.name !== m.id ? `<div class="mname">${esc(m.name)}</div>` : '';
     const credits = m.credits ? `<span class="rate">${esc(formatCredits(m.credits))}</span>` : '<span class="rate">—</span>';
     const actions = m.hidden
-      ? `<button type="button" class="sm ghost" data-act="restore" data-id="${esc(m.id)}"${busyRow ? ' disabled' : ''}>恢复</button>`
-      : `<button type="button" class="sm ghost danger-text" data-act="hide" data-id="${esc(m.id)}"${busyRow ? ' disabled' : ''}>删除</button>`;
-    return `<tr class="${m.enabled && !m.hidden ? '' : 'off'}" data-id="${esc(m.id)}">`
+      ? `<button type="button" class="sm ghost" data-act="restore" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>恢复</button>`
+      : `<button type="button" class="sm ghost danger-text" data-act="hide" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>删除</button>`;
+    return `<tr class="${m.enabled && !m.hidden ? '' : 'off'}" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}">`
       + `<td><div class="mid"><span class="t">${esc(m.id)}</span>`
       + `<button type="button" class="cp" data-copy="${esc(m.id)}" title="复制模型 ID">⧉</button></div>${name}</td>`
       + `<td>${credits}</td>`
       + `<td>${aliasChips(m)}</td>`
-      + `<td class="state"><label class="switch"><input type="checkbox" data-act="toggle" data-id="${esc(m.id)}"${m.enabled ? ' checked' : ''}${m.hidden || busyRow ? ' disabled' : ''}><span class="track"></span></label></td>`
+      + `<td class="state"><label class="switch"><input type="checkbox" data-act="toggle" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${m.enabled ? ' checked' : ''}${m.hidden || busyRow ? ' disabled' : ''}><span class="track"></span></label></td>`
       + `<td class="r"><div class="row-actions">${actions}</div></td></tr>`;
+  }
+
+  /** 行内操作的防重入键：同名模型在多家同时存在时，`id` 不足以定位一行 */
+  function rowKey(m) {
+    return `${m.provider || ''}:${m.id}`;
   }
 
   function render() {
@@ -171,9 +176,13 @@
 
   // ─── 行内操作 ────────────────────────────
 
-  async function runRowAction(id, run, doneText) {
-    if (pending.has(id)) return;
-    pending.add(id);
+  /**
+   * 行内操作执行器。`key` 是防重入标记（提供商:模型 id）——同名模型在多家
+   * 同时存在，只按 id 记会把两家的行一起标成「执行中」。
+   */
+  async function runRowAction(key, run, doneText) {
+    if (pending.has(key)) return;
+    pending.add(key);
     render();
     try {
       accept(await run());
@@ -182,7 +191,7 @@
       toast(`操作失败：${error.message}`, 'err');
       render();
     } finally {
-      pending.delete(id);
+      pending.delete(key);
       render();
     }
   }
@@ -191,15 +200,18 @@
     const button = event.target.closest('[data-act]');
     if (!button) return;
     const { act, id, alias, provider } = button.dataset;
+    // 同一模型 id 在多家同时存在时（如 kimi-k3 同时由 CatPaw 与小浣熊提供），
+    // 启停 / 删除都要带上提供商才能精确到一行
+    const key = `${provider || ''}:${id}`;
     if (act === 'expand') { expanded.add(provider); render(); return; }
     if (act === 'collapse') { expanded.delete(provider); render(); return; }
     if (act === 'hide') {
-      if (!confirm(`确定删除模型「${id}」？只是从清单隐藏，可在「已删除」筛选里恢复。`)) return;
-      void runRowAction(id, () => workbuddyDesktop.setModelState({ id, hidden: true }), '模型已删除');
+      if (!confirm(`确定删除模型「${id}」？只是从该提供商的清单隐藏，可在「已删除」筛选里恢复。`)) return;
+      void runRowAction(key, () => workbuddyDesktop.setModelState({ id, provider, hidden: true }), '模型已删除');
       return;
     }
     if (act === 'restore') {
-      void runRowAction(id, () => workbuddyDesktop.setModelState({ id, hidden: false }), '模型已恢复');
+      void runRowAction(key, () => workbuddyDesktop.setModelState({ id, provider, hidden: false }), '模型已恢复');
       return;
     }
     if (act === 'unmap') {
@@ -213,9 +225,14 @@
   function onTableChange(event) {
     const input = event.target.closest('input[data-act="toggle"]');
     if (!input) return;
-    const { id } = input.dataset;
+    const { id, provider } = input.dataset;
     const enabled = input.checked;
-    void runRowAction(id, () => workbuddyDesktop.setModelState({ id, enabled }), enabled ? '模型已启用' : '模型已禁用');
+    const key = `${provider || ''}:${id}`;
+    void runRowAction(
+      key,
+      () => workbuddyDesktop.setModelState({ id, provider, enabled }),
+      enabled ? '模型已启用' : '模型已禁用',
+    );
   }
 
   // ─── 映射弹窗 ────────────────────────────

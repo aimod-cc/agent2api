@@ -43,7 +43,8 @@ use serde_json::Value;
 
 use crate::server::config;
 use crate::server::core::providers::catalog::{
-    default_model_catalog, default_model_usable, providers_for_model, suggest_models,
+    default_model_catalog, default_model_usable, model_blocked_everywhere, providers_for_model,
+    suggest_models,
 };
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
@@ -191,7 +192,9 @@ pub async fn chat_completions(
         }
         requested_model = target;
     }
-    if !requested_model.is_empty() && rules.is_blocked(&requested_model) {
+    // 按提供商区分启停后，请求名的 404 判定是「所有承载家都被禁用」（见
+    // model_blocked_everywhere）；只要还有一家可用，选路自己会跳过被禁的那家
+    if !requested_model.is_empty() && model_blocked_everywhere(&requested_model) {
         let error = GatewayError::bad_request(format!(
             "模型已在网关中禁用: {requested_model}。完整列表见 GET /v1/models"
         ))
