@@ -1,6 +1,6 @@
 {
   "name": "agent2api",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Agent2API - 多提供商本地网关：把 WorkBuddy / 小浣熊 / CatPaw / AutoClaw 等客户端登录态包装成 OpenAI 兼容接口，附带账号管理、内容脱敏与请求报表",
   "type": "module",
   "private": true,
