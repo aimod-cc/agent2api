@@ -1,0 +1,173 @@
+name: Build macOS
+
+# 打包 macOS 安装包，产出**一个通用（Universal）DMG**，同时支持
+# Apple Silicon 与 Intel：内部把 aarch64 / x86_64 两份二进制用 lipo 合成一个可执行文件。
+#
+# 触发方式：
+#   · 在 Actions 页面手动点 "Run workflow"
+#   · 推送 v* 形式的 tag（如 v2.2.0）时自动构建，产物挂到 Draft Release
+#
+# 产物：
+#   · Agent2API_<版本>_universal.dmg        —— 分发用，双击后把 App 拖进「应用程序」
+#   · Agent2API_universal.app.tar.gz        —— 免安装版，解包后直接运行
+#
+# ── 签名与公证 ──────────────────────────────────────────────────
+# 不配 Secrets 时走**未签名（ad-hoc）**构建：自己机器上用没问题，别人从浏览器
+# 下载后会被 Gatekeeper 拦（提示「已损坏，无法打开」），解法是让用户执行
+#     xattr -dr com.apple.quarantine /Applications/Agent2API.app
+#
+# 要出可直接分发的包，在仓库 Settings → Secrets and variables → Actions 里加上
+# 下面这些，workflow 会自动切到「签名 + 公证」分支：
+#   APPLE_CERTIFICATE            Developer ID Application 证书 .p12 的 base64
+#                                （base64 -i cert.p12 | pbcopy）
+#   APPLE_CERTIFICATE_PASSWORD   .p12 的导出密码
+#   APPLE_SIGNING_IDENTITY       形如 "Developer ID Application: 你的名字 (TEAMID)"
+#   APPLE_ID                     开发者账号邮箱（公证用）
+#   APPLE_PASSWORD               该账号的 App 专用密码（不是登录密码）
+#   APPLE_TEAM_ID                10 位 Team ID
+# 注意：Developer ID 证书需要 Apple Developer Program（99 美元/年）付费账号。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+# 发布 Release 需要写权限，其余步骤只读
+permissions:
+  contents: write
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-macos:
+    name: macOS Universal
+    # macOS 15 的 arm64 镜像。选它而不是 macos-14，是因为 14 已在退役流程里；
+    # 也不用 macos-latest —— 它会在版本间静默漂移，出问题不好复现。
+    # 交叉编译 x86_64 需要 arm64 宿主机，Apple Silicon 镜像正好满足。
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    # job 级 env：这样下面步骤的 if 才能通过 env 上下文判断有没有配证书。
+    # 未配置的 Secret 会展开成空串。
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # universal-apple-darwin 要求两个架构的 std 都装好，CLI 会依次编译两份再 lipo 合并
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # 不缓存的话 tauri 的全量依赖每次都要从零编一遍（本机实测仅 cargo check
+      # 就要 1 分 18 秒，release + LTO 更久）。语法是
+      # `<crate 目录> -> <target 目录>`：仓库根的 target/ 来自
+      # desktop-tauri/src-tauri/.cargo/config.toml 里的 target-dir 设置。
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "desktop-tauri/src-tauri -> ../../target"
+          key: macos-universal
+
+      - name: 打印工具链版本
+        run: |
+          node --version
+          npm --version
+          rustc --version
+          cargo --version
+
+      - name: 安装前端依赖
+        working-directory: desktop-tauri
+        run: |
+          set -euo pipefail
+          # 上游 lockfile 里的 resolved 指向 npmmirror（国内镜像）。GitHub runner
+          # 在海外，直连镜像既慢又可能失败，这里把主机名换回官方源再装。
+          # 镜像只是官方 tarball 的原样缓存，integrity 哈希一致，校验照样通过。
+          sed -i '' 's|https://registry.npmmirror.com|https://registry.npmjs.org|g' package-lock.json
+          npm ci
+
+      # ── 未配证书：ad-hoc 签名 ────────────────────────────────────
+      # 三个要点：
+      # 1) 证书类变量必须真正 unset 而不能留空串 —— Tauri 只要发现
+      #    APPLE_CERTIFICATE 存在（哪怕是 ""）就会去导入证书，base64 解空串直接报错。
+      # 2) APPLE_SIGNING_IDENTITY 设为 "-" 表示 ad-hoc 签名：Apple Silicon 上
+      #    完全未签名的可执行文件会被系统直接杀掉，ad-hoc 是能跑起来的最低要求。
+      # 3) 必须同时关掉 hardenedRuntime（默认是开的）。它开着时会启用库校验
+      #    （library validation），而校验要求加载的动态库与主程序同属一个 Team；
+      #    ad-hoc 签名没有 Team ID，App 会在启动瞬间被 dyld 以
+      #    "code signature not valid for use in process using Library Validation" 杀掉。
+      #    hardened runtime 只有公证才需要，未签名这条路径本来就不公证，关掉没有损失。
+      - name: 构建（未签名 / ad-hoc）
+        if: env.APPLE_CERTIFICATE == ''
+        working-directory: desktop-tauri
+        run: |
+          set -euo pipefail
+          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+          unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          export APPLE_SIGNING_IDENTITY="-"
+          npm run build -- \
+            --target universal-apple-darwin \
+            --bundles app,dmg \
+            --config '{"bundle":{"macOS":{"hardenedRuntime":false}}}'
+
+      - name: 构建（签名 + 公证）
+        if: env.APPLE_CERTIFICATE != ''
+        working-directory: desktop-tauri
+        run: npm run build -- --target universal-apple-darwin --bundles app,dmg
+
+      # universal 目标的产物在 target/universal-apple-darwin/release/bundle/
+      - name: 收集产物
+        run: |
+          set -euo pipefail
+          BUNDLE="target/universal-apple-darwin/release/bundle"
+          mkdir -p dist
+
+          # .dmg 是单文件，内部的 .app 连同可执行位与签名一起完整保留，分发首选
+          find "$BUNDLE/dmg" -maxdepth 1 -name '*.dmg' -exec cp -v {} dist/ \; 2>/dev/null || true
+
+          # .app 是目录。直接交给 upload-artifact 会在打包/解包途中丢掉可执行位
+          # 和 Framework 里的符号链接（下来就是打不开的），所以先打成 tar.gz。
+          APP_PATH="$(find "$BUNDLE/macos" -maxdepth 1 -name '*.app' -print -quit 2>/dev/null || true)"
+          if [ -n "$APP_PATH" ]; then
+            APP_NAME="$(basename "$APP_PATH")"
+            tar -czf "dist/${APP_NAME%.app}_universal.app.tar.gz" -C "$(dirname "$APP_PATH")" "$APP_NAME"
+          fi
+
+          echo "--- 产物 ---"
+          ls -lh dist
+          if [ -z "$(ls -A dist)" ]; then
+            echo "::error::没有找到任何产物。实际目录树："
+            find target -name '*.dmg' -o -name '*.app' | head -20
+            exit 1
+          fi
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-macos-universal
+          path: dist/*
+          if-no-files-found: error
+
+      - name: 挂到 Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          # 先落成草稿，人工确认产物没问题再发布
+          draft: true
