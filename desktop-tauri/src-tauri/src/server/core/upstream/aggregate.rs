@@ -79,6 +79,11 @@ pub async fn aggregate_sse_completion(
             first_chunk_seen = true;
             telemetry.note_first_frame();
         }
+        // 调试模式：上游原始字节旁路给采集器（在解析之前 —— 采的是上游原样
+        // 吐出的 SSE 文本，不是我们解析 / 改写后的结果）
+        if let Some(capture) = telemetry.capture() {
+            capture.push(&chunk);
+        }
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         // 逐行消费（只处理到最后一个 '\n' 之前的内容）
         while let Some(index) = buffer.find('\n') {

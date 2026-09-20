@@ -90,7 +90,7 @@
     }
   }
 
-  function onClick(event) {
+  async function onClick(event) {
     const button = event.target.closest('[data-act]');
     if (!button) return;
     const { act, id } = button.dataset;
@@ -101,7 +101,14 @@
     }
     if (act === 'remove') {
       const key = keys().find(k => k.id === id);
-      if (!confirm(`确定删除 Key「${key?.name || key?.masked || id}」？使用它的客户端会立刻无法访问。`)) return;
+      const name = esc(key?.name || key?.masked || id);
+      // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认）
+      if (!(await window.wbConfirm?.ask?.({
+        title: '删除网关 Key',
+        html: `确定删除 Key「<strong>${name}</strong>」？使用它的客户端会立刻无法访问。`,
+        okText: '删除',
+        okClass: 'danger',
+      }))) return;
       void runRowAction(id, () => workbuddyDesktop.deleteKey(id), 'Key 已删除');
     }
   }

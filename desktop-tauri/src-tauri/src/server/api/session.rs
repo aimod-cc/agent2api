@@ -198,6 +198,37 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
             "edition": task.edition, "provider": "qoder" }));
     }
+    // Cline：**设备授权登录**（WorkOS RFC 8628）。形态上介于「网页登录」与
+    // 「Qoder 设备授权」之间：同步问上游要 user_code 与授权页地址（一次 POST），
+    // 把地址交给界面打开；用户确认后由后台任务轮询换令牌。
+    // 响应形状与另外两条登录链一致（`{state, authUrl}`），前端不需要新分支。
+    //
+    // ── 池怎么定（拆分后由 provider 身份给出，不再读参数）──────
+    // provider id 自己就是池（`cline-free` / `cline-pass`），登录只决定
+    // **落哪一家的账号**；上游那套设备授权两个池共用，没有站点或通道维度。
+    // 因此这里不再解析 `pool` / `edition` —— 早先那套「池是账号的属性，
+    // 得从 body 传进来」的前提已随拆分退场（见 `providers::cline::models`
+    // 的模块头）。前端仍可能发来 `pool` 字段（旧版界面），忽略即可：
+    // 它要表达的意思已经由 provider 表达了。
+    if matches!(
+        kind,
+        crate::server::core::providers::ProviderKind::ClineFree
+            | crate::server::core::providers::ProviderKind::ClinePass
+    ) {
+        let name = payload
+            .as_ref()
+            .and_then(|payload| payload.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .filter(|value| !value.trim().is_empty());
+        let provider_id = crate::server::core::providers::kind_id(kind);
+        let handle = match state.login().start_cline_device_login(provider_id, name).await {
+            Ok(handle) => handle,
+            Err(error) => return management_error(400, error),
+        };
+        let task = handle.snapshot();
+        return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
+            "edition": task.edition, "provider": provider_id }));
+    }
     // CatPaw：上游把 token **推**到我们的 loopback 回调上（见 core::login::catpaw），
     // 所以这里除了发起还要把回调基址告诉它 —— 那必须是本网关自己的监听地址，
     // 而上游的 redirect 白名单只放行 127.0.0.1 / localhost（实测）。

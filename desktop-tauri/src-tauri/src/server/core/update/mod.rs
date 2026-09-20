@@ -37,8 +37,8 @@ use serde_json::{json, Map, Value};
 use crate::server::logging;
 
 pub use version::{
-    assert_downloadable, compare_versions, pick_installer, safe_file_name, UpdateError,
-    DEFAULT_REPO, GITHUB_API, MAX_INSTALLER_BYTES,
+    assert_downloadable, compare_versions, installer_kind, pick_installer, safe_file_name,
+    UpdateError, DEFAULT_REPO, GITHUB_API, MAX_INSTALLER_BYTES,
 };
 
 /// 检测与下载建连阶段的超时（Node 版 REQUEST_TIMEOUT_MS）。
@@ -317,6 +317,9 @@ impl UpdateManager {
             "asset": asset.clone().unwrap_or(Value::Null),
             "repository": repository,
             "downloadSupported": asset.is_some(),
+            // 安装包形态（"nsis" / "dmg"）：界面据此决定文案 ——
+            // Windows 要提示 UAC 提权、macOS 是挂载磁盘映像后手动拖进应用程序
+            "installerKind": installer_kind(),
             "downloadDir": download_dir.to_string_lossy(),
             "task": task.map(|task| task.to_json()).unwrap_or(Value::Null),
         })

@@ -276,17 +276,36 @@
 }
 
 /* 覆盖 components.css 的 input[type=number]{max-width:130px}：这里要收窄到 92px，
-   三行等宽；数字用等宽字形，改了位数一眼看得出来。左对齐（不右对齐）是为了
-   让显示出来的步进箭头不推着数字走 —— Chromium 的箭头在 hover / focus 时才占位，
-   右对齐会让数字在那一下左右跳。 */
+   三行等宽；数字用等宽字形，改了位数一眼看得出来。数字居中 —— 与定时任务页的
+   间隔框同一套处理（那里的注释解释了为什么居中不会被步进箭头推动）。 */
 .retention-input input[type="number"] {
   flex: 0 0 auto;
   width: 92px;
   max-width: 92px;
   font-variant-numeric: tabular-nums;
+  text-align: center;
 }
 
 .retention-input .unit { color: var(--text-3); font-size: 12px; }
+
+/* ─── 保存位置 ───
+   复用 .retention-row 的两列版式；第二列是「路径 + 更改按钮」：路径是主体，
+   可能很长（用户自定义目录），允许在任意字符处折行 —— 目录路径没有天然的
+   断点，靠 word-break 拆，否则长路径会把行撑出横向滚动 */
+.storage-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.storage-path {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 11.5px;
+  color: var(--text-2);
+  word-break: break-all;
+  line-height: 1.45;
+}
 
 /* 说明另起一行、占满整行（从标签左边缘开始，不必再缩进）。
    字号 / 行高沿用 components.css 的 .hint，这里只管换行位置 */

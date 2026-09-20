@@ -3,15 +3,16 @@
 //! ── 为什么要有这个模块 ──────────────────────────────────────
 //! 改造前整个网关只有 WorkBuddy 一个上游，provider 概念是隐含的：账号就是
 //! workbuddy 账号、端点常量写在 `endpoints.rs`、鉴权逻辑写在 `auth.rs`。
-//! 多提供商（注册表现有五家：WorkBuddy / 小浣熊 raccoon / CatPaw / AutoClaw /
-//! Qoder，五家都参与推理转发，见各自的 `mod.rs`），
+//! 多提供商（注册表现有七家：WorkBuddy / 小浣熊 raccoon / CatPaw / AutoClaw /
+//! Qoder / Cline Free / Cline Pass，七家都参与推理转发，见各自的 `mod.rs`），
 //! 后两家分别由 W5-T-d4 与 W4b-T-c2 接上各自的适配器）之后，
 //! 「这个账号属于哪家」「这一家叫什么名字」需要一个
 //! 全局唯一的定义点 —— 就是本模块。
 //!
 //! 账号数据里的 `provider` 字段存的是 **provider id 字符串**
-//! （`"workbuddy"` / `"raccoon"` / `"catpaw"` / `"autoclaw"` / `"qoder"`）：它要落进
-//! accounts.json、要出现在 HTTP 响应里、还要被前端当筛选条件用，所以
+//! （`"workbuddy"` / `"raccoon"` / `"catpaw"` / `"autoclaw"` / `"qoder"` /
+//! `"cline-free"` / `"cline-pass"`）：它要落进 accounts.json、要出现在 HTTP 响应里、
+//! 还要被前端当筛选条件用，所以
 //! **字符串本身就是契约**，不能随手改。
 //! 本模块负责 id ↔ `ProviderKind` ↔ `ProviderMeta` 三者互查，避免这些字符串
 //! 散落到 account_store / api 各处各写一遍（写错一处不会报错，只会静默失配）。
@@ -75,12 +76,23 @@
 //!                 protocol.rs    OpenAI ↔ Qoder 协议转换
 //!                 stream.rs      上游 SSE 信封解包 + 思考标签拆解
 //!                 chat.rs        转发编排（构造 → 发送 → 翻译）
+//!   cline/       Cline（官方 api.cline.bot）：账号管理 **+ 推理转发**，
+//!                按**两个提供商**接入（`cline-free` 免费池 / `cline-pass` 订阅池）。
+//!                实现是参数化的：模块共用，实例按池给。
+//!                 credentials.rs 凭证格式（workos: 前缀 token）+ 桌面端登录态读取
+//!                 login.rs       设备授权登录（WorkOS RFC 8628）
+//!                 refresh.rs     续期（refresh_token 轮换 + 单飞）
+//!                 models.rs      模型目录（recommended-models + 两池清单 + 静态兜底）
+//!                 balance.rs     额度查询（credit 余额归一）
+//!                 adapter.rs     ProviderAdapter 实现（无状态，OpenAI 兼容，
+//!                                按池参数化）
 //! 本文件仍然只做「身份与元数据」这一件事，不认识磁盘也不认识账号。
 
 pub mod adapter;
 pub mod autoclaw;
 pub mod catalog;
 pub mod catpaw;
+pub mod cline;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
@@ -116,6 +128,39 @@ pub enum ProviderKind {
     /// `is_stateful()` 为 true（一次发送由适配器自己完成，见 `qoder/mod.rs`）；
     /// 它参与全局队列与模型广告，`supports_chat()` 为 true。
     Qoder,
+    /// Cline **免费额度池**（`cline-free/...`）。官方 `api.cline.bot`。
+    ///
+    /// ── 为什么两池是两家而不是「一家的一个选项」（本次改动的核心）────
+    /// 早先的实现把它们当成**同一个账号上的两个额度池**：账号记录带一个
+    /// `pool` 字段，池过滤（`advertise_models`）按「账号库里有哪个池」决定
+    /// 广告哪一批。那套做法的后果是：池是**账号的属性**，界面上一家 Cline
+    /// 里混着两个池的模型（还随账号变化），而「哪个池能用」这件事在
+    /// 模型列表里完全看不出来。
+    ///
+    /// 现在按**两个提供商**建模：各自有独立的账号、清单、启停规则与映射，
+    /// 界面上各占一个分组。于是：
+    ///   - `cline-free` 只列免费池的模型，`cline-pass` 只列订阅池的；
+    ///   - 加了哪家的账号，哪家的模型才出现（`provider_available` 的既有口径）；
+    ///   - 上游模型 id 的池前缀**仍是原样转发**的通道选择器（见下），
+    ///     但「这家收哪个前缀的模型」已经由 provider 身份保证，
+    ///     不再需要按账号里的 `pool` 字段做二次过滤。
+    ///
+    /// ── 模型名的两池前缀（转发侧仍然存在）──────────────────────
+    /// 上游模型 id 形如 `cline-free/deepseek-v4.1-flash` 与
+    /// `cline-pass/glm-5.3`，**必须原样发给上游** —— 前缀就是它的计费通道
+    /// 选择器。对下游的友好名（剥掉前缀）由 `model_rules` 的默认映射种子给出，
+    /// 见 `cline::models` 的模块头。
+    ClineFree,
+    /// Cline **订阅池**（`cline-pass/...`）。与 [`ProviderKind::ClineFree`]
+    /// 同一上游、同一套协议，差别只有「收哪个前缀的模型」。
+    ///
+    /// ── 与 ClineFree 共享的东西（不要各自复制）──────────────────
+    /// 凭证格式、API 基址、错误分类、SSE 回写、余额查询、远程目录接口
+    /// （`GET {apiBase}/ai/cline/recommended-models` **拉一次就能拿到两个池**）
+    /// 全部共用 —— 因此 `cline/` 下的实现是参数化的：
+    /// `ClineAdapter` 持有一个 `Pool`，`adapter_for` 按 kind 给出该池的实例。
+    /// 远程目录缓存也共用一份（`models::REMOTE`），两家只是按池过滤它。
+    ClinePass,
 }
 
 /// 一个提供商的静态元数据。
@@ -145,6 +190,8 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "catpaw", label: "CatPaw" },
     ProviderMeta { id: "autoclaw", label: "AutoClaw" },
     ProviderMeta { id: "qoder", label: "Qoder" },
+    ProviderMeta { id: "cline-free", label: "Cline Free" },
+    ProviderMeta { id: "cline-pass", label: "Cline Pass" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -210,6 +257,8 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "catpaw" => Some(ProviderKind::CatPaw),
         "autoclaw" => Some(ProviderKind::AutoClaw),
         "qoder" => Some(ProviderKind::Qoder),
+        "cline-free" => Some(ProviderKind::ClineFree),
+        "cline-pass" => Some(ProviderKind::ClinePass),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -233,6 +282,8 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::CatPaw => "catpaw",
         ProviderKind::AutoClaw => "autoclaw",
         ProviderKind::Qoder => "qoder",
+        ProviderKind::ClineFree => "cline-free",
+        ProviderKind::ClinePass => "cline-pass",
     }
 }
 
@@ -248,6 +299,22 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
 /// 之类的清单 —— 那正是本函数要消灭的东西。
 pub fn is_known_provider_id(id: &str) -> bool {
     kind_from_id(id).is_some()
+}
+
+/// provider id → 注册表里的展示名；未登记的 id 原样回显。
+///
+/// 回退成 id 而不是「未知」：调用点手上的 id 来自真实数据（账号记录、
+/// `owned_by`、日志），真出现未登记的 id 时，回显原文比一句笼统的「未知」
+/// 更能定位问题。前端也照这个口径做兜底（见 `ui/providers.js`）。
+///
+/// 这是「id → 给人看的名字」的**唯一入口** —— 别处不要再写
+/// `match id { "catpaw" => "CatPaw", ... }`：那种表漏一家不会报错，
+/// 只会让界面上少一个名字。
+pub fn label_of(id: &str) -> &str {
+    match kind_from_id(id) {
+        Some(kind) => meta(kind).label,
+        None => id,
+    }
 }
 
 /// `ProviderKind` → 元数据。

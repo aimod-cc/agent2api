@@ -147,6 +147,7 @@ pub fn run() {
             commands::login_state,
             commands::cancel_login,
             commands::export_logs,
+            commands::pick_directory,
             commands::get_app_settings,
             commands::save_app_settings,
             commands::export_accounts,
@@ -265,7 +266,7 @@ pub fn run() {
                 .center()
                 .maximized(true)
                 .visible(!launched_by_autostart())
-                .initialization_script(bridge::BRIDGE_JS)
+                .initialization_script(bridge::bridge_js())
                 .build()?;
 
             // 启动后端；就绪后再跑一次启动维护（临期 token 刷新 + 余额查询）

@@ -91,6 +91,12 @@ pub(super) fn describe_proxy(proxy: Option<&ResolvedProxy>) -> String {
 /// round / event / turn/stop 三个端点都是短请求，共用这一个函数：出网经
 /// `egress::client_for`（连接池与超时旋钮都在那里，账号级代理在此生效），
 /// 总超时由 `timeout_ms` 给出（与客户端上的 read_timeout 是叠加关系）。
+///
+/// `capture`：调试模式的采集器（`None` = 不采）。**只有承载对话内容的 round
+/// 会传**（见 `conversation::submit_round`）—— 状态回报、turn/stop 这些
+/// 控制类往返不是用户要看的「上游报文」，目录刷新（`catalog.rs`）同理。
+/// 传进来时本函数负责把请求 envelope 与响应头/体都补上：它在唯一能同时
+/// 拿到这三样的位置（响应一旦被 `text()` 读走就没有第二份）。
 pub(super) async fn post_json(
     base_url: &str,
     path: &str,
@@ -98,6 +104,7 @@ pub(super) async fn post_json(
     proxy: Option<&ResolvedProxy>,
     body: &Value,
     timeout_ms: u64,
+    capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
 ) -> Result<Value, CatPawError> {
     let url = format!("{}{path}", base_url.trim_end_matches('/'));
     let payload = serde_json::to_string(body)
@@ -107,8 +114,12 @@ pub(super) async fn post_json(
         .post(&url)
         .timeout(Duration::from_millis(timeout_ms))
         .body(payload);
-    for (key, value) in request_headers(credentials, "application/json") {
+    let headers = request_headers(credentials, "application/json");
+    for (key, value) in &headers {
         builder = builder.header(key, value);
+    }
+    if let Some(capture) = capture {
+        capture.reset_request(&url, "catpaw", &headers, body);
     }
     let response = builder.send().await.map_err(|error| {
         CatPawError::upstream(format!(
@@ -118,7 +129,13 @@ pub(super) async fn post_json(
         ))
     })?;
     let status = response.status().as_u16();
+    if let Some(capture) = capture {
+        capture.attach_response(status, response.headers());
+    }
     let text = response.text().await.unwrap_or_default();
+    if let Some(capture) = capture {
+        capture.push(text.as_bytes());
+    }
     if !(200..300).contains(&status) {
         logging::log("[CatPaw]", &format!("上游 {path} HTTP {status}"));
         let detail: String = text.trim().chars().take(500).collect();
@@ -172,6 +189,8 @@ pub(super) async fn report_status(
         proxy,
         &body,
         REQUEST_TIMEOUT_MS,
+        // 状态回报是控制类往返，不是用户要看的「上游报文」：不采
+        None,
     )
     .await
 }
@@ -226,6 +245,8 @@ pub(super) async fn stop_turn(
         proxy,
         &body,
         STOP_TIMEOUT_MS,
+        // turn/stop 同理：控制类往返，不采
+        None,
     )
     .await
     {

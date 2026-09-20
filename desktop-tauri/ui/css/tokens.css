@@ -119,7 +119,7 @@
   color-scheme: dark;
 
   --bg: oklch(0 0 0);
-  --surface: oklch(0.26154 0.00554 286.01);
+  --surface: oklch(0.19212 0.00399 286.02);
   --surface-2: oklch(0.28254 0.00726 285.93);
   --surface-3: oklch(0.32737 0.01050 285.81);
   --surface-raised: oklch(0.30 0.005 286);
@@ -190,7 +190,7 @@
     color-scheme: dark;
 
     --bg: oklch(0 0 0);
-    --surface: oklch(0.26154 0.00554 286.01);
+    --surface: oklch(0.19212 0.00399 286.02);
     --surface-2: oklch(0.28254 0.00726 285.93);
     --surface-3: oklch(0.32737 0.01050 285.81);
     --surface-raised: oklch(0.30 0.005 286);

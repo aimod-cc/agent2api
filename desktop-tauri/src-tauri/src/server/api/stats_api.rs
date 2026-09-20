@@ -2,15 +2,15 @@
 //!
 //! ```text
 //! GET    /api/stats/summary     报表聚合（概览 / 热力图 / 缓存命中率 / 趋势）
-//! GET    /api/stats/requests    请求明细（分页 + 模型 / 状态 / 时间区间过滤）
+//! GET    /api/stats/requests    请求日志（分页 + 模型 / 状态 / 时间区间过滤）
 //! DELETE /api/stats/requests    清空明细与按天聚合
-//! GET    /api/retention         三档保留天数（事件日志 / 请求明细 / 按天聚合）
+//! GET    /api/retention         三档保留天数（事件日志 / 请求日志 / 按天聚合）
 //! PUT    /api/retention         更新保留天数并**立即**触发清理
 //! ```
 //!
 //! ── 为什么两条前缀放在一个文件里 ─────────────────────────────
 //! `/api/retention` 是这三条数据保留期的**统一入口**（事件日志在 `logs_store`、
-//! 请求明细与聚合在 `request_stats`），其中两条属于请求统计；而改完设置必须
+//! 请求日志与聚合在 `request_stats`），其中两条属于请求统计；而改完设置必须
 //! 立刻裁剪，裁剪又要拿 `request_stats` 句柄 —— 两者共享同一份校验与清理逻辑，
 //! 拆成两个文件只会让「校验 → 写配置 → 立即清理」这条链断成两段。
 //! 文件名沿用 `logs_api.rs` / `config_api.rs` 的 `*_api.rs` 约定。
@@ -30,7 +30,7 @@
 //! 全部是**新增**端点与新增可选查询参数：`/api/logs` 只多认 `start` / `end`
 //! 两个可选参数，不传时行为与以前完全一致（见 `logs_api::query_logs`）。
 //!
-//! ── provider 维度（Agent2API W4：T-e1）──────────────────────
+//! ── provider / account 维度（Agent2API W4：T-e1）────────────
 //! 两条报表路由的响应各多一处 **provider 维度**，都由存储层组装完再透传
 //! （路由层不加工，理由同上）：
 //!   - `/api/stats/requests`：每行含 `provider`（id，旧行/未承载为空串）
@@ -39,8 +39,15 @@
 //!   - `/api/stats/summary`：新增顶层 `providers` 数组
 //!     `[{id,label,requests,success,failures,totalTokens}]`，按 requests 降序，
 //!     统计区间与 `overview` / `topModel` 完全一致；空 id 的组 label 为「未知」。
-//! 两者都是**新增键**，既有字段的键名、类型、语义一个都没动
-//! （前端按「providers 存在则展示、缺失则隐藏」消费）。
+//!
+//! **account 维度**与 providers 同形并列（`accounts` 数组，同样的字段与排序），
+//! 是「具体哪个登录态在出力」的那一维 —— 一家提供商可以挂多个账号，
+//! 所以它比 providers 更细。两点差异：`label` 是**聚合时留下的名字快照**
+//! 而不是现算（账号可能已被删除，注册表里查不到），取「快照名 → id」，
+//! 两者都空的那一组 label 为「未知账号」。
+//!
+//! 以上都是**新增键**，既有字段的键名、类型、语义一个都没动
+//! （前端按「providers / accounts 存在则展示、缺失则隐藏」消费）。
 
 use std::collections::HashMap;
 
@@ -151,13 +158,60 @@ pub async fn stats_requests(State(state): State<ServerState>, Query(params): Que
     ok_json(state.request_stats().query_requests(&filter))
 }
 
-/// DELETE /api/stats/requests —— 清空明细与按天聚合，返回清空后的存储概况。
+/// DELETE /api/stats/requests?model=&status=&start=&end=&all=
 ///
-/// 与 `logs_api::clear_logs` 同形：清空是用户显式动作，响应带上「清空后长什么样」，
-/// 前端不必再补一次 GET。清空**不动保留期设置**（它只删数据，不改配置）。
-pub async fn clear_stats_requests(State(state): State<ServerState>) -> Response {
-    let stats = state.request_stats().clear();
-    logging::log("[Stats]", "请求统计已清空（明细 + 按天聚合）");
+/// 带筛选参数时**只删命中的明细**并重算受影响日期的聚合（「清空筛选结果」，
+/// 与 GET 同一份过滤链）；清空全部必须**显式**带 `all=1`（不带的空请求给 400）——
+/// 与 `logs_api::clear_logs` 同一道护栏（理由见那边的注释：筛选清空漏传参数
+/// 的代价是全部明细没了）。响应带删除后的存储概况，有删除时另带 `removed`。
+/// 清空**不动保留期设置**。
+pub async fn clear_stats_requests(
+    State(state): State<ServerState>,
+    Query(params): Query<Params>,
+) -> Response {
+    let filter = RequestQuery {
+        offset: 0,
+        limit: None,
+        model: text_of(&params, "model"),
+        status: text_of(&params, "status"),
+        start: parse_query_ms(params.get("start")),
+        end: parse_query_ms(params.get("end")),
+    };
+    let has_filters =
+        filter.model.is_some() || filter.status.is_some() || filter.start.is_some() || filter.end.is_some();
+    if !has_filters {
+        let explicit_all = params.get("all").map_or(false, |value| {
+            let text = value.trim();
+            text == "1" || text.eq_ignore_ascii_case("true")
+        });
+        if !explicit_all {
+            return errors::management_error(
+                400,
+                "未指定筛选条件：要清空全部请求日志请显式带 all=1",
+            );
+        }
+    }
+    let stats = if has_filters {
+        state.request_stats().clear_where(&filter)
+    } else {
+        state.request_stats().clear()
+    };
+    // 全量清空时连调试模式的原始报文一起清：那些报文是按 id 关联到明细的，
+    // 明细没了它们就成了永远取不到的孤儿，白占磁盘。
+    // **按筛选条件清空时不动**：筛选清的是部分明细，报文可能还对应着留下的行，
+    // 且筛选语义（模型 / 状态 / 时间）在报文侧没有对应字段可判。
+    if !has_filters {
+        crate::server::core::debug_traffic::clear();
+    }
+    let removed = stats.get("removed").and_then(Value::as_u64);
+    match removed {
+        Some(count) => {
+            logging::log("[Stats]", &format!("已按筛选条件清空 {count} 条请求明细（受影响日期的聚合已重算）"));
+        }
+        None => {
+            logging::log("[Stats]", "请求统计已清空（明细 + 按天聚合）");
+        }
+    }
     ok_json(stats)
 }
 
@@ -244,7 +298,7 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
         logging::log(
             "[Config]",
             &format!(
-                "数据保留期已更新: 事件日志 {} 天 / 请求明细 {} 天 / 按天聚合 {} 天",
+                "数据保留期已更新: 事件日志 {} 天 / 请求日志 {} 天 / 按天聚合 {} 天",
                 settings.log_days, settings.request_days, settings.daily_days
             ),
         );

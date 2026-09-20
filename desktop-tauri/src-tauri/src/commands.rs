@@ -232,14 +232,26 @@ pub async fn change_port(app: AppHandle, port: u16) -> Result<Value, String> {
 /// `provider` 是 Option：老版本界面不会传它，缺省（None）按 workbuddy 处理 ——
 /// 那条链的行为必须逐字保持。`Option<String>` 在 Tauri 命令里就是「可以不传」，
 /// 比给一个空串默认值更贴实地表达「老客户端没有这个概念」。
+///
+/// `social_restore` 同样缺省为 false（不恢复 Google / GitHub 入口），
+/// 老界面不传它时得到的是与新界面默认不勾选一致的行为：登录窗口只按官方
+/// 登录页的形态走，不放宽域名白名单。
 #[tauri::command]
 pub async fn start_login(
     app: AppHandle,
     edition: String,
     mode: String,
     provider: Option<String>,
+    social_restore: Option<bool>,
 ) -> Result<Value, String> {
-    login::start(&app, edition, mode, provider.unwrap_or_default()).await
+    login::start(
+        &app,
+        edition,
+        mode,
+        provider.unwrap_or_default(),
+        social_restore.unwrap_or(false),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -259,6 +271,23 @@ pub fn login_state(app: AppHandle) -> LoginState {
 pub async fn cancel_login(app: AppHandle) -> Result<Value, String> {
     login::cancel(&app).await?;
     Ok(json!({ "canceled": true }))
+}
+
+/// 弹系统目录选择框（更改数据保存位置用），返回所选目录的绝对路径。
+#[tauri::command]
+pub fn pick_directory(app: AppHandle, title: Option<String>) -> Result<Value, String> {
+    let mut dialog = app.dialog().file();
+    let title = title.as_deref().unwrap_or("").trim();
+    if !title.is_empty() {
+        dialog = dialog.set_title(title);
+    }
+    let Some(target) = dialog.blocking_pick_folder() else {
+        return Ok(json!({ "canceled": true }));
+    };
+    let path = target
+        .into_path()
+        .map_err(|error| format!("所选路径无效: {error}"))?;
+    Ok(json!({ "path": path.to_string_lossy() }))
 }
 
 /// 导出运行日志：拉取 JSONL 原文，弹系统保存框落盘。
@@ -462,8 +491,8 @@ pub async fn cancel_update() -> Result<Value, String> {
 
 /// 运行已下载的安装包。
 ///
-/// 路径必须通过 `update::verify_installer` 的校验（存在、.exe、位于下载目录内），
-/// 否则这个命令就成了「执行任意程序」的入口。
+/// 路径必须通过 `update::verify_installer` 的校验（存在、后缀属于本平台、
+/// 位于下载目录内），否则这个命令就成了「执行任意程序」的入口。
 ///
 /// `restart` 为 true 时：先把退出标志置位再退出，让出安装包要覆盖的文件占用
 /// （不置位的话关窗逻辑会把退出拦成「最小化到托盘」，安装程序会卡在文件占用上）。
@@ -472,24 +501,58 @@ pub async fn cancel_update() -> Result<Value, String> {
 /// 壳自己退出并不会带走 node 子进程（`exit(0)` 不保证触发 `RunEvent::Exit`），
 /// NSIS 覆盖安装时 node.exe 仍占着可执行文件与 3065 端口，复制文件必然失败；
 /// `backend::shutdown` 内部是同步的 kill + wait，返回时占用已经释放。
+///
+/// ── macOS 上为什么不退出（与 Windows 的关键差异）────────────────
+/// Windows 的 NSIS 是**覆盖安装**：安装程序要往正在运行的那个安装目录里写文件，
+/// 所以必须先把本进程与后端都让出来，否则复制文件必然失败。
+///
+/// macOS 的 dmg 是**挂载 + 拖拽**：`open` 只是把磁盘映像挂上，安装动作发生在
+/// 用户把 .app 拖进「应用程序」的那一刻，与当前正在运行的进程没有文件冲突。
+/// 此时若照着 Windows 那样退出，副作用反而更糟 —— 用户还没开始拖，
+/// 本机网关就已经停了（而且 dmg 挂载后用户往往会先去看一眼再决定），
+/// 等于用一个没有必要的退出打断了正在服务的网关。所以这一支不关机、不退出，
+/// 只把映像挂上，并如实把 `restart: false` 回给界面（界面据此不提示「即将退出」）。
 #[tauri::command]
 pub fn run_installer(app: AppHandle, path: String, restart: Option<bool>) -> Result<Value, String> {
     let target = crate::update::verify_installer(&path)?;
-    // 先让出 node.exe 的文件占用与 3065 端口，再让安装包去覆盖文件
-    crate::backend::shutdown(&app.state::<AppState>());
-    crate::update::launch_installer(&target, true)?;
 
-    if restart.unwrap_or(true) {
-        let state = app.state::<AppState>();
-        state.begin_exit();
-        // 稍留一点时间让命令的返回值先回到前端，再退出
-        let handle = app.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(400));
-            handle.exit(0);
-        });
+    // macOS：挂载磁盘映像即可，不回收后端、不退出（理由见函数说明）
+    #[cfg(target_os = "macos")]
+    {
+        // app 只被下面那一支用到；显式消费一次，避免 macOS 构建出现未使用告警
+        let _ = &app;
+        let _ = restart;
+        crate::update::launch_installer(&target, false)?;
+        return Ok(json!({
+            "launched": true,
+            "path": target.to_string_lossy(),
+            "restart": false,
+        }));
     }
-    Ok(json!({ "launched": true, "path": target.to_string_lossy(), "restart": restart.unwrap_or(true) }))
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // 先让出 node.exe 的文件占用与 3065 端口，再让安装包去覆盖文件
+        crate::backend::shutdown(&app.state::<AppState>());
+        crate::update::launch_installer(&target, true)?;
+
+        let restart = restart.unwrap_or(true);
+        if restart {
+            let state = app.state::<AppState>();
+            state.begin_exit();
+            // 稍留一点时间让命令的返回值先回到前端，再退出
+            let handle = app.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                handle.exit(0);
+            });
+        }
+        Ok(json!({
+            "launched": true,
+            "path": target.to_string_lossy(),
+            "restart": restart,
+        }))
+    }
 }
 
 /// 用系统默认浏览器打开 Release 页面。

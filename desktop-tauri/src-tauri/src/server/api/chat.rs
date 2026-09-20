@@ -4,6 +4,10 @@
 //!   GET  /v1/models             public（Node 版这条**不查** API Key ——
 //!                               它是只读探针，客户端启动时常在配 key 之前调用）
 //!
+//! 另外两条协议入口（`/v1/responses`、`/v1/messages`）在 `api::protocol` 里，
+//! 它们与本文件共用 `api::pipeline` 的公共管道（模型解析 / 记账 / 响应构造），
+//! 差异只在出入口的协议翻译（见 `core::protocol` 模块头）。
+//!
 //! ── handleModelRequest 的处理顺序（照抄，别调整）──────────────
 //!   ① body 必须是 JSON 对象（400「请求体必须是 JSON 对象」）
 //!   ② 必须有 messages 数组（400「缺少 messages 数组」）
@@ -32,44 +36,31 @@
 //! 429 自动换账号属于同一次请求，不额外记账。
 //! 流式分支把记账交给 `RecordingStream`（收尾发生在 handler 返回之后），
 //! 非流式与转发前失败则在原地记账。usage 由 `core::upstream` 的旁路槽提供。
+//!
+//! ── 公共管道已抽到 `api::pipeline`（三协议共用）──────────────
+//! 模型解析、记账、响应构造、调试落盘这四件事现在住在那里面，本文件只保留
+//! 「Chat 协议专属」的部分：messages 数组的校验、OpenAI 风格的错误体。
+//! 这样 `/v1/responses` 与 `/v1/messages` 能共用同一份口径，不会漂移。
 
 use std::sync::Arc;
 
-use axum::body::{Body, Bytes};
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::server::config;
-use crate::server::core::providers::catalog::{
-    default_model_catalog, default_model_usable, model_blocked_everywhere, providers_for_model,
-    suggest_models,
-};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
 use crate::server::errors::GatewayError;
 use crate::server::http::raw_json;
 use crate::server::logging;
-use crate::server::request_stats::{NewRequestEntry, RequestStats};
 use crate::server::ServerState;
 
-/// 调试落盘的目录名与文件名（Node 版 `join(CONFIG_DIR, 'debug', ...)`）
-const DEBUG_DIR: &str = "debug";
-const DEBUG_REQUEST_FILE: &str = "last-request.json";
-const DEBUG_META_FILE: &str = "last-request.meta.txt";
-
-/// 明细里 `error` 摘要的字符上限。
-///
-/// 上游报错可能带上整段 HTML/长文案（`read_upstream_error` 自己截到 500 字符），
-/// 但报表页是把 error 直接铺在列表里的一列 —— 200 字符足够看清「为什么失败」，
-/// 再长只会把行撑爆。按**字符**截而不是字节：中文报错按字节截会切出半个字。
-const ERROR_SUMMARY_CHARS: usize = 200;
-
-/// 客户端中断 / 服务退出导致响应流被提前丢弃时的错误摘要。
-///
-/// HTTP 状态早就发出去了（2xx），明细里只能靠这条文案解释「为什么没有 token」。
-const STREAM_ABORTED: &str = "响应流未完整下发（客户端中断或服务退出）";
+use super::pipeline::{
+    self, json_response, model_field_text, record_early_failure, record_entry, sse_response,
+    write_debug_files, RecordContext, RecordingStream,
+};
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
@@ -77,15 +68,12 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // 请求开始时刻（请求统计用）。放在最前面：它要覆盖 body 解析与选路的耗时，
-    // 而不是只覆盖「已经确定要转发」之后的那段。
+    // 请求开始时刻（请求统计用）。放在最前面：它要覆盖 body 解析与选路的耗时
     let started_at = logging::now_ms();
     // ① body 必须是 JSON 对象（数组/标量/null 都算非法）
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        // body 都没解析出来，模型自然无从谈起 —— 记一条空模型的失败明细，
-        // 让「客户端配错了」这类问题在报表里也看得见（见 record_early_failure）
         record_early_failure(&state, started_at, "", &error);
         return error.payload_response();
     };
@@ -103,135 +91,42 @@ pub async fn chat_completions(
 
     let method = "POST";
     let path = "/v1/chat/completions";
-    // 模型字段按 JS 语义取值：`!body.model` 是**真值判定**（null/"" /0/false 都算未指定），
-    // 真值里非字符串的（数字/对象）会被 `String()` 化后参与目录比对 ——
-    // 与 Node 的 `modelCatalog.has(body.model)` 内部那次转换一致。
-    let model_field = model_field_text(&payload);
     let stream = payload.get("stream").map(|value| value == &Value::Bool(true)).unwrap_or(false);
     let message_count = payload
         .get("messages")
         .and_then(Value::as_array)
         .map(|items| items.len())
         .unwrap_or(0);
-    let user_agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("-")
-        .to_string();
+    let user_agent = pipeline::user_agent_of(&headers);
 
+    // ③ 调试落盘：保存最近一次入站请求体，供重放分析（覆盖写）
+    write_debug_files(&body, method, path, &user_agent);
+
+    // ④ 模型路由走公共管道（默认模型回落 / 别名映射 / 目录校验，
+    //    与另外两条协议入口逐条同源）。下游原始请求名在改写前取一次：
+    //    请求日志的「下游模型」显示的是客户端发来的名字，不是解析后的
+    let client_model = model_field_text(&payload);
+    let requested_model = match pipeline::resolve_model(&state, &mut payload) {
+        Ok(model) => model,
+        Err(error) => {
+            record_early_failure(&state, started_at, &model_field_text(&payload), &error);
+            return error.payload_response();
+        }
+    };
     logging::verbose(
         "[Model]",
         &format!(
             "← {method} {path} model={} stream={stream} msgs={message_count} bytes={} ua={user_agent}",
-            if model_field.is_empty() { "(未指定)" } else { &model_field },
+            if requested_model.is_empty() { "(未指定)" } else { &requested_model },
             body.len(),
         ),
     );
 
-    // ④ 调试落盘：保存最近一次入站请求体，供重放分析（覆盖写）
-    write_debug_files(&body, method, path, &user_agent);
-
-    // ⑤ 模型路由：点名的模型必须是**聚合目录**里真实存在的 id（Agent2API §4.4）。
-    // 判定走 `providers::catalog` 的能力判定（各家清单的合并视图），
-    // 与 `/v1/models` 的输出同源 —— 只认 workbuddy 单家清单会让「清单里有、
-    // 校验说没有」这种自相矛盾出现。不做任何静默改写/回退：请求 4.1 就必须
-    // 路由到 4.1，不存在就 400 报错（附近似名提示），让下游自己改配置。
-    if model_field.is_empty() {
-        // 客户端没点名 → 网关默认；默认值不可用时落到目录里 isDefault 的模型，
-        // 再不行取目录首项（三者的判定顺序照抄 Node 的
-        // `has(defaultModel) ? defaultModel : list().find(isDefault)?.id ?? list()[0]?.id`）
-        //
-        // ── defaultModel 的 provider 语义（§4.4 末句）──────────────
-        // `defaultModel` 是 config.json 里的**workbuddy 语义**（默认 auto），
-        // `isDefault` / 首项这两级同样来自清单 —— 三者都只有「认默认模型概念」
-        // 的 provider 才认（本期只有 workbuddy）。所以回落链的候选集合走
-        // `catalog::default_model_catalog()`（按能力收窄后的聚合清单）：
-        //   - 有认这个概念的家 → 回落链与改造前**逐字相同**（单家时就是
-        //     原目录，既有用户的默认模型不变）；
-        //   - 一家都不认 → 不注入 model，按「未指定」处理（让上游用它自己的
-        //     默认模型），符合 §4.4「命中 provider 无默认概念时不注入」。
-        //
-        // 注意目录为空时 Node 会把 body.model 置成 undefined 并**跳过**下面的
-        // 校验（`if (body.model && ...)`），请求照样往上游发 —— 上游会自己报错。
-        // 这里保持同一行为：拿不到兜底值就什么都不填。
-        let snapshot = config::current();
-        let default_model = snapshot.default_model();
-        let models = default_model_catalog();
-        // 第一级：config 的 defaultModel（只有认「默认模型」概念的家才认它）
-        let fallback = if default_model_usable(default_model) {
-            Some(default_model.to_string())
-        } else {
-            models
-                .iter()
-                .find(|model| model.get("isDefault").map(value_is_truthy).unwrap_or(false))
-                .or_else(|| models.first())
-                .and_then(|model| model.get("id"))
-                .filter(|id| !id.is_null())
-                .map(|id| match id {
-                    Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                })
-        };
-        if let Some(fallback) = fallback {
-            if let Some(object) = payload.as_object_mut() {
-                object.insert("model".to_string(), Value::String(fallback));
-            }
-        }
-    }
-    // 校验用的是**客户端原样给出的值**（真值化后的文本形态）：非字符串的真值
-    // （数字/对象）也被字符串化后参与比对，与 Node 的 `has(body.model)` 一致
-    let mut requested_model = model_field_text(&payload);
-    // 模型映射：下游用映射名请求时改写成目标上游模型，后续校验 / 转发 / 记账
-    // 都按改写后的真实模型进行
-    let rules = crate::server::core::model_rules::current();
-    if let Some(target) = rules.resolve_alias(&requested_model) {
-        let target = target.to_string();
-        logging::verbose("[Model]", &format!("映射 {requested_model} → {target}"));
-        if let Some(object) = payload.as_object_mut() {
-            object.insert("model".to_string(), Value::String(target.clone()));
-        }
-        requested_model = target;
-    }
-    // 按提供商区分启停后，请求名的 404 判定是「所有承载家都被禁用」（见
-    // model_blocked_everywhere）；只要还有一家可用，选路自己会跳过被禁的那家
-    if !requested_model.is_empty() && model_blocked_everywhere(&requested_model) {
-        let error = GatewayError::bad_request(format!(
-            "模型已在网关中禁用: {requested_model}。完整列表见 GET /v1/models"
-        ))
-        .with_code("model_not_found");
-        record_early_failure(&state, started_at, &requested_model, &error);
-        return error.payload_response();
-    }
-    if !requested_model.is_empty() && providers_for_model(&requested_model).is_empty() {
-        let hint = suggest_models(&requested_model, 5);
-        let message = format!(
-            "模型不存在: {requested_model}{}。完整列表见 GET /v1/models",
-            if hint.is_empty() {
-                String::new()
-            } else {
-                format!("（目录里相近的模型: {}）", hint.join("、"))
-            },
-        );
-        let mut error = GatewayError::bad_request(message);
-        // Node 版这条错误手写了 `code: 'model_not_found'`（其它 400 没有），
-        // 客户端据此可以区分「参数错」与「模型名错」
-        error = error.with_code("model_not_found");
-        record_early_failure(&state, started_at, &requested_model, &error);
-        return error.payload_response();
-    }
-    // ⑥ 记录本次实际用的模型（默认值已填充完毕），供账号页筛选默认选中
-    if !requested_model.is_empty() {
-        config::remember_request_model(&requested_model);
-    }
-
-    // ⑦ 转发：请求体原样交给转发层（内容处理在每家 provider 发送前按作用范围
+    // ⑤ 转发：请求体原样交给转发层（内容处理在每家 provider 发送前按作用范围
     // 逐家判定，见 `core::upstream::payload` 的 `send_body`）；去重键取**客户端
     // 原始请求体**的哈希，与「某一家是否被处理」无关。
-    let dedupe_key = sha256_hex(&body);
-    // usage / 尝试次数的旁路槽：本函数持有一份，另一份随请求进转发链路。
-    // 流式请求的收尾在响应流里发生（那时本函数早就返回了），两份克隆指向
-    // 同一份数据，所以读得到最终值。
-    let telemetry = Arc::new(RequestTelemetry::new());
+    let dedupe_key = pipeline::sha256_hex(&body);
+    let telemetry = Arc::new(RequestTelemetry::with_id());
     let outcome = state
         .upstream()
         .forward(ForwardRequest {
@@ -242,35 +137,31 @@ pub async fn chat_completions(
             telemetry: telemetry.clone(),
         })
         .await;
-    // 记账句柄在这里取：下面各分支都要用（`state` 在本函数结束时才析构）
     let stats = state.request_stats();
 
     match outcome {
-        Ok(ForwardOutcome::Stream { status, stream }) => {
+        Ok(ForwardOutcome::Stream { status, stream: source }) => {
             // 流式：记账**不能**在这里做 —— 这里只是「响应头已就绪」，
-            // 内容还在下发。包装一层，由流自己在跑完/被丢弃时记账，
-            // 于是 durationMs 覆盖到「最后一个字节发完」，中断也能记上一条。
-            //
-            // 状态码与 `sse_response` 用同一套归一（非法 u16 落 200），
-            // 明细里记的必须是客户端实际看到的那个码
+            // 内容还在下发。包装一层，由流自己在跑完/被丢弃时记账
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             let context = RecordContext {
                 stats,
                 telemetry,
                 started_at,
                 model: requested_model.clone(),
+                client_model: client_model.clone(),
                 status: i64::from(status.as_u16()),
             };
-            sse_response(status, Box::new(RecordingStream::new(stream, context))).into_response()
+            sse_response(status, Box::new(RecordingStream::new(source, context))).into_response()
         }
         Ok(ForwardOutcome::Completion { body }) => {
-            // 非流式：聚合已经完成，此刻就是用户视角的「请求完成点」
             record_entry(
                 &RecordContext {
                     stats,
                     telemetry,
                     started_at,
                     model: requested_model.clone(),
+                    client_model: client_model.clone(),
                     status: 200,
                 },
                 None,
@@ -280,8 +171,6 @@ pub async fn chat_completions(
         Err(error) => {
             // headers 还没发出（流式还没开始）→ 直接给 OpenAI 风格错误
             logging::log("[Model]", &format!("❌ {}", error.message));
-            // 状态码取**实际下发**的那个（与 payload_response 同一口径）：
-            // 非法的 status_code 会被归一成 500，明细要与客户端看到的一致
             let status = i64::from(error.http_status().as_u16());
             let message = error.message.clone();
             record_entry(
@@ -290,6 +179,7 @@ pub async fn chat_completions(
                     telemetry,
                     started_at,
                     model: requested_model.clone(),
+                    client_model: client_model.clone(),
                     status,
                 },
                 Some(message),
@@ -297,291 +187,6 @@ pub async fn chat_completions(
             error.payload_response()
         }
     }
-}
-
-/// ─── 请求记账（请求统计的唯一写入点）────────────────────────
-
-/// 一条请求的收尾上下文：流式分支要把它交给响应流，等流真的结束时再记账。
-///
-/// 为什么字段是「值」而不是引用：`RecordContext` 会被移进响应流，
-/// 而响应流是 `'static`（它要活得比 handler 的栈帧久）。
-struct RecordContext {
-    /// 统计存储句柄（`Arc` 克隆，与 ServerState 里那份是同一实例）
-    stats: Arc<RequestStats>,
-    /// usage / 尝试次数旁路槽
-    telemetry: Arc<RequestTelemetry>,
-    /// 请求开始时刻（毫秒 Unix 时间戳）
-    started_at: i64,
-    /// **实际使用**的模型（默认模型回落、目录兜底都已生效的那个）
-    model: String,
-    /// 下发给客户端的 HTTP 状态码
-    status: i64,
-}
-
-/// 转发前就失败（body 非法 / messages 缺失 / 模型不在目录）时的记账。
-///
-/// 这些请求**一次都没往上游发**，所以 attempts 记 0 会被存储层夹成 1
-/// （契约是「含首次、恒 ≥1」，0 不是一个合法的尝试次数）—— 用 1 表示
-/// 「至少被处理过一次」，这与「上游被打了 N 次」在报表里是两回事，
-/// 报表侧靠 status 与 error 区分。
-///
-/// 为什么这几条也要记：`model_not_found` 是客户端配置错误最常见的形态，
-/// 不记的话用户在报表里看不到「请求全在失败」，只会以为统计漏了。
-fn record_early_failure(
-    state: &ServerState,
-    started_at: i64,
-    model: &str,
-    error: &GatewayError,
-) {
-    let context = RecordContext {
-        stats: state.request_stats(),
-        telemetry: Arc::new(RequestTelemetry::new()),
-        started_at,
-        model: model.to_string(),
-        // 与 `payload_response` 同一口径：非法状态码会被归一成 500
-        status: i64::from(error.http_status().as_u16()),
-    };
-    record_entry(&context, Some(error.message.clone()));
-}
-
-/// 记一条请求明细。
-///
-/// ── 记账为什么绝不能影响请求 ─────────────────────────────────
-/// `RequestStats::record` 本身不返回 `Result`：内部对写盘失败只打
-/// `[Stats] 统计写入失败`，锁中毒走 `poisoned.into_inner()` 继续用，
-/// 序列化失败跳过该条 —— 也就是存储层已把「统计失败」全部收敛成「少记一条」，
-/// 没有任何 unwind 路径，所以这里不需要 `catch_unwind`，也不可能因为
-/// 统计把用户请求带崩（release 是 panic=abort，这一点是硬要求）。
-///
-/// ── 字段口径 ────────────────────────────────────────────────
-///   ts          请求**开始**时刻（不是记账时刻）：趋势图要按「用户什么时候
-///               发的请求」归日，长请求若按收尾时刻归档会落到错误的日期
-///   durationMs  收尾 - 开始（含排队、选路、上游等待、流下发）
-///   firstResponseMs  上游/下发首帧到达 - 开始（见 first_response_ms 的赋值处）；
-///               全程没有帧到达（转发前就失败）时为 null，前端显示「-」
-///   attempts    旁路槽里累计的上游请求数；一次都没发出去（400/裸错误）时才回落 1
-///   error       旁路槽里的原因优先（更接近根因），否则用调用方给的兜底文案；
-///               成功请求两者都没有 → 落盘为 null
-fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
-    let snapshot = context.telemetry.snapshot();
-    // 收尾时刻只取一次：明细里的 durationMs 与日志里打的那一个是同一个值
-    // （取两次会让两处偶尔差 1ms，排障时看着像对不上账）
-    let finished_at = logging::now_ms();
-    let duration_ms = finished_at - context.started_at;
-    // 首响：采集点记的是绝对时刻，这里换算成相对请求开始的耗时 ——
-    // 与 durationMs 用同一个 `started_at` 作参考点，两列不会各说各话。
-    // None（全程没有帧到达，例如转发前就失败）原样落盘为 null，
-    // 前端显示「-」；负值（时钟回拨的理论值）夹成 0。
-    let first_response_ms = snapshot
-        .first_response_at
-        .map(|at| (at - context.started_at).max(0));
-    let error = snapshot
-        .error
-        .or(fallback_error)
-        .map(|text| truncate_chars(&text, ERROR_SUMMARY_CHARS));
-    let attempts = snapshot.attempts.max(1);
-    let mut entry = NewRequestEntry::new(context.model.clone(), context.status);
-    entry.ts = Some(context.started_at);
-    entry.duration_ms = duration_ms;
-    entry.first_response_ms = first_response_ms;
-    entry.attempts = attempts;
-    // 存储契约里这两个字段是 String（不是 Option），空串就是「没有账号」的表示
-    // —— 未配置账号列表、走默认登录态转发时就是这种情况
-    entry.account_id = snapshot.account_id;
-    entry.account_name = snapshot.account_name;
-    // 实际承载的 provider（转发链路填；None = 一次都没发出去就失败了）。
-    // 本波只带到记账点，落盘与接口透出归 W4（见 NewRequestEntry::provider）
-    entry.provider = snapshot.provider;
-    entry.error = error;
-    // 失败请求的 token 由存储层归一成 0（见 NewRequestEntry::normalize），
-    // 这里照抄上游上报的原值即可，不必自己判成功与否
-    entry.prompt_tokens = snapshot.prompt_tokens;
-    entry.completion_tokens = snapshot.completion_tokens;
-    entry.total_tokens = snapshot.total_tokens;
-    entry.cache_read_tokens = snapshot.cache_read_tokens;
-    context.stats.record(entry);
-    logging::verbose(
-        "[Stats]",
-        &format!(
-            "记一条请求: model={} status={} {duration_ms}ms 首响={} attempts={attempts} tokens={}+{}（缓存 {}）",
-            if context.model.is_empty() { "(未指定)" } else { &context.model },
-            context.status,
-            first_response_ms
-                .map(|value| format!("{value}ms"))
-                .unwrap_or_else(|| "-".to_string()),
-            snapshot.prompt_tokens,
-            snapshot.completion_tokens,
-            snapshot.cache_read_tokens,
-        ),
-    );
-}
-
-/// 按字符截断（超出部分用 `…` 收尾）。
-fn truncate_chars(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(limit).collect();
-    out.push('…');
-    out
-}
-
-/// 边透传边记账的响应流。
-///
-/// ── 为什么包一层（而不是在 handler 里记账）────────────────────
-/// 流式请求的「用户视角完成点」是**最后一个字节发完**，而 handler 在交出
-/// 响应头时就返回了。包一层之后，明细的 durationMs 覆盖整个下发过程，
-/// 客户端中途断开、上游断流这两种「非正常收尾」也能各记一条（否则这些请求
-/// 在报表里会整条消失，看起来像统计漏了）。
-///
-/// ── 透传是否受影响 ──────────────────────────────────────────
-/// 不影响：本类型对每个 `Item` 原样转发（只是补一个「是不是到 None 了」的
-/// 观察），不读、不改、不缓存字节，也不吞错误 —— 客户端收到的字节序列与
-/// 不包这一层时完全一致。
-struct RecordingStream {
-    inner: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
-    /// 收尾上下文；`take()` 走即表示「已记账」（保证恰好记一条）
-    context: Option<RecordContext>,
-}
-
-impl RecordingStream {
-    fn new(
-        inner: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
-        context: RecordContext,
-    ) -> Self {
-        Self { inner, context: Some(context) }
-    }
-
-    /// 记账并清空上下文（幂等：第二次调用什么都不做）
-    fn settle(&mut self, fallback_error: Option<String>) {
-        if let Some(context) = self.context.take() {
-            record_entry(&context, fallback_error);
-        }
-    }
-}
-
-impl futures::Stream for RecordingStream {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        use futures::StreamExt;
-        // 本类型的字段全部是 Unpin（Box / Option<String> / Arc / i64），
-        // 自身也就 Unpin，get_mut 是安全的（没有结构体钉住的字段）
-        let this = self.get_mut();
-        // 已记账（说明上游流已结束）→ 不再去 poll 上游，直接报结束。
-        // 少了这一步，axum 在收到 None 之后若再 poll 一次，就会去碰
-        // 已经结束的底层流（reqwest 的流在 None 之后行为未定义）。
-        if this.context.is_none() {
-            return std::task::Poll::Ready(None);
-        }
-        let polled = this.inner.poll_next_unpin(cx);
-        // 首响采集：**下发的第一个字节**到达时记一次（OmniProxy 的 logTtfb 同款
-        // 挂位 —— 挂在透传流上而不是上游字节流上，于是四条转发路径（无状态流式 /
-        // 聚合 / CatPaw 流式 / CatPaw 聚合）在此收敛为同一处，不需要每家适配器
-        // 各自埋点）。绝对时刻进旁路槽，相对耗时由记账点统一计算。
-        // `note_first_frame` 首次为准：之后每次 poll 都会走到这里，是空操作。
-        if let std::task::Poll::Ready(Some(_)) = &polled {
-            if let Some(context) = &this.context {
-                context.telemetry.note_first_frame();
-            }
-        }
-        if matches!(polled, std::task::Poll::Ready(None)) {
-            // 正常收尾：此刻记账，durationMs 就是真实的下发耗时
-            this.settle(None);
-        }
-        polled
-    }
-}
-
-impl Drop for RecordingStream {
-    fn drop(&mut self) {
-        // 还能走到这里，说明响应流**没有**跑到 None 就被丢弃了
-        // （客户端断开 / 服务退出）。仍记一条 —— 请求确实发生了，
-        // 让它从报表里消失比记成「中断」更糟。
-        self.settle(Some(STREAM_ABORTED.to_string()));
-    }
-}
-
-/// 非流式响应：`Content-Type: application/json; charset=utf-8` + 200。
-///
-/// 状态码固定 200：上游非 2xx 时转发层已经抛出（不会走到这里），
-/// 与 Node 的 `res.writeHead(200, ...)` 一致。charset 显式写上 ——
-/// Node 也是这么发的，且响应体里有中文（错误文案/思考内容）。
-fn json_response(body: Value) -> Response {
-    let text = match serde_json::to_string(&body) {
-        Ok(text) => text,
-        Err(error) => {
-            // 序列化失败只可能是内部数据坏了：给一个 OpenAI 风格 500，
-            // 绝不 panic（release 是 panic=abort）
-            let message = format!("响应序列化失败: {error}");
-            logging::log("[Model]", &format!("❌ {message}"));
-            return GatewayError::with_status(500, message).payload_response();
-        }
-    };
-    let mut response = Response::new(Body::from(text));
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=utf-8"),
-    );
-    response
-}
-
-/// 请求体里的 model → 供校验/记录用的文本。
-///
-/// 复刻 Node 的取值链：`if (!body.model)` 先做真值判定（null/""/0/false 都算
-/// 未指定），真值再交给目录查（`get()` 内部是 `String(id).toLowerCase()`），
-/// 所以数字/对象这类非字符串值也会被字符串化后参与比对 —— 本函数做的就是
-/// 那个字符串化，且**不改动 payload 里的原值**（上游收到什么由客户端决定）。
-fn model_field_text(payload: &Value) -> String {
-    let Some(value) = payload.get("model") else {
-        return String::new();
-    };
-    if !value_is_truthy(value) {
-        return String::new();
-    }
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// JS 真值判定（`Boolean(x)`）
-fn value_is_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().map(|item| item != 0.0).unwrap_or(false),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
-    }
-}
-
-/// 流式响应：`Content-Type: text/event-stream; charset=utf-8` +
-/// `Cache-Control: no-cache` + `Connection: keep-alive`，状态码透传。
-///
-/// 流项目是 `Result<Bytes, io::Error>`：上游断流时 axum 结束连接
-/// （Node 版此时是补写 error 帧 + `[DONE]`，见模块头部说明）。
-///
-/// 收 `StatusCode` 而不是 `u16`：调用点要先做一次「非法码落 200」的归一
-/// （记账要用同一个值），归一放在调用点、这里只负责下发，避免两处各写一遍。
-fn sse_response(
-    status: StatusCode,
-    stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
-) -> Response {
-    let mut response = Response::new(Body::from_stream(stream));
-    *response.status_mut() = status;
-    let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
-    response
 }
 
 /// GET /v1/models —— 免鉴权（Node 版这条没调 checkApiKey）。
@@ -594,13 +199,112 @@ fn sse_response(
 /// 聚合查询需要账号存储判断「哪几家可用」，所以这里用 `state.store()` ——
 /// 句柄是 `Clone` 的轻量 Arc，且绝不在持锁时做网络请求（这是本项目的硬约束，
 /// 聚合层只调 `accounts_for_provider` 做一次文件读取）。
-pub async fn list_models(State(state): State<ServerState>) -> Response {
-    let response = raw_json(crate::server::core::providers::catalog::models_response(
-        state.store(),
-    ));
+pub async fn list_models(State(state): State<ServerState>, headers: HeaderMap) -> Response {
+    let body = crate::server::core::providers::catalog::models_response(state.store());
     // 异步刷新模型目录，不阻塞响应（对照 Node 的 `void refreshModelCatalog()`）
     spawn_catalog_refresh(&state);
-    response
+    // Anthropic 客户端（Claude Code / Claude Desktop）走同一路径，但它们
+    // 只认 Anthropic 原生的列表形态（`type:"model"` + `display_name` +
+    // 顶层 `has_more`/`first_id`/`last_id`），拿到 OpenAI 的
+    // `{object:"list"}` 会解析不出任何模型。判据用 `anthropic-version` 头
+    // ——那是 Anthropic SDK 必带的，OpenAI 客户端不会发。
+    //
+    // ── 为什么不拆成 /anthropic/v1/models ───────────────────────
+    // Claude Code 的网关发现是**直接打 `{ANTHROPIC_BASE_URL}/v1/models`**
+    // 的（它自己拼路径，不会加前缀），拆路径等于让发现永远失败。
+    // 按请求头分流是这里唯一可行的做法。
+    if headers.contains_key("anthropic-version") || headers.contains_key("x-api-key") {
+        return json_response(anthropic_models_view(&body));
+    }
+    raw_json(body)
+}
+
+/// 把聚合目录的 OpenAI 形态转成 Anthropic 原生列表形态。
+///
+/// 字段对应关系（Anthropic 官方 List Models 响应）：
+///   `data[].id`            ← 原 `id`
+///   `data[].type`          ← 固定 `"model"`
+///   `data[].display_name`  ← 原 `name`（缺省回落 id）
+///   `data[].created_at`    ← 原 `created`（Unix 秒转 ISO；缺省给当前时刻）
+///   顶层 `has_more` / `first_id` / `last_id` 由列表首尾算出
+///
+/// 额外字段（`maxInputTokens` 等）**保留**：Anthropic 的客户端会忽略不认识的
+/// 键，而本项目的其它前端（模型管理页）需要它们。
+fn anthropic_models_view(body: &Value) -> Value {
+    let empty: Vec<Value> = Vec::new();
+    let items = body.get("data").and_then(Value::as_array).unwrap_or(&empty);
+    let mut data: Vec<Value> = Vec::with_capacity(items.len());
+    for item in items {
+        // 注意取值函数：这里要的是**成员值本身**，不是 `model_field_text`
+        // ——那个函数读的是请求体的 `model` 字段，传一个裸字符串进去只会得到空串
+        let text_of = crate::server::core::protocol::string_value;
+        let id = item.get("id").map(text_of).unwrap_or_default();
+        let display = {
+            let name = item.get("name").map(text_of).unwrap_or_default();
+            if name.is_empty() { id.clone() } else { name }
+        };
+        let mut entry = match item.as_object() {
+            Some(map) => map.clone(),
+            None => serde_json::Map::new(),
+        };
+        entry.insert("id".to_string(), Value::String(id.clone()));
+        entry.insert("type".to_string(), Value::String("model".to_string()));
+        entry.insert("display_name".to_string(), Value::String(display));
+        // created_at：Anthropic 用 ISO-8601 字符串；本地目录没有创建时间，
+        // 用「目录最近刷新时刻」代替（比编一个假日期诚实），拿不到就省略
+        if let Some(refreshed) = body.pointer("/meta/lastRefreshedAt").and_then(Value::as_i64) {
+            if refreshed > 0 {
+                if let Some(utc) = chrono::DateTime::from_timestamp_millis(refreshed) {
+                    entry.insert(
+                        "created_at".to_string(),
+                        Value::String(utc.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+                    );
+                }
+            }
+        }
+        data.push(Value::Object(entry));
+    }
+    let first = data.first().and_then(|item| item.get("id")).cloned().unwrap_or(Value::Null);
+    let last = data.last().and_then(|item| item.get("id")).cloned().unwrap_or(Value::Null);
+    json!({
+        "data": data,
+        "has_more": false,
+        "first_id": first,
+        "last_id": last,
+    })
+}
+
+/// POST /v1/messages/count_tokens
+///
+/// Anthropic 的官方契约里这是**独立端点**（Claude Code 启动时会探它）。
+/// 真正的分词只有上游知道，而本项目六家上游都没有对应的 tokenizer 接口 ——
+/// 所以这里给一个**估算**并如实标注 `estimated: true`：
+/// 按「字符数 ÷ 3.5」估（中英混排的经验值，与 Anthropic 官方「约 3.5 字符
+/// 一个 token」的量级一致）。
+///
+/// ── 为什么不直接 404 ────────────────────────────────────────
+/// Claude Code 在网关模式下会调它做上下文预算；404 会让它按「网关不支持」
+/// 处理（行为随版本变化，可能是降级也可能是报错）。给一个量级正确的估算，
+/// 比让它拿到 404 更接近「能用」。宁可数字粗略，也不要让整条链断掉。
+pub async fn count_tokens(State(state): State<ServerState>, body: Bytes) -> Response {
+    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    let Some(payload) = parsed.filter(Value::is_object) else {
+        let error = GatewayError::bad_request("请求体必须是 JSON 对象");
+        return error.payload_response();
+    };
+    // 复用 Anthropic → Chat 的转换来统计：这样「工具定义 / 图片块 / system」
+    // 的文本都被算进去，口径与真正转发时一致（转换失败则按原始 JSON 估）
+    let text = match crate::server::core::protocol::anthropic::chat_from_anthropic(&payload) {
+        Ok(chat) => serde_json::to_string(&chat).unwrap_or_default(),
+        Err(_) => serde_json::to_string(&payload).unwrap_or_default(),
+    };
+    let characters = text.chars().count();
+    let tokens = ((characters as f64) / 3.5).ceil().max(1.0) as i64;
+    let _ = state;
+    json_response(json!({
+        "input_tokens": tokens,
+        "estimated": true,
+    }))
 }
 
 /// 起一个后台任务刷新模型目录（不阻塞当前响应）。
@@ -619,48 +323,3 @@ pub fn spawn_catalog_refresh(state: &ServerState) {
         crate::server::core::providers::adapter::refresh_implemented(&store).await;
     });
 }
-
-/// ─── 杂项 ───────────────────────────────────────────────────
-
-/// 调试落盘：原始 body + 一行 meta（覆盖写；**失败不影响请求**）。
-///
-/// 与 Node 版一致：目录不存在时创建，任何 IO 失败都静默吞掉 ——
-/// 调试落盘是排障辅助，不能因为它失败就让用户的请求失败。
-fn write_debug_files(body: &[u8], method: &str, path: &str, user_agent: &str) {
-    let dir = config::config_dir().join(DEBUG_DIR);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let _ = std::fs::write(dir.join(DEBUG_REQUEST_FILE), body);
-    let meta = format!(
-        "{} {method} {path} {}B ua={user_agent}",
-        iso_timestamp(),
-        body.len(),
-    );
-    let _ = std::fs::write(dir.join(DEBUG_META_FILE), meta);
-}
-
-/// ISO-8601 UTC 时间戳（对应 Node 的 `new Date().toISOString()`，形如
-/// `2026-09-17T08:30:00.123Z`）
-fn iso_timestamp() -> String {
-    let millis = logging::now_ms();
-    match chrono::DateTime::from_timestamp_millis(millis) {
-        Some(utc) => utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-        None => String::new(),
-    }
-}
-
-/// 请求体 sha256（十六进制小写）——去重键，对应 Node 的
-/// `createHash('sha256').update(rawBody).digest('hex')`
-fn sha256_hex(body: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(body);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-

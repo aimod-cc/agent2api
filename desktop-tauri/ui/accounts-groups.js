@@ -38,18 +38,26 @@
    * 签到按钮、版本徽章、明细行字段名）都要问同一个问题 ——「这家有没有这个概念」。
    * 散在各处写 if 的话，加一家就要翻一遍全文件，漏掉一处不报错、只静默少一个按钮。
    *
-   * usage **四家都是 true**（余额 / 积分查询已扩到全部提供商）：各家的接口、鉴权、
+   * usage **各家都是 true**（余额 / 积分查询已扩到全部提供商）：各家的接口、鉴权、
    * 凭证来源全不相同，但都由各自的适配器实现（`ProviderAdapter::query_usage`），
    * 前端只回答「这一家有没有这个概念」。CatPaw 的余额接口要单独配置一个网页会话
    * 凭证（token2），没配置时后端返回可识别的「未配置」、面板显示成中性提示
    * （见 usage-panel.js）—— 所以它的按钮照样渲染，用户才有「去配置」的入口。
    * checkin 是**有签到活动**的家：workbuddy（腾讯每日签到）、raccoon（桌面登录
-   * 积分发放）、autoclaw（通用任务接口的 daily_signin 任务）。CatPaw / Qoder
-   * 有积分但确实没有签到，所以是 false —— 这个字段决定批量签到的目标集合与卡片上
-   * 的签到按钮，报错的家不该出现在这里。
+   * 积分发放）、autoclaw（通用任务接口的 daily_signin 任务）。CatPaw / Qoder /
+   * Cline 有积分但确实没有签到，所以是 false —— 这个字段决定批量签到的目标集合与
+   * 卡片上的签到按钮，报错的家不该出现在这里。
    * edition 决定卡片是否显示国内版 / 国际版徽章与组内二级分组；
    * identifier / expiry 是「账号标识」与「有效期」在记录里的键名
    * （workbuddy 用 uid / expiresAt，小浣熊用 userId / tokenExpiresAt）。
+   *
+   * ── Cline 两条键（两个额度池各一家）────────────────────────
+   * `cline-free` 与 `cline-pass` 是同一家上游按计费通道拆出来的两个 provider
+   * （见 providers::cline::models 的模块头），账号形态完全一样：都是 credit
+   * 余额可查、都没有签到活动，标识落在 `account` 键（邮箱或 usr-… id）、
+   * 有效期与 workbuddy 同键名（毫秒时间戳）。所以两条配置逐字相同 ——
+   * 分两条写是因为查表按 provider id 精确匹配，只登记 `cline` 那个旧 id
+   * 会让两家都落进 GENERIC_FEATURES（症状：余额按钮消失、标识列显示成空）。
    */
   const PROVIDER_FEATURES = {
     workbuddy: { usage: true, checkin: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
@@ -57,6 +65,8 @@
     catpaw: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
     autoclaw: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
     qoder: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+    'cline-free': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
+    'cline-pass': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
   };
 
   /**
@@ -139,6 +149,34 @@
   /** 是否为「桌面端实时登录态」账号（凭证实时读客户端文件；可禁用、也可删除） */
   function isDesktopAccount(account) {
     return account?.desktop === true;
+  }
+
+  /** 某时刻所在**本地自然日**的零点。自然日的判定统一走这里，
+   *  与限流恢复时间的「今天 / 明天」（accounts-model 的 startOfDay）同一口径。 */
+  const startOfLocalDay = value => {
+    const date = new Date(value);
+    return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  };
+
+  /**
+   * 该账号**今天是否已签到**（后端落盘的 `checkinAt` 落在本地今天）。
+   *
+   * 签到按自然日幂等（上游按天重置额度），所以「签过没有」不能只看有没有这个
+   * 时间戳，必须比自然日 —— 过了 0 点同一个字段自然失效，**不需要任何定时器
+   * 去重置**：判定是每次渲染现算的，跨零点后下一次重绘（最多 20 秒的那轮轮询）
+   * 按钮就自己变回可点。这正是「签到时间要记下来」而不是「记一个布尔」的原因。
+   *
+   * 看的是后端字段而不是界面缓存：自动签到的执行者是**后端**（定时任务），
+   * 界面缓存里根本没有那次签到的结果；只有读落盘时间，手动签与自动签才会
+   * 在按钮上表现一致。
+   */
+  function checkedInToday(account) {
+    const at = Number(account?.checkinAt) || 0;
+    if (at <= 0) return false;
+    // 时间戳比现在还晚（改过系统时钟、或手工编辑过账号文件）时仍按「今天」算：
+    // 它只可能来自一次真实的签到，宁可显示已签到也不要让按钮一直亮着
+    if (at > Date.now()) return true;
+    return startOfLocalDay(at) === startOfLocalDay(Date.now());
   }
 
   /**
@@ -336,6 +374,7 @@
     activeLimits,
     accountEdition,
     supportsCheckin,
+    checkedInToday,
     checkinableAccounts,
     // 筛选与队列
     matchProvider,

@@ -8,7 +8,7 @@
  *
  * ── 这一页管两类任务（接口也是两组）──────────────────────────
  *   · **间隔型**（凭证自动维护 / 定时查询积分 / 模型目录刷新 / 软件版本检查 /
- *     日志页自动刷新 / 请求明细自动刷新）
+ *     日志页自动刷新 / 请求日志自动刷新 / 报表自动刷新）
  *     —— 形状统一：`{enabled, interval, unit}`，走 /api/scheduled-tasks。
  *   · **自动签到** —— 每天定点型：`{enabled, time}` 外加当天去重与启动补签，
  *     走 /api/auto-checkin。它与间隔型不是同一个形状，所以后端也是两组接口
@@ -16,10 +16,18 @@
  *     界面上两者收在同一页，用同一套卡片观感，只是签到多一个时刻输入框。
  *
  * ── 前端任务与后端任务的区别（界面上要看得出来）──────────────
- * `runner: "frontend"` 的两条（日志页 / 请求明细自动刷新）执行者是**页面自己**，
- * 所以它们没有「上次执行 / 下次执行」，也不给「立即执行」按钮 —— 按钮点了也没有
- * 任何东西可跑。改成配置后由 `logs-panel` / `requests-panel` 自己的定时器读取
- * （它们的 10 秒轮询已换成配置值，见那两个文件的 startAuto）。
+ * `runner: "frontend"` 的三条（日志页 / 请求日志页 / 报表页自动刷新）执行者是
+ * **页面自己**，所以它们没有「上次执行 / 下次执行」，也不给「立即执行」按钮 ——
+ * 按钮点了也没有任何东西可跑。改成配置后由 `logs-panel` / `requests-panel` /
+ * `report` 自己的定时器读取（它们原先写死在本地的轮询已换成配置值，
+ * 见那三个文件的 startAuto）。
+ *
+ * ── 任务说明改成问号（与设置页同款）──────────────────────────
+ * 七条任务原先各自常驻一整段说明（`.task-desc`），叠起来是一屏灰字，而它其实
+ * 只在「第一次配置」时需要读一遍。现在收进标题旁的 `.tip-q` + `data-tip`
+ * （由 tooltip.js 增强成气泡），卡片本身只剩标题、状态与控件。
+ * 间隔型那七条的文案由后端随任务下发；自动签到的不在注册表里，文案写在
+ * 本文件（见 `CHECKIN_DESC`）。
  *
  * ── 保存时机：开关立即存、间隔失焦才存 ────────────────────────
  * 开关是「拨一下就该生效」的动作（与设置页其它开关一致）；间隔输入框若每敲一位
@@ -34,6 +42,17 @@
 
   /** 自动签到在界面上的 id：它不是间隔型任务，但要在同一个列表里排序与定位 */
   const CHECKIN_ID = 'autoCheckin';
+  /**
+   * 自动签到的说明文案（问号 tooltip 的内容）。
+   *
+   * 它不来自后端：签到不走 `/api/scheduled-tasks`（形状不同，见文件头），
+   * 后端那份注册表里没有这一条，所以文案只能写在这里。其余六条的说明都由
+   * 后端随任务下发（`TaskDef::description`），前端不抄一份。
+   */
+  const CHECKIN_DESC = '到点后自动签到勾选提供商的已启用账号（WorkBuddy 走每日签到接口，仅限国内版；'
+    + '小浣熊走桌面端每日积分链路；AutoClaw 走官方客户端的每日签到任务；国际版账号没有签到活动，会被跳过）。'
+    + '多个账号串行执行，避免同时请求触发上游风控。若启动时当天还没签过，会立即补签一次，'
+    + '不会因为当时没开机而漏掉。各家签到接口都是幂等的，重复执行不会重复领取。';
   /** 页面可见时的自动同步间隔：与 app.js 的主状态轮询同频，页面不可见时不跑 */
   const SYNC_MS = 20_000;
 
@@ -91,6 +110,15 @@
    *
    * 输入框带 `data-task-input` 标记：`render` 重绘时不整块重建 DOM，
    * 而是就地更新（见 `renderTask` 的说明）—— 所以这里只负责生成初始结构。
+   *
+   * ── 介绍文案为什么是问号（与设置页同款）──────────────────────
+   * 原先每条任务的说明是一整段常驻的 `.task-desc`，七条任务叠起来是一屏
+   * 密不透风的灰字，而它其实是「第一次配置时才需要读一遍」的内容。
+   * 改成 `tip-q` + `data-tip`（tooltip.js 增强成气泡）后，说明挪到鼠标
+   * 悬停处，卡片本身只剩下标题与运行状态 —— 与设置页各面板标题的做法一致。
+   *
+   * `data-tip` 的内容经 `esc` 转义：说明里含中文引号与括号，但**不含 HTML**，
+   * 转义只是防御（后端文案将来若带上尖括号，不至于把 tooltip 撑坏）。
    */
   function taskCard(task) {
     const unit = unitOf(task.unit);
@@ -117,10 +145,10 @@
               <span class="track"></span>
               <span class="task-name">${esc(task.label)}</span>
             </label>
+            <span class="tip-q" data-tip="${esc(task.description)}"></span>
             <span class="badge ${task.enabled ? 'ok' : ''} task-badge" data-task-badge>${task.enabled ? '已开启' : '已关闭'}</span>
             ${task.running ? '<span class="badge warn task-badge">执行中…</span>' : ''}
           </div>
-          <p class="task-desc">${esc(task.description)}</p>
           <div class="task-state" data-task-state>${state.join('　·　')}</div>
         </div>
         <div class="task-actions">
@@ -178,11 +206,11 @@
               <span class="track"></span>
               <span class="task-name">自动签到</span>
             </label>
+            <span class="tip-q" data-tip="${esc(CHECKIN_DESC)}"></span>
             <span class="badge ${enabled ? 'ok' : ''} task-badge" id="task-checkin-badge">${
               !data ? '不可用' : enabled ? (data.lastFiredToday ? '今日已执行' : '已开启') : '已关闭'}</span>
             ${data?.running ? '<span class="badge warn task-badge">执行中…</span>' : ''}
           </div>
-          <p class="task-desc">到点后自动签到勾选提供商的已启用账号（WorkBuddy 走每日签到接口，仅限国内版；小浣熊走桌面端每日积分链路；AutoClaw 走官方客户端的每日签到任务；国际版账号没有签到活动，会被跳过）。多个账号串行执行，避免同时请求触发上游风控。若启动时当天还没签过，会立即补签一次，不会因为当时没开机而漏掉。各家签到接口都是幂等的，重复执行不会重复领取。</p>
           <div class="task-providers" id="task-checkin-providers">
             <span class="lead">签到提供商：</span>
             ${options.map(option => `
@@ -203,6 +231,33 @@
           <button class="sm" id="btn-task-checkin-run" ${data ? '' : 'disabled'}>立即签到</button>
         </div>
       </div>`;
+  }
+
+  /**
+   * 整块重建时的卡片序列。
+   *
+   * ── 为什么后六条要裹一层两栏网格 ─────────────────────────────
+   * 一条任务一整行时，八条要滚两屏，而每行右侧动作区之外大片留白（任务名与
+   * 状态都短）。自动签到与凭证自动维护两条留在整行：前者自带提供商勾选与
+   * 两个按钮，本来就比别的卡片高，压进半栏会挤成一团；后者留一行，也让下面的
+   * 分栏看着是「其中一段收成两栏」而不是整页换了排版。
+   *
+   * 后六条按两栏三行排，**列优先**（顺序即阅读顺序）：左栏三条是后端任务
+   * （定时查询积分 / 模型目录刷新 / 软件版本检查，都带「立即执行」），
+   * 右栏三条是页面任务（日志页 / 请求日志页 / 报表页自动刷新，执行者是页面自己的
+   * 定时器，所以没有按钮）—— 分栏恰好把这两类分开，扫一眼就知道哪一栏是
+   * 「网关在跑」、哪一栏是「页面在跑」。
+   *
+   * 分栏由 CSS 的 flex / grid 布局实现（`.task-grid`，见 page-tasks.css）；
+   * 这里只负责把后六条裹进那个容器。条数将来变了也只是分栏比例变，不会错位。
+   */
+  const LEAD_CARDS = 2;   // 整行铺开的条数：自动签到 + 凭证自动维护
+
+  function cardsHtml() {
+    const cards = [checkinCard(), ...tasks.map(taskCard)];
+    const rest = cards.slice(LEAD_CARDS);
+    return cards.slice(0, LEAD_CARDS).join('')
+      + (rest.length ? `<div class="task-grid">${rest.join('')}</div>` : '');
   }
 
   /**
@@ -234,7 +289,7 @@
 
     if (!sameShape) {
       // 结构变了：整块重建（事件走容器委托，不必重新绑定）
-      list.innerHTML = [checkinCard(), ...tasks.map(taskCard)].join('');
+      list.innerHTML = cardsHtml();
     } else {
       // 结构没变 → 只更新每张卡的值（保留焦点与编辑中的输入）
       tasks.forEach(task => updateTask(task));
@@ -436,12 +491,12 @@
   }
 
   /**
-   * 把两条**前端**任务的配置推给执行者（日志页 / 请求明细面板的定时器）。
+   * 把三条**前端**任务的配置推给执行者（日志页 / 请求日志页 / 报表页的定时器）。
    *
-   * 只有这两条需要推：后端任务由后端的循环自己读配置（下一轮生效），
+   * 只有这三条需要推：后端任务由后端的循环自己读配置（下一轮生效），
    * 而前端页面的定时器长在各自的模块里，改完得有人告诉它们。
    *
-   * 走可选链：那两个面板可能还没加载（加载顺序上本文件排在它们之后，
+   * 走可选链：那几个面板可能还没加载（加载顺序上本文件排在它们之后，
    * 所以正常都就绪；但万一脚本加载失败，这里不该抛错把保存流程带崩）。
    * 它们在启动时也会自读一次配置，所以推失败不会留下不一致。
    */
@@ -450,6 +505,8 @@
       window.wbLogsPanel?.applyAutoRefresh?.(task);
     } else if (task.id === 'requestsAutoRefresh') {
       window.wbRequestsPanel?.applyAutoRefresh?.(task);
+    } else if (task.id === 'reportAutoRefresh') {
+      window.wbReport?.applyAutoRefresh?.(task);
     }
   }
 

@@ -298,9 +298,14 @@
     if (isProxy) void batchProxyForm?.loadClashOptions();
   }
 
-  /** 批量删除是不可逆操作，按数量做二次确认 */
+  /** 批量删除是不可逆操作，按数量做二次确认（自绘弹窗：原生 confirm 在 Tauri WebView 里不弹窗直接放行） */
   function confirmBatchRemove(count) {
-    return confirm(`确定删除选中的 ${count} 个账号？此操作不可恢复，账号的登录态会一并移除。`);
+    return window.wbConfirm?.ask?.({
+      title: '删除选中的账号',
+      html: `确定删除选中的 <strong>${count}</strong> 个账号？此操作不可恢复，账号的登录态会一并移除。`,
+      okText: '删除',
+      okClass: 'danger',
+    });
   }
 
   async function runBatch() {
@@ -317,7 +322,7 @@
         return;
       }
     }
-    if (action === 'remove' && !confirmBatchRemove(batchIds.length)) return;
+    if (action === 'remove' && !(await confirmBatchRemove(batchIds.length))) return;
 
     // 批量禁用/删除可能把所有启用中的账号一起停掉，转发将无账号可用，提醒一下更稳妥。
     // 判据是「选中的账号是否已覆盖全部启用中的账号」，而不是数量对比 ——
@@ -327,7 +332,12 @@
       const survivors = allAccounts().filter(a => a.enabled !== false && !picked.has(a.id));
       if (!survivors.length) {
         const what = action === 'remove' ? '删除' : '禁用';
-        if (!confirm(`这会${what}所有启用中的账号，转发将不可用。确定继续？`)) return;
+        if (!(await window.wbConfirm?.ask?.({
+          title: `全部启用中的账号将被${what}`,
+          html: `这会<strong>${what}</strong>所有启用中的账号，转发将不可用。确定继续？`,
+          okText: what,
+          okClass: action === 'remove' ? 'danger' : 'primary',
+        }))) return;
       }
     }
 

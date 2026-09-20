@@ -156,6 +156,31 @@ pub fn log(tag: &str, text: &str) {
     });
 }
 
+/// 显式指定级别的日志，其余行为与 `log()` 完全一致。
+///
+/// 汇总类文案（「成功 X，跳过 Y，失败 Z」）的级别必须由**结果**决定而不是
+/// 靠文案推断：失败数为 0 的正常轮次里也有「失败」二字，`infer_level`
+/// 会把它误判成 error（导航徽标只统计 error，等于一跑定时任务就亮红标）。
+/// 调用方手里就有失败数，按它选 `"info"` / `"error"` 即可。
+pub fn log_with_level(tag: &str, text: &str, level: &str) {
+    console_line(tag, text);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let Some(store) = store() else {
+        return;
+    };
+    let message = format!("{tag} {trimmed}");
+    store.append(NewEntry {
+        level,
+        category: category_of(tag),
+        message: &message,
+        data: None,
+        ts: None,
+    });
+}
+
 /// 调试日志：只有开关打开时才入库（对应 Node 版 verbose()）。
 /// 控制台始终输出，方便排障时用普通启动也能看到细节。
 pub fn verbose(tag: &str, text: &str) {

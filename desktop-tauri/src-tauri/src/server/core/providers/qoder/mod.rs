@@ -348,7 +348,19 @@ impl ProviderAdapter for QoderAdapter {
                 ),
             );
 
+            // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
+            // Qoder 是单次请求（一条对话 = 一次上游往返），与无状态路径同一
+            // 时机：请求体已定稿、即将发送。开关关着时 capture 为 None。
+            let capture = telemetry.capture();
+            if let Some(capture) = capture.as_deref() {
+                let headers: Vec<(String, String)> = plan.headers.clone();
+                capture.reset_request(&plan.url, "qoder", &headers, body);
+            }
+
             let response = chat::send(&plan, effective_proxy.as_ref()).await?;
+            if let Some(capture) = capture.as_deref() {
+                capture.attach_response(response.status().as_u16(), response.headers());
+            }
             if !response.status().is_success() {
                 // 只有失败响应才读体（成功的是 SSE 流，读了就没流了）
                 let status = response.status().as_u16();
@@ -433,7 +445,7 @@ fn account_label_for(store: &AccountStore, account_id: &str) -> String {
 /// 错误处理分两段（与通用层同一形态）：
 ///   - **首帧之前**的错误：还没有任何内容下发，直接补一帧 error + `[DONE]` 收尾
 ///     （HTTP 头已经发出去了，只能这样告诉客户端）—— 同时写 telemetry，
-///     让请求明细能解释「为什么这条是失败的」；
+///     让请求日志能解释「为什么这条是失败的」；
 ///   - 中途断流：同上，且把已累积的内容留在前面（不丢用户已经看到的部分）。
 async fn drive_stream(
     response: reqwest::Response,
@@ -447,6 +459,8 @@ async fn drive_stream(
     let mut lines = stream::LineBuffer::new();
     let mut source = response.bytes_stream();
     let mut failed: Option<String> = None;
+    // 调试模式的采集器（在解析之前旁路原始字节 —— 采的是上游原样吐出的内容）
+    let capture = telemetry.capture();
 
     'outer: while let Some(item) = source.next().await {
         let chunk = match item {
@@ -459,6 +473,9 @@ async fn drive_stream(
                 break;
             }
         };
+        if let Some(capture) = capture.as_deref() {
+            capture.push(&chunk);
+        }
         for data in lines.push(&chunk) {
             match stream::parse_sse_line(&data) {
                 SseEvent::Skip => {}
@@ -613,6 +630,8 @@ async fn drive_aggregate(
     let mut lines = stream::LineBuffer::new();
     let mut source = response.bytes_stream();
     let mut business_failure: Option<GatewayError> = None;
+    // 调试模式的采集器（与 drive_stream 同一位置：解析之前采原始字节）
+    let capture = telemetry.capture();
 
     'outer: while let Some(item) = source.next().await {
         let chunk = item.map_err(|error| {
@@ -624,6 +643,9 @@ async fn drive_aggregate(
                 ),
             )
         })?;
+        if let Some(capture) = capture.as_deref() {
+            capture.push(&chunk);
+        }
         for data in lines.push(&chunk) {
             match stream::parse_sse_line(&data) {
                 SseEvent::Skip => {}

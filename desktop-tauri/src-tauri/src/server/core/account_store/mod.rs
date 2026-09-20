@@ -65,6 +65,7 @@ pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
 pub mod catpaw_import;
+pub mod cline_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
@@ -116,6 +117,30 @@ pub(crate) const AUTOCLAW_PROVIDER_ID: &str = crate::server::core::providers::ki
 pub(crate) const QODER_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::Qoder,
 );
+
+/// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同
+/// [`RACCOON_PROVIDER_ID`] 的口径）。账号形态见 `cline_accounts.rs`。
+pub(crate) const CLINE_FREE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::ClineFree,
+);
+
+/// Cline **订阅池** provider id（同 [`CLINE_FREE_PROVIDER_ID`] 的口径）
+pub(crate) const CLINE_PASS_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::ClinePass,
+);
+
+/// 这个 provider 是不是 **Cline 系**（两个额度池之一）。
+///
+/// 账号层几处判断只关心「是不是 Cline」（桌面端实时凭据、余额、续期回写、
+/// 身份字段落在 `account` 键上），不关心哪个池 —— 那些分支全走本函数，
+/// 于是将来加池或改名时只需改这里一处，而不是散在各文件里的 `id == "cline"`。
+///
+/// 注意 `"cline"` 这个 id **已经不存在**（拆分后是 `cline-free` /
+/// `cline-pass`，见 `providers::PROVIDERS`）：写 `id == "cline"` 会恒为假，
+/// 是个不会报错的静默失配，所以这里给出唯一的判据函数。
+pub(crate) fn is_cline_family(provider_id: &str) -> bool {
+    provider_id == CLINE_FREE_PROVIDER_ID || provider_id == CLINE_PASS_PROVIDER_ID
+}
 
 /// 小浣熊 provider id（账号存储内部多处要用）。
 ///

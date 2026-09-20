@@ -5,16 +5,23 @@
    颜色一律取 tokens.css 的语义变量，浅色深色共用同一组声明。
    ───────────────────────────────────────────── */
 
-/* 八列：时间 / 提供商·账号 / 重试 / 状态 / 模型 / 用时 / 用量 / 错误。
+/* 九列：时间 / 提供商·账号 / 重试 / 状态 / 模型 / 用时 / 用量 / 错误 / 详情。
    时间与用时定宽（等宽数字 + tabular-nums，竖着比对才齐），
    其余占弹性宽度（都是不定长内容，给固定宽度会互相挤）：
    模型 1.3fr（claude-sonnet-4-5 这类名字要放得下），
-   用量 1.6fr（两行读数里 in/out/all 最长），超出由省略号收住、完整值进 title。 */
+   用量 1.6fr（两行读数里 in/out/all 最长），超出由省略号收住、完整值进 title。
+   详情列定宽（只有一个「详情」按钮或一个「-」）。
+
+   --req-cols 是用户拖过的列宽（table-columns.js 写在 #req-list 上，靠继承
+   作用到每一行 —— 表格是整体重绘的，变量不需要在渲染后再写一遍）：
+   拖过哪一列，那一条轨道就从 minmax(…fr) 换成固定像素，没拖过的仍是弹性权重，
+   于是这一行永远填满、不滚动、不留空。变量没设时走下面的默认值，
+   改默认列宽时与 table-columns.js 里对应列的 track 字段要同步。 */
 .req-row,
 .req-head {
   display: grid;
-  grid-template-columns:
-    92px minmax(0, 1.1fr) 52px 68px minmax(0, 1.3fr) 96px minmax(0, 1.6fr) minmax(0, 1.2fr);
+  grid-template-columns: var(--req-cols,
+    92px minmax(0, 1.1fr) 52px 68px minmax(0, 1.3fr) 96px minmax(0, 1.6fr) minmax(0, 1.2fr) 60px);
   gap: 12px;
   align-items: center;
   padding: 10px 14px;
@@ -37,6 +44,9 @@
   font-weight: 600;
   letter-spacing: .02em;
 }
+
+/* 表头格子是列宽把手的定位锚（.col-grip 绝对定位挂在它内側右缘，见 components.css） */
+.req-head > span { position: relative; }
 
 .req-row { border-bottom: 1px solid var(--hairline); transition: background .12s ease; }
 .req-row:last-child { border-bottom: none; }
@@ -99,6 +109,26 @@
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 上下名分行的形态（转发名 ≠ 请求名时，如映射 / 备援改写）：
+   ⬆️ 上游实际收到的名字（主读数）在上，⬇️ 下游请求的名字（淡一档）在下 ——
+   与用时列的两行结构同一手法；单行请求不受影响（类不出现）。 */
+.req-row .req-model-split {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.req-row .req-model-line {
+  overflow: hidden;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
+.req-row .req-model-line.sub {
+  color: var(--text-3);
+  font-size: 11px;
 }
 
 /* 用时：等宽 + 右对齐，相邻行的数字能直接竖着比大小。
@@ -176,6 +206,9 @@
     grid-template-columns: 92px minmax(0, 1fr) 68px 52px;
     row-gap: 4px;
   }
+  /* 重排成四行之后轨道已经不是那八条了：上面这条声明直接覆盖 --req-cols，
+     拖动没有意义，把手一并收起，免得点了没反应 */
+  .req-head .col-grip { display: none; }
 
   /* 表头只保留第一行的四格，其余列头隐藏（列位置已重排，留着会冲突） */
   .req-head .req-time { grid-row: 1; grid-column: 1 / 2; }
@@ -197,15 +230,20 @@
   .req-row .req-dur { grid-row: 2; grid-column: 3 / 5; }
   /* 第三行：用量整行铺开（两行读数不再被列宽挤省略） */
   .req-row .req-usage { grid-row: 3; grid-column: 1 / -1; }
-  /* 第四行：错误。整行铺开时允许折行；没有错误的行不渲染这格 */
+  /* 第四行：错误 + 详情。整行铺开时允许折行；没有错误的行不渲染错误那格。
+     详情排在错误之后（同一行右端）—— 有错误时它跟着换到这一行，
+     没错误时错误格不渲染，它自己占满这一行 */
   .req-row .req-error {
     grid-row: 4;
-    grid-column: 1 / -1;
+    grid-column: 1 / 4;
     white-space: normal;
     word-break: break-word;
   }
+  .req-row .req-detail { grid-row: 4; grid-column: 4 / 5; justify-self: end; }
   /* 「-」占位不再独占一行：窄窗口下空行比省略号更难解释 */
   .req-row .req-error-cell { display: none; }
+  /* 详情列头在窄窗口下没有稳定的列位（位置随有没有错误而变），一并隐藏 */
+  .req-head .req-detail { display: none; }
 }
 
 /* 窄窗口：页头的自动刷新开关整行铺开，与日志页、报表页的时间范围同款处理。
@@ -216,4 +254,60 @@
     margin-left: 0;
     justify-content: flex-start;
   }
+}
+
+/* ─── 详情列与详情弹窗（调试模式的上游原始报文）───────────────
+   报文里是上游原文（SSE 文本、JSON 体），一律等宽字体 + 保留换行；
+   弹窗比常规确认框宽（原文行很长），高度吃满可用空间后内部滚动。 */
+
+.req-row .req-detail { justify-self: end; }
+
+/* 详情按钮：小号、无边框感（一列里最轻的控件，不与状态徽章抢注意力） */
+.req-detail-btn {
+  padding: 2px 8px;
+  font-size: 11.5px;
+}
+
+.modal-wide { width: min(920px, 100%); }
+
+.req-detail-meta {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.7;
+  word-break: break-all;
+}
+
+.req-detail-block { margin-top: 14px; }
+
+.req-detail-block h3 {
+  margin-bottom: 6px;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+
+.req-detail-pre {
+  max-height: 320px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2, var(--surface));
+  color: var(--text-2);
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+}
+
+.req-detail-empty {
+  padding: 24px 0;
+  color: var(--text-3);
+  font-size: 12.5px;
+  text-align: center;
 }

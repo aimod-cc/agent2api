@@ -1,5 +1,7 @@
 # Agent2API · 多提供商本地网关
 
+**简体中文** | [English](./README.en.md)
+
 把多家 AI 桌面客户端的登录态包装成本地 **OpenAI 兼容 API 网关**，统一暴露一个 `base_url`，附带多提供商账号管理、模型管理（启停 / 删除 / 映射）、内容脱敏、出网代理与请求报表，并提供一个开箱即用的 Tauri 桌面端。任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 为端点调用这几家的模型额度——不需要 API Key，不需要改客户端源码。
 
 ```
@@ -15,13 +17,16 @@ OpenAI 客户端 / 任意 SDK
         │                （自有 conversation 会话协议）
         ├──▶ autoclaw   autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw
         │                X-Authorization: Bearer <token>（OpenAI 兼容）
-        └──▶ qoder      api3.qoder.sh（国际版）/ gateway.qoder.com.cn（中国版）
-                         COSY 自签名头（不是 Bearer）· 信封式 SSE（自有编码与签名）
+        ├──▶ qoder      api3.qoder.sh（国际版）/ gateway.qoder.com.cn（中国版）
+        │                COSY 自签名头（不是 Bearer）· 信封式 SSE（自有编码与签名）
+        └──▶ cline      api.cline.bot · Authorization: Bearer workos:<JWT>
+                         X-CLIENT-TYPE: cline-sdk（缺了它免费池模型一律 403）
+                         模型名带池前缀：cline-pass/…（订阅池）· cline-free/…（免费池）
 ```
 
 > **本项目仅供学习与交流使用。** 它通过本地反向代理复用你自己账号的登录态，这种「以非官方客户端形态转发」的方式可能不符合上游服务的用户协议，使用风险（含账号被风控、封禁）由使用者自行承担；禁止用于商业用途或绕过计费。详见[使用声明](#使用声明)与 [LICENSE](./LICENSE)。
 >
-> 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder）及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
+> 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder）、Cline 及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
 
 ---
 
@@ -43,7 +48,7 @@ OpenAI 客户端 / 任意 SDK
 > 从 1.x 的「按当前用户安装」（`%LOCALAPPDATA%\<产品名>`）升级过来时，新版本启动后会清掉那份旧安装：先确认目录里确实是本产品的主程序才动，然后删除目录、开始菜单/桌面的快捷方式、卸载注册项与失效的开机自启登记；旧目录还在用（删不掉）或不是本产品的会跳过。这段清理只在 release 构建里执行 —— 开发时跑 `tauri dev` 不会影响你本机已装的正式版。数据目录不受影响（迁移是复制）。
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口。若检测到 1.x 的旧数据目录 `~/.workbuddy-proxy`，会自动**整体拷贝**为 `~/.agent2api`（旧目录保留不删，可回退），并自动导入三家的旧账号数据（旧网关账号文件与各家桌面端登录态；WorkBuddy 账号随目录拷贝一并带过来）。
-2. 点「报表」或「账号」页上的「登录 / 添加账号」，**在弹窗里选提供商**（WorkBuddy / 小浣熊 / CatPaw / AutoClaw / Qoder），再按该家的方式完成登录或填写凭证。WorkBuddy 只支持网页登录（内嵌窗口或系统浏览器）；小浣熊支持网页登录、填写 token 与「从本机导入桌面端登录态」；CatPaw 支持网页登录、填写凭证与「从本机导入桌面端登录态」；AutoClaw 支持手机验证码登录、填写凭证与「从本机导入桌面端登录态」；Qoder 支持网页登录（国际版与中国版都能登）与个人访问令牌（PAT），网页登录与国际版 / 中国版是同一套设备授权协议，选哪站就登哪站。导入桌面端登录态即直接复用桌面客户端自己的登录态文件，账号记录里不落 token，客户端重新登录后网关立刻跟上（Qoder 没有这一项）。
+2. 点「报表」或「账号」页上的「登录 / 添加账号」，**在弹窗里选提供商**（WorkBuddy / 小浣熊 / CatPaw / AutoClaw / Qoder / Cline），再按该家的方式完成登录或填写凭证。WorkBuddy 只支持网页登录（内嵌窗口或系统浏览器）；小浣熊支持网页登录、填写 token 与「从本机导入桌面端登录态」；CatPaw 支持网页登录、填写凭证与「从本机导入桌面端登录态」；AutoClaw 支持手机验证码登录、填写凭证与「从本机导入桌面端登录态」；Qoder 支持网页登录（国际版与中国版都能登）与个人访问令牌（PAT），网页登录与国际版 / 中国版是同一套设备授权协议，选哪站就登哪站；Cline 支持设备授权登录（打开授权页确认即可，无需粘贴任何东西）、填写 accessToken / refreshToken 与「从本机导入桌面端登录态」。导入桌面端登录态即直接复用桌面客户端自己的登录态文件，账号记录里不落 token，客户端重新登录后网关立刻跟上（Qoder 没有这一项）。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。
@@ -91,6 +96,7 @@ print(resp.choices[0].message.content)
 - **模型名默认用上游原始名**，网关不加前缀。清单是各家的聚合结果，同名模型的条目保留注册表顺序里靠前的那家（`owned_by` 记为实际承载它的 provider），但请求走哪家由**账号优先级**决定 —— 候选链是「提供该模型的各家账号按全局优先级排队」，逐个尝试，全部失败才把最后一个真实错误透传出来。
 - 点名的模型必须真实存在于目录中，否则直接返回 400（`code: "model_not_found"`）并附近似名提示 —— 把 `deepseek-v4.1-flash` 悄悄换成别的模型会造成「请求 A 实跑 B」这类难以察觉的事故，所以不做静默回退。
 - **模型管理页可以起映射名**：为某个上游模型配一个对外的别名（alias → target），下游用别名请求时网关改写成目标模型再转发；别名也会作为独立条目出现在 `/v1/models` 里（`is_default` 恒为 false）。同一别名只能指向一个目标，且不得与任何上游模型 id 重名。禁用或删除的模型不出现在 `/v1/models`，请求它返回 400 `model_not_found`（删除只从清单隐藏，可在管理页「已删除」筛选里恢复）。
+- **带前缀的上游模型名会自动配一条去前缀映射**（Cline 是当前唯一这样的家）：它的模型名带**计费通道前缀** —— `cline-pass/…` 是 ClinePass 订阅池、`cline-free/…` 是免费额度池，前缀必须原样发给上游（剥掉会 404）。网关为每个带前缀的模型自动加一条映射（`glm-5.3` → `cline-pass/glm-5.3`），因此**两种名字都能用**：写 `glm-5.3` 或写完整 id 都行。这条映射和手工加的映射一样在模型管理页可见、可删；删掉后网关不会再自动加回来。两个池有同名模型时（如 `deepseek-v4.1-flash`）**先到先得**：先处理的那个池拿到短名，另一个池只用完整 id 点名（`/v1/models` 里两个完整 id 都在）。
 - **清单只收录对话模型**（内部补全 / 工具模型、图像与视频模型不会出现在对外目录里），并且**只广告当前有可用登录态的家**。
 - 只实现了对话这一条链路：补全、向量、图像、视频等路径没有转发实现（请求得到 404）。
 - 上游限流（HTTP 429）时，错误体带 `type: "rate_limit_exceeded"`，并附 `reset_at`（时间戳）与 `reset_at_text`（本地时间文本）。
@@ -129,10 +135,14 @@ agent2api/
 │  │  │  │  │  │                upstream_http / image_compress / models / credentials / balance
 │  │  │  │  │  ├─ autoclaw/     智谱 autoglm：adapter / credentials / refresh / crypto / models /
 │  │  │  │  │  │                balance / login（手机验证码）/ checkin（每日签到任务）
-│  │  │  │  │  └─ qoder/        Qoder：adapter / endpoints（两站地址）/ oauth（设备授权）/
-│  │  │  │  │                   auth / cosy（COSY 签名与体编码）/ protocol（信封解码）/
-│  │  │  │  │                   chat（会话式转发）/ stream / machine（PKCE 与机器标识）/
-│  │  │  │  │                   credentials / refresh / models / balance
+│  │  │  │  │  ├─ qoder/        Qoder：adapter / endpoints（两站地址）/ oauth（设备授权）/
+│  │  │  │  │  │                auth / cosy（COSY 签名与体编码）/ protocol（信封解码）/
+│  │  │  │  │  │                chat（会话式转发）/ stream / machine（PKCE 与机器标识）/
+│  │  │  │  │  │                credentials / refresh / models / balance
+│  │  │  │  │  └─ cline/        Cline：adapter（Bearer + 产品面头）/ credentials（workos: 前缀
+│  │  │  │  │                   + 桌面端登录态 + 姓名解析）/ login（WorkOS 设备授权）/
+│  │  │  │  │                   refresh（单飞续期）/ models（两额度池 + 默认映射种子）/
+│  │  │  │  │                   balance（credit 余额，微 credit ÷1e6）
 │  │  │  │  ├─ upstream/        转发编排：全局账号队列循环（provider_loop）+ 发送体处理
 │  │  │  │  │                    （payload）+ SSE 透传/聚合 + usage 旁路提取
 │  │  │  │  ├─ account_store/   账号存储（全局优先级、限额冷却、各家添加与导入）

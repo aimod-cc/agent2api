@@ -227,6 +227,34 @@ fn claim_result(
     }
 }
 
+/// 这次签到是否意味着「今天已经签过了」—— 决定要不要落 `checkinAt`。
+///
+/// 三种情况都算，因为它们在「今天不能再领」这件事上没有区别：
+///   1. `success === true`：本次真的领到了；
+///   2. `alreadyCompleted === true`：上游明确告知今天已完成
+///      （AutoClaw 的 `daily_signin` 会带这个字段，见 `providers::autoclaw::checkin`）；
+///   3. `msg` 里含「已签到 / 已领取」：WorkBuddy 只把「今日已签到」放在文案里，
+///      没有专门的码位可用，所以这里只能看文案。
+///
+/// 小浣熊不需要第 3 条：它的「今天已领过」是通过**账单核对**发现的 ——
+/// 今天有入账记录就会算出 `granted_today > 0`，于是自然落到第 1 条。
+///
+/// ── 为什么不能宽到「只要没报错就算」─────────────────────────
+/// 失败行（网络错误 / 凭证失效 / 5xx）与「今天已签到」是两回事：前者意味着今天
+/// 可能一次都没签上，把它当作已签到去置灰按钮会白丢一天。这不是假想 ——
+/// 实测见过自动签到 4 个账号全部未领取、17 秒后手动逐个重试全部成功
+/// （批次撞上上游风控），所以判据必须收紧到「上游说签过了」。
+fn checkin_completed_today(claim: &Value) -> bool {
+    if claim.get("success").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    if claim.get("alreadyCompleted").and_then(Value::as_bool) == Some(true) {
+        return true;
+    }
+    let message = claim.get("msg").and_then(Value::as_str).unwrap_or("");
+    message.contains("已签到") || message.contains("已领取")
+}
+
 /// 执行一次签到并汇总（Node 版 `runCheckin(id)`）。
 ///
 /// `id` 为 None 时签全部符合条件的账号（定时签到走这条），范围由 `providers`
@@ -241,7 +269,24 @@ pub async fn run_checkin(
     let (targets, skipped) = resolve_checkin_targets(store, providers, id)?;
     let mut results = Vec::with_capacity(targets.len());
     for account in &targets {
-        results.push(checkin_for(store, billing, account).await);
+        let row = checkin_for(store, billing, account).await;
+        // 落签到时间：手动单签与定时签到走的是**这一段**（两条链都调本函数），
+        // 所以账号页的「已签到」在两种路径下都会亮起来，不需要各自记一次。
+        // 写盘失败只记日志、不改签到结果 —— 上游那边积分已经领到了，
+        // 因为一次落盘失败就把成功的签到报成失败是本末倒置。
+        if let Some(account_id) = row.get("id").and_then(Value::as_str) {
+            let completed = row
+                .get("claim")
+                .map(checkin_completed_today)
+                .unwrap_or(false);
+            if completed && !store.mark_checkin(account_id, logging::now_ms()) {
+                logging::verbose(
+                    "[Accounts]",
+                    &format!("账号 {account_id} 的签到时间未能落盘（账号可能已被删除）"),
+                );
+            }
+        }
+        results.push(row);
     }
     let succeeded = results
         .iter()

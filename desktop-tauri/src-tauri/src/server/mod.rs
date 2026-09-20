@@ -215,7 +215,15 @@ impl ServerState {
         // 决定 debug 级别日志要不要入库（默认只有 info 以上入库，避免刷屏）
         let verbose = env_flag(&["AGENT2API_VERBOSE", "WORKBUDDY_VERBOSE"]);
         let snapshot = config::init();
-        logging::init_store(&config_dir, verbose);
+        // 两类数据的保存目录：config.json 里写了绝对路径（用户在设置页改过位置）
+        // 就用它，否则（缺省 / 写坏）都落配置目录。必须用**解析后**的目录构造
+        // 两个存储 —— 它们的目录由此定死，运行期搬家靠 relocate（storage_api）。
+        let dirs = config::storage_dirs();
+        logging::init_store(&dirs.log_dir, verbose);
+        // 调试模式的原始报文存储：无论开关是否打开都初始化 —— 开关是**逐请求**
+        // 判定的（改完设置下一个请求就生效），存储没就绪会让开启后的第一批
+        // 请求无处可落
+        core::debug_traffic::init(dirs.debug_dir.clone());
 
         // 账号库 + 鉴权 + 登录 + 计费（四者共享同一个 store 句柄）
         let store = AccountStore::with_config_dir();
@@ -257,9 +265,10 @@ impl ServerState {
         // 更新管理器：下载目录 `{config_dir}/updates`，与壳侧 update::download_dir() 同源
         let update = core::update::init_global(UpdateManager::new(config_dir.clone()));
 
-        // 请求统计：数据目录与 LogStore **同源**（都是 config_dir，见
-        // `logging::init_store(&config_dir, ...)`）—— 明细 `requests.jsonl`
-        // 与聚合 `request-daily.jsonl` 就落在配置目录里，与 logs.jsonl 并排。
+        // 请求统计：数据目录默认与 LogStore **同源**（都是 config_dir）—— 明细
+        // `requests.jsonl` 与聚合 `request-daily.jsonl` 落在配置目录里，与
+        // logs.jsonl 并排；用户在设置页改过「请求日志保存位置」时用的是自定义目录
+        // （`config::storage_dirs()` 已按配置解析好）。两个目录互不约束。
         //
         // 保留期走**回调**，每次裁剪时动态读配置：明细天数来自
         // `requestRetentionDays`、聚合天数来自 `dailyRetentionDays`
@@ -268,7 +277,7 @@ impl ServerState {
         // 于是设置页改完天数，下一次记账 / prune 立即生效，**不需要重启进程**，
         // 也不必改这里的构造方式。这也正是 RequestStats::new 把保留期做成
         // 回调而不是构造参数的原因（见那边的注释）。
-        let request_stats = Arc::new(RequestStats::new(config_dir.clone(), || {
+        let request_stats = Arc::new(RequestStats::new(dirs.request_stats_dir, || {
             let settings = config::retention_settings();
             Retention {
                 request_days: settings.request_days,
@@ -291,7 +300,16 @@ impl ServerState {
         //   ① 历史账号补 `provider: "workbuddy"`（Agent2API 惰性迁移，§3.2）
         //   ② 优先级去重 —— 逐 provider 分组重编号，相对顺序保持不变
         //      （所以升级后实际转发顺序不变）
+        //   ③ Cline 拆池改名（`provider: "cline"` + `pool` → cline-free / cline-pass）
         store.migrate_startup();
+        // 模型规则的同一轮迁移（`modelRules` 里的 disabled / hidden / mappings /
+        // seeded 都按 provider id 记账，`"cline"` 这个 id 一没就全部匹配不上）。
+        // 与账号迁移分开读一次 config.json：两者在不同的文件（config / accounts），
+        // 而且**必须各自幂等**（只有一个存在迁移内容时不该拖着另一个一起写盘）。
+        // 放这里而不是更早：它要读 modelRules，而那时 config 已经 init 完毕。
+        if let Some(summary) = core::model_rules::migrate_cline_split() {
+            logging::log("[Models]", &summary);
+        }
         // 小浣熊旧数据一次性导入（架构文档 §3.3，W3-T4）：
         //   `~/.raccoon-proxy/accounts.json`（旧网关多账号）+
         //   `~/.box-agent/config/auth.json`（桌面端实时登录态）→ raccoon 账号。

@@ -22,9 +22,14 @@
 //! 本模块其余代码（可用性过滤、去重、排序、响应拼装）不认识任何一家的清单实现。
 //!
 //! ── 两种「有」的区分（重要）────────────────────────────────
-//!   - **有能力**（`providers_for_model` / 路由候选链）：只看清单里有没有这个名字。
-//!     候选链是「如果这家可用，就该轮到它」，由转发层逐家尝试时自然跳过
-//!     无可用账号的家（架构文档 §4.3）。
+//!   - **有能力**（`providers_for_model`）：只看清单里有没有这个名字，
+//!     不查账号、**也不查启用状态**（启停是另一层，见下条）。
+//!   - **路由候选链**（`router::route_for_forward`）：在能力之上再剔除
+//!     **被禁用 / 隐藏的家**，然后交给转发层逐家尝试。
+//!     ⚠️ 「转发层会自己跳过不可用的家」**只对账号维度成立**（无账号 / 已禁用
+//!     账号 / 该模型限流中，见 `routing::account_usability`）——它**没有**模型
+//!     级启停的判据，所以启停必须在候选链那一层就过滤掉，否则会出现
+//!     「管理页关了某家的模型，请求仍然落到那家」。
 //!   - **当前可用**（`models_response`）：还要这家此刻有可用登录态，否则
 //!     `/v1/models` 会广告一堆客户端根本用不了的模型。
 //!
@@ -66,7 +71,7 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::core::model_rules;
 use crate::server::core::models::{list_item, list_response_from, model_id, suggest_from, ModelCatalog};
 use crate::server::core::providers::adapter::adapter_for;
-use crate::server::core::providers::{kind_from_id, kind_id, meta, ProviderKind, PROVIDERS};
+use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVIDERS};
 
 /// 某一 provider 当前的模型清单（克隆；调用方看不到后续刷新）。
 ///
@@ -74,8 +79,35 @@ use crate::server::core::providers::{kind_from_id, kind_id, meta, ProviderKind, 
 /// `ProviderAdapter::list_models` 给出，本模块不认识任何一家的清单实现。
 /// 未实现适配器的 provider（将来新增的那些）返回空清单 —— 不猜模型名，
 /// 猜出来的名字会把请求路由到不存在的上游。
+///
+/// **这是「能力」口径的清单**（`providers_for_model` / 路由候选链用）：
+/// 客户端点名一个模型时，这里有的才允许转发。**不要**在这里过滤
+/// （要按偏好收窄广告用 `advertised_manifest_for`，见 `list_models` 的契约说明）。
 fn manifest_for(kind: ProviderKind) -> Vec<Value> {
     adapter_for(kind).list_models()
+}
+
+/// 某一 provider 的**广告用**清单：`manifest_for` 再经适配器的
+/// `advertise_models` 过滤。
+///
+/// 与 `manifest_for` 分开的理由见 `ProviderAdapter::advertise_models` 的文档：
+/// 被过滤掉的模型**仍然可以点名调用**，只是不出现在 `/v1/models` 与管理页里。
+///
+/// ── 目前没有一家覆盖这个方法（这是对的状态）──────────────────
+/// 唯一的实现者曾是 Cline：那时两个额度池共用一家 provider，池是**账号的属性**，
+/// 所以要在广告时按「账号库里有哪个池」现算一遍。池拆成两家之后，过滤是身份的
+/// 固有属性（`cline::models::list(pool)` 只列本池），已经体现在 `manifest_for`
+/// 里 —— 于是这里走 trait 的默认实现（原样透传）就是正确答案。
+///
+/// 保留这个中间层与 `advertise_models` 这个钩子：它是「清单（能路由什么）」
+/// 与「广告（对客户端露出什么）」这两件事的分离点，将来若有家需要按运行期
+/// 状态收窄（额度、地区、实验开关），该家在这里给出实现即可，不必再动
+/// `manifest_for` 的调用点。
+///
+/// `store` 原样透传给适配器（它需要读账号状态才能决定收窄口径，且必须读
+/// **调用方手上那个句柄**，理由见那个方法的文档）。
+fn advertised_manifest_for(store: &AccountStore, kind: ProviderKind) -> Vec<Value> {
+    adapter_for(kind).advertise_models(store, manifest_for(kind))
 }
 /// workbuddy 的目录句柄（`core::models` 的进程级实例）。
 ///
@@ -91,11 +123,13 @@ fn workbuddy_catalog() -> ModelCatalog {
 /// 某一家的刷新元信息 `(是否远程刷新过, 最后刷新时间)` —— 用于 `models_response`
 /// 的 `meta.source` / `lastRefreshedAt`。
 ///
-/// workbuddy 走它自己的目录句柄（既有契约），小浣熊走
-/// `providers::raccoon::models` 的进程级句柄；CatPaw 与占位的 AutoClaw 给
-/// `(false, 0)` —— 两家都是**内置清单**语义（CatPaw 的模型表是静态的，
-/// 上游没有目录接口；AutoClaw 的占位实现清单恒为空，根本进不了
-/// `active_manifests`），这个分支只为让 match 穷举。
+/// workbuddy 走它自己的目录句柄（既有契约），其余各家走各自的进程级句柄。
+///
+/// **各家都有远程目录**（CatPaw 与 AutoClaw 原先被当成「内置清单」语义说
+/// 「上游没有目录接口」，那两个前提后来都被证伪 —— 接口一直都在，
+/// 分别是 `POST /api/agent/maas/model-types` 与
+/// `GET .../proxy/autoclaw-model-config`；Cline 与 Qoder 接入时就带着各自的
+/// 目录接口）。
 fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
     match kind {
         ProviderKind::WorkBuddy => (
@@ -116,9 +150,23 @@ fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             ),
             crate::server::core::providers::qoder::models::last_refreshed_at(),
         ),
-        // CatPaw / AutoClaw 都是**内置清单**语义（CatPaw 的模型表是静态的，
-        // 上游没有目录接口；AutoClaw 是静态路由表 + `zai_auto` 回退）。
-        ProviderKind::CatPaw | ProviderKind::AutoClaw => (false, 0),
+        // 这两家的远程清单一拿到就非空（`catalog::refresh` 对空清单报失败、
+        // 不动缓存），所以「清单非空」等价于「远程刷新成功过」。
+        ProviderKind::CatPaw => (
+            !crate::server::core::providers::catpaw::catalog::remote_models().is_empty(),
+            crate::server::core::providers::catpaw::catalog::last_refreshed_at(),
+        ),
+        ProviderKind::AutoClaw => (
+            !crate::server::core::providers::autoclaw::catalog::remote_models().is_empty(),
+            crate::server::core::providers::autoclaw::catalog::last_refreshed_at(),
+        ),
+        // Cline 也有远程目录（`GET /api/v1/ai/cline/recommended-models`，实测
+        // **无需鉴权**即可拉），刷新到非空才算「远程」。两个池共用同一份缓存
+        // （一次请求就拿到两池），所以这两个 provider 的元信息是同一个值。
+        ProviderKind::ClineFree | ProviderKind::ClinePass => (
+            crate::server::core::providers::cline::models::remote_refreshed(),
+            crate::server::core::providers::cline::models::last_refreshed_at(),
+        ),
     }
 }
 
@@ -172,12 +220,15 @@ pub fn provider_available(store: &AccountStore, kind: ProviderKind) -> bool {
 }
 
 /// 参与 `/v1/models` 聚合的 `(provider, 清单)`：清单非空 **且** 当前有可用登录态。
+///
+/// 用的是**广告用**清单（`advertised_manifest_for`，经适配器的
+/// `advertise_models` 收窄）—— 能力判定仍走未收窄的 `manifest_for`。
 pub fn active_manifests(store: &AccountStore) -> Vec<(ProviderKind, Vec<Value>)> {
     sorted_by_route(all_kinds())
         .into_iter()
         .filter(|kind| provider_available(store, *kind))
         .filter_map(|kind| {
-            let manifest = manifest_for(kind);
+            let manifest = advertised_manifest_for(store, kind);
             if manifest.is_empty() {
                 None
             } else {
@@ -190,8 +241,13 @@ pub fn active_manifests(store: &AccountStore) -> Vec<(ProviderKind, Vec<Value>)>
 /// 能提供该模型名的 provider，**按路由优先级升序**。
 ///
 /// 语义是「能力」而不是「当前可用」：只看各家的清单里有没有这个名字，
-/// 不查账号 —— 候选链给出后，转发层逐家尝试时会自然跳过无可用账号的家。
+/// 不查账号、**也不查禁用 / 隐藏**（那是 `route_for_forward` 在候选链上做的
+/// 过滤，以及 `advertised_manifest_contains` 在广告视图上做的收窄）。
 /// 返回空数组 = 目录里没有这个模型名（未知模型）。
+///
+/// ⚠️ 消费方注意：本函数的结果**不能直接当转发候选链用**（会漏掉启停过滤），
+/// 转发一律走 `router::route_for_forward`；这里保留「不过滤」是为了让
+/// 「入口全禁判定」（`model_blocked_everywhere`）能问出「有没有家承载」。
 ///
 /// ── 匹配口径：先比 id、再比 name（逐字对齐既有 `ModelCatalog::get`）──
 /// 改造前的校验是 `ModelCatalog::has(model)`，而 `has` 走 `get`：
@@ -320,26 +376,6 @@ pub fn default_model_usable(model: &str) -> bool {
     })
 }
 
-/// 聚合后的模型名列表（去重，顺序 = `models_response` 的 data 顺序，**不查可用性**）。///
-/// 与 `providers_for_model` 同一份清单视角（能力而非可用性）：提示里出现的名字
-/// 一定要能被 `/v1/models` 列出（有账号的那几家），否则提示本身就是误导；
-/// 但在「这台机器恰好没账号」时仍给出提示，比给一片空白更有用。
-fn aggregated_model_ids() -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for kind in sorted_by_route(all_kinds()) {
-        for entry in manifest_for(kind) {
-            let id = model_id(&entry);
-            if id.is_empty() {
-                continue;
-            }
-            if !ids.iter().any(|known| known.eq_ignore_ascii_case(&id)) {
-                ids.push(id);
-            }
-        }
-    }
-    ids
-}
-
 /// 合并各家的清单：**先剔除该家自己禁用 / 隐藏的条目，再做跨提供商去重**。
 ///
 /// 与 `merged_items` 的差别就在先后顺序：按提供商区分启停后，同一模型 id
@@ -376,7 +412,65 @@ fn merged_items_available(
     items
 }
 
-/// 请求名是否在**所有**能承载它的提供商上都被禁用 / 隐藏。
+/// 请求名是否在**广告视图**里（`/v1/models` 与管理页实际列出的那些名字）。
+///
+/// ── 为什么校验要用广告视图（而不是能力视图）─────────────────────
+/// 「列表里能看到什么，就只允许点什么」：客户端手里的模型清单来自
+/// `/v1/models`，点一个列表里没有的名字应当立刻 400，而不是转给上游换回一个
+/// 与真实原因无关的上游报错（Cline 实测回 `invalid model format`，
+/// 而真正的原因是那个模型属于这个账号用不了的额度池）。
+///
+/// 广告视图与能力视图的差别只在**收窄**：能力视图是「这家有没有这个名字」，
+/// 广告视图还叠加了「按账号收窄（Cline 按额度池）+ 有可用登录态 + 未被禁用」
+/// 三层过滤，并追加映射别名。校验用后者，于是「广告里没有」与「请求被拒」
+/// 是同一件事，不存在「列表里看不到却能调通」的中间态。
+///
+/// ── 匹配口径 ────────────────────────────────────────────────
+/// 与能力判定一致：**先 id 后 name、忽略大小写**，映射别名以 id 形态参与
+/// （`models_response` 把每条别名复制成一个独立条目，见那里）。保留 name 轮
+/// 是为了既有客户端：传展示名（`Auto` / `Deepseek-V4-Pro`）在它**确实被广告**
+/// 时依然可用，只是不再能绕过广告视图。
+///
+/// ── 调用方为什么要先判 `active` 非空 ──────────────────────────
+/// 一家可用提供商都没有（没加账号）时广告视图必然为空，此时一律 400「模型
+/// 不存在」会盖掉转发层更准确的「没有可用账号，无账号可转发」。所以那种情形
+/// 由调用方跳过本判定，让请求走到转发层拿那条可操作的错误。
+pub fn advertised_manifest_contains(
+    active: &[(ProviderKind, Vec<Value>)],
+    model: &str,
+) -> bool {
+    let target = model.trim().to_lowercase();
+    if target.is_empty() {
+        return false;
+    }
+    let rules = model_rules::current();
+    let items = merged_items_available(active, &rules);
+    if items
+        .iter()
+        .any(|(_, item)| model_id(item).to_lowercase() == target)
+    {
+        return true;
+    }
+    // 映射别名：按 `models_response` 同一份 `aliases_of_any` 判定 ——
+    // 「广告里有」与「这里放行」必须是同一个集合，否则又会出现能看不能点
+    if items.iter().any(|(_, item)| {
+        rules
+            .aliases_of_any(&model_id(item))
+            .iter()
+            .any(|alias| alias.eq_ignore_ascii_case(&target))
+    }) {
+        return true;
+    }
+    items.iter().any(|(_, item)| {
+        item.get("name")
+            .map(crate::server::core::models::shape_value_text)
+            .unwrap_or_default()
+            .to_lowercase()
+            == target
+    })
+}
+
+/// 请求名是否在**路由候选全链**上都被禁用 / 隐藏。
 ///
 /// 按提供商区分启停后，chat 入口的 404 校验不能再用「名字在 blocked 列表里」
 /// 判定：只要还有一家提供且可用就应放行（转发候选链自己会跳过被禁的家），
@@ -384,33 +478,209 @@ fn merged_items_available(
 /// 请求名解析成条目 id（**先 id 后 name、忽略大小写**，与 `providers_for_model`
 /// 同口径），所以放在目录模块而不是 model_rules。
 ///
-/// 名字在所有家都不存在时返回 false —— 那由调用方的「模型不存在」分支处理，
-/// 错误文案应区分「没这个模型」与「被禁用了」。
+/// ── 候选全链口径（原生 + 映射，照抄 OmniProxy 的候选语义）──────
+/// 判定范围 = 请求名的原生承载家 + 各映射条目的候选家：请求名被映射后，
+/// 「原生家全禁」正是映射该接手的时刻，此时若按单名判定返回 404，映射就
+/// 永远没有出场机会。每段各自按单名口径判定，**所有**段都全禁才返回 true。
+///
+/// 请求名在所有家都不存在时原生段返回 false —— 那由调用方的「模型不存在」
+/// 分支处理，错误文案应区分「没这个模型」与「被禁用了」。
 pub fn model_blocked_everywhere(model: &str) -> bool {
     let rules = model_rules::current();
+    // 原生段：请求名自己的承载家
+    if !model_blocked_single(model, &rules) {
+        return false;
+    }
+    // 映射段：任一条映射的候选家可用（未全禁）即放行
+    let mappings = rules.mappings_of(model);
+    if mappings.is_empty() {
+        return true;
+    }
+    mappings.iter().all(|mapping| match &mapping.provider {
+        // 指定家：该家被禁用 / 隐藏了 target 才算这段全禁。判定与转发候选链的
+        // 过滤用**同一个** `provider_blocks_model`（含「先 id 后 name」的解析），
+        // 否则两边口径会分叉成「过滤说这家的 target 没被禁、这里说全禁」，
+        // 请求既过不了入口 404、又落不到那家。
+        Some(provider) => kind_from_id(provider)
+            .map(|kind| provider_blocks_model(&rules, kind, &mapping.target))
+            // 未知 provider id（配置里写了注册表没有的家）→ 不算全禁，
+            // 让它走「未知模型」那条更贴切的错误
+            .unwrap_or(false),
+        // 旧版全局条目：候选 = 承载 target 的所有家
+        None => model_blocked_single(&mapping.target, &rules),
+    })
+}
+
+/// 单个模型名的「承载家是否全被禁用 / 隐藏」（`model_blocked_everywhere` 的
+/// 单名段；见它的说明）。
+fn model_blocked_single(model: &str, rules: &model_rules::ModelRules) -> bool {
     let providers = providers_for_model(model);
     if providers.is_empty() {
         return false;
     }
-    let target = model.trim().to_lowercase();
     providers.iter().all(|kind| {
-        let entry_id = manifest_for(*kind)
-            .iter()
-            .find(|entry| {
-                model_id(entry).to_lowercase() == target
-                    || entry
-                        .get("name")
-                        .map(crate::server::core::models::shape_value_text)
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        == target
-            })
-            .map(model_id);
-        match entry_id {
+        match entry_id_in_manifest(&manifest_for(*kind), model) {
             Some(id) => rules.is_blocked(kind_id(*kind), &id),
             None => false,
         }
     })
+}
+
+/// 某一 provider 对「这个名字」是否已被禁用 / 隐藏 —— **转发候选链的过滤判据**。
+///
+/// 与 `model_blocked_single` 的分工：那个回答「承载家是否**全**被禁」（入口 404
+/// 判定用，需要「被禁的家也算承载」才能答出「全禁」），这个回答「这一家还能不能
+/// 收这个名字」（`router::route_for_forward` 逐家过滤用）。判据本身相同：把名字
+/// 解析成该家目录里的条目 id（**先 id 后 name、忽略大小写**）再查规则，于是
+/// 「用户禁用的是该家目录里的真名」与「客户端请求的是它的展示名」能对上。
+///
+/// 名字不在该家目录里时（映射 target 指向一个没被收录的上游名）按**原值**查，
+/// 与 `model_blocked_everywhere` 的映射段同口径：规则里写了这个名字就认。
+///
+/// `rules` 由调用方传入而不是内部取 `model_rules::current()`：候选链要为链上
+/// 每一家、每一个映射段各判一次，逐次读锁并克隆整份规则是白费的（转发热路径）。
+pub fn provider_blocks_model(
+    rules: &model_rules::ModelRules,
+    kind: ProviderKind,
+    name: &str,
+) -> bool {
+    let id = entry_id_in_manifest(&manifest_for(kind), name)
+        .unwrap_or_else(|| name.trim().to_string());
+    rules.is_blocked(kind_id(kind), &id)
+}
+
+/// 清单里「请求名」对应的条目 id（该家认识的**发送名**）。
+///
+/// ── 匹配口径：先比 id、再比 name（与 `providers_for_model` 逐字同口径）──
+/// 两轮而不是单轮 OR：只有当清单里**没有任何条目的 id 命中**时才启用 name
+/// 匹配 —— 与 `providers_for_model` 的「id 全不命中才走 name 轮」一致
+///（避免「某家的 name 恰好等于另一条目的 id」时选错条目）。
+///
+/// ── 为什么发送前需要它 ──────────────────────────────────────
+/// 客户端可能按**展示名**点名：Cline 的 `openai/gpt-6-astra` 展示名正是
+/// `gpt-6-astra`。`providers_for_model` 的 name 轮会放行这类请求（这是既有
+/// 契约：客户端传展示名不得突然 400），但把展示名原样发给上游会被拒
+/// （Cline 实测 400 `invalid model format. Expected format: modelType/model`
+/// —— 它要的是带通道前缀的完整 id）。所以发送前把展示名还原成该家的真名。
+///
+/// id 命中时返回**请求名原值**（不取清单里的大小写）：那是零改写的常见路径，
+/// 统一大小写会让 body 白复制一次、日志里也多一行「改写」噪音。
+fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Option<String> {
+    let target = requested.trim().to_lowercase();
+    if target.is_empty() {
+        return None;
+    }
+    if manifest
+        .iter()
+        .any(|entry| model_id(entry).to_lowercase() == target)
+    {
+        return Some(requested.trim().to_string());
+    }
+    manifest
+        .iter()
+        .find(|entry| {
+            entry
+                .get("name")
+                .map(crate::server::core::models::shape_value_text)
+                .unwrap_or_default()
+                .to_lowercase()
+                == target
+        })
+        .map(model_id)
+}
+
+/// 发给某个 provider 时应使用的**该家认识的**模型名。
+///
+/// ── 为什么需要这个改写 ─────────────────────────────────────
+/// 候选链经映射扩池后，链上各家的目录里认的名字未必相同：WorkBuddy 认
+/// `deepseek-v4.1-flash`，小浣熊只认 `sn-deepseek-v4-1-flash`。把请求名原样
+/// 发给映射家必然 404 —— 上游只认识自己目录里的真名。所以**每家即将发送前**
+/// 把 body 的 model 改成该家承载的那个名字。解析优先级：
+///   ① 该家原生承载请求名 → 用**该家清单里那条目的 id**：id 命中时即请求名
+///      原值（大多数请求是零改写，同名映射时原生家自动优先于映射，这正是
+///      「主路」的来源）；展示名命中时还原成真名 —— 客户端按展示名点名
+///      （Cline 的 `gpt-6-astra` 是 `openai/gpt-6-astra` 的展示名）时，
+///      原样发上游会被拒（Cline 实测 400 `invalid model format`），
+///      见 [`entry_id_in_manifest`]；
+///   ② 请求名的映射条目里指定了该家 → 用那条的 target。同家多条命中（Cline
+///      两池的短名各挂一条，**只有这一家会这样**）时优先选 target 落在本家
+///      通道前缀里的那条 —— 前缀就是 provider id（`cline-free/` / `cline-pass/`，
+///      见 `cline::models::Pool::target_prefix`），于是「这条映射属于哪个池」
+///      由 target 自己说了算，不再需要读账号上的字段（早先按账号的 `pool`
+///      字段判定，那套已随「池是身份而不是账号属性」的改动退场）；
+///      其余家最多一条按家条目，这一步等于没开销；
+///   ③ 旧版全局条目（provider 缺失）且该家承载 target → 用 target；
+///      **② 恒先于 ③**，与数组顺序无关（全局条目是兼容形态，不挡新条目）；
+///   ④ 都不命中 → 原样返回（防御：正常选路下不会发生，链就是这么算的）。
+///
+/// 与改写前旧实现的差别：改写不再发生在请求入口（payload 的 model 保持
+/// 客户端原值），只发生在**发出去的字节**上 —— 记账 / 限额键 / 日志里的模型
+/// 始终是客户端请求的名字，报表不会因为映射而「换姓」。
+///
+/// `account` 参数保留但**不再被读**：它原先只用于「同家多条映射时按账号的
+/// `pool` 字段挑一条」，现在这个判断由 target 前缀给出（见 ②）。留着它是因为
+/// 调用方（`upstream::payload`）手上本来就有账号对象，而「这条映射该按谁的
+/// 身份挑」将来可能再需要账号信息；去掉参数只会让那条链多一处改动。
+pub fn wire_model_for_provider(
+    model: &str,
+    provider_id: &str,
+    account: Option<&Value>,
+) -> String {
+    let _ = account;
+    let requested = model.trim();
+    if requested.is_empty() {
+        return model.to_string();
+    }
+    // ① 该家原生承载：发送名取该家清单里那条目的 id（id 命中 = 原值，
+    //   展示名命中 = 还原真名）。「哪家承载」与「发什么名字」用的是**同一份
+    //   清单、同一套匹配口径**（`providers_for_model` 与本函数都先 id 后 name），
+    //   所以这里不会出现「认了它却发不出它的真名」。
+    if providers_for_model(requested)
+        .iter()
+        .any(|kind| kind_id(*kind) == provider_id)
+    {
+        return kind_from_id(provider_id)
+            .and_then(|kind| entry_id_in_manifest(&manifest_for(kind), requested))
+            .unwrap_or_else(|| requested.to_string());
+    }
+    let rules = model_rules::current();
+    let mappings = rules.mappings_of(requested);
+    // ② 先于 ③ 是**两遍扫描**而不是单循环按数组顺序：具体条目必须优先于
+    // 旧版全局条目 —— 后者是升级兼容形态，存量用户盘上留着的旧条目（如
+    // Cline 短名指向 pass 池的那条）在数组里排在前面，单循环会让它永远
+    // 挡住新种出来的按家条目，短名改写就切不过来了。
+    //
+    // ② 内部同家多条命中时选 target 落在本家前缀里的那条（见函数头 ②）。
+    let own: Vec<_> = mappings
+        .iter()
+        .filter(|m| {
+            m.provider
+                .as_deref()
+                .map_or(false, |p| p.eq_ignore_ascii_case(provider_id))
+        })
+        .collect();
+    // 本家的**通道前缀**（`cline-free/` / `cline-pass/`）：只有 Cline 系有这个概念，
+    // 前缀本身定义在 `cline::models::Pool`（那是「池 → 前缀」的唯一事实来源，
+    // 转发侧与种子侧都用它）—— 这里按 provider id 反查，不另写一份字面量。
+    let channel_prefix = super::cline::models::Pool::from_provider_id(provider_id)
+        .map(super::cline::models::Pool::target_prefix);
+    let picked = own
+        .iter()
+        .copied()
+        .find(|m| channel_prefix.is_some_and(|prefix| m.target.starts_with(prefix)))
+        .or_else(|| own.first().copied());
+    if let Some(mapping) = picked {
+        return mapping.target.clone();
+    }
+    for mapping in mappings.iter().filter(|m| m.provider.is_none()) {
+        if providers_for_model(&mapping.target)
+            .iter()
+            .any(|kind| kind_id(*kind) == provider_id)
+        {
+            return mapping.target.clone();
+        }
+    }
+    requested.to_string()
 }
 
 /// 聚合结果的来源元信息 `(meta.source, meta.lastRefreshedAt)`。
@@ -461,10 +731,11 @@ pub fn models_response(store: &AccountStore) -> Value {
     let mut data: Vec<Value> = Vec::new();
     let mut aliases: Vec<Value> = Vec::new();
     // 「可用的先认领」：某家禁用的模型由仍提供的另一家继续对外暴露（见
-    // merged_items_available 的说明）；映射条目同样只在目标模型仍可用时追加
+    // merged_items_available 的说明）；映射条目同样只在目标模型仍可用时追加，
+    // 同一对外名跨提供商去重（同名多条映射只广告一条）
     for (_, item) in merged_items_available(&active, &rules) {
         let id = model_id(&item);
-        for alias in rules.aliases_of(&id) {
+        for alias in rules.aliases_of_any(&id) {
             let mut copy = item.clone();
             if let Some(object) = copy.as_object_mut() {
                 object.insert("id".to_string(), Value::String(alias.to_string()));
@@ -478,9 +749,43 @@ pub fn models_response(store: &AccountStore) -> Value {
     list_response_from(data, source, last_refreshed_at)
 }
 
+/// 广告视图里的全部对外名（条目 id + 映射别名，去重、忽略大小写）。
+///
+/// 与 `/v1/models` 的 data 同源（`merged_items_available` + `aliases_of_any`，
+/// 见 `models_response`）：供「相近模型提示」使用 —— 提示里出现的名字一定能
+/// 被列出来，也一定能通过 `resolve_model` 的广告视图校验，不会出现
+/// 「提示它、点它又被拒」的循环。
+pub fn advertised_model_ids(active: &[(ProviderKind, Vec<Value>)]) -> Vec<String> {
+    let rules = model_rules::current();
+    let mut ids: Vec<String> = Vec::new();
+    for (_, item) in merged_items_available(active, &rules) {
+        let id = model_id(&item);
+        if id.is_empty() {
+            continue;
+        }
+        let aliases: Vec<String> = rules
+            .aliases_of_any(&id)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let names = std::iter::once(id).chain(aliases);
+        for name in names {
+            if !ids.iter().any(|known| known.eq_ignore_ascii_case(&name)) {
+                ids.push(name);
+            }
+        }
+    }
+    ids
+}
+
 /// 管理页视图：**每家提供商自己的完整清单**（含禁用 / 隐藏），每条带
-/// `enabled` / `hidden` / `aliases`，另附映射表。形状：
-/// `{ models: [...], mappings: [{alias, target}] }`
+/// `enabled` / `hidden` / `aliases` / `source`，另附映射表。形状：
+/// `{ models: [...], mappings: [{alias, target, provider}] }`
+///
+/// `source` 是这家清单的出处（`"remote"` / `"builtin"`，见 [`catalog_source`]），
+/// 供前端的「来源」列显示 —— 用户在管理页看到某个模型，能一眼知道它是从上游
+/// 目录实时拉来的，还是内置静态表里的（后者在上游目录接口失效 / 未登录时
+/// 才会成为唯一数据源，两者可信度不同）。
 ///
 /// ── 为什么这里**不做跨提供商去重**（与 `/v1/models` 的关键差别）──
 /// 同一个模型名（如 `glm-5.3-flash`）可能同时出现在多家的清单里。
@@ -493,6 +798,12 @@ pub fn models_response(store: &AccountStore) -> Value {
 /// 禁用 / 删除规则按 **(提供商, 模型 id)** 生效（modelRules 的键带 provider）：
 /// 管理页里关掉某一家的模型，只是这一家不再接收该模型的请求，别家照常 ——
 /// 与 /v1/models「可用的先认领」的对外语义一致（见 `merged_items_available`）。
+///
+/// **映射（aliases）按行归属过滤**：带 provider 的条目只出现在自己那家的行上，
+/// 旧版全局条目（provider 缺失）在所有承载 target 的行上都显示 —— 管理页的
+/// 一行 = 一次「这条上游模型以哪些对外名暴露」，映射的主备关系（同一对外名
+/// 在多行出现）在表格上一眼可见。顶层 `mappings` 是全量映射表（含 provider），
+/// 前端添加映射弹窗的提供商下拉用注册表，不需要它，但留着便于排查。
 pub fn manage_view(store: &AccountStore) -> Value {
     let rules = model_rules::current();
     let models: Vec<Value> = manage_entries(store, &rules)
@@ -512,7 +823,12 @@ pub fn manage_view(store: &AccountStore) -> Value {
                 );
                 object.insert(
                     "aliases".to_string(),
-                    Value::Array(rules.aliases_of(&id).into_iter().map(|a| Value::String(a.to_string())).collect()),
+                    Value::Array(
+                        rules.aliases_of(&provider, &id)
+                            .into_iter()
+                            .map(|a| Value::String(a.to_string()))
+                            .collect(),
+                    ),
                 );
             }
             entry
@@ -521,7 +837,59 @@ pub fn manage_view(store: &AccountStore) -> Value {
     let mappings: Vec<Value> = rules
         .mappings
         .iter()
-        .map(|m| json!({ "alias": m.alias, "target": m.target }))
+        .map(|m| {
+            // `dangling`：这条映射挂不到**上面那批行里的任何一行**。
+            //
+            // 判据与渲染映射 chip 的 `aliases_of` 逐字同源（target 比行 id，
+            // provider 缺失的旧版条目对任何家都命中）—— 直接对着刚构建好的
+            // `models` 问「有没有一行接得住它」，而不是另查一份清单：
+            // 管理页的行来自**广告清单**（Cline 还会按账号池收窄），另查
+            // 路由清单会出现「标了未挂载、表格里却有那一行」这种自相矛盾。
+            //
+            // 前端据此在表尾列一个「未挂载的映射」分组：映射存进了配置、
+            // 也真的参与转发，却在表里没有任何行可以显示 —— 用户会以为
+            // 没保存成功。被账号池收窄的（Cline 的 `cline-pass/*`）同样落进
+            // 这一组，那是对的：它们确实一行都挂不上，而这正好解释了
+            // 「为什么 pass 池的模型一个都不显示」。
+            let dangling = !models.iter().any(|row| {
+                model_id(row).eq_ignore_ascii_case(&m.target)
+                    && m.provider.as_deref().map_or(true, |provider| {
+                        row.get("provider")
+                            .and_then(Value::as_str)
+                            .map_or(false, |row_provider| {
+                                row_provider.eq_ignore_ascii_case(provider)
+                            })
+                    })
+            });
+            // `carried`：这个名字**路由层认不认**（不分账号、不看池收窄）——
+            // 带 provider 的条目只看那一家，旧版全局条目看所有家（与
+            // `wire_model_for_provider` 的候选口径一致）。
+            //
+            // 与 `dangling` 配对使用，把「表里看不见」的两种情形分开：
+            //   dangling=true,  carried=true  → 配置有效，只是这家现在不广告它
+            //                                   （Cline 的池收窄是典型：没加
+            //                                   pass 池账号时 pass 系模型不广告，
+            //                                   但路由链仍然认得它们）；
+            //   dangling=true,  carried=false → 名字哪儿都没有（手输打错、
+            //                                   上游下架），那条映射是死的。
+            // 两种都要列出来（都挂不到行上），但该给用户的建议相反：前者可能
+            // 只是缺个账号，后者该改或该删 —— 由前端分档措辞，后端只给事实。
+            let carried = match m.provider.as_deref() {
+                Some(provider) => kind_from_id(provider).is_some_and(|kind| {
+                    manifest_for(kind)
+                        .iter()
+                        .any(|entry| model_id(entry).eq_ignore_ascii_case(&m.target))
+                }),
+                None => !providers_for_model(&m.target).is_empty(),
+            };
+            json!({
+                "alias": m.alias,
+                "target": m.target,
+                "provider": m.provider,
+                "dangling": dangling,
+                "carried": carried,
+            })
+        })
         .collect();
     json!({ "models": models, "mappings": mappings })
 }
@@ -556,13 +924,16 @@ pub fn session_models(store: &AccountStore) -> Vec<Value> {
 
 /// 管理页条目：**不去重**的每家清单（`manage_view` 的数据源）。
 ///
-/// 与 `session_entries` 的唯一差别是数据源：那里走 `merged_items`
+/// 与 `session_models` 的唯一差别是数据源：那里走 `merged_items_available`
 /// （跨提供商按模型 id 去重，服务「客户端能请求什么」的对外视图），
 /// 这里直接遍历 `active_manifests` 的每家原始清单 —— 管理页要看见的是
 /// 「每家上游到底有哪些模型」，同名模型（如 WorkBuddy 与 AutoClaw 都有
 /// `glm-5.3-flash`）必须每家各显示一行，否则被别家认领的那家会凭空少模型。
-/// 条目形状与 `session_entries` 完全一致（`id` / `name` / `isDefault` /
-/// `credits` / `provider` / `providerLabel`），前端两份数据共用一套渲染。
+///
+/// 条目字段（`id` / `name` / `isDefault` / `credits` / `provider` /
+/// `providerLabel` / `source`）里，**只有 `source` 是本层独有的**：前六个与
+/// `/api/session` 的 `models` 同形，前端两份数据共用一套渲染；`source` 是管理页
+/// 「来源」列专用（`/api/session` 的条目不带它，见 [`catalog_source`]）。
 ///
 /// **组内排序**：每家清单内启用的模型排在前、禁用的排在后（`sort_by_key`
 /// 稳定排序，两段各自保持清单原顺序）。理由：管理页每组默认只展开前几行
@@ -573,18 +944,48 @@ fn manage_entries(store: &AccountStore, rules: &model_rules::ModelRules) -> Vec<
     let mut entries: Vec<Value> = Vec::new();
     for (kind, manifest) in active_manifests(store) {
         let provider_id = kind_id(kind);
+        let source = catalog_source(kind);
         let mut items = manifest;
         // 组内排序：启用的排前（同一家内按该家自己的启停状态）
         items.sort_by_key(|item| rules.is_disabled(provider_id, &model_id(item)));
         for item in items {
-            entries.push(manage_entry_json(provider_id, &item));
+            entries.push(manage_entry_json(provider_id, &item, source));
         }
     }
     entries
 }
 
-/// 管理页 / 会话条目的公共成形逻辑（从 `list_item` 输出里挑字段）。
-fn manage_entry_json(provider_id: &str, item: &Value) -> Value {
+/// 某一家的清单**当前来自哪里**（管理页「来源」列）。
+///
+/// ── 为什么是「家」级而不是「条」级 ────────────────────────────
+/// 五家的清单都是**二选一**的：远程拉到过就用远程那份，否则用内置静态表
+/// （`list()` 全是「远程非空 → 返回远程；否则返回静态」这一种形状，见各家
+/// 的清单模块）。模型条目本身不携带来源位，所以来源是这一家的属性，
+/// 同一次渲染里该家所有行标同一个值。
+///
+/// ── 为什么复用 `refresh_meta` ────────────────────────────────
+/// 它已经给出「这家是否远程刷新成功过」的判据（各家的判定细节不同：WorkBuddy
+/// 认整个 catalog 的 `remote_refreshed`、Qoder 认两个地区任一、CatPaw / AutoClaw
+/// 认远程清单非空）。这里再写一份就会与该判据分叉 —— 界面上标「远程」而
+/// `/v1/models` 的 `meta.source` 标 `builtin`（或反过来）是纯粹的误导。
+///
+/// 注意判据是「**曾经**成功拉到过」而不是「这次请求返回的就是远程那份」：
+/// 刷新失败会保留上一份成功结果（各家的 `refresh` 都是这个取向），
+/// 那份数据的来源仍是远程，标「远程」正确。
+fn catalog_source(kind: ProviderKind) -> &'static str {
+    if refresh_meta(kind).0 {
+        "remote"
+    } else {
+        "builtin"
+    }
+}
+
+/// 管理页条目的公共成形逻辑（从 `list_item` 输出里挑字段）。
+///
+/// `source` 是这一家的清单来源（`"remote"` / `"builtin"`，见 [`catalog_source`]）：
+/// 前端的「来源」列直接读它，不在前端做任何 id→来源的映射（那是后端注册表
+/// 与各家清单模块的职责，加一家 provider 时前端零改动）。
+fn manage_entry_json(provider_id: &str, item: &Value, source: &str) -> Value {
     let mut entry = Map::new();
     entry.insert(
         "id".to_string(),
@@ -608,30 +1009,32 @@ fn manage_entry_json(provider_id: &str, item: &Value) -> Value {
         "providerLabel".to_string(),
         Value::String(provider_label_of(provider_id).to_string()),
     );
+    entry.insert("source".to_string(), Value::String(source.to_string()));
     Value::Object(entry)
 }
 
 /// provider id → 注册表里的展示名；未登记的 id 原样回显。
 ///
 /// 回退成 id 而不是「未知」：条目里的 id 来自 `owned_by`，它是实际承载该模型的
-/// 那家 —— 真出现未登记的 id，回显原文比一句笼统的「未知」更能定位问题
-/// （与 `request_stats::report::provider_label` 的取舍一致）。
+/// 那家 —— 真出现未登记的 id，回显原文比一句笼统的「未知」更能定位问题。
 /// 前端对「归属缺失」另有兜底组（见 app.js 的 renderModels），两处都不会丢条目。
+///
+/// 实现落在注册表模块（`providers::label_of`）：那是「id → 名字」的唯一事实
+/// 来源，本模块只沿用它的取舍，不另写一份 match。
 fn provider_label_of(provider_id: &str) -> &str {
-    match kind_from_id(provider_id) {
-        Some(kind) => meta(kind).label,
-        None => provider_id,
-    }
+    crate::server::core::providers::label_of(provider_id)
 }
 
-/// 未知模型报错用的「相近模型」提示：在**聚合后的模型名集合**里找最相近的。
+/// 未知模型报错用的「相近模型」提示：在**广告视图**的对外名集合里找最相近的。
 ///
-/// 判定规则复用 `models::suggest_from`（纯函数），与改造前 workbuddy 单家的
-/// 提示口径完全一致；数据源换成聚合目录（架构文档 §4.4「未知模型校验与相近
-/// 提示逻辑保持（聚合后判定）」）。
-///
-/// 由 chat.rs 调用（已接线）：聚合目录的相近提示 —— 数据源与 `providers_for_model`
-/// 同一份（能力判定），所以「提示里出现的名字」一定能被 `/v1/models` 列出。
-pub fn suggest_models(model: &str, limit: usize) -> Vec<String> {
-    suggest_from(aggregated_model_ids(), model, limit)
+/// 数据源是 `advertised_model_ids`（条目 id + 映射别名）而不是能力视图：
+/// 提示里出现的名字一定能被 `/v1/models` 列出、也一定能通过 `resolve_model`
+/// 的校验 —— 否则就成了「提示它、点它又被拒」的循环。判定规则复用
+/// `models::suggest_from`（纯函数），与改造前 workbuddy 单家的提示口径一致。
+pub fn suggest_advertised(
+    active: &[(ProviderKind, Vec<Value>)],
+    model: &str,
+    limit: usize,
+) -> Vec<String> {
+    suggest_from(advertised_model_ids(active), model, limit)
 }

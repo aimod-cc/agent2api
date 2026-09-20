@@ -78,12 +78,18 @@
 //!      统一形状的契约写在 [`ProviderAdapter::query_usage`] 的文档里。
 //!   9. `supports_model_refresh` + `refresh_models(force)`（「刷新模型清单」）：
 //!      「这家有没有远程目录可拉」与「这次要不要绕过缓存」是两件事，拆成两个
-//!      入口（前者恒定能力，后者单次语义）。默认 false，四家里 WorkBuddy /
-//!      小浣熊覆写成 true，CatPaw / AutoClaw 保持默认 —— 后两家的清单是
-//!      **上游没有目录接口**的静态表（美团 CatPaw 的固定模型 id、AutoClaw 的
-//!      静态路由表），点了只会白打一次网络。`refresh_models` 的返回类型也随之
-//!      从 `()` 变成 [`ModelRefreshOutcome`]：自动路径不看它（照旧只打日志），
+//!      入口（前者恒定能力，后者单次语义）。**五家现在都覆写成 true** ——
+//!      每家都有远程目录：WorkBuddy `GET /v3/config`、小浣熊
+//!      `GET {llmBase}/model_catalog`、Qoder `GET {gateway}algo/api/v2/model/list`、
+//!      CatPaw `POST /api/agent/maas/model-types`、AutoClaw
+//!      `GET .../proxy/autoclaw-model-config`。
+//!      （CatPaw 与 AutoClaw 曾保持默认 false，理由是「上游没有目录接口」——
+//!      那两个前提后来都被证伪，接口一直都在，只是形态看错了，见各自
+//!      `catalog.rs` 的模块头。）`refresh_models` 的返回类型是
+//!      [`ModelRefreshOutcome`]：自动路径不看它（照旧只打日志），
 //!      手动路径靠它逐家如实汇报，见 [`refresh_implemented_forced`]。
+//!      默认实现仍是 false：那是给「将来新接入、目录还没拉通」的 provider 留的
+//!      过渡态（与 `supports_chat` 同一性质）。
 //!
 //! ── 未注册的 provider 怎么办 ────────────────────────────────
 //! 四家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
@@ -189,7 +195,48 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// 返回的是**上游原始形态**的记录数组（字段名与 `/v3/config` 或
     /// 小浣熊 `/model_catalog` 一致），聚合层用 `models::list_item` 做字段映射。
+    ///
+    /// ── 这个方法的返回值**同时**喂两条路（改它之前先读这段）──────
+    ///   - **能力判定**（`catalog::providers_for_model` → 路由候选链）：某家
+    ///     「有没有这个名字」，决定候选链把请求派给谁；
+    ///   - **广告视图的原料**（`/v1/models` 与管理页的条目，再经
+    ///     [`Self::advertise_models`] 收窄）。
+    ///
+    /// 两者共用一份清单是刻意的（「校验说没有、转发却发了」的自相矛盾由此
+    /// 杜绝）。因此**不要**在这里做任何「按用户偏好收窄」的过滤：要按偏好
+    /// 收窄只影响广告时，覆写 [`Self::advertise_models`]。
+    ///
+    /// ── 收窄掉的模型**不可点名调用**（2026-09 起）──────────────
+    /// 入口校验（`api::pipeline::resolve_model`）以**广告视图**为准：客户端
+    /// 手里的清单来自 `/v1/models`，点一个那里没有的名字直接 400
+    /// `model_not_found`，不再转给上游。因此被 [`Self::advertise_models`]
+    /// 收窄掉的模型（如 Cline 按额度池收窄的那些）**不再可点名调用** ——
+    /// 「列表里能看到什么，就只允许点什么」。
     fn list_models(&self) -> Vec<Value>;
+
+    /// 对外广告前的清单收窄（默认为恒等）。
+    ///
+    /// `manifest` 是 [`Self::list_models`] 的返回值，本方法只决定「其中的哪些
+    /// 条目要出现在 `/v1/models` 与管理页里」。
+    ///
+    /// ── 收窄是**门禁**，不只是展示偏好（2026-09 起）────────────
+    /// 入口校验以广告视图为准（`api::pipeline::resolve_model` →
+    /// `catalog::advertised_manifest_contains`）：收窄掉的模型客户端看不到、
+    /// 也点不动（400 `model_not_found`）。所以这里的口径就是「这个账号能用
+    /// 哪些模型」，写错会把用户真能用的模型挡在门外。
+    ///
+    /// ── `store` 为什么是参数（而不是让实现自己造一个）──────────
+    /// 需要按账号状态收窄的实现（当前只有 Cline 按额度池）必须读**调用方手上
+    /// 那个 store 句柄**：`AccountStore` 是 `Clone` 但每个 `with_config_dir()`
+    /// 各自持一把锁，自己再造一个就成了「绕过主句柄的第二把锁」——
+    /// 读到的可能不是最新状态，而且它保护的读-改-写周期与主句柄互不可见。
+    /// 由调用方传入既省一次文件读，也让「读的是同一份账号状态」这件事成立。
+    ///
+    /// 默认恒等（另外五家没有「同一个模型的两个通道」这种结构），
+    /// 因此默认实现忽略 `store`。
+    fn advertise_models(&self, _store: &AccountStore, manifest: Vec<Value>) -> Vec<Value> {
+        manifest
+    }
 
     /// 用账号凭证构造上游请求（URL / 头 / 体）。
     ///
@@ -285,17 +332,29 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// 本 provider 是否有**可拉取的远程模型目录**（模块头扩展 9）。
     ///
-    /// 默认 false = 这家没有远程目录接口，清单是本地的静态表。判据与
-    /// `supports_refresh` 同一口径：**上游到底有没有那个接口**，不是「我们想
-    /// 不想实现」。当前四家：WorkBuddy 是 `GET /v3/config`、小浣熊是
-    /// `GET {llmBase}/model_catalog`（都为 true）；CatPaw（固定模型 id
-    /// `kimi-k3` / `glm-5.3-flash`）与 AutoClaw（静态路由表 + `zai_auto` 回退）
-    /// 的上游都没有目录接口，保持默认 false。
+    /// 判据与 `supports_refresh` 同一口径：**上游到底有没有那个接口**，
+    /// 不是「我们想不想实现」。当前五家**全部覆写成 true**：
+    /// ```text
+    ///   WorkBuddy   GET  /v3/config
+    ///   小浣熊       GET  {llmBase}/model_catalog
+    ///   Qoder       GET  {gateway}algo/api/v2/model/list
+    ///   CatPaw      POST /api/agent/maas/model-types
+    ///   AutoClaw    GET  .../proxy/autoclaw-model-config
+    /// ```
+    /// 默认 false 是给「将来新接入、目录还没拉通」的 provider 留的过渡态。
     ///
-    /// 为什么要有这个查询（而不靠「反正刷新是空操作」）：这是**用户可见的
-    /// 按钮**，界面对不支持的家必须如实说明（「这两家用的是固定清单」）。
-    /// 声称支持却拿不到新清单，用户只会以为是 bug；遍历时对静态表打一次必然
-    /// 白跑的网络请求更是纯粹的浪费。与 `supports_usage` 同一取舍。
+    /// ── 为什么要有这个查询（而不靠「反正刷新是空操作」）──────────
+    /// 这是**用户可见的按钮**，界面对不支持的家必须如实说明，
+    /// 否则「声称支持却拿不到新清单」只会让用户以为是 bug。
+    /// 与 `supports_usage` 同一取舍。
+    ///
+    /// ── 一条历史（避免后来者重犯）─────────────────────────────
+    /// CatPaw 与 AutoClaw 曾返回 false，理由是「上游没有目录接口、清单是静态表」。
+    /// 那个结论**两次都错**：接口一直都在，只是找法错了 —— CatPaw 的
+    /// `tenant/scene/env` 是 POST body 不是 query（看着像 query 参数），
+    /// AutoClaw 的目录在同 host 的 `/proxy/` 一级而不是对话用的 `/proxy/autoclaw`
+    /// （顺着 `chat/completions` 找永远找不到）。**「这家没有某接口」的结论
+    /// 要能说清是怎么排除的**，否则它只是一个还没找到的接口。
     fn supports_model_refresh(&self) -> bool {
         false
     }
@@ -316,7 +375,12 @@ pub trait ProviderAdapter: Send + Sync {
     /// 「可退避重试的错误」的建议（模块头扩展 1）；None = 不重试。
     ///
     /// `attempt` 是**已经重试过**的次数（0 表示首次失败、还没重试过）。
-    fn retry_advice(&self, _error_body: &Value, _attempt: usize) -> Option<RetryAdvice> {
+    ///
+    /// `budget` 是**本轮的退避预算**（还能退避几次），由编排层按「这次尝试
+    /// 是不是落在切换后的另一家提供商」给出（两档设置见 `config::RetrySettings`）。
+    /// 适配器据此判断该不该再退避 —— 而不是自己去读全局设置：那样写的话
+    /// 「换了家要换一档次数」这条规则就会漏进每个适配器里各实现一遍。
+    fn retry_advice(&self, _error_body: &Value, _attempt: usize, _budget: usize) -> Option<RetryAdvice> {
         None
     }
 
@@ -630,6 +694,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::CatPaw => &super::catpaw::adapter::CATPAW_ADAPTER,
         ProviderKind::AutoClaw => &super::autoclaw::adapter::AUTOCLAW_ADAPTER,
         ProviderKind::Qoder => &super::qoder::QODER_ADAPTER,
+        // Cline 的两个额度池是两个 provider、两个实例（同一份实现的按池
+        // 参数化，见 `cline::adapter` 的模块头）
+        ProviderKind::ClineFree => &super::cline::CLINE_FREE_ADAPTER,
+        ProviderKind::ClinePass => &super::cline::CLINE_PASS_ADAPTER,
     }
 }
 
@@ -640,9 +708,13 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 /// 注册表项都在、但适配器是占位」的中间态，那时它**不在本列表里**；
 /// W4b-T-c2 接上真身（`autoclaw::adapter::AUTOCLAW_ADAPTER`）后列入本表 ——
 /// 与 CatPaw 在 W5-T-d4 走过的路径相同。Qoder 也走过同一条路：接入推理转发
-/// 之前它只有账号管理能力，本波次接上真身后列入。**五家现在全部在列表里**，
+/// 之前它只有账号管理能力，本波次接上真身后列入。**现在七家全部在列表里**，
 /// 与 `PROVIDERS` 的 id 集合一一对应（过渡期的占位实现已在 W6 随
 /// `pending.rs` 删除）。
+///
+/// Cline 算两家（`ClineFree` / `ClinePass`）：它们是两个 provider、两份清单，
+/// 刷新时各刷各的 —— 尽管底层那次远程请求是同一个接口（`cline::models::refresh`
+/// 一次拉回两池，缓存共用），两次调用是幂等的。
 ///
 /// 为什么这份列表必须排除占位实现（当时的口径）：它的消费方是后台目录刷新
 /// （`refresh_implemented` ← `api::chat::spawn_catalog_refresh` 与
@@ -661,6 +733,8 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::CatPaw,
         ProviderKind::AutoClaw,
         ProviderKind::Qoder,
+        ProviderKind::ClineFree,
+        ProviderKind::ClinePass,
     ]
 }
 
@@ -755,6 +829,32 @@ fn seed_current_qoder_defaults() {
     qoder::models::seed_default_rules();
 }
 
+/// 对**当前清单**里的 Cline 模型补一次默认映射种子（带池前缀的模型自动获得
+/// 去前缀别名，如 `deepseek-v4.1-flash → cline-free/deepseek-v4.1-flash`，
+/// 见 `model_rules::seed_cline_defaults`）。
+///
+/// 要这一手补种的理由与另外三家相同：Cline 的目录在「没有账号 / 远程刷新失败」
+/// 时只有静态兜底清单，那条路径上没有种子可挂 —— 而**静态兜底里也有带前缀的
+/// 模型**，不补种的话用户装上就看到 `cline-free/deepseek-v4.1-flash` 这种名字。
+/// 幂等：种过的 id 不会再动（用户删掉自动映射后不会被改回来）。
+///
+/// ── 两个池各跑一遍（顺序即「谁先拿到同名短名」）─────────────
+/// 两池有同名模型（`deepseek-v4.1-flash`），去前缀种子按「先到先得」只给一家
+/// 建映射，因此**遍历顺序决定短名先落在谁家**。这里按 `Pool::ALL` 的顺序
+/// （Free 在前）—— 免费池无门槛（不需要订阅），让它当默认归属更合理；
+/// 另一家由 `model_rules::EXTRA_ALIASES` 点名补上，所以**短名对两家都能路由**，
+/// 顺序只影响候选链里谁在前，不影响可用性。
+///
+/// 不再需要 `store`：早先要按「账号库里有哪个池」重排（池是账号属性时的
+/// 遗留），现在池是身份，两家的种子各按各的清单跑。
+fn seed_current_cline_defaults() {
+    for pool in super::cline::models::Pool::ALL {
+        if let Some(summary) = super::cline::adapter::seed_defaults(pool) {
+            crate::server::logging::log("[Models]", &summary);
+        }
+    }
+}
+
 /// 让所有**已实现**的 provider 各刷新一次模型目录（后台任务入口）。
 ///
 /// 调用点：`api::chat::spawn_catalog_refresh`（GET /v1/models 的异步刷新）
@@ -769,6 +869,7 @@ pub async fn refresh_implemented(store: &AccountStore) {
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
+    seed_current_cline_defaults();
     for kind in implemented_kinds() {
         let adapter = adapter_for(kind);
         // 注册表与适配器自报的 kind 必须一致（不一致说明 `adapter_for`
@@ -812,7 +913,7 @@ pub async fn refresh_implemented(store: &AccountStore) {
 ///   - `failed`：**尝试了，但上游或本地出错了**（HTTP 非 2xx、网络错误、
 ///     解析失败）。`message` 里带原因，用户可能要排查（网络 / 凭证）。
 ///   把 `failed` 报成 `skipped` 会让真实故障静默；把 `skipped` 报成 `failed`
-///   会让「CatPaw 用的是固定清单」这种正常事实变成一条红色错误。
+///   会让「这家本次没有新清单」这种正常事实变成一条红色错误。
 ///
 /// 失败不抛错、逐家串行：一家的失败不影响其余家（`refresh_models` 契约本身就
 /// 失败不返回错误），串行的理由与自动路径相同（provider 个位数、日志顺序稳定）。
@@ -823,15 +924,17 @@ pub async fn refresh_implemented_forced(store: &AccountStore) -> Vec<Value> {
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
+    seed_current_cline_defaults();
     for kind in implemented_kinds() {
         let adapter = adapter_for(kind);
         debug_assert_eq!(adapter.kind(), kind);
         let provider_id = kind_id(kind);
         let provider_label = meta(kind).label;
         if !adapter.supports_model_refresh() {
-            // 不支持的家**不进网络**：静态清单刷十次还是同一份，
-            // 打上游只是白跑（CatPaw 的模型 id 是固定的，上游没有目录接口）。
-            // `fixed: true` 是给前端的机器可识别标记（理由见上方「结果字段」）
+            // 不支持的家**不进网络**：静态清单刷十次还是同一份，打上游只是白跑。
+            // `fixed: true` 是给前端的机器可识别标记（理由见上方「结果字段」）。
+            // **当前五家都支持远程目录，本分支在生产路径上走不到** ——
+            // 保留它是给将来新接入的 provider 用的（与 trait 的默认 false 配对）
             results.push(json!({
                 "provider": provider_id,
                 "providerLabel": provider_label,

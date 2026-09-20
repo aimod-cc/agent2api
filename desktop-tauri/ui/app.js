@@ -4,6 +4,10 @@
 const api = window.workbuddyDesktop;
 const $ = id => document.getElementById(id);
 let state = null;
+// 最近一次 `refresh()` 的失败原因（成功时清空）。
+// 它是给顶栏状态区挂 title 用的：后端不可达时页面上其余数字都只是「上一次的值」，
+// 而顶栏是常驻可见的那一处，把原因挂在那里用户悬停就能看到（见 renderTopbarStatus）。
+let stateError = '';
 // busy 是「全局一次只干一件事」的互斥锁：刷新、切换账号、登录、保存配置等都要先占它。
 // 注意它与 account-panel.js 里的 panelBusy 是两把互不相干的锁：弹窗内的保存不占这把锁。
 let busy = false;
@@ -30,15 +34,6 @@ function formatTime(value) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '';
   return date.toLocaleString('zh-CN', { hour12: false });
-}
-
-function formatRemaining(ms) {
-  if (!Number.isFinite(ms) || !ms) return '';
-  const diff = ms - Date.now();
-  if (diff <= 0) return '（已过期）';
-  const minutes = Math.round(diff / 60000);
-  if (minutes < 60) return `（${minutes} 分钟后过期）`;
-  return `（${Math.round(minutes / 60)} 小时后过期）`;
 }
 
 // ─── 主题 ────────────────────────────────────
@@ -121,8 +116,9 @@ function showPage(name, { persist = true } = {}) {
     clearLogsBadge();
     window.wbLogsPanel?.load?.();
   }
-  // 请求日志页自持数据与筛选，切进去时拉一次最新
+  // 请求日志页自持数据与筛选，切进去时拉一次最新；顺带清掉未读失败角标
   if (page === 'requests') {
+    clearRequestsBadge();
     window.wbRequestsPanel?.load?.();
   }
   // 定时任务页自持清单与编辑态，切进去时拉一次最新
@@ -132,6 +128,11 @@ function showPage(name, { persist = true } = {}) {
   // 切到设置页时拉一次启动设置与网关地址（面板内部自持状态，这里只做转发）
   if (page === 'settings') {
     window.wbSettingsPanel?.load?.();
+  }
+  // 切到账号页时立刻补一次连接数：那条 2 秒轮询只在「当时就在账号页」时才发请求，
+  // 切走的这段时间里缓存已经过期，不补一下会先看到几秒前的旧数字
+  if (page === 'accounts') {
+    void window.wbAccountsView?.syncConnections?.();
   }
   // 模型管理 / 网关 Key 页各自持有数据，切进去时拉一次最新
   if (page === 'gateway') {
@@ -189,6 +190,9 @@ function renderTopbarStatus() {
   };
 
   box.innerHTML = views[currentPage]?.() ?? views.overview();
+  // 加载失败的原因挂在这里（会话状态卡片删除后它没有别的落点）：此时下面各页面
+  // 显示的都是上一次的值，顶栏是唯一常驻可见的位置。成功一次即清空。
+  box.title = stateError ? `加载失败：${stateError}` : '';
 }
 
 // ─── 日志未读徽标（只提示 error） ─────────────
@@ -304,6 +308,87 @@ async function syncLogsBadge() {
   }
 }
 
+// ─── 请求日志未读徽标（只提示失败请求） ─────────
+
+/**
+ * 与日志徽标同一套水位机制，但口径换成**失败的请求**：
+ * 数字含义是「已读水位之后新增的失败请求数」。
+ *
+ * 请求日志没有日志那样的自增 id（按 ts 升序、用时间分页），水位只能取
+ * 毫秒时间戳：进过一次请求日志页就把水位推到当下，之后的失败才算未读。
+ * 「请求发起」与「设置水位」落在同一毫秒这种碰撞按未读算（start 是含边界）——
+ * 宁可多提示一条，不冒漏提示的险；多提示的代价是进一次页面就清掉。
+ *
+ * 未读条数直接复用请求日志接口：`status=error&start=<水位>` 的 matched
+ * 正是水位之后的失败数（与面板/报表同一个成功口径：非 2xx 或带错误摘要），
+ * limit 压到 1 只为拿计数，明细不走网络之外的额外路径。
+ */
+let lastSeenReqTs = readSeenReqTs();
+
+/** 读回持久化的水位；无值 / 值被改坏一律当作「还没有水位」（首次运行） */
+function readSeenReqTs() {
+  try {
+    const raw = localStorage.getItem('workbuddy-desktop-req-seen');
+    if (raw === null || raw.trim() === '') return null;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 推进已读水位；localStorage 只负责跨次启动恢复，本会话的判断都看内存值 */
+function markRequestsSeen(ts) {
+  lastSeenReqTs = ts;
+  try {
+    localStorage.setItem('workbuddy-desktop-req-seen', String(ts));
+  } catch {
+    // 存储不可用时只影响下次启动的起点，不影响本次会话
+  }
+}
+
+function clearRequestsBadge() {
+  const badge = $('nav-count-requests');
+  if (badge) badge.style.display = 'none';
+  markRequestsSeen(Date.now());
+}
+
+/** 查水位之后的失败请求数并重画徽标：挂在 20 秒全局轮询上 */
+async function syncRequestsBadge() {
+  const badge = $('nav-count-requests');
+  if (!badge) return;
+  // 首次运行：把当下记为已读，否则一装上就挂着历史失败
+  if (lastSeenReqTs === null) {
+    markRequestsSeen(Date.now());
+    return;
+  }
+  // 人就在请求日志页：等于已经看到，水位推进到当下
+  if (currentPage === 'requests') {
+    markRequestsSeen(Date.now());
+    badge.style.display = 'none';
+    return;
+  }
+  try {
+    const result = await api.getStatsRequests({
+      status: 'error',
+      start: lastSeenReqTs,
+      limit: 1,
+    });
+    // 等待期间进了请求日志页：这次结果已过期，别拿旧数把刚清掉的角标又点亮
+    if (currentPage === 'requests') return;
+    const unread = Number(result?.matched) || 0;
+    if (!unread) {
+      badge.style.display = 'none';
+      return;
+    }
+    badge.textContent = unread > 99 ? '99+' : String(unread);
+    badge.title = `${unread} 条失败请求未读，点开「请求日志」查看`;
+    badge.style.display = '';
+  } catch {
+    // 保持上一次的显示：查询偶尔失败不该反过来抹掉已有提示
+  }
+}
+
 // ─── 新版本可用提示 ───────────────────────────
 
 /** 最近一次检查结果。存下来是为了换页时能重画提示（检查本身只在启动与手动触发时跑） */
@@ -401,47 +486,6 @@ $('update-modal')?.addEventListener('click', event => {
   if (event.target === $('update-modal')) closeUpdateModal();
 });
 
-// ─── 渲染：会话状态 ────────────────────────────
-
-function renderSession() {
-  const session = state?.session || {};
-  const health = state?.health || {};
-  const badge = $('session-badge');
-  // 会话信息不随每个请求的选路结果变化。
-  const sessionAccountId = session.currentAccountId || state?.accounts?.currentAccountId;
-  const currentAccount = state?.accounts?.accounts?.find(a => a.id === sessionAccountId);
-
-  // title 还被「加载失败」用来挂后端不可达的原因（见 refresh 的 catch），
-  // 每次重渲染都先清空：否则恢复后鼠标悬停仍会读到上一次的失败提示
-  badge.title = '';
-
-  if (!health.upstreamConfigured) {
-    badge.className = 'badge bad';
-    badge.textContent = '⚠️ 未登录';
-    badge.title = health.unavailableReason || '';
-  } else if (!session.loggedIn) {
-    badge.className = 'badge bad';
-    badge.textContent = '未登录';
-  } else {
-    const expiresAt = Number(session.tokenExpiresAt) || 0;
-    const expiringSoon = expiresAt && expiresAt - Date.now() < 5 * 60 * 1000;
-    badge.className = `badge ${expiringSoon ? 'warn' : 'ok'}`;
-    badge.textContent = expiringSoon ? '临期（将自动刷新）' : '已登录';
-  }
-
-  $('session-nickname').textContent = session.nickname || currentAccount?.nickname || currentAccount?.name || '—';
-  $('session-uid').textContent = session.accountUid || currentAccount?.uid || '—';
-  $('session-endpoint').textContent = session.endpoint || '—';
-  const expiresAt = Number(session.tokenExpiresAt) || 0;
-  $('session-expires').textContent = session.loggedIn
-    ? `${formatTime(expiresAt)}${formatRemaining(expiresAt)}`
-    : '—';
-
-  // 退出登录 / 刷新 Token 是否可用，取决于后端是否有可用登录态
-  $('btn-logout').disabled = !session.loggedIn;
-  $('btn-refresh-token').disabled = !session.loggedIn;
-}
-
 // ─── 渲染：网关 / 模型 / 配置 ──────────────────
 
 /**
@@ -471,7 +515,6 @@ function renderProxyStatus() {
 }
 
 function render() {
-  renderSession();
   renderAccountsView();
   renderGateway();
   renderModels();
@@ -540,6 +583,8 @@ async function refresh() {
   try {
     const next = await api.getState();
     state = next;
+    // 拿到状态即清掉上一次的失败说明（见下面 catch 的注释）
+    stateError = '';
     // 词表通过独立接口加载，避免阻塞状态
     await loadDesensitize();
     // 清掉已删除账号的本地缓存；代理可选项也可能在 Clash 侧改过，下次打开弹窗重读
@@ -549,12 +594,12 @@ async function refresh() {
     render();
   } catch (error) {
     state = null;
+    stateError = error.message;
     render();
-    // 「本地代理状态」卡片已随报表页改造删除，加载失败改挂到会话徽标的 title 上：
-    // 徽标此时本来就显示「⚠️ 未登录」，悬停即可看到真实原因（后端不可达 / 接口报错）。
+    // 「本地代理状态」卡片与会话状态卡片都已删除，加载失败的说明改挂到顶栏状态区的
+    // title 上（见 renderTopbarStatus）：那里此时本来就显示「未登录 / 未就绪」，
+    // 悬停即可看到真实原因（后端不可达 / 接口报错）。
     // 不用 toast：refresh() 每 20 秒轮询一次，后端长时间不可用会变成刷屏。
-    const badge = $('session-badge');
-    if (badge) badge.title = `加载失败：${error.message}`;
     console.warn('加载状态失败:', error.message);
   } finally {
     releaseBusy();
@@ -587,7 +632,16 @@ async function runAccountAction(action, id) {
       toast('✅ Token 已刷新');
     } else if (action === 'remove') {
       const account = state?.accounts?.accounts?.find(a => a.id === id);
-      if (!confirm(`确定删除账号「${account?.nickname || account?.name || id}」？${window.wbAccountsModel?.isDesktopAccount?.(account) ? '（不会影响客户端登录态）' : ''}`)) return;
+      const name = esc(account?.nickname || account?.name || id);
+      // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），
+      // 危险确认一律走自绘弹窗（wbConfirm，见 confirm-dialog.js）—— 下同
+      const note = window.wbAccountsModel?.isDesktopAccount?.(account) ? '（不会影响客户端登录态）' : '';
+      if (!(await window.wbConfirm?.ask?.({
+        title: '删除账号',
+        html: `确定删除账号「<strong>${name}</strong>」？${esc(note)}`,
+        okText: '删除',
+        okClass: 'danger',
+      }))) return;
       await api.removeAccount(id);
       await refresh();
       toast('账号已删除');
@@ -611,35 +665,6 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () 
   if ((localStorage.getItem('workbuddy-desktop-theme') || 'system') === 'system') applyTheme('system');
 });
 applyTheme(localStorage.getItem('workbuddy-desktop-theme') || 'system');
-
-$('btn-refresh-state').addEventListener('click', () => refresh().then(() => toast('状态已刷新')));
-$('btn-refresh-token').addEventListener('click', async () => {
-  if (busy) return;
-  busy = true;
-  try {
-    await api.refreshSession();
-    await refresh();
-    toast('✅ Token 已刷新');
-  } catch (error) {
-    toast(`刷新失败：${error.message}`, 'err');
-  } finally {
-    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
-  }
-});
-$('btn-logout').addEventListener('click', async () => {
-  if (!confirm('确定退出登录？这会删除当前登录态对应的账号记录（可重新登录加回来）。')) return;
-  if (busy) return;
-  busy = true;
-  try {
-    await api.logout();
-    await refresh();
-    toast('已退出登录');
-  } catch (error) {
-    toast(`退出失败：${error.message}`, 'err');
-  } finally {
-    releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
-  }
-});
 
 api.onStateChanged(next => {
   if (!next?.accounts && !next?.session && !next?.health) return;
@@ -747,6 +772,8 @@ setInterval(() => {
   // 日志未读错误也一起轮询：否则人不在日志页时，只有日志面板那次 10 秒轮询
   // 才会更新徽标 —— 而那个轮询恰恰只在日志页可见时才发请求（见 logs-panel.js）
   void syncLogsBadge();
+  // 请求日志的未读失败同理：人不在请求日志页时也要有人推进角标
+  void syncRequestsBadge();
   // 「定时查询积分」的结果快照也跟着这一轮读一次：后端的定时任务在跑，
   // 界面得跟上它（否则用户不点按钮就永远停在启动那次的旧余额上）。
   // 快照时间戳没变时它自己会早退，不会造成无谓的重绘。

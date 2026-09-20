@@ -19,7 +19,7 @@
 //! 这里只保留旧目录名常量与旧目录路径访问器（`LEGACY_DIR_NAME` 仍是全仓
 //! 唯一的字面量）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use serde_json::{Map, Value};
@@ -37,10 +37,28 @@ pub const DEFAULT_LOCALE: &str = "zh-CN";
 
 /// 事件日志（logs.jsonl）保留天数
 pub const KEY_LOG_RETENTION_DAYS: &str = "logRetentionDays";
-/// 请求明细（requests.jsonl）保留天数
+/// 请求日志（requests.jsonl）保留天数
 pub const KEY_REQUEST_RETENTION_DAYS: &str = "requestRetentionDays";
 /// 按天聚合（request-daily.jsonl）保留天数
 pub const KEY_DAILY_RETENTION_DAYS: &str = "dailyRetentionDays";
+
+/// 事件日志的保存目录（config.json 键）。
+///
+/// 值是**绝对路径**；缺省 / 空串 / 相对路径（读侧视为写坏）都回落配置目录 ——
+/// 两类数据各一个键，互不约束（可以搬到同一个目录，文件名不冲突）。
+pub const KEY_LOG_DIR: &str = "logDir";
+/// 请求日志（明细 + 按天聚合）的保存目录（config.json 键），语义同 `KEY_LOG_DIR`
+pub const KEY_REQUEST_STATS_DIR: &str = "requestStatsDir";
+/// 调试模式原始报文的保存目录（config.json 键），语义同 `KEY_LOG_DIR`
+pub const KEY_DEBUG_DIR: &str = "debugDir";
+
+/// 调试模式开关（config.json 键）。
+///
+/// 开启后转发层会把**发给上游的请求头（脱敏）与请求体、上游返回的响应头与
+/// 响应体**完整落到 `debug-traffic.jsonl`（见 `core::debug_traffic`），请求日志
+/// 页的「详情」列据此展示。默认关闭 —— 报文体积可达数百 KB，常开会让日志目录
+/// 迅速膨胀；关闭时采集路径完全不执行（零开销，见各采集点的 `if enabled`）。
+pub const KEY_DEBUG_MODE: &str = "debugMode";
 
 /// 三档保留天数的默认值（缺失时用它们）
 pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
@@ -73,7 +91,7 @@ pub const RETENTION_MAX_DAYS: i64 = 3650;
 pub struct RetentionSettings {
     /// 事件日志保留天数
     pub log_days: i64,
-    /// 请求明细保留天数
+    /// 请求日志保留天数
     pub request_days: i64,
     /// 按天聚合保留天数
     pub daily_days: i64,
@@ -115,8 +133,10 @@ pub const KEY_CREDENTIAL_MAINTENANCE: &str = "credentialMaintenance";
 pub const KEY_MODEL_REFRESH: &str = "modelRefresh";
 /// 日志页自动刷新在 `scheduledTasks` 下的子键（**前端**定时器，后端只存配置）
 pub const KEY_LOGS_AUTO_REFRESH: &str = "logsAutoRefresh";
-/// 请求明细页自动刷新在 `scheduledTasks` 下的子键（同上）
+/// 请求日志页自动刷新在 `scheduledTasks` 下的子键（同上）
 pub const KEY_REQUESTS_AUTO_REFRESH: &str = "requestsAutoRefresh";
+/// 报表页自动刷新在 `scheduledTasks` 下的子键（同上）
+pub const KEY_REPORT_AUTO_REFRESH: &str = "reportAutoRefresh";
 /// 软件版本检查在 `scheduledTasks` 下的子键（后端定时向 GitHub 查最新发布版本）
 pub const KEY_UPDATE_CHECK: &str = "updateCheck";
 /// 定时查询积分在 `scheduledTasks` 下的子键（后端定时查全部账号的余额 / 积分）
@@ -130,9 +150,15 @@ pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
 /// 上游（见 `providers::workbuddy` 的 `refresh_models`），间隔太密等于给上游
 /// 添无谓的负载。一小时的粒度对「模型清单变了没」这个问题足够。
 pub const DEFAULT_MODEL_REFRESH_MINUTES: i64 = 60;
-/// 两个前端自动刷新的默认间隔（秒）：与改造前页内硬编码的 10 秒一致
-pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 10;
-pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 10;
+/// 两个前端自动刷新的默认间隔（秒）：每秒一次。
+///
+/// 比改造前的硬编码 10 秒密得多，这是有意的：两条任务都只在**对应页面可见时**
+/// 才请求（`document.hidden` 与当前页都判过），离开页面就完全静默，所以
+/// 「密」的代价只落在用户正盯着那一页的时候 —— 而那正是他想要实时的时刻。
+/// 两条接口都是本地读写（一条读日志库、一条查统计库），不出网。
+pub const DEFAULT_LOGS_AUTO_REFRESH_SECONDS: i64 = 1;
+pub const DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS: i64 = 1;
+pub const DEFAULT_REPORT_AUTO_REFRESH_SECONDS: i64 = 1;
 /// 软件版本检查默认间隔（分钟）：每 5 分钟查一次 GitHub 最新发布。
 ///
 /// GitHub 匿名限额是 60 次/小时/IP：5 分钟一次（12 次/小时）留足余量；
@@ -146,13 +172,17 @@ pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 5;
 pub const DEFAULT_USAGE_QUERY_MINUTES: i64 = 10;
 
 /// 间隔型任务的取值范围。上下限分两套（分钟 / 秒），因为两类任务的合理区间
-/// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（5 秒～10 分钟）。
+/// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（1 秒～10 分钟）。
+///
+/// 秒级下限放到 1 秒：这两条任务是**页面可见才跑**的本地轮询（不出网、不打上游），
+/// 密一点最坏是「多读几次本地库里的一页数据」，不会给任何外部服务添负担。
+/// 原来的 5 秒下限没有技术理由，只是照着改造前的 10 秒兜底值随手划的。
 ///
 /// 与保留期同样：**写侧（`scheduled_tasks::parse_interval`）与读侧
 /// （`interval_field`）共用这些常量**，否则会出现「接口拒绝 60 而手改文件接受它」。
 pub const INTERVAL_MIN_MINUTES: i64 = 1;
 pub const INTERVAL_MAX_MINUTES: i64 = 1440;
-pub const INTERVAL_MIN_SECONDS: i64 = 5;
+pub const INTERVAL_MIN_SECONDS: i64 = 1;
 pub const INTERVAL_MAX_SECONDS: i64 = 600;
 
 /// 一个间隔型任务的配置：开关 + 间隔（单位由任务定义决定）。
@@ -163,7 +193,7 @@ pub struct IntervalTask {
     pub interval: i64,
 }
 
-/// 六条间隔型任务的配置（设置页「定时任务」区域）。
+/// 七条间隔型任务的配置（设置页「定时任务」区域）。
 ///
 /// 与 `RetentionSettings` 同一取舍：几个值总是一起用（GET 一次返回、各自循环
 /// 各取所需），打包成一个 `Copy` 值让调用方一次拿到、不必多次读锁。
@@ -173,6 +203,7 @@ pub struct ScheduledSettings {
     pub model_refresh: IntervalTask,
     pub logs_auto_refresh: IntervalTask,
     pub requests_auto_refresh: IntervalTask,
+    pub report_auto_refresh: IntervalTask,
     pub update_check: IntervalTask,
     pub usage_query: IntervalTask,
 }
@@ -196,6 +227,10 @@ impl Default for ScheduledSettings {
                 enabled: true,
                 interval: DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS,
             },
+            report_auto_refresh: IntervalTask {
+                enabled: true,
+                interval: DEFAULT_REPORT_AUTO_REFRESH_SECONDS,
+            },
             update_check: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_UPDATE_CHECK_MINUTES,
@@ -215,6 +250,97 @@ pub struct IntervalTaskPatch {
     pub interval: Option<i64>,
 }
 
+// ─── 请求重试设置的键名与边界（config.json 里的字段名**就是契约**）─────
+//
+// 转发层的退避重试读这三个值（见 `upstream::provider_loop::send_with_retry`）。
+//
+// ── 为什么分两档次数（同一家 / 换了家）──────────────────────
+// 一次转发失败后的处置有两条路：**在原提供商上再试**（可能换该家的下一个
+// 账号，也可能只是同账号重发），以及**换一家提供商再试**。这两件事的代价与
+// 收益完全不同：前者便宜、可能只是瞬时抖动；后者要跨到另一家的额度与限流上，
+// 用户往往希望「先在本家多试几次，实在不行再换家」。所以两档各有一个次数，
+// 而不是共用一个。
+//
+// 判定口径（`provider_loop::attempt_queue` 记账）：
+//   - 请求**首次选中的那一家**用 `retryCount`；
+//   - 一旦选中的账号属于**另一家**，预算就换成 `retryCrossProviderCount`，
+//     且从零开始计（不是接着上一档扣）—— 「换家之后还能试 5 次」是用户填
+//     这个数字时的直觉，接着扣会得到「换家后只剩 2 次」这种没人能预期的结果。
+
+/// **同一提供商内**的重试次数（0 = 失败立即报错，不重试）
+pub const KEY_RETRY_COUNT: &str = "retryCount";
+/// **换到别的提供商之后**的重试次数（0 = 换家后不再重试）
+pub const KEY_RETRY_CROSS_PROVIDER_COUNT: &str = "retryCrossProviderCount";
+/// 两次重试之间的等待秒数
+pub const KEY_RETRY_INTERVAL_SECONDS: &str = "retryIntervalSeconds";
+
+/// 同一提供商的重试次数默认值：失败后再试 3 次（连同首次共 4 次发送）
+pub const DEFAULT_RETRY_COUNT: i64 = 3;
+/// 换家后的重试次数默认值：换到另一家后再试 5 次。
+///
+/// 比同一家那档更宽是刻意的：能走到换家说明本家确实不通（额度耗尽 / 持续
+/// 5xx），此时多给几次试错机会比快速失败更符合预期。
+pub const DEFAULT_RETRY_CROSS_PROVIDER_COUNT: i64 = 5;
+/// 重试间隔默认值：5 秒
+pub const DEFAULT_RETRY_INTERVAL_SECONDS: i64 = 5;
+
+/// 次数与间隔的合法范围。
+///
+/// 上限 10 次 / 300 秒：次数过多或间隔过长都会让客户端干等（重试是「再发一次」，
+/// 与「换一个账号」不是一回事）。下限 0：次数 0 = 关闭该档重试，间隔 0 = 立即重发。
+pub const RETRY_MIN_COUNT: i64 = 0;
+pub const RETRY_MAX_COUNT: i64 = 10;
+pub const RETRY_MIN_INTERVAL_SECONDS: i64 = 0;
+pub const RETRY_MAX_INTERVAL_SECONDS: i64 = 300;
+
+/// 请求重试设置（设置页「通用 → 请求重试」区域）。
+///
+/// 与 `RetentionSettings` 同一取舍：几个值总是一起用（转发层每次重试判定
+/// 都取），打包成 `Copy` 值让调用方一次拿到、不必多次读锁。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetrySettings {
+    /// **同一提供商内**的最大重试次数（0 = 不重试）
+    pub count: i64,
+    /// **换到别的提供商之后**的最大重试次数（0 = 换家后不重试）
+    pub cross_provider_count: i64,
+    /// 两次重试之间的间隔（秒）
+    pub interval_seconds: i64,
+}
+
+impl RetrySettings {
+    /// 间隔的毫秒形态（转发层的 sleep 直接用）
+    pub fn delay_ms(&self) -> u64 {
+        self.interval_seconds.max(0) as u64 * 1000
+    }
+
+    /// 某个阶段的重试预算（`switched` = 已经换到别的提供商）。
+    ///
+    /// 负值按 0 处理：`bounded_int_field` 已保证范围，这里是防御性的
+    /// （负数转 `usize` 会回绕成天文数字，那会让重试变成死循环）。
+    pub fn budget(&self, switched: bool) -> usize {
+        let value = if switched { self.cross_provider_count } else { self.count };
+        value.max(0) as usize
+    }
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            count: DEFAULT_RETRY_COUNT,
+            cross_provider_count: DEFAULT_RETRY_CROSS_PROVIDER_COUNT,
+            interval_seconds: DEFAULT_RETRY_INTERVAL_SECONDS,
+        }
+    }
+}
+
+/// 请求重试的**部分**更新入参（`None` = 该项不动）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RetryPatch {
+    pub count: Option<i64>,
+    pub cross_provider_count: Option<i64>,
+    pub interval_seconds: Option<i64>,
+}
+
 /// 运行期生效的配置快照。
 ///
 /// 字段是「本切片真正会用到的」子集，其余未知字段留在 `raw` 里原样保留，
@@ -225,7 +351,7 @@ pub struct RuntimeConfig {
     locale: String,
     default_model: String,
     last_request_model: Option<String>,
-    /// 三档保留天数（事件日志 / 请求明细 / 按天聚合）。
+    /// 三档保留天数（事件日志 / 请求日志 / 按天聚合）。
     ///
     /// 为什么解析进字段而不是让调用方每次去 `raw` 里翻：保留期要被**每次记账 / 写日志**
     /// 取用（回调形式），从 `Value` 里逐个取值要处理类型不符、缺字段、范围夹紧，
@@ -237,6 +363,24 @@ pub struct RuntimeConfig {
     /// （改完设置下一轮生效，不重启进程），从 `Value` 里翻一次要处理一堆
     /// 类型与范围判定，解析一次存下来最省事。
     scheduled: ScheduledSettings,
+    /// 请求重试的次数与间隔（设置页「通用 → 请求重试」区域）。
+    ///
+    /// 与保留期同一理由：转发层**每次重试判定**都要取它（改完设置下一个
+    /// 失败请求就用新值，不重启进程），解析一次存下来最省事。
+    retry: RetrySettings,
+    /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
+    /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
+    log_dir: Option<String>,
+    /// 请求日志的保存目录（原始配置值；None = 未设置）
+    request_stats_dir: Option<String>,
+    /// 调试模式原始报文的保存目录（原始配置值；None = 未设置）
+    debug_dir: Option<String>,
+    /// 调试模式开关（设置页「通用 → 调试模式」）。
+    ///
+    /// 与保留期同一理由：转发层**每次发送前**都要判一次（改完开关下一个请求
+    /// 就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存下来
+    /// 最省事 —— 这条判定在转发热路径上。
+    debug_mode: bool,
     /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
     raw: Map<String, Value>,
 }
@@ -266,6 +410,11 @@ impl RuntimeConfig {
     /// 最近一次实际转发的模型（账号页「模型」筛选的默认值）
     pub fn last_request_model(&self) -> Option<&str> {
         self.last_request_model.as_deref()
+    }
+
+    /// 调试模式是否开启（转发层每次发送前判一次，见字段说明）
+    pub fn debug_mode(&self) -> bool {
+        self.debug_mode
     }
 
     /// 掩码后的 API Key，格式照抄 server.mjs 920 行：前 6 后 4。
@@ -339,16 +488,17 @@ fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 从原始 JSON 里取天数：缺字段 / 类型不符 / 非整数 / 越界一律回落到 `default`。
+/// 从原始 JSON 里取「带范围边界的整数」：缺字段 / 类型不符 / 非整数 / 越界
+/// 一律回落到 `default`。
 ///
-/// **越界回落而非夹紧**：手改 config.json 写了 99999 时，静默改成 3650
-/// 会让人以为「设置生效了」，回默认值至少与用户在设置页看到的不一致时好排查。
-/// 走接口写入的值在 `stats_api::parse_days` 里已按同一范围校验过（那里是 400 报错）。
+/// **越界回落而非夹紧**：手改 config.json 写了天文数字时，静默夹紧会让人
+/// 以为「设置生效了」，回默认值至少与用户在设置页看到的不一致时好排查。
+/// 走接口写入的值在各自的 PUT 处理器里已按同一范围校验过（那里是 400 报错）。
 ///
 /// 接受 `30.0` 这种整值浮点（与 `parse_days` 同一口径）：JSON 里
 /// `30` 与 `30.0` 都是合法数字，为后者回落到默认值会显得莫名其妙
 /// （用户手改文件时把 30 写成 30.0 是完全可能的事）。
-fn days_field(map: &Map<String, Value>, key: &str, default: i64) -> i64 {
+fn bounded_int_field(map: &Map<String, Value>, key: &str, default: i64, min: i64, max: i64) -> i64 {
     let parsed = map.get(key).and_then(|value| match value {
         Value::Number(number) => number.as_i64().or_else(|| {
             number
@@ -358,9 +508,12 @@ fn days_field(map: &Map<String, Value>, key: &str, default: i64) -> i64 {
         }),
         _ => None,
     });
-    parsed
-        .filter(|value| (RETENTION_MIN_DAYS..=RETENTION_MAX_DAYS).contains(value))
-        .unwrap_or(default)
+    parsed.filter(|value| (min..=max).contains(value)).unwrap_or(default)
+}
+
+/// 从原始 JSON 里取天数（`bounded_int_field` 的保留期特化）
+fn days_field(map: &Map<String, Value>, key: &str, default: i64) -> i64 {
+    bounded_int_field(map, key, default, RETENTION_MIN_DAYS, RETENTION_MAX_DAYS)
 }
 
 /// 由原始 JSON 解析三档保留天数（缺字段各自用默认值）
@@ -451,6 +604,12 @@ fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             INTERVAL_MIN_SECONDS,
             INTERVAL_MAX_SECONDS,
         ),
+        report_auto_refresh: task(
+            KEY_REPORT_AUTO_REFRESH,
+            defaults.report_auto_refresh.interval,
+            INTERVAL_MIN_SECONDS,
+            INTERVAL_MAX_SECONDS,
+        ),
         update_check: task(
             KEY_UPDATE_CHECK,
             defaults.update_check.interval,
@@ -462,6 +621,36 @@ fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             defaults.usage_query.interval,
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
+        ),
+    }
+}
+
+// ─── 请求重试设置的解析（retryCount / retryCrossProviderCount / retryIntervalSeconds）──
+
+/// 由原始 JSON 解析请求重试设置（缺字段各自用默认值）
+fn retry_from(map: &Map<String, Value>) -> RetrySettings {
+    let defaults = RetrySettings::default();
+    RetrySettings {
+        count: bounded_int_field(
+            map,
+            KEY_RETRY_COUNT,
+            defaults.count,
+            RETRY_MIN_COUNT,
+            RETRY_MAX_COUNT,
+        ),
+        cross_provider_count: bounded_int_field(
+            map,
+            KEY_RETRY_CROSS_PROVIDER_COUNT,
+            defaults.cross_provider_count,
+            RETRY_MIN_COUNT,
+            RETRY_MAX_COUNT,
+        ),
+        interval_seconds: bounded_int_field(
+            map,
+            KEY_RETRY_INTERVAL_SECONDS,
+            defaults.interval_seconds,
+            RETRY_MIN_INTERVAL_SECONDS,
+            RETRY_MAX_INTERVAL_SECONDS,
         ),
     }
 }
@@ -513,6 +702,7 @@ fn read_raw() -> Map<String, Value> {
 fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let retention = retention_from(&raw);
     let scheduled = scheduled_from(&raw);
+    let retry = retry_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）
         api_key: string_field(&raw, "apiKey").or_else(env_api_key),
@@ -523,6 +713,13 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         last_request_model: string_field(&raw, "lastRequestModel"),
         retention,
         scheduled,
+        retry,
+        log_dir: string_field(&raw, KEY_LOG_DIR),
+        request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
+        debug_dir: string_field(&raw, KEY_DEBUG_DIR),
+        // 只有字面 `true` 算开启（手改文件写 "1" / "yes" 一律当关）：与
+        // 「写坏回落」同一取向 —— 这个开关控制是否把凭据落盘，宁可少采
+        debug_mode: raw.get(KEY_DEBUG_MODE).and_then(Value::as_bool).unwrap_or(false),
         raw,
     }
 }
@@ -584,6 +781,20 @@ pub fn scheduled_settings() -> ScheduledSettings {
         }
     }
     ScheduledSettings::default()
+}
+
+/// 只取请求重试设置的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retention_settings()` 同一取舍：转发层每个失败请求都要问一次
+/// 「还能重试几次、间隔多久」，而 `current()` 每次都会克隆整个 `raw` Map
+/// —— 热路径上没必要。读锁取一个 `Copy` 值即可。未初始化时给默认值。
+pub fn retry_settings() -> RetrySettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.retry;
+        }
+    }
+    RetrySettings::default()
 }
 
 /// 用一个变换函数原子地更新配置（读 → 改 → 落盘 → 回写内存）。
@@ -781,5 +992,129 @@ pub fn set_scheduled_task(
         // 「界面上改完、循环还是按旧间隔跑」（且要等下次重启才生效），
         // 与保留期那套「改完立刻生效」的承诺不一致。
         config.scheduled = scheduled_from(&config.raw);
+    })
+}
+
+/// 更新请求重试设置（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`retry_api::put_retry`）**必须先校验范围**：本函数按「已合法」
+/// 处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃（那会让用户以为
+/// 设置生效了）。
+///
+/// 与 `set_retention` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个
+/// 失败请求立刻用新值，后者保证写盘时不吃掉 config.json 里的其它字段。
+pub fn set_retry(patch: RetryPatch) -> bool {
+    update(|config| {
+        let mut next = config.retry;
+        if let Some(count) = patch.count {
+            config.raw.insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
+            next.count = count;
+        }
+        if let Some(count) = patch.cross_provider_count {
+            config
+                .raw
+                .insert(KEY_RETRY_CROSS_PROVIDER_COUNT.to_string(), Value::from(count));
+            next.cross_provider_count = count;
+        }
+        if let Some(seconds) = patch.interval_seconds {
+            config
+                .raw
+                .insert(KEY_RETRY_INTERVAL_SECONDS.to_string(), Value::from(seconds));
+            next.interval_seconds = seconds;
+        }
+        config.retry = next;
+    })
+}
+
+// ─── 调试模式（debugMode）────────────────────────────────────
+
+/// 写入调试模式开关。
+///
+/// 与 `set_retry` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个请求
+/// 立刻用新值（转发层逐请求读快照），后者保证写盘时不吃掉 config.json 里的
+/// 其它字段。返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_debug_mode(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_DEBUG_MODE.to_string(), Value::Bool(enabled));
+        config.debug_mode = enabled;
+    })
+}
+
+// ─── 数据保存目录（logDir / requestStatsDir / debugDir）────────
+
+/// 按当前快照解析出的三类数据保存目录（设置页「保存位置」与三个存储的启动用）。
+#[derive(Clone, Debug)]
+pub struct StorageDirs {
+    /// 事件日志（logs.jsonl）的目录
+    pub log_dir: PathBuf,
+    /// 请求日志（requests.jsonl + request-daily.jsonl）的目录
+    pub request_stats_dir: PathBuf,
+    /// 调试模式原始报文（debug-traffic.jsonl）的目录
+    pub debug_dir: PathBuf,
+}
+
+/// 解析三类数据的保存目录：配置里写了**绝对路径**就用它，否则回落配置目录。
+///
+/// 「写坏回落而不是报错」的取舍：目录是启动期就要用的值（两个存储的构造参数），
+/// 这里报错只会让整个网关起不来 —— 而相对路径 / 空串最多是「手改文件写得不规范」，
+/// 回落到默认目录是任何情况下都安全的行为。
+pub fn storage_dirs() -> StorageDirs {
+    let base = config_dir();
+    // 只从内存快照读（`init` 之后才有意义；未初始化时回落默认 —— 与
+    // `retention_settings()` 同一兜底取向）。三次读锁合成一次，减少锁往返。
+    let (log_dir, request_stats_dir, debug_dir) = match CONFIG.read() {
+        Ok(guard) => match guard.as_ref() {
+            Some(config) => (
+                resolve_dir(config.log_dir.as_deref(), &base),
+                resolve_dir(config.request_stats_dir.as_deref(), &base),
+                resolve_dir(config.debug_dir.as_deref(), &base),
+            ),
+            None => (base.clone(), base.clone(), base.clone()),
+        },
+        // 锁中毒：配置快照读不出来，回落默认目录（与各读取函数同一取向）
+        Err(_) => (base.clone(), base.clone(), base.clone()),
+    };
+    StorageDirs {
+        log_dir,
+        request_stats_dir,
+        debug_dir,
+    }
+}
+
+/// 单个目录的解析：非空 + 绝对路径才算数，其余回落 `base`
+fn resolve_dir(raw: Option<&str>, base: &Path) -> PathBuf {
+    raw.map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| base.to_path_buf())
+}
+
+/// 写入 / 清除一类数据的保存目录。`dir` 为 None 或空串 = 清除（回到默认目录）。
+///
+/// 与 `set_retention` 同一套 `update` 原子写法：raw 与解析后的字段一起刷新，
+/// 于是「保存成功 → `storage_dirs()` 立即读到新值」，不需要重启进程。
+pub fn set_storage_dir(key: &str, dir: Option<&str>) -> bool {
+    let key = key.to_string();
+    let dir = dir
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    update(move |config| {
+        match &dir {
+            Some(path) => {
+                config.raw.insert(key.clone(), Value::String(path.clone()));
+            }
+            None => {
+                config.raw.remove(&key);
+            }
+        }
+        // 同步内存快照里的原始值（`storage_dirs` 读的是它，不是 raw）
+        if key == KEY_LOG_DIR {
+            config.log_dir = dir.clone();
+        } else if key == KEY_REQUEST_STATS_DIR {
+            config.request_stats_dir = dir.clone();
+        } else if key == KEY_DEBUG_DIR {
+            config.debug_dir = dir;
+        }
     })
 }

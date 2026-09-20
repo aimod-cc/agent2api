@@ -68,6 +68,8 @@
    * 重绘期间把它置真、结束置假，commitPriority 见真就跳过。
    */
   let rendering = false;
+  /** accountId -> 活跃请求数（只留 >0 的；见下方「连接数（实时）」一节） */
+  const connectionsMap = new Map();
 
   const accounts = () => wbApp.getState()?.accounts?.accounts || [];
   const snapshot = () => wbApp.getState()?.accounts;
@@ -146,6 +148,8 @@
         usageEntry: usageMap.get(account.id),
         usageOpen: panelOpen(account.id, 'usage'),
         limitsOpen: panelOpen(account.id, 'limits'),
+        // 连接数取实时计数缓存（缺失 = 0，connectionsHtml 会渲染成空）
+        connections: connectionsOf(account.id),
       });
       const panels = panelsHtml(account);
       return row + (panels ? table.panelsRowHtml(account, panels) : '');
@@ -239,6 +243,81 @@
   function refreshCaches(validIds) {
     actions.refreshCaches(validIds);
     for (const id of openPanels.keys()) if (!validIds.has(id)) openPanels.delete(id);
+    for (const id of connectionsMap.keys()) if (!validIds.has(id)) connectionsMap.delete(id);
+  }
+
+  // ─── 连接数（实时） ─────────────────────────
+  //
+  // 口径与 OmniProxy 上游管理页的「连接」列一致：**此刻正在使用这个账号的请求数**
+  // （一个请求在账号间轮换时计数跟着走，见后端 core::upstream::connections）。
+  //
+  // 为什么单独一条 2 秒轮询、而不是跟着 app.js 那 20 秒一轮：连接数的全部意义
+  // 就在「现在」，20 秒的滞后会让它变成一串没什么信息量的历史值。后端那边是
+  // 进程内计数（不读盘、不出网），所以这条链路的代价足够低。
+
+  /** 2 秒：够快看得出「正在跑」，又不至于让 DevTools 的网络面板刷屏 */
+  const CONNECTIONS_POLL_MS = 2000;
+
+  const connectionsOf = id => connectionsMap.get(id) || 0;
+
+  /**
+   * 拉一次连接数并**就地更新**那一列，不重绘整张表。
+   *
+   * ── 为什么不走 render() ──────────────────────────────────
+   * 整表重绘会打断正在编辑的优先级输入框、把用户展开的明细行重排，而这个数字
+   * 每 2 秒就可能变一次 —— 用重绘去追它，页面会一直在抖。连接数格子里没有交互，
+   * 宽度又由 colgroup 定死（不参与自适应），所以改它的 innerHTML 是安全的。
+   *
+   * 失败静默：2 秒一次的轮询，后端不可达时 toast 会变成刷屏；且缓存保留上一轮的
+   * 值比清空更贴近事实（用户看到的是「刚才还在跑」，而不是「突然全没了」）。
+   */
+  async function syncConnections() {
+    try {
+      const data = await api.getAccountConnections?.();
+      const counts = data?.counts && typeof data.counts === 'object' ? data.counts : {};
+      // 先更新缓存：即便下面的 DOM 更新因为表格正在重绘而落空，
+      // 紧接着的那次 render() 也会用上新值（rowHtml 读的就是这份缓存）
+      connectionsMap.clear();
+      for (const [id, value] of Object.entries(counts)) {
+        const count = Number(value) || 0;
+        if (count > 0) connectionsMap.set(id, count);
+      }
+      paintConnections();
+      return true;
+    } catch {
+      // 静默：下一次轮询自然重试（与 app.js 的 refresh / syncLogsBadge 同一取舍）
+      return false;
+    }
+  }
+
+  /** 把缓存里的连接数写进现有表格的对应格子（没有账号行时是空操作） */
+  function paintConnections() {
+    const list = $('account-list');
+    if (!list) return;
+    list.querySelectorAll('tr.acct-row').forEach(row => {
+      const cell = row.querySelector('td.cell-connections');
+      if (!cell) return;
+      const html = table.connectionsHtml(connectionsOf(row.dataset.id));
+      // 内容没变就不碰 DOM：2 秒一次无谓的 innerHTML 赋值会把鼠标悬停在数字上
+      // 时那个 title 提示打断（表现为提示反复闪烁）
+      if (cell.innerHTML !== html) cell.innerHTML = html;
+    });
+  }
+
+  /**
+   * 起轮询定时器（只起一次）。
+   *
+   * 只在**账号页可见**时真发请求：切到别的页、或窗口被最小化时不打后端 ——
+   * 与 requests-panel / logs-panel 的轮询同一取舍。页面上没有账号行时
+   * （空列表 / 筛选后为空）`paintConnections` 会自己空转，不做特判。
+   */
+  let connectionsTimer = null;
+  function startConnectionsPolling() {
+    if (connectionsTimer) return;
+    connectionsTimer = setInterval(() => {
+      if (document.hidden || wbApp.currentPage !== 'accounts') return;
+      void syncConnections();
+    }, CONNECTIONS_POLL_MS);
   }
 
   // ─── 优先级行内编辑 ─────────────────────────
@@ -529,6 +608,12 @@
         if (typeof entry === 'string') toast(`签到失败：${entry}`, 'err');
         else if (entry?.success) toast('✅ 该账号签到成功');
         else if (entry?.msg) toast(entry.msg, 'err');
+        // 重新拉一次账号状态：签到时间（checkinAt）是**后端**落的，
+        // 不重拉的话这一行的按钮要等下一轮 20 秒轮询才会变成「已签到」，
+        // 而这期间它还是可点的 —— 正好是这次改动要消除的「看起来还能再签一次」。
+        // 失败路径也拉：上游说「今天已签到」同样会落时间（见后端 checkin_completed_today），
+        // 所以那条也不是纯粹的失败。
+        void wbApp.refresh?.();
       } catch (error) {
         checkinMap.set(id, error instanceof Error ? error.message : String(error));
         render();
@@ -623,12 +708,19 @@
   // 它的 change 监听（filters.bind）在 bindEvents 里才挂得上。
   filters.mount();
   bindEvents();
+  // 连接数轮询：定时器自持「页面可见才发请求」的判定（见 startConnectionsPolling）。
+  // 这里不立刻拉一次 —— 首屏那次 refresh() 渲染出的表格里连接数本来就是空的，
+  // 两秒后第一轮轮询会把它填上；抢跑一次只会与首屏的状态请求撞在一起。
+  startConnectionsPolling();
 
   window.wbAccountsView = {
     render,
     renderNavCount,
     refreshCaches,
     openPanels: openPanelsFor,
+    // 连接数：切页面回来时视图侧主动补一次（轮询只认「当时在账号页」，
+    // 切走的这两分钟里数据已经过期了）
+    syncConnections,
     // 余额 / 签到的动作与缓存都在 usage-actions.js，这里只做转发：
     // app.js 与外部仍按原有的 wbAccountsView 名字调用，引用路径一行不用改
     applyBalances: actions.applyBalances,

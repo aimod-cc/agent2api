@@ -91,6 +91,17 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         }
         return Err("缺少 uid 与 loginName（无法标识 CatPaw 账号）".to_string());
     }
+    // Cline 的账号标识落在 `account`（邮箱或 `usr-…` id）而不是 `userId`
+    // —— 见 `account_store::cline_accounts` 的公开形态。少了这一支，
+    // Cline 账号导出后再导入会因「缺少 userId」整条失败。
+    // **两个池共用这一支**（判据是「属于 Cline 系」，不是某个具体 provider id）。
+    if crate::server::core::account_store::is_cline_family(provider) {
+        let account = text("account");
+        if !account.is_empty() {
+            return Ok(account);
+        }
+        return Err("缺少 account（无法标识 Cline 账号）".to_string());
+    }
     if user_id.is_empty() {
         return Err(format!("缺少 userId（无法标识 {provider} 账号）"));
     }
@@ -115,6 +126,16 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
             return Some(uid);
         }
         return (!login_name.is_empty()).then_some(login_name);
+    }
+    // Cline：身份在 `account` 键上（与 `identity_of_item` 同一口径，两池共用）
+    if crate::server::core::account_store::is_cline_family(provider) {
+        let account = record
+            .get("account")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return (!account.is_empty()).then_some(account);
     }
     let user_id = record.user_id().trim().to_string();
     (!user_id.is_empty()).then_some(user_id)

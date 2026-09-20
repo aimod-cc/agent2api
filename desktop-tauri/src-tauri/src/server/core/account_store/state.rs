@@ -246,6 +246,21 @@ impl StoredAccount {
             .insert("updatedAt".to_string(), Value::from(value));
     }
 
+    /// 最近一次**签到成功**的时刻（毫秒时间戳，0 = 从未签过或记录里没有）。
+    ///
+    /// 与 `updatedAt` 分开记是必须的：`updatedAt` 在任何一次改动（改备注名、
+    /// 切代理、限额标记）时都会刷新，拿它判「今天签过没」会把「今天改过设置」
+    /// 误判成「今天签过」。签到是按自然日幂等的，需要的是**这件事本身**的
+    /// 时间戳，所以单独一个字段。
+    pub fn checkin_at(&self) -> i64 {
+        integer_of(self.fields.get("checkinAt"))
+    }
+
+    pub fn set_checkin_at(&mut self, value: i64) {
+        self.fields
+            .insert("checkinAt".to_string(), Value::from(value));
+    }
+
     /// 账号级出网代理配置（缺失返回 Value::Null）
     pub fn proxy(&self) -> Value {
         self.fields.get("proxy").cloned().unwrap_or(Value::Null)

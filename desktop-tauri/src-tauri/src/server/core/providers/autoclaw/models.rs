@@ -219,6 +219,20 @@ fn entry_by_catalog_name(name: &str) -> Option<&'static ModelEntry> {
         .or_else(|| MODELS.iter().find(|entry| same(entry.route_id)))
 }
 
+/// 远程目录里按目录口径认一条路由（返回**完整路由 ID**，即 `X-Request-Model`
+/// 要发的那个）。
+///
+/// ── 为什么必须在静态表之外再查一次 ──────────────────────────
+/// 远程目录会广告静态表没有的模型（实测多出 `zai_auto` / `zai_auto-fast`）。
+/// 不查这里的话，客户端请求 `auto-fast` 会走到 `resolve_model_route` 的最后
+/// 一档 —— **静默回退 `zai_auto`**（选错模型，而且错得无声无息）。
+/// `zai_auto-fast` 这种路由还有个陷阱：它剥前缀后是 `auto-fast`，而
+/// `is_route_id("auto-fast")` 为 false（连字符不算合法路由 ID 字符），
+/// 所以「按路由 ID 形态透传」那条路也接不住它 —— 只有远程目录知道它。
+fn remote_route_by_catalog_name(name: &str) -> Option<String> {
+    super::catalog::remote_route_id(name)
+}
+
 /// 把客户端传入的 model 解析成上游路由（源实现 `resolveModelRoute` 的
 /// `strict = false` 路径 —— 网关侧不做严格模式：未知模型在校验层就拦掉了，
 /// 到这里还进来的都是要回退默认路由的）。
@@ -251,6 +265,16 @@ pub fn resolve_model_route(raw_model: &str) -> ModelRoute {
             requested_model: name.to_string(),
         };
     }
+    // 远程目录命中：用它给的路由 ID（静态表里没有的模型 —— 实测多出
+    // `zai_auto` / `zai_auto-fast`）。**必须放在兜底之前**，否则这些模型会
+    // 静默回退默认路由：客户端要 A 却跑了 B，而且日志上只看到一次「成功」
+    if let Some(route_id) = remote_route_by_catalog_name(name) {
+        return ModelRoute {
+            body_model_id: strip_route_prefix(&route_id).to_string(),
+            requested_model: name.to_string(),
+            route_model_id: route_id,
+        };
+    }
     for prefix in KNOWN_ROUTE_PREFIXES {
         if name.starts_with(prefix) {
             return ModelRoute {
@@ -274,13 +298,23 @@ pub fn resolve_model_route(raw_model: &str) -> ModelRoute {
     }
 }
 
-/// 模型清单（聚合层认的**上游原始形态**；源实现 `MODELS` 的 JSON 形态）。
+/// 模型清单（聚合层认的**上游原始形态**）。
+///
+/// ── 远程目录优先 ────────────────────────────────────────────
+/// 上游有 `GET .../proxy/autoclaw-model-config`（见 [`super::catalog`]），
+/// 实测返回 4 条，而静态表只有 2 条 —— 缺的 `zai_auto` 恰恰是本家
+/// `default_route()` 的回退目标。远程不可用（未登录 / 网络不通）时回落静态表，
+/// 于是 `/v1/models` 在两种状态下都非空。
 ///
 /// 键名对照 `core/models/shape.rs::list_item`：它读 `id` / `name` /
-/// `maxInputTokens` / `maxOutputTokens` / `supportsImages` / `supportsReasoning`。
-/// `routeId` 不是聚合层要的键，但**转发必须用**（`X-Request-Model`），
-/// 所以一并带上（聚合层会原样忽略未知键）。
+/// `maxInputTokens` / `maxOutputTokens` / `supportsImages` / `supportsReasoning` /
+/// `credits`。`routeId` 不是聚合层要的键，但**转发必须用**
+/// （`X-Request-Model`），所以一并带上（聚合层会原样忽略未知键）。
 pub fn list() -> Vec<Value> {
+    let remote = super::catalog::remote_models();
+    if !remote.is_empty() {
+        return remote;
+    }
     MODELS
         .iter()
         .map(|entry| {
@@ -298,6 +332,8 @@ pub fn list() -> Vec<Value> {
                 // 因为聚合层的 `supports_tool_call` 缺失时会输出 false，
                 // 会让客户端以为这批模型不能调工具
                 "supportsToolCall": true,
+                // 静态表没有倍率（上游的 `creditConsumptionLevel` 只在远程
+                // 目录里，且是「低/中/高」文案而非数值），键缺失 → 界面显示 `—`
             })
         })
         .collect()

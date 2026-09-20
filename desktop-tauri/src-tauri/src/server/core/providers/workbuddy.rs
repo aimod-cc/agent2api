@@ -9,7 +9,7 @@
 //!   - 头集合与 URL        ← `upstream::request::{chat_headers, chat_completions_url}`
 //!   - system 注入         ← `upstream::request::ensure_leading_system_message`
 //!   - 429 / 6004 判定     ← `upstream::request::is_quota_limit_error` + `errors::parse_quota_reset_at`
-//!   - 11128 退避建议      ← `upstream::request::{RATE_LIMIT_CODE, WAF_RETRY_DELAYS_MS}`
+//!   - 11128 退避建议      ← 本文件 `RATE_LIMIT_CODE`（次数 / 间隔走全局重试设置）
 //!   - token 临期刷新      ← `auth::{get_current_session, is_token_expiring, refresh_account}`
 //!   - 模型清单            ← `core::models::global_catalog()`
 //!
@@ -48,11 +48,9 @@ use super::ProviderKind;
 /// 实测语义：多为提示词命中上游敏感词审核而被拦截（并非单纯的频率风控）。
 /// 常量名沿用 Node 版的历史命名，不要据此理解成「频率限制」。
 /// 拦截会持续一小段时间，期间客户端失败自动重试会形成重试风暴并给拦截续期，
-/// 因此命中 11128 时退避间隔必须足够长、仅重试 2 次（见 `WAF_RETRY_DELAYS_MS`）。
+/// 因此命中 11128 时值得退避重试 —— 次数与间隔统一走设置页的「请求重试」
+/// （历史硬编码是 10 秒 / 25 秒各一次；间隔设得过短会拉长拦截窗口，建议 ≥10 秒）。
 const RATE_LIMIT_CODE: i64 = 11128;
-
-/// 11128 的退避间隔（10 秒、25 秒），照抄 Node 版。
-const WAF_RETRY_DELAYS_MS: &[u64] = &[10_000, 25_000];
 
 /// 上游要求首条消息必须是 system prompt，否则返回 400
 /// （first message is not system prompt）。客户端没带 system 消息时注入一条兜底系统消息。
@@ -317,25 +315,33 @@ impl ProviderAdapter for WorkBuddyAdapter {
         true
     }
 
-    /// 11128 退避建议（改造前 `rotate::request_with_waf_retry` 的判定 + 文案）。
+    /// 11128 退避建议（改造前 `rotate::request_with_waf_retry` 的判定；
+    /// 次数与间隔改由设置页的「请求重试」统一提供）。
     ///
     /// **循环**留在编排层（架构文档 §4.3「11128 退避逻辑保持在转发层」），
     /// 这里只回答「这个错误要不要退避、退多久、日志怎么写」——
     /// 「哪个码是敏感词拦截」是 workbuddy 的知识，不该漏进 `upstream/`。
-    fn retry_advice(&self, error_body: &Value, attempt: usize) -> Option<RetryAdvice> {
+    ///
+    /// `budget` 是编排层按「这一轮是不是已经换过家」算出的预算
+    /// （见 `ProviderAdapter::retry_advice` 的说明）—— 本函数只比 `attempt`
+    /// 与它，不去读全局设置里的哪一档。
+    fn retry_advice(&self, error_body: &Value, attempt: usize, budget: usize) -> Option<RetryAdvice> {
         let code = error_body.get("code").and_then(Value::as_i64);
-        if code != Some(RATE_LIMIT_CODE) || attempt >= WAF_RETRY_DELAYS_MS.len() {
+        if code != Some(RATE_LIMIT_CODE) {
             return None;
         }
-        let delay_ms = WAF_RETRY_DELAYS_MS[attempt];
+        if attempt >= budget {
+            return None;
+        }
+        let retry = crate::server::config::retry_settings();
         Some(RetryAdvice {
-            delay_ms,
+            delay_ms: retry.delay_ms(),
             log_message: format!(
                 "⚠️ 上游敏感词拦截（11128），请检查提示词中的敏感词（可在「脱敏」页维护词表）；\
-                 {}s 后重试（第 {}/{} 次）",
-                delay_ms / 1000,
+                 {} 秒后重试（第 {}/{} 次）",
+                retry.interval_seconds,
                 attempt + 1,
-                WAF_RETRY_DELAYS_MS.len(),
+                budget,
             ),
         })
     }

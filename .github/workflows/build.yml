@@ -1,0 +1,106 @@
+name: build
+
+# 构建桌面端安装包并挂到 GitHub Release 上。
+#
+# ── 为什么需要 CI 构建 ─────────────────────────────────────────
+# Tauri 的 macOS 产物（.app / .dmg）**只能在 macOS 上生成**，无法从 Windows
+# 交叉编译。因此 Windows 上开发、又要出 Mac 包时，只能借助 CI 的 macOS runner。
+# 本仓库是公开仓库，标准 GitHub-hosted runner（含 macOS）对公开仓库免费且
+# 不计分钟数 —— macOS runner 是私有仓库里最贵的一档，公开仓库没有这个问题。
+#
+# ── 触发方式 ──────────────────────────────────────────────────
+#   · 仅手动 workflow_dispatch（在 Actions 页面选分支触发）：
+#     两个平台一起构建，产物作为 workflow artifact 下载，不发布 Release
+#
+# ── 签名 ──────────────────────────────────────────────────────
+# 默认**不签名**（ad-hoc）。macOS 上未签名的应用 Gatekeeper 会拦下，
+# 用户需要在「系统设置 → 隐私与安全性」里手动放行一次。要消除这一步需要
+# Apple Developer 账号（$99/年）做 Developer ID 签名 + 公证，届时在仓库里配
+# APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY /
+# APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID 这几个 secret 即可，
+# tauri-action 与 tauri CLI 会自动完成签名与公证。
+
+on:
+  workflow_dispatch:
+
+env:
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── macOS ─────────────────────────────────────────────────
+  macos:
+    # macos-latest 是 Apple Silicon（M1）。这里用 universal 目标同时产出
+    # x86_64 与 aarch64 两个架构并合并，Intel 与 M 芯片都能原生运行 ——
+    # 代价是 Rust 部分要编两遍，缓存命中时约十几分钟。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # universal 需要两个目标都装上（合并时两个架构各编一遍）
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # 缓存 Rust 依赖：冷编译约 10 分钟，命中后大幅缩短。
+      # key 里带上 Cargo.lock 的哈希，依赖变动时自动失效。
+      # target 路径按 .cargo/config.toml 的 target-dir 指向仓库根的 target/
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> ../../target
+
+      - name: 安装桌面端依赖
+        run: npm --prefix desktop-tauri ci
+
+      # 不走 tauri-action：它的默认脚本是 `npm run tauri build`，而本项目的
+      # package.json 里那条脚本叫 `build`（见 desktop-tauri/package.json）。
+      # 直接用 CLI 更直白，也少一层 action 的版本耦合。
+      - name: 构建 macOS 安装包
+        run: npm --prefix desktop-tauri run build -- --target universal-apple-darwin
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          # 只取 .dmg：bundle 目录下还有 .app 与 .dSYM 等调试产物，
+          # 它们不是分发形态（用户要的是 dmg），传上去只会白占存储
+          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  # ── Windows ─────────────────────────────────────────────────
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 Rust 依赖
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> ../../target
+
+      - name: 安装桌面端依赖
+        run: npm --prefix desktop-tauri ci
+
+      - name: 构建 Windows 安装包
+        run: npm --prefix desktop-tauri run build
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error

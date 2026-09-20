@@ -75,10 +75,12 @@ pub async fn refresh_models(State(state): State<ServerState>) -> Response {
     // 汇总算一次：响应里那份与日志里的三个数同源（见 `summary_of`）
     let (mut payload, (refreshed, skipped, failed)) = summary_of(&results);
     // 一行汇总进日志库：用户在日志页能看到「点了刷新、结果如何」
-    // （逐家的细节在各适配器自己的日志里，这里只记总数）
-    logging::log(
+    // （逐家的细节在各适配器自己的日志里，这里只记总数）。
+    // 级别跟结果走：全成功是正常操作，别让「失败 0 个」的文案把它抬成 error
+    logging::log_with_level(
         "[Models]",
         &format!("手动刷新模型清单：成功 {refreshed}，跳过 {skipped}，失败 {failed}"),
+        if failed > 0 { "error" } else { "info" },
     );
     // 清单在**刷新之后**取：此时各家句柄里已是新内容（见上面「为什么带清单」）
     let models = catalog::session_models(store);

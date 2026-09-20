@@ -24,7 +24,7 @@
 //! 所以所有方法都吞掉异常、不 panic —— 统计少记一条是可接受的，把用户请求
 //! 搞坏不可接受（release 是 panic=abort，一次 panic 会带走整个桌面应用）。
 
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde_json::Value;
 
@@ -83,6 +83,12 @@ pub struct TelemetrySnapshot {
     /// 存储契约是「含首次、恒 ≥1」，所以 0 只出现在「一次都没发出去」时，
     /// 由记账点 `.max(1)` 归一。
     pub attempts: i64,
+    /// 本条请求的关联 id（转发开始前生成一次，全链路不变）。
+    ///
+    /// 用途：请求日志条目与调试模式的原始报文（`core::debug_traffic`）用同一个
+    /// id 关联 —— 日志页的「详情」列拿它去取报文。空串 = 该条没有（本字段引入
+    /// 前落盘的旧行），前端据此不显示详情入口。
+    pub id: String,
     /// 最终承载本次请求的账号（用默认登录态转发、或选路结果无账号时为空串）
     pub account_id: String,
     /// 账号展示名，取值顺序与限额日志一致：账号名 → 会话昵称 → 账号 id
@@ -92,10 +98,18 @@ pub struct TelemetrySnapshot {
     /// `None` = 还没走到选路就失败了，例如请求体非法 / 模型不存在）。
     ///
     /// 为什么存 id 字符串而不是 `ProviderKind`：这个值要跨模块交给记账点
-    /// （`api::chat` → `request_stats`），落进请求明细的 `provider` 字段，
+    /// （`api::chat` → `request_stats`），落进请求日志的 `provider` 字段，
     /// 最终出现在报表与前端 —— 契约里它就是 id 字符串（architecture §3.6）。
     /// 存字符串省掉一次「kind → id」的转换与两处枚举依赖。
     pub provider: Option<String>,
+    /// 实际发给上游的模型名（映射 + 备援按家改写后的**最终值**；空串 =
+    /// 一次都没发出去，例如转发前就失败）。
+    ///
+    /// 与 `provider` 同一「最后一次为准」口径：429 换账号（可能换家）后，
+    /// 请求日志的「上游模型」应该跟着实际承载的那一次走。采集点在发送体
+    /// 决定处（`upstream::payload::send_body`，每家首次尝试时覆盖一次）。
+    /// 空串口径与 `account_id` 一致：键恒在、空串表示没有。
+    pub upstream_model: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
@@ -124,6 +138,15 @@ pub struct TelemetrySnapshot {
 /// 只能靠一个双方都能拿到的句柄传话。槽位只在一条请求内共享，不存在争用。
 pub struct RequestTelemetry {
     inner: Mutex<TelemetrySnapshot>,
+    /// 调试模式的原始报文采集器（`core::debug_traffic`；None = 未开启调试模式）。
+    ///
+    /// 挂在这里而不是层层传参：流式路径的采集发生在 `ForwardStream::poll_next`
+    /// （handler 早已返回），非流式发生在聚合函数里，两者手上都只有 telemetry
+    /// —— 转发层在**即将发送前**把它装进来，两条路径各自从同一个槽位取。
+    ///
+    /// 独立一把锁（不与 `inner` 共用）：采集器的读写都在转发热路径上，
+    /// 与「记账字段」的锁分开可以避免两处互不相关的写互相等待。
+    capture: Mutex<Option<Arc<super::super::debug_traffic::TrafficCapture>>>,
 }
 
 impl Default for RequestTelemetry {
@@ -134,7 +157,60 @@ impl Default for RequestTelemetry {
 
 impl RequestTelemetry {
     pub fn new() -> Self {
-        Self { inner: Mutex::new(TelemetrySnapshot::default()) }
+        Self {
+            inner: Mutex::new(TelemetrySnapshot::default()),
+            capture: Mutex::new(None),
+        }
+    }
+
+    /// 建一个已带关联 id 的槽位（三个对话入口都走这条：转发开始前生成一次）。
+    ///
+    /// 为什么不把 id 生成塞进 `new()`：`RequestTelemetry::new()` 还被
+    /// 「转发前就失败」的记账路径用（`record_early_failure`），那些请求没有
+    /// 原始报文可采，凭空生成一个 id 只会让日志里多出一批没有详情的行。
+    pub fn with_id() -> Self {
+        let telemetry = Self::new();
+        telemetry.ensure_id(&super::request::new_request_id());
+        telemetry
+    }
+
+    /// 装入调试模式的采集器（转发层即将发送前调一次）。
+    pub fn set_capture(&self, capture: Arc<crate::server::core::debug_traffic::TrafficCapture>) {
+        let mut guard = self
+            .capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(capture);
+    }
+
+    /// 取采集器（未开启调试模式时为 None，调用点据此完全跳过采集）
+    pub fn capture(
+        &self,
+    ) -> Option<Arc<crate::server::core::debug_traffic::TrafficCapture>> {
+        self.capture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 生成并记下本条请求的关联 id（转发开始前调一次）。
+    ///
+    /// **首次为准**：重复调用不覆盖 —— id 一旦生成，请求日志与调试报文就必须
+    /// 认它，中途换一个会让已经落盘的报文变成孤儿。空串参数不写（调用方拿不到
+    /// id 时保持空，前端据此不显示详情入口）。
+    pub fn ensure_id(&self, id: &str) {
+        if id.is_empty() {
+            return;
+        }
+        let mut guard = self.lock();
+        if guard.id.is_empty() {
+            guard.id = id.to_string();
+        }
+    }
+
+    /// 本条请求的关联 id（未生成时为空串）
+    pub fn id(&self) -> String {
+        self.lock().id.clone()
     }
 
     /// 记一次「已向这个账号发出上游请求」（选路循环每轮调一次）。
@@ -144,14 +220,26 @@ impl RequestTelemetry {
     /// attempts 是累计值 —— 它要回答的是「这条请求换了几个账号才发出」。
     ///
     /// `provider` 同样是**最后一次**（多提供商轮询后真正承载请求的那家）。
-    pub fn note_attempt(&self, account_id: Option<&str>, account_name: &str, provider: &str) {
-        let mut guard = self.lock();
+    pub fn note_attempt(&self, account_id: Option<&str>, account_name: &str, provider: &str) {        let mut guard = self.lock();
         guard.attempts += 1;
         guard.account_id = account_id.unwrap_or("").to_string();
         guard.account_name = account_name.to_string();
         if !provider.is_empty() {
             guard.provider = Some(provider.to_string());
         }
+    }
+
+    /// 记录「这一次尝试实际发给上游的模型名」（覆盖式，最后一次为准）。
+    ///
+    /// 与 `note_attempt` 的 provider 同一口径：429 换家后，最终值是最后一次
+    /// 尝试发出的名字。空串不写（没有「清空」的语义 —— 槽位初始就是空串，
+    /// 写空只可能来自调用方的兜底路径，那些路径不该覆盖已采到的值）。
+    pub fn note_upstream_model(&self, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        let mut guard = self.lock();
+        guard.upstream_model = model.to_string();
     }
 
     /// 上报一次 usage（覆盖式，最后一次为准；字段名兼容见 `extract_usage`）。

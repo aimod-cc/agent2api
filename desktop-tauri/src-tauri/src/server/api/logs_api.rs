@@ -45,6 +45,14 @@ pub async fn not_found(request: axum::extract::Request) -> Response {
     crate::server::errors::management_error(404, format!("Not found: {method} {path}"))
 }
 
+/// 查询串里的 `all` 是否显式要求「清空全部」（`all=1` / `all=true`）
+fn explicit_all(params: &Params) -> bool {
+    params.get("all").map_or(false, |value| {
+        let text = value.trim();
+        text == "1" || text.eq_ignore_ascii_case("true")
+    })
+}
+
 /// 取出全局日志库；未启用时返回与 Node 版一致的 503
 fn store_or_error() -> Result<&'static logs_store::LogStore, Response> {
     logging::store_ref().ok_or_else(|| {
@@ -131,16 +139,71 @@ pub async fn stats_logs(State(_state): State<ServerState>) -> Response {
     ok_json(data)
 }
 
-/// DELETE /api/logs
-pub async fn clear_logs(State(_state): State<ServerState>) -> Response {
+/// DELETE /api/logs?level=&category=&keyword=&start=&end=&all=
+///
+/// 带筛选参数时**只删命中的条目**（「清空筛选结果」—— 与 GET 同一份过滤链，
+/// 界面上筛出什么就删什么）；清空全部必须**显式**带 `all=1`
+/// （不带的空请求给 400）—— 护栏的理由见下面 `explicit_all` 的注释。
+/// 全清沿用 `clear()` 的原语义（id 重新从 1 数起，导航徽标的已读水位有对应处理）。
+/// 响应带删除后的统计，有删除时另带 `removed`（删除条数）。
+pub async fn clear_logs(State(_state): State<ServerState>, Query(params): Query<Params>) -> Response {
     let store = match store_or_error() {
         Ok(store) => store,
         Err(response) => return response,
     };
-    let stats = store.clear();
-    logging::log("[Logs]", "运行日志已清空");
+    let non_empty = |key: &str| params.get(key).map_or(false, |value| !value.trim().is_empty());
+    let has_filters = non_empty("level")
+        || non_empty("category")
+        || non_empty("keyword")
+        || non_empty("start")
+        || non_empty("end");
+
+    if !has_filters {
+        // ── 护栏：无筛选参数时必须显式声明 all=1 才全清 ──────────────
+        // 为什么值得多一个参数：筛选清空漏传参数（曾经的真实事故：
+        // 前端传了 URLSearchParams 对象、桥接层转成空查询串）的代价是
+        // **全部日志没了**，而「全清」是低频的显式动作 —— 用多一个参数
+        // 把这类事故变成一条 400，很划算。
+        if !explicit_all(&params) {
+            return crate::server::errors::management_error(
+                400,
+                "未指定筛选条件：要清空全部日志请显式带 all=1",
+            );
+        }
+        let stats = store.clear();
+        logging::log("[Logs]", "运行日志已清空");
+        return match serde_json::to_value(stats) {
+            Ok(value) => ok_json(value),
+            Err(error) => {
+                logging::log("[Logs]", &format!("❌ 清空后统计序列化失败: {error}"));
+                raw_json(json!({ "success": false, "error": "日志清空失败" }))
+            }
+        };
+    }
+
+    let query = LogQuery {
+        // 删除没有分页概念：limit 不参与（过滤链在 Query::matches，不含 limit）
+        limit: None,
+        level: params.get("level").cloned(),
+        category: params.get("category").cloned(),
+        keyword: params.get("keyword").cloned(),
+        since_id: None,
+        start: parse_query_ms(params.get("start")),
+        end: parse_query_ms(params.get("end")),
+    };
+    let (removed, stats) = store.clear_where(&query);
+    logging::log(
+        "[Logs]",
+        &format!("已按筛选条件清空 {removed} 条日志"),
+    );
     match serde_json::to_value(stats) {
-        Ok(value) => ok_json(value),
+        Ok(mut value) => {
+            if let Some(object) = value.as_object_mut() {
+                attach_dictionary(object);
+                object.insert("removed".to_string(), json!(removed));
+            }
+            ok_json(value)
+        }
         Err(error) => {
             logging::log("[Logs]", &format!("❌ 清空后统计序列化失败: {error}"));
             raw_json(json!({ "success": false, "error": "日志清空失败" }))

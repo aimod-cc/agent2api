@@ -76,6 +76,16 @@ const CATALOG_TIMEOUT_MS: u64 = 10_000;
 /// `displayName` / `description` / `tags` / `contextWindow` / `maxTokens` /
 /// `supportImage` / `supportThinking`）—— 于是「远程目录」与「静态兜底」两条
 /// 来源在下游（聚合目录）看来没有区别，不会出现「离线时字段少一半」。
+///
+/// ── `credits` 是静态快照，取**基准倍率** ────────────────────────
+/// 与远程路径同形（`"x1 credits"`）。取 `billing_multiplier`（基准/原价）而
+/// 不是折后的 `billing_effective_multiplier`：折扣带明确的活动期
+/// （目录里 `sn-glm-5-3-flash` 的折扣到 2026-09-30、`sn-sensenova-6-8-flash-lite`
+/// 的限免到 2026-09-28），写死折后价会在活动结束后继续显示低价 ——
+/// 折扣由远程刷新如实带回来，兜底表只保证「离线也有一个不会说谎的数」。
+///
+/// `raccoon-chat-ml-5-5` **刻意不给**：它不在远程目录里（是桌面端本地配置的
+/// 默认模型），没有任何官方倍率可查 —— 编一个不如显示 `—`。
 pub fn fallback_models() -> Vec<Value> {
     json!([
         {
@@ -87,6 +97,7 @@ pub fn fallback_models() -> Vec<Value> {
             "maxTokens": 100_000,
             "supportImage": true,
             "supportThinking": false,
+            "credits": "x1 credits",
         },
         {
             "name": "raccoon-19b265",
@@ -97,6 +108,7 @@ pub fn fallback_models() -> Vec<Value> {
             "maxTokens": 100_000,
             "supportImage": false,
             "supportThinking": false,
+            "credits": "x1 credits",
         },
         {
             "name": "raccoon-405a1c",
@@ -107,6 +119,7 @@ pub fn fallback_models() -> Vec<Value> {
             "maxTokens": 100_000,
             "supportImage": false,
             "supportThinking": false,
+            "credits": "x1 credits",
         },
         {
             "name": default_model_id(),
@@ -127,6 +140,7 @@ pub fn fallback_models() -> Vec<Value> {
             "maxTokens": 63_999,
             "supportImage": false,
             "supportThinking": true,
+            "credits": "x0.5 credits",
         },
     ])
     .as_array()
@@ -456,18 +470,42 @@ fn normalize_catalog_entry(entry: &Value) -> Option<Value> {
     normalized.insert("supportImage".to_string(), Value::Bool(support_image));
     // 源实现恒为 true（目录没有这个字段，客户端按「支持思考」渲染）
     normalized.insert("supportThinking".to_string(), Value::Bool(true));
-    // 目录自带的两个展示字段（积分倍率 / 计费状态）原样透传。
-    // **它们不是积分功能**：网关不读、不判定、也不参与任何预算/账单计算
-    // （本期明确不迁移 credit-*），只是把上游目录里的展示信息带给前端
-    // （架构文档 §6：小浣熊模型卡片按目录元数据渲染）。
+    // 倍率：上游目录里的 `billing_multiplier`（基准/原价倍率）与
+    // `billing_effective_multiplier`（计入活动与限免后的**实付**倍率）。
+    //
+    // ── 为什么不是 `points_multiplier` ──────────────────────────
+    // 那个字段**已被上游废弃**：桌面端代码里保留着读取（`normalizeCatalogEntry`
+    // 仍写 `pointsMultiplier: s(t.points_multiplier)`），但当前 `/model_catalog`
+    // 的响应里一个都没有 —— 实测 8 个 chat 条目中 `points_multiplier` 出现 0 次、
+    // `billing_multiplier` 出现 8 次。本文件早先从更早的实测快照移植，此后上游
+    // 改了名而我们没跟上，于是透传出去的 `pointsMultiplier` 恒为 null。
+    //
+    // 三个字段的取向与桌面端界面一致：界面文案用「原 N 倍 / 现 N 倍」并列展示，
+    // 我们这一列只有一格，取**实付**（`billing_effective_multiplier`）——
+    // 用户真正会扣掉的那个数。实付缺失时回落基准值（老响应没有该字段）。
+    //
+    // 这两个数**不是积分功能**：网关不读、不判定、也不参与任何预算/账单计算，
+    // 只是把上游目录里的展示信息带给前端（架构文档 §6）。
+    let billing_base = number_of(object.get("billing_multiplier"));
+    let billing_effective = number_of(object.get("billing_effective_multiplier"));
+    let multiplier = billing_effective.or(billing_base);
     normalized.insert(
         "pointsMultiplier".to_string(),
-        object
-            .get("points_multiplier")
-            .and_then(|value| value.as_f64())
-            .filter(|value| value.is_finite())
+        billing_base
             .map(crate::server::core::account_store::state::json_number)
             .unwrap_or(Value::Null),
+    );
+    // `credits` 是**聚合层与前端共用的那一列**（`list_item` 把它影子成
+    // `credits`，前端 `formatCredits` 再转成 `0.2x` 展示）。空串 = 上游没给，
+    // 界面显示 `—`。形态与 WorkBuddy 的 `"x0.16 credits"` 对齐，两家的
+    // 倍率列因此走同一条渲染分支。
+    normalized.insert(
+        "credits".to_string(),
+        Value::String(
+            multiplier
+                .map(|value| format!("x{} credits", format_multiplier(value)))
+                .unwrap_or_default(),
+        ),
     );
     normalized.insert(
         "billingStatus".to_string(),
@@ -496,6 +534,40 @@ fn int_of(value: &Value) -> Option<i64> {
     } else {
         None
     }
+}
+
+/// 倍率字段读法：上游给的是 JSON 数字，但**字符串形态也接受**
+/// （小浣熊的目录里 `context_window` 这类字段就混着字符串形态，
+/// 而倍率一旦被上游改成 `"0.2"` 就会静默变成「没给」）。
+///
+/// `0` 是合法值（限免的 `billing_effective_multiplier = 0`），
+/// 因此**不能**用 `filter(|v| v != 0.0)` 这种「假值即缺失」的写法。
+fn number_of(value: Option<&Value>) -> Option<f64> {
+    let number = match value? {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(text) => text.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if number.is_finite() && number >= 0.0 {
+        Some(number)
+    } else {
+        None
+    }
+}
+
+/// 倍率数字 → 紧凑文本：整数不带小数点，其余最多两位小数并裁掉尾零
+/// （`0.2` → `0.2`、`0.75` → `0.75`、`1` → `1`、`0` → `0`）。
+///
+/// 桌面端界面的文案是「N 倍」（中文）用 `toFixed` 后裁零，这里同一取向；
+/// 保留两位是因为目录里 `0.25` / `0.75` 这类值真实存在，一位小数会把
+/// `0.25` 显示成 `0.3`。
+fn format_multiplier(value: f64) -> String {
+    let rounded = (value * 100.0).round() / 100.0;
+    if (rounded - rounded.trunc()).abs() < 1e-9 {
+        return format!("{}", rounded.trunc() as i64);
+    }
+    let text = format!("{rounded:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// JS `String(x)`（name/description 这类字段的文本形态；null 给空串）

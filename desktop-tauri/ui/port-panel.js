@@ -45,13 +45,23 @@
   /** 网关进程是否在监听（顶栏徽标用；null = 还没查过） */
   const isReady = () => backendStatus?.ready === true;
 
-  /** 只负责写这 3 个元素，首次渲染与端口补更新共用，避免两处文案走偏 */
+  /**
+   * 只负责写接口条里的地址元素，首次渲染与端口补更新共用，避免两处文案走偏。
+   *
+   * 对话协议三种都写出来（Chat Completions / Responses / Anthropic Messages）：
+   * 客户端支持哪种就填哪一行，三家共用同一套模型与账号池。
+   * 元素缺失（不在网关页 / 旧 DOM）时静默跳过，别让 render 崩。
+   */
   function paintGatewayAddress(base) {
-    const chat = $('api-chat');
-    if (!chat) return; // 不在网关页 / 旧 DOM：静默跳过，别让 render 崩
-    chat.textContent = `POST ${base}/v1/chat/completions`;
-    $('api-models').textContent = `GET ${base}/v1/models`;
-    $('api-base').textContent = `${base}/v1`;
+    const paint = (id, text) => {
+      const el = $(id);
+      if (el) el.textContent = text;
+    };
+    paint('api-base', `${base}/v1`);
+    paint('api-chat', `POST ${base}/v1/chat/completions`);
+    paint('api-responses', `POST ${base}/v1/responses`);
+    paint('api-messages', `POST ${base}/v1/messages`);
+    paint('api-models', `GET ${base}/v1/models`);
   }
 
   /**
@@ -217,7 +227,14 @@
         '',
         '结束它会强制退出该程序未保存的数据。确认继续？',
       ];
-      if (!window.confirm(lines.join('\n'))) return;
+      // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认）——
+      // 走自绘确认弹窗（wbConfirm）；text 形态内部会转义并保留换行
+      if (!(await window.wbConfirm?.ask?.({
+        title: '结束占用端口的进程',
+        text: lines.join('\n'),
+        okText: '结束进程',
+        okClass: 'danger',
+      }))) return;
 
       button.textContent = '结束中…';
       const result = await api.endPortOccupant();
@@ -225,7 +242,11 @@
         window.wbApp?.toast?.(`已结束进程 ${occupant.name}（PID ${occupant.pid}），端口已释放`);
         // 端口释放了，但网关还没起来（它启动时端口被占，已经放弃）。
         // 问一句是否现在重启，而不是替用户决定重启。
-        if (window.confirm('端口已释放。现在重启程序让网关用这个端口启动？')) {
+        if (await window.wbConfirm?.ask?.({
+          title: '重启程序',
+          text: '端口已释放。现在重启程序让网关用这个端口启动？',
+          okText: '重启',
+        })) {
           await restartApp('重启中…');
         } else {
           await sync();

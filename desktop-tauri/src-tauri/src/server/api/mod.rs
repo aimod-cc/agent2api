@@ -11,6 +11,7 @@
 //!   logs_api.rs   GET /api/logs、/api/logs/stats、/api/logs/download、DELETE /api/logs
 //!   stats_api.rs  GET /api/stats/summary、/api/stats/requests、DELETE /api/stats/requests、
 //!                 GET/PUT /api/retention
+//!   retry_api.rs  GET/PUT /api/retry（请求重试设置，转发层退避的次数 / 间隔）
 //!   accounts.rs   /api/accounts*（对照 workbuddy-account-routes.mjs）
 //!   proxies.rs    /api/proxies*（Clash 读取 + 出口测试）
 //!   billing.rs    积分 / 签到 / 运营活动（对照 workbuddy-billing.mjs + server.mjs 871-911 行）
@@ -35,6 +36,7 @@ pub mod auto_checkin;
 pub mod billing;
 pub mod chat;
 pub mod config_api;
+pub mod debug_api;
 pub mod desensitize;
 pub mod endpoints;
 pub mod health;
@@ -42,8 +44,12 @@ pub mod keys_api;
 pub mod logs_api;
 pub mod model_manage;
 pub mod models;
+pub mod pipeline;
+pub mod protocol;
 pub mod proxies;
+pub mod retry_api;
 pub mod scheduled_tasks;
 pub mod session;
 pub mod stats_api;
+pub mod storage_api;
 pub mod update;

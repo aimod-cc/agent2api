@@ -27,6 +27,7 @@
     priority: 132,
     provider: 132,
     account: 300,
+    connections: 56,
     status: 80,
     limits: 148,
     expiry: 80,

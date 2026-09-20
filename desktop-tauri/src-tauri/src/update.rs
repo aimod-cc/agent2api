@@ -1,18 +1,37 @@
 //! 软件更新中「壳」这一侧要做的事。
 //!
-//! 检测新版本、下载安装包都放在 Node 后端（壳侧 reqwest 为省 TLS 依赖
+//! 检测新版本、下载安装包都放在后端（壳侧 reqwest 为省 TLS 依赖
 //! 关掉了默认特性，发不出 GitHub 的 HTTPS 请求）。这里只负责三件
 //! 壳才能做的事：
 //!   1. 报出当前应用版本（后端不知道自己被哪个壳打包，比较必须有此值）
 //!   2. 校验后端下载好的安装包路径确实落在受控目录内
-//!   3. 启动安装包，并按需要退出本程序（NSIS 覆盖安装前要先让出文件占用）
+//!   3. 启动安装包，并按需要退出本程序（覆盖安装前要先让出文件占用）
 //!
 //! 路径校验不是多余的：`run_installer` 会执行一个可执行文件，
 //! 若把路径当信任输入，等于给渲染层开了任意程序执行的入口。
+//!
+//! ── 平台差异（后缀与启动方式）────────────────────────────────
+//! 安装包后缀按平台分派（见 [`installer_suffix`]）：Windows 是 NSIS 的
+//! `.exe`，macOS 是 `.dmg`。启动方式也完全不同 —— Windows 要 `runas` 提权，
+//! macOS 是「挂载磁盘映像 → 让用户把 app 拖进应用程序」，因此 dmg 走
+//! `open`（系统自己处理挂载），不像 exe 那样带静默安装参数。
 
 use std::path::{Path, PathBuf};
 
 use crate::gateway;
+
+/// 本平台的安装包后缀（小写，**不含点**）。
+///
+/// 与后端 `update::version::installer_suffix` 是**同一口径的两份实现**：
+/// 后端用它挑 Release 资产，这里用它校验「要运行的这个文件是不是安装包」。
+/// 两边都按 `cfg!(target_os)` 编译期取值，所以不会出现不一致。
+pub const fn installer_suffix() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "dmg"
+    } else {
+        "exe"
+    }
+}
 
 /// 下载目录：与后端 `createUpdateManager` 的 downloadDir 一致
 pub fn download_dir() -> PathBuf {
@@ -30,7 +49,7 @@ fn normalize(path: &Path) -> Option<PathBuf> {
     Some(parent.canonicalize().ok()?.join(name))
 }
 
-/// 校验待运行的安装包：必须存在、是 .exe、且位于下载目录内。
+/// 校验待运行的安装包：必须存在、后缀属于本平台、且位于下载目录内。
 ///
 /// 三者缺一不可 —— 少了「目录内」这一条，渲染层就能传入任意路径
 /// 让本进程替它执行；少了后缀检查，则可能被用来启动脚本类文件。
@@ -48,8 +67,9 @@ pub fn verify_installer(raw: &str) -> Result<PathBuf, String> {
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    if suffix != "exe" {
-        return Err("只允许运行 .exe 安装包".to_string());
+    let expected = installer_suffix();
+    if suffix != expected {
+        return Err(format!("只允许运行 .{expected} 安装包"));
     }
 
     let target = normalize(&path).ok_or_else(|| "无法解析安装包路径".to_string())?;
@@ -64,20 +84,37 @@ pub fn verify_installer(raw: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
-/// 启动安装包。`silent` 为 true 时带上 NSIS 的静默参数。
+/// 启动安装包。
 ///
-/// 不等待安装结束：NSIS 安装程序通常需要用户交互，阻塞在这里会让
+/// Windows：`silent` 为 true 时带上 NSIS 的 `/S /R`（静默 + 装完重启）。
+/// macOS：dmg 没有等价的静默参数，交给系统 `open` 挂载（用户随后自己把
+/// app 拖进「应用程序」）—— 这也是 dmg 分发的常规交互，强行静默反而会让
+/// 用户不知道安装包被挂到哪去了。
+///
+/// 不等待安装结束：安装程序通常需要用户交互，阻塞在这里会让
 /// 界面一直转圈。调用方随后自行决定是否退出程序。
 pub fn launch_installer(path: &Path, silent: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
         launch_installer_elevated(path, silent)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // dmg 由系统挂载：`open` 会交给 DiskImages 处理并弹出安装窗口。
+        // silent 在这里没有对应语义（见函数说明），显式忽略而不是假装支持。
+        let _ = silent;
+        std::process::Command::new("open")
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("打开磁盘映像失败: {error}"))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let mut command = std::process::Command::new(path);
         if silent {
-            // /S 静默，/R 装完自动重启；Tauri 的 NSIS 模板支持这两个参数
             command.arg("/S").arg("/R");
         }
         command

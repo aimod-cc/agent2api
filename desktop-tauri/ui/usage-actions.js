@@ -122,15 +122,20 @@
   }
 
   /**
-   * 查询余额。`id` 缺省 = 全部（后端批量接口）；
-   * 给了 id 也走同一接口，只是把结果**只**落到那一个账号上 ——
-   * 后端没有单账号余额接口（它统一按目标集合返回），所以「查一个」是「取一批后筛一条」。
+   * 查询余额。`id` 缺省 = 全部（后端批量目标集合）；
+   * 给了 id 则**带 `?id=` 请求**，后端只查那一个账号。
    *
-   * 单个账号查询时会把面板一起展开（由调用方在点按钮前做好），失败行带 code 时
-   * 由调用方按 usageFailureOf 分流提示语。
+   * ── 为什么单查要走 `?id=` 而不是「取一批后筛一条」────────────
+   * 后端批量路径的目标集合是「全部**启用**账号」—— 禁用是「别用它转发」的意思，
+   * 定时那一轮不该为它们发请求。但用户手点某一行账号的「积分」按钮问的是另一个
+   * 问题：「这个账号现在还剩多少」。按启用状态把它挡掉，结果里就没有这一行，
+   * 界面只能兜底成「未返回余额数据」—— 用户分不清是禁用了还是上游挂了。
+   * 所以单查带 id 走后端那条**不看启用状态**的分支（见 core::usage_query）。
+   *
+   * 批量（`id` 缺省）仍是「全部启用账号」，行为与改造前一致。
    */
   async function queryUsageFor(id) {
-    const data = await api.getAllBalances();
+    const data = await api.getAllBalances(id || undefined);
     const rows = Array.isArray(data?.results) ? data.results : [];
     const returned = new Set();
     for (const row of rows) {
@@ -140,14 +145,19 @@
       usageMap.set(row.id, cacheEntryOf(row));
     }
     if (id) {
+      // 后端返回了 0 行才是真的「没数据」（账号刚被删、或 provider 不认这个 id）；
+      // 禁用账号走到这里是正常的 —— 单查不过滤启用状态。
       if (!returned.has(id)) usageMap.set(id, '未返回余额数据');
       repaint();
       return data;
     }
-    // 只对有余额概念的账号补「未返回」：后端的目标集合本就滤掉了不支持的家，
-    // 给别家补这一条会凭空多出一片「未返回余额数据」
+    // 只给**批量目标集合内的**账号补「未返回」：后端的目标集合是「启用 +
+    // 有余额概念」，缺失一行才是异常。禁用账号不在集合里，补它等于把
+    // 「这行没参与本轮查询」说成「上游没给数据」—— 与单查那个 bug 同源。
     for (const acc of accounts()) {
-      if (!returned.has(acc.id) && supportsUsage(acc)) usageMap.set(acc.id, '未返回余额数据');
+      if (!returned.has(acc.id) && supportsUsage(acc) && acc.enabled !== false) {
+        usageMap.set(acc.id, '未返回余额数据');
+      }
     }
     repaint();
     return data;
@@ -235,7 +245,12 @@
     if (checkinBusy) return;
     const targets = checkinableAccounts(accounts());
     if (!targets.length) { toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版 / 小浣熊 / AutoClaw）', 'err'); return; }
-    if (!confirm(`将对 ${targets.length} 个账号串行签到，可能需要一点时间。继续？`)) return;
+    if (!(await window.wbConfirm?.ask?.({
+      title: '批量签到',
+      html: `将对 <strong>${targets.length}</strong> 个账号串行签到，可能需要一点时间。继续？`,
+      okText: '继续',
+      bodyClass: '',
+    }))) return;
     checkinBusy = true;
     const button = document.getElementById('btn-checkin-all');
     if (button) { button.disabled = true; button.textContent = '签到中…'; }
@@ -257,6 +272,10 @@
     } finally {
       checkinBusy = false;
       if (button) { button.disabled = false; button.textContent = '全部签到'; }
+      // 重拉账号状态：签到时间由后端落盘，行上的签到按钮据此变成「已签到」。
+      // 与单个签到的处理同理（见 accounts-view.js 的 runCheckin）——
+      // 不重拉的话按钮要等下一轮 20 秒轮询才跟上，那期间还显示成可点。
+      void wbApp.refresh?.();
     }
   }
 

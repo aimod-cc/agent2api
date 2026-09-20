@@ -35,6 +35,7 @@
     isDesktopAccount,
     supportsUsage,
     supportsCheckin,
+    checkedInToday,
     accountTags,
     editionCell,
     formatResetText,
@@ -57,20 +58,39 @@
   // ─── 列定义（表头、colgroup 与 colspan 的唯一来源）─────
 
   /**
-   * 列：勾选 / 优先级 / 提供商 / 账号 / 状态 / 限流 / 有效期 / 余额 · 积分 / 操作。
+   * 列：勾选 / 优先级 / 提供商 / 账号 / 连接数 / 状态 / 限流 / 有效期 / 余额 · 积分 / 操作。
    *
    * 优先级是整张表的主线（全局队列），所以放在提供商之前、紧跟勾选列；
    * `key` 同时是 CSS 类名后缀（`cell-<key>`），默认列宽在 page-accounts-table.css
    * 里按这些类名声明 —— 用户拖宽后由 accounts-columns.js 按同一批 key 存取，
    * 键名只有这一处定义。
+   *
+   * 连接数紧跟账号列：它回答的是「这个账号此刻有几个请求在跑」，属于**账号的身份**
+   * 而非健康状态 —— 放在状态列之前，与状态列（可用性）分工清楚。
+   *
+   * `hint` 是表头里那小字副标题（如「全局队列」），`title` 是悬停说明。
+   * 两者都写在这里而不是散在 headRowHtml 的三元表达式里：列一多，
+   * 那种链式判定就要为每列各加一层，改一处得先读懂整串。
    */
   const COLUMNS = [
     { key: 'pick', label: '' },
-    { key: 'priority', label: '优先级', hint: '全局队列' },
+    {
+      key: 'priority', label: '优先级', hint: '全局队列',
+      title: '全局一条队列：数值越小越先用，不分提供商',
+    },
     { key: 'provider', label: '提供商' },
     { key: 'account', label: '账号' },
+    {
+      // 不加 hint 小字：这一列只有 56px，「连接数」三个字加副标题会撑破表头。
+      // 口径说明放在 title 里（悬停可见）。
+      key: 'connections', label: '连接数',
+      title: '此刻正在使用这个账号的请求数（含还在下发内容的流式请求）；为 0 时不显示',
+    },
     { key: 'status', label: '状态' },
-    { key: 'limits', label: '限流', hint: '按模型' },
+    {
+      key: 'limits', label: '限流', hint: '按模型',
+      title: '该账号当前限流中的模型；点徽章看明细',
+    },
     { key: 'expiry', label: '有效期' },
     { key: 'usage', label: '余额 / 积分' },
     { key: 'actions', label: '操作' },
@@ -79,7 +99,7 @@
   const columnCount = () => COLUMNS.length;
   const columnKeys = () => COLUMNS.map(column => column.key);
 
-  /** 表头行：优先级 / 限流列带口径说明；勾选列放「全选当前筛选结果」的第二个入口。
+  /** 表头行：优先级 / 限流 / 连接数列带口径说明；勾选列放「全选当前筛选结果」的第二个入口。
    *  每个可拖列的右缘放一枚把手（accounts-columns.js 委托 mousedown / dblclick）。 */
   function headRowHtml() {
     const cells = COLUMNS.map(column => {
@@ -91,7 +111,7 @@
         return `<th class="cell-${column.key}"><input type="checkbox" id="acct-select-all"`
           + ` title="全选 / 取消全选当前筛选结果（与批量栏同一个选择）"></th>`;
       }
-      return `<th class="cell-${column.key}"><span class="th-label"${column.key === 'priority' ? ' title="全局一条队列：数值越小越先用，不分提供商"' : ''}${column.key === 'limits' ? ' title="该账号当前限流中的模型；点徽章看明细"' : ''}>${esc(column.label)}${hint}</span>${grip}</th>`;
+      return `<th class="cell-${column.key}"><span class="th-label"${column.title ? ` title="${esc(column.title)}"` : ''}>${esc(column.label)}${hint}</span>${grip}</th>`;
     }).join('');
     return `<thead><tr>${cells}</tr></thead>`;
   }
@@ -212,11 +232,44 @@
   }
 
   /**
+   * 连接数格子的**内容**（不含 td 外壳）：0 / 缺失都渲染成空串。
+   *
+   * 拆出来是为了就地更新：2 秒一次的轮询只改这一格的 innerHTML
+   * （见 accounts-view.js 的 syncConnections），不重绘整张表 ——
+   * 整表重绘会打断正在编辑的优先级输入框、也会把用户展开的明细行重排。
+   */
+  function connectionsHtml(count) {
+    const value = Number(count) || 0;
+    if (value <= 0) return '';
+    const title = `${value} 个请求正在使用该账号（含还在下发内容的流式请求）`;
+    return `<span class="conn-count" title="${esc(title)}">${value}</span>`;
+  }
+
+  /**
+   * 连接数：此刻正在使用这个账号的请求数（`ctx.connections`，由 accounts-view
+   * 从 `/api/accounts/connections` 拉的实时计数）。
+   *
+   * 口径与 OmniProxy 上游管理页的「连接」列一致 —— 有连接时显示数字、为 0 时
+   * **什么都不显示**（留空）。为什么空着而不是显示 0：这一列绝大多数时间都是空的，
+   * 满屏的 0 会把少数几个真正在跑的账号淹没；要看「谁是 0」时空白本身就是答案。
+   *
+   * 计数缺失（还没拉到、后端不可达）与 0 同样处理 —— 都渲染成空。
+   * 这条取舍是刻意的：把一个尚未知的值渲染成 0 会读成「这个账号没在用」，
+   * 而事实可能是「数据还没到」。
+   *
+   * 数字带 title 说明，因为「连接数」这个词在本项目里没有别的用法，
+   * 不看说明容易误解成 TCP 连接数。
+   */
+  function connectionsCell(account, ctx) {
+    return `<td class="cell-connections">${connectionsHtml(ctx.connections)}</td>`;
+  }
+
+  /**
    * 状态：启用 / 禁用开关 + 健康徽章。
    *
    * 开关直接落 `PATCH { enabled }`（与「⋯」菜单里的启用/禁用是同一条链，语义一致），
    * 不做二次确认 —— 这个动作可逆，且关掉后账号记录仍在列表里（不是删除）。
-   * 徽章沿用 accounts-model 的 accountTags：正常 / 代理异常 / 不可用 / 已禁用。
+   * 徽章沿用 accounts-model 的 accountTags：启用 / 代理异常 / 不可用 / 禁用。
    */
   function statusCell(account) {
     const enabled = isEnabled(account);
@@ -345,18 +398,40 @@
       + `<span class="usage-sum ${summary.kind}" title="${esc(summary.title)}">${esc(summary.text)}</span></td>`;
   }
 
-  /** 操作：设为首选 / 设置 / 签到 / ⋯。置顶只看全局位置，不按可用性过滤。 */
+  /**
+   * 操作：设为首选 / 设置 / 签到 / ⋯。置顶只看全局位置，不按可用性过滤。
+   *
+   * ── 签到按钮的两种形态 ─────────────────────────────────────
+   * 今天已经签过（`checkinAt` 落在本地今天，含自动签到与手动签到两条路径）时
+   * 显示为**「已签到」并置灰**：这天再点也只能拿到上游「今天已签到」，
+   * 留着可点会让人以为还能再领一次。判定与文案的依据见 accounts-groups 的
+   * `checkedInToday`。
+   *
+   * `disabled` 是真的禁用属性（而不是只加个灰样式）：这才同时挡住点击与键盘
+   * 操作，也让读屏软件念出「不可用」—— 与「设为首选」在队首时的处理一致。
+   */
   function actionsCell(account, ctx) {
     const enabled = isEnabled(account);
     const settings = `<button data-action="settings" data-id="${esc(account.id)}" title="备注名 / 启用 / 代理">设置</button>`;
-    const checkin = enabled && supportsCheckin(account)
-      ? `<button data-action="checkin" data-id="${esc(account.id)}" title="为该账号签到">签到</button>`
-      : '';
+    const checkedIn = checkedInToday(account);
+    const checkin = !enabled || !supportsCheckin(account)
+      ? ''
+      : checkedIn
+        ? `<button data-action="checkin" data-id="${esc(account.id)}" disabled`
+          + ` title="${esc(checkinDoneTitle(account))}">已签到</button>`
+        : `<button data-action="checkin" data-id="${esc(account.id)}" title="为该账号签到">签到</button>`;
     const atFront = ctx.seat?.position === 1;
     const promote = `<button data-action="switch" data-id="${esc(account.id)}"`
       + ` title="${atFront ? '已在全局队列第一位' : '仅将优先级调整到全局第一位，不改变启用状态'}"${atFront ? ' disabled' : ''}>设为首选</button>`;
     return `<td class="cell-actions"><div class="acct-actions">${promote}${settings}${checkin}`
       + `<button data-action="more" data-id="${esc(account.id)}" title="更多操作">⋯</button></div></td>`;
+  }
+
+  /** 「已签到」按钮的悬停说明：给出签到时刻与重置时机，回答「为什么点不动、什么时候能再签」 */
+  function checkinDoneTitle(account) {
+    const at = Number(account?.checkinAt) || 0;
+    const clock = at > 0 ? `今天 ${new Date(at).toTimeString().slice(0, 5)}` : '今天';
+    return `${clock} 已签到；签到按自然日重置，明天 0 点后可再签`;
   }
 
   // ─── 整行 ──────────────────────────────────
@@ -369,6 +444,7 @@
    *   picked           是否被勾选
    *   usageEntry       余额缓存条目；usageOpen 是否已展开明细
    *   limitsOpen       是否已展开限流明细
+   *   connections      该账号此刻的活跃请求数（实时轮询的结果，缺失 = 0）
    *   draft            正在编辑中的优先级草稿（重绘时保住用户没提交完的输入）
    */
   function rowHtml(account, ctx) {
@@ -381,6 +457,7 @@
       + priorityCell(account, ctx)
       + providerCell(providerOf(account), account)
       + accountCell(account)
+      + connectionsCell(account, ctx)
       + statusCell(account)
       + limitsCell(account, ctx)
       + expiryCell(account)
@@ -431,6 +508,9 @@
     rowHtml,
     panelsRowHtml,
     columnKeys,
+    // 连接数格子由视图侧**就地更新**（2 秒轮询只改这一格，不重绘整表；
+    // 见 accounts-view.js 的 syncConnections），所以这个渲染函数要导出
+    connectionsHtml,
     // 优先级的号段常量与归一：视图侧的输入框提交要按同一份口径判「改了没有」，
     // 所以一起导出（列宽之类的纯内部细节则不导出）
     PRIORITY_DEFAULT,

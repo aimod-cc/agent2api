@@ -101,7 +101,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/logs/{*rest}", any(api::logs_api::not_found))
         // ── 统计报表与数据保留（切片 7 之后的扩展，非 Node 版对齐项）──
         // 三条 /api/stats/* 与两条 /api/retention 都挂 protected：
-        // 它们能读到全部请求明细（含模型、账号、token 用量）并能删数据 / 改保留期，
+        // 它们能读到全部请求日志（含模型、账号、token 用量）并能删数据 / 改保留期，
         // 与 /api/logs 同级敏感，必须和日志接口一样走 API Key 检查。
         // 未知 /api/stats/* 子路径返回管理信封 404（照 logs_api::not_found 的做法，
         // 而不是全局兜底的 OpenAI 形状）—— 同一前缀下的 404 形状保持一致。
@@ -124,6 +124,28 @@ pub fn router(state: ServerState) -> Router {
             "/api/retention",
             get(api::stats_api::get_retention).put(api::stats_api::put_retention),
         )
+        // 请求重试：GET 读「次数 / 间隔」，PUT（允许部分字段）更新。
+        // 与 /api/retention 同一模式独立成端点而不混进 /api/config：
+        // config 是 Node 对齐项（apiKey / locale），重试是本壳新增的转发行为
+        // 设置；这条没有「立即清理」类副作用，保存后对下一个失败请求生效。
+        .route(
+            "/api/retry",
+            get(api::retry_api::get_retry).put(api::retry_api::put_retry),
+        )
+        // ── 调试模式（设置页「通用 → 调试模式」）──
+        // GET/PUT 开关；traffic 是按 id 取原始报文的详情端点（列表接口不返回
+        // 报文，见 debug_api 的模块头）。挂 protected：报文含上游 URL 与请求体。
+        .route(
+            "/api/debug",
+            get(api::debug_api::get_debug).put(api::debug_api::put_debug),
+        )
+        .route("/api/debug/traffic", get(api::debug_api::get_traffic))
+        // ── 数据保存位置（设置页「保存位置」）──
+        // 与 /api/retention 同级敏感：能读数据概况、能搬数据，挂 protected。
+        // relocate 是**同步**迁移（阻塞到搬完才返回），期间前端轮询 progress 画进度。
+        .route("/api/storage", get(api::storage_api::get_storage))
+        .route("/api/storage/relocate", post(api::storage_api::relocate))
+        .route("/api/storage/progress", get(api::storage_api::progress))
         // ── 账号管理（对照 workbuddy-account-routes.mjs）──
         // 用 any(...) 注册两条入口（无尾段 + 通配尾段），方法/路径的判定交给
         // api::accounts::dispatch —— 这是为了复刻 Node 版 tryHandle 的判定顺序
@@ -184,6 +206,17 @@ pub fn router(state: ServerState) -> Router {
         // Node 版这条查 API Key，所以挂 protected；/v1/models 不查，
         // 挂在上面 public 组（分组判据见各自注释）
         .route("/v1/chat/completions", post(api::chat::chat_completions))
+        // ── 另外两条协议入口（Responses / Anthropic Messages）──
+        // 与 chat/completions 完全同构：都查 API Key（挂 protected）、
+        // 都走同一套转发链路，差异只在出入口的协议翻译（见 api::protocol 与
+        // core::protocol 的模块头）。放在同一组是因为它们**就是**对话入口，
+        // 而不是管理 API —— 客户端的 base_url 换成 /v1 即可直接用。
+        .route("/v1/responses", post(api::protocol::responses_endpoint))
+        .route("/v1/messages", post(api::protocol::messages_endpoint))
+        // Anthropic 的 token 计数端点：Claude Code 在网关模式下会探它做上下文
+        // 预算。上游没有对应能力，这里给带 `estimated: true` 的估算（见该函数
+        // 说明）—— 给 404 会让客户端按「网关不支持」处理，比一个粗略数字更糟。
+        .route("/v1/messages/count_tokens", post(api::chat::count_tokens))
         // 手动刷新模型清单（网关页按钮）：它会**真打上游**（各家的模型目录接口），
         // 所以和 /v1/chat/completions 一样必须过 API Key；GET /v1/models 那条
         // 免鉴权的只读探针不受影响（两者是不同的东西，见 api::models 模块头）。
@@ -422,6 +455,64 @@ pub fn parse_body(bytes: &[u8]) -> Result<Value, errors::GatewayError> {
     }
     serde_json::from_str(&text)
         .map_err(|error| errors::GatewayError::bad_request(format!("请求体不是合法 JSON: {error}")))
+}
+
+/// 从原始查询串里取一个参数（先按 `&` 切、再按 `=` 切，最后百分号解码）。
+///
+/// 缺失返回 `None`；**不区分「参数不存在」与「参数为空」**（`?id=` 与无此参数
+/// 都得到 `Some("")`）—— 调用方若要按空值走另一条分支，自己 `filter` 一下，
+/// 这也正是 `accounts_usage` 取 `id` 时的写法。
+///
+/// 为什么提到 HTTP 层：`/api/update` 的 `current`、`/api/desensitize` 的 `term`
+/// 与本条各有一份私有实现，三者口径必须一致（都对应 JS 的 `URLSearchParams`），
+/// 各写一份迟早会漂。既有的两份私有实现保持原样未动（避免顺手改动已交付路径），
+/// 新代码请用这个。
+pub fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        let (name, value) = match pair.split_once('=') {
+            Some((name, value)) => (name, value),
+            None => (pair, ""),
+        };
+        if name == key {
+            return Some(percent_decode(value));
+        }
+    }
+    None
+}
+
+/// 百分号解码（对应 URLSearchParams 的解码；`+` 也算空格，与表单语义一致）。
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                match std::str::from_utf8(&bytes[index + 1..index + 3])
+                    .ok()
+                    .and_then(|text| u8::from_str_radix(text, 16).ok())
+                {
+                    Some(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    None => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 /// 把查询串里的时间戳解析成毫秒整数（供 `/api/logs` 与 `/api/stats/*` 共用）。

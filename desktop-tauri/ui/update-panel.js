@@ -37,6 +37,41 @@
   let repository = '';      // owner/repo，来自接口：作者主页与仓库地址由它拼出来，不写死
   let checkedAt = 0;        // 上次检查更新的时刻
 
+  // ─── 平台文案 ─────────────────────────────────
+  //
+  // 安装包形态由后端按**编译目标平台**给出（checkUpdate 的 installerKind）：
+  //   'nsis' → Windows：启动安装程序需要管理员权限，会弹 UAC 确认框；
+  //   'dmg'  → macOS：挂载磁盘映像，用户自己把 app 拖进「应用程序」，没有提权这一步。
+  //
+  // 为什么把这几句话集中在一处：它们散在下载中 / 下载完成 / 安装启动三个位置，
+  // 各自硬编码会让「macOS 上提示 UAC」这种错位很难发现 —— 而 macOS 用户看到
+  // 「会弹出 UAC 确认框」只会一头雾水（那台机器上根本不存在 UAC）。
+  //
+  // ── 为什么还要一条 UA 兜底 ──────────────────────────────────
+  // `installerKind` 来自 checkUpdate 的返回，而「面板切回来时发现上次遗留的
+  // 下载任务」这条路（load 里的 renderTask）**可能早于任何一次 checkUpdate**：
+  // 那时 info 还是 null，只看 installerKind 会退回 Windows 文案。
+  // 此时读一次 UA 就能判准，比让 macOS 用户看到 UAC 提示强。
+  // 有后端给的值时一律以后端为准（它才是编译目标的权威口径）。
+  const uaLooksMac = () => /Mac|iPhone|iPad/.test(navigator.userAgent || '');
+
+  const isMacInstaller = () => (info?.installerKind
+    ? info.installerKind === 'dmg'
+    : uaLooksMac());
+
+  /** 「开始下载」时的提示：说明下载完会发生什么 */
+  const downloadHint = () => (isMacInstaller()
+    ? '正在下载安装包…（下载完成后会挂载磁盘映像，把应用拖进「应用程序」即可完成安装）'
+    : '正在下载安装包…（下载完成后启动安装程序需要管理员权限，会弹出 UAC 确认框）');
+
+  /** 「安装包已就绪」的提示：说明下一步该做什么 */
+  const readyHint = name => (isMacInstaller()
+    ? `安装包已就绪：${name}。点击「打开安装包」后会挂载磁盘映像，把应用拖进「应用程序」即可完成安装。`
+    : `安装包已就绪：${name}。点击「安装并重启」后需要管理员权限，会弹出 UAC 确认框。`);
+
+  /** 安装按钮的文案：macOS 不重启（dmg 与运行中的进程没有文件冲突） */
+  const installButtonText = () => (isMacInstaller() ? '打开安装包' : '安装并重启');
+
   // ─── 工具 ─────────────────────────────────────
 
   /** 两位补零。与 logs-panel 的时间格式同一套写法（手工 pad + 本地时区），
@@ -174,12 +209,14 @@
       // 就直接弹安装程序，属于用户没有预期的副作用
       if (autoInstall) {
         autoInstall = false;
-        setState('安装包已下载完成，正在启动安装程序（需要管理员权限，会弹出 UAC 确认框）…');
+        setState(isMacInstaller()
+          ? '安装包已下载完成，正在挂载磁盘映像…'
+          : '安装包已下载完成，正在启动安装程序（需要管理员权限，会弹出 UAC 确认框）…');
         void install(task.path);
       } else {
-        setState(`安装包已就绪：${task.filename || task.path}。点击「安装并重启」后需要管理员权限，会弹出 UAC 确认框。`);
+        setState(readyHint(task.filename || task.path));
         if (button) {
-          button.textContent = '安装并重启';
+          button.textContent = installButtonText();
           button.dataset.installPath = task.path;
         }
       }
@@ -203,11 +240,17 @@
     polling = setInterval(() => { void pollProgress(); }, POLL_MS);
   }
 
-  /** 安装：启动安装包并由壳退出本程序，让出文件占用 */
+  /** 安装：启动安装包；Windows 上由壳退出本程序，让出文件占用 */
   async function install(path) {
     try {
-      await api.runInstaller(path, true);
-      setState('安装程序已启动，本程序将退出以便完成覆盖安装。安装程序需要管理员权限，会弹出 UAC 确认框，请选择「是」。');
+      // 返回值里的 restart 是**壳按平台定的**：Windows 覆盖安装前必须先退出，
+      // macOS 挂载 dmg 则不需要（也不该）退出 —— 所以这里不假设重启，
+      // 按壳回传的取值决定提示语（否则 macOS 用户会等一个不会发生的退出）
+      const result = await api.runInstaller(path, true);
+      const willRestart = result?.restart !== false;
+      setState(willRestart
+        ? '安装程序已启动，本程序将退出以便完成覆盖安装。安装程序需要管理员权限，会弹出 UAC 确认框，请选择「是」。'
+        : '安装包已挂载，请在弹出的窗口里把应用拖进「应用程序」完成安装。安装完成后重新打开本程序即可。');
     } catch (error) {
       setBadge('启动失败', 'bad');
       // UAC 被拒时壳侧返回的提示已经说明「可重新点击安装并重启」，这里原样透出，
@@ -397,7 +440,7 @@
       autoInstall = true;
       delete button?.dataset.installPath;
       setBadge('下载中', 'warn');
-      setState('正在下载安装包…（下载完成后启动安装程序需要管理员权限，会弹出 UAC 确认框）');
+      setState(downloadHint());
       if (button) button.textContent = '取消下载';
       startPolling();
     } catch (error) {

@@ -67,6 +67,7 @@ use crate::server::logging;
 use super::credentials::{self, AutoClawCredentials, CredentialOrigin};
 use super::models;
 use super::refresh;
+use super::catalog;
 
 /// 客户端版本号（源实现 `createUpstreamClient` 的 `desktopAppVersion` 默认值；
 /// `server.mjs` 从不覆盖它，所以这里是常量而不是配置项）。
@@ -278,29 +279,48 @@ impl ProviderAdapter for AutoClawAdapter {
         })
     }
 
-    /// 无操作：模型清单是**静态路由表**（`autoclaw-models.mjs` 的 `MODELS`），
-    /// 上游没有可拉取的目录接口（`models.rs` 模块头详述）。
+    /// 拉取远程模型目录（`GET .../proxy/autoclaw-model-config`，见 `catalog.rs`）。
     ///
-    /// §4.2 约定刷新失败不返回错误；这里连失败都谈不上 —— 返回
-    /// `unchanged()`（没刷、也不是错误），让自动路径遍历到本家时零副作用。
+    /// 凭证取**当前账号**（与转发同一套：Bearer token + `refresh` 的签名头）；
+    /// 没有可用登录态时返回 `unchanged()` —— 脚本 / CI 用户走环境变量旁路时
+    /// 本就不该刷目录，报红色失败只会让他以为哪里坏了。
     ///
-    /// `force` 在本家无意义：没有远程目录就没有缓存可绕。手动路径不会走到这里
-    /// （`supports_model_refresh()` 为 false，先被拦成 `skipped`）。
+    /// §4.2 约定刷新失败不返回错误：失败时保留现有清单（`catalog::refresh`
+    /// 内部就是这么做的，与另外三家一致），用户该看到的是「为什么没变」。
+    ///
+    /// `force` 一路透传给 `catalog::refresh`：`false` 走 5 分钟 TTL 早退
+    /// （自动路径，与桌面端自身的轮询周期对齐），`true` 真打上游
+    /// （用户手动点了「刷新模型清单」）。
     fn refresh_models<'a>(
         &'a self,
-        _store: &'a AccountStore,
-        _force: bool,
+        store: &'a AccountStore,
+        force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     > {
-        Box::pin(async { ModelRefreshOutcome::unchanged() })
+        Box::pin(async move {
+            let credentials = match resolve_credentials(store, "") {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    logging::verbose(
+                        "[Models]",
+                        &format!("AutoClaw 模型目录刷新跳过：{}", error.message),
+                    );
+                    return ModelRefreshOutcome::unchanged();
+                }
+            };
+            catalog::refresh(&credentials, force).await
+        })
     }
 
-    /// AutoClaw **不支持**刷新模型清单：模型是静态路由表（`zai_auto` 回退规则
-    /// 也在本地，见 `models.rs`），上游没有目录接口。保持默认 false，
-    /// 界面对这家如实说明「使用固定清单」。
+    /// AutoClaw **有**远程模型目录（`GET .../proxy/autoclaw-model-config`）。
+    ///
+    /// 这条声明曾经是 false，理由是「模型是静态路由表，上游没有目录接口」——
+    /// 那个前提后来被证伪：接口在同 host 的 `/proxy/` 一级（**不是**对话用的
+    /// `/proxy/autoclaw`），顺着 `chat/completions` 找永远找不到
+    /// （见 `catalog.rs` 模块头）。
     fn supports_model_refresh(&self) -> bool {
-        false
+        true
     }
 
     /// AutoClaw 有环境变量旁路（`AUTOCLAW_TOKEN` + 可选的

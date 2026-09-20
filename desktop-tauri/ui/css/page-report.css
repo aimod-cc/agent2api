@@ -86,34 +86,99 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* ─── Top 提供商占比 ───
+/* ─── Top 账号 / Top 提供商：并排两张卡 ───
+   两者回答同一个问题的两个粒度（哪一家在承载 / 哪个登录态在承载），放在一起才便于
+   对照着看，所以各占一半宽度而不是各占一整行 —— 满宽时条要拉出一千多像素，
+   读起来反而比不出差别。
+
+   用 flex 而不是 grid：两张卡**各自独立决定显隐**（后端字段缺失就藏），
+   flex-wrap 下藏掉一张时剩下一张自动铺满整行；grid 的固定两列会留下半行空白。
+   flex-basis 320px 是「低于这个宽度就换行」的阈值，两卡并排的下限因此是
+   ~654px（两张 320 + 间距），比 900px 的窄窗口断点更早换行 —— 换行后每张满宽，
+   也就是窄窗口下退化成改动前的观感。 */
+.report-rank-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+/* min-width:0 是 flex 项的必需声明：不写的话内容（长名字）会把项撑破，
+   flex 的收缩下限默认是内容宽度，两张卡就不再等宽了。
+   container-type 供下面按卡片宽度分档用（名字列的上限），具名 rank 是为了
+   将来这张卡里再嵌别的容器时不会互相认错祖先 —— 与 page-accounts.css 的
+   具名容器 card 同一手法。 */
+.report-rank-grid > .panel {
+  flex: 1 1 320px;
+  min-width: 0;
+  container: rank / inline-size;
+}
+
+/* 上面给 .panel 写了 flex 显示，就压过了浏览器对 hidden 的默认 display:none ——
+   于是「字段缺失就藏起来」会失效（卡片留在原地空着）。显式补回来，
+   两张卡的显隐判断在 JS 里，这里只保证它落得下去。
+   （与 page-accounts-providers.css 里 .add-provider-block[hidden] 同一个坑。） */
+.report-rank-grid > .panel[hidden] { display: none; }
+
+/* ─── 排行行（两张卡共用）───
    每行「名字 + 条 + 请求数 + 百分比」四列。用 HTML + 百分比宽度而不是 SVG：
    这一块没有坐标轴与刻度，条宽只要跟着容器伸缩即可，SVG 反而要多挂一个
    ResizeObserver 去量宽度重绘（三张图的观察器是给坐标轴用的，这里用不上）。
 
-   列宽：名字与百分比定宽（名字给 96px，中文名最长到「AutoClaw」这一档放得下，
-   放不下由省略号收住；百分比 48px 容得下 100.0%），中间的条吃掉剩余宽度。
-   百分比用等宽数字，纵着扫下来小数点对齐才好比。 */
-.provider-shares {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
+   列宽：**名字列按内容自适应**，百分比定宽（48px 容得下 100.0%），中间的条吃掉
+   剩余宽度。名字列不给固定值，是因为这一列的长度天生不齐：同屏既有「未知账号」
+   这样的短名，又有完整邮箱（账号名就是登录邮箱，20 个字符起）。固定宽度只有两种
+   下场 —— 按短的给，邮箱被省略号切掉（用户看不出是哪个账号，而这一列的全部意义
+   就是认出账号）；按长的给，短名字那张卡白占一列、条被挤短。所以让它自己量：
+   取本卡最长那条名字的宽度，上限 200px（再长就截断，全名仍在 tooltip 与 title 里）。
+
+   上限之所以必要：名字列宽了，条就窄了。两张卡并排时每张的内宽约 450px，
+   名字列吃掉 200px 后条仍有一百多像素，看得出长短；不设上限则一条超长 UID
+   就能把条挤成 0，那时整块看起来像坏了。条自己也有 56px 下限，与名字列的
+   上限一起把「谁先让位」定死：窗口窄到放不下时先截名字，条不会消失。
+
+   ── 上限分两档，按卡片自己的宽度给（container query）──────
+   上限不该是一个定值，因为同一份样式要伺候两种卡片宽度：两维数据都在时两张卡
+   并排（每张约 450px 内宽），只有一维时剩下一张铺满整行（约 1000px 内宽）。
+   前者给 200px 就得让条剩一百多像素；后者给 200px 则是白白浪费 —— 明明有
+   一千像素，这一列还是把邮箱截掉，而它存在的全部意义就是让人认出账号。
+   所以按卡片宽度分档：窄卡（< 700px）200px，宽卡 300px。
+   用 container query 而不是媒体查询：要看的是**卡片**多宽，不是窗口多宽 ——
+   窗口宽时两张卡各占一半，窗口窄时它们换行后各占满宽，同一个窗口宽度下
+   卡片的实际宽度并不固定，只有问卡片自己才问得准。
+
+   ── 为什么用 subgrid ────────────────────────────────────────
+   列宽要在**同一张卡内共享**：四列若各行独立算，每行的名字列都会等于自己那条
+   名字的宽度，条就从不同的 x 起画，一张卡里几条参差的起点看起来像排版坏了。
+   subgrid 让各行复用父容器算出的列轨（父容器按所有行的内容取最大），
+   于是既自适应又对齐。这要求 Chromium 117+，本应用跑在 WebView2（常青版）上。 */
+.rank-shares {
+  display: grid;
+  /* 名字列 minmax(0, max-content)：取本卡最长名字的宽度，放不下时能一路收到 0
+     （不收的话整行会顶出卡片）；条 minmax(56px, 1fr)：保底 56px 再吃剩余空间 */
+  grid-template-columns: minmax(0, max-content) minmax(56px, 1fr) 56px 48px;
+  align-items: center;
+  gap: 8px 10px;
   padding: 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);
   background: var(--surface-inset);
 }
 
-.provider-share {
+/* 空态（「还没有账号用量」）占满整行，不被四列轨道切成窄条 */
+.rank-shares > .empty { grid-column: 1 / -1; }
+
+.rank-row {
+  grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: 96px minmax(0, 1fr) 56px 48px;
+  grid-template-columns: subgrid;
   align-items: center;
-  gap: 10px;
   cursor: default;
 }
 
-.provider-share .name {
+.rank-row .name {
   overflow: hidden;
+  max-width: 200px;
   color: var(--text);
   font-size: 12.5px;
   font-weight: 500;
@@ -121,15 +186,21 @@
   white-space: nowrap;
 }
 
+/* 卡片铺满整行时（另一维没数据、被隐藏）给名字列更宽的上限。
+   查询的是具名容器 rank，也就是卡片本身（见上面 .report-rank-grid > .panel）。 */
+@container rank (min-width: 700px) {
+  .rank-row .name { max-width: 300px; }
+}
+
 /* 轨道：定高 + 圆角，与热力图格子同一档观感（都是「一格量化数据」） */
-.provider-share .track {
+.rank-row .track {
   height: 10px;
   overflow: hidden;
   border-radius: 999px;
   background: var(--surface-3);
 }
 
-.provider-share .bar {
+.rank-row .bar {
   display: block;
   height: 100%;
   min-width: 2px;
@@ -139,8 +210,8 @@
 }
 
 /* 请求数与百分比：都走等宽 + 右对齐，各行竖着比对才齐 */
-.provider-share .num,
-.provider-share .pct {
+.rank-row .num,
+.rank-row .pct {
   color: var(--text-2);
   font-family: var(--font-mono);
   font-size: 11.5px;
@@ -149,12 +220,11 @@
   white-space: nowrap;
 }
 
-.provider-share .pct { color: var(--text); font-weight: 600; }
+.rank-row .pct { color: var(--text); font-weight: 600; }
 
-/* 窄窗口：名字列收窄（中文名短，96px 在那个宽度下太占），条仍吃掉剩余部分 */
-@media (max-width: 900px) {
-  .provider-share { grid-template-columns: 80px minmax(0, 1fr) 52px 46px; gap: 8px; }
-}
+/* 卡片被拖到很窄时（两张并排的下限 ~320px，或窗口极小），条保住自己的
+   56px 下限，名字列跟着收到放得下的宽度 —— 列轨是 minmax(0, max-content)，
+   上限只是「不许长过」，放不下时它自己会缩，所以这里不需要额外断点。 */
 
 /* ─── 热力图 ───
    53 列（365 天）在格子下限 7px 时约 550px 宽，正常窗口都放得下；

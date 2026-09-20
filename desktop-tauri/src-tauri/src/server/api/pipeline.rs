@@ -1,0 +1,522 @@
+//! 对话链路的公共管道：模型解析、请求记账、响应构造、调试落盘。
+//!
+//! ── 为什么需要这个模块 ──────────────────────────────────────
+//! 网关对外提供三条对话入口（`/v1/chat/completions`、`/v1/responses`、
+//! `/v1/messages`），它们的**差异只在协议翻译**上，其余三件事完全相同：
+//!   1. 模型解析（默认模型回落 → 映射别名 → 禁用/存在性校验）
+//!   2. 请求记账（每个用户请求恰好一条明细，流式也要覆盖到最后字节）
+//!   3. 响应构造（JSON / SSE 的头与状态码）
+//! 这三件事从 `api/chat.rs` 抽到这里，三条入口共用一份 —— 否则任何一处
+// 口径调整（比如记账字段、默认模型回落顺序）都要在三个文件里各改一遍，
+// 迟早会漂移成三套不一致的行为。
+//!
+//! ── 与 `api/chat.rs` 的关系 ─────────────────────────────────
+//! `chat.rs` 仍是对外入口（`/v1/chat/completions` 的 handler），它现在从本模块
+//! 取公共件；`api/protocol.rs` 里的两个新入口同理。**本模块不认识任何具体
+//! 协议**（不看 messages / input / content），协议差异一律留在各 handler 里。
+//!
+//! ── 硬约束 ──────────────────────────────────────────────────
+//! release 是 `panic=abort`：零 unwrap/expect/panic。
+
+use std::sync::Arc;
+
+use axum::body::{Body, Bytes};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::Response;
+use serde_json::Value;
+
+use crate::server::config;
+use crate::server::core::providers::catalog::{
+    active_manifests, advertised_manifest_contains, default_model_catalog, default_model_usable,
+    model_blocked_everywhere, suggest_advertised,
+};
+use crate::server::core::upstream::usage::RequestTelemetry;
+use crate::server::errors::GatewayError;
+use crate::server::logging;
+use crate::server::request_stats::{NewRequestEntry, RequestStats};
+use crate::server::ServerState;
+
+/// 调试落盘的目录名与文件名（Node 版 `join(CONFIG_DIR, 'debug', ...)`）
+const DEBUG_DIR: &str = "debug";
+const DEBUG_REQUEST_FILE: &str = "last-request.json";
+const DEBUG_META_FILE: &str = "last-request.meta.txt";
+
+/// 明细里 `error` 摘要的字符上限。
+///
+/// 上游报错可能带上整段 HTML/长文案（`read_upstream_error` 自己截到 500 字符），
+/// 但报表页是把 error 直接铺在列表里的一列 —— 200 字符足够看清「为什么失败」，
+/// 再长只会把行撑爆。按**字符**截而不是字节：中文报错按字节截会切出半个字。
+const ERROR_SUMMARY_CHARS: usize = 200;
+
+/// 客户端中断 / 服务退出导致响应流被提前丢弃时的错误摘要。
+///
+/// HTTP 状态早就发出去了（2xx），明细里只能靠这条文案解释「为什么没有 token」。
+pub const STREAM_ABORTED: &str = "响应流未完整下发（客户端中断或服务退出）";
+
+// ─── 模型解析 ───────────────────────────────────────────────
+
+/// 解析并落地请求体里的模型名，返回**实际使用**的模型。
+///
+/// 顺序（与改造前的 `/v1/chat/completions` 逐条一致）：
+///   ① 未指定 → 默认模型回落链（config 的 defaultModel → 目录 isDefault → 目录首项）
+///   ② 路由全链（原生 + 映射）全禁用 → 400（`model_not_found`）
+///   ③ **广告视图里没有**且没有任何映射 → 400（带相近模型提示，`model_not_found`）
+///
+/// ── ③ 为什么以广告视图为准（「列表里没有就拒绝」）──────────────
+/// 客户端手里的模型清单来自 `/v1/models`；点一个那里没有的名字，应当立刻
+/// 400，而不是转给上游换回一个与真实原因无关的上游报错。收窄掉的模型
+/// （Cline 按账号额度池收窄、没有可用账号的家、被禁用 / 隐藏的）因此**不再
+/// 可点名调用** —— 校验口径与广告口径就此统一，不存在「列表里看不到却能调通」
+/// 的中间态。判定见 `catalog::advertised_manifest_contains`。
+///
+/// 两处**例外**（都不做这层判定，交给转发层给更准确的错误）：
+///   - 客户端**没点名**（走 ① 注入的默认模型）：默认值是网关自己挑的，
+///     不该被自己的广告视图否掉；
+///   - **一家可用提供商都没有**（没加账号）：此时广告视图必然为空，
+///     一律报「模型不存在」会盖掉「没有可用账号，无账号可转发」这条
+///     可操作的提示。
+///
+/// ── 映射为什么不再在这里改写（照抄 OmniProxy 的候选语义）──────
+/// 改造前的映射是「请求名命中 alias → payload 整体改写成 target」：请求名
+/// 与上游 id 同名时，改写会**遮蔽**那个同名的上游模型（它的原生路由收不到
+/// 流量），所以旧版干脆禁止同名。映射语义重做后（同名允许、同名校多提供商
+/// 主备），改写下沉到**发送侧按家进行**（`payload::send_body` →
+/// `catalog::wire_model_for_provider`）：请求名全程保持客户端原值，原生承载
+/// 家收到本名、映射家收到各自的 target —— 候选链的展开在
+/// `providers::router::route_for_forward`。
+///
+/// `payload` 会被就地改写（仅填默认模型）：后续转发与记账都用一致的请求名，
+/// 而客户端原始 body 的去重键在调用方算（见各 handler）。
+pub fn resolve_model(state: &ServerState, payload: &mut Value) -> Result<String, GatewayError> {
+    let requested = model_field_text(payload);
+    // 客户端是否**点名**了模型：默认值注入后这个事实就丢了，先记下来
+    let client_named = !requested.is_empty();
+    if !client_named {
+        // 客户端没点名 → 网关默认。三级回落链的候选集合走
+        // `default_model_catalog()`（按「认不认默认模型概念」收窄后的聚合清单）：
+        // 一家都不认时不注入 model，按「未指定」处理（让上游用它自己的默认）
+        let snapshot = config::current();
+        let default_model = snapshot.default_model();
+        let models = default_model_catalog();
+        let fallback = if default_model_usable(default_model) {
+            Some(default_model.to_string())
+        } else {
+            models
+                .iter()
+                .find(|model| model.get("isDefault").map(value_is_truthy).unwrap_or(false))
+                .or_else(|| models.first())
+                .and_then(|model| model.get("id"))
+                .filter(|id| !id.is_null())
+                .map(|id| match id {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+        };
+        if let Some(fallback) = fallback {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("model".to_string(), Value::String(fallback));
+            }
+        }
+    }
+    let requested_model = model_field_text(payload);
+    // 按提供商区分启停后，404 判定是「路由全链（原生 + 映射）都不可用」
+    if !requested_model.is_empty() && model_blocked_everywhere(&requested_model) {
+        return Err(GatewayError::bad_request(format!(
+            "模型已在网关中禁用: {requested_model}。完整列表见 GET /v1/models"
+        ))
+        .with_code("model_not_found"));
+    }
+    // ③ 广告视图里没有 → 400（「列表里没有就拒绝」；例外见函数头说明）
+    if client_named && !requested_model.is_empty() {
+        let active = active_manifests(state.store());
+        let has_provider = !active.is_empty();
+        if has_provider && !advertised_manifest_contains(&active, &requested_model) {
+            let hint = suggest_advertised(&active, &requested_model, 5);
+            let message = format!(
+                "模型不存在: {requested_model}{}。完整列表见 GET /v1/models",
+                if hint.is_empty() {
+                    String::new()
+                } else {
+                    format!("（目录里相近的模型: {}）", hint.join("、"))
+                },
+            );
+            return Err(GatewayError::bad_request(message).with_code("model_not_found"));
+        }
+    }
+    // 记录本次实际用的模型（默认值已填充完毕），供账号页筛选默认选中
+    if !requested_model.is_empty() {
+        config::remember_request_model(&requested_model);
+    }
+    Ok(requested_model)
+}
+
+/// 请求体里的 model → 供校验/记录用的文本。
+///
+/// 复刻 Node 的取值链：`if (!body.model)` 先做真值判定（null/""/0/false 都算
+/// 未指定），真值再交给目录查（`get()` 内部是 `String(id).toLowerCase()`），
+/// 所以数字/对象这类非字符串值也会被字符串化后参与比对 —— 本函数做的就是
+/// 那个字符串化，且**不改动 payload 里的原值**。
+pub fn model_field_text(payload: &Value) -> String {
+    let Some(value) = payload.get("model") else {
+        return String::new();
+    };
+    if !value_is_truthy(value) {
+        return String::new();
+    }
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// JS 真值判定（`Boolean(x)`）
+pub fn value_is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(flag) => *flag,
+        Value::Number(number) => number.as_f64().map(|item| item != 0.0).unwrap_or(false),
+        Value::String(text) => !text.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+/// 从请求头取 User-Agent（日志用；缺失给 `-`）
+pub fn user_agent_of(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
+}
+
+// ─── 请求记账（请求统计的唯一写入点）────────────────────────
+
+/// 一条请求的收尾上下文：流式分支要把它交给响应流，等流真的结束时再记账。
+///
+/// 为什么字段是「值」而不是引用：`RecordContext` 会被移进响应流，
+/// 而响应流是 `'static`（它要活得比 handler 的栈帧久）。
+pub struct RecordContext {
+    /// 统计存储句柄（`Arc` 克隆，与 ServerState 里那份是同一实例）
+    pub stats: Arc<RequestStats>,
+    /// usage / 尝试次数旁路槽
+    pub telemetry: Arc<RequestTelemetry>,
+    /// 请求开始时刻（毫秒 Unix 时间戳）
+    pub started_at: i64,
+    /// **实际使用**的模型（默认模型回落、目录兜底都已生效的那个）
+    pub model: String,
+    /// **下游请求的**模型名（客户端请求体里的原值，映射 / 默认注入生效前；
+    /// 客户端没点名时为空串）。请求日志用它和上游名（telemetry 的
+    /// `upstream_model`）分两行展示「请求的什么 → 转发的什么」。
+    pub client_model: String,
+    /// 下发给客户端的 HTTP 状态码
+    pub status: i64,
+}
+
+/// 转发前就失败（body 非法 / 缺字段 / 模型不在目录）时的记账。
+///
+/// 这些请求**一次都没往上游发**，所以 attempts 记 0 会被存储层夹成 1
+/// （契约是「含首次、恒 ≥1」）。用 1 表示「至少被处理过一次」，
+/// 这与「上游被打了 N 次」在报表里是两回事，报表侧靠 status 与 error 区分。
+///
+/// 为什么这几条也要记：`model_not_found` 是客户端配置错误最常见的形态，
+/// 不记的话用户在报表里看不到「请求全在失败」，只会以为统计漏了。
+pub fn record_early_failure(state: &ServerState, started_at: i64, model: &str, error: &GatewayError) {
+    let context = RecordContext {
+        stats: state.request_stats(),
+        telemetry: Arc::new(RequestTelemetry::new()),
+        started_at,
+        client_model: model.to_string(),
+        model: model.to_string(),
+        // 与 `payload_response` 同一口径：非法状态码会被归一成 500
+        status: i64::from(error.http_status().as_u16()),
+    };
+    record_entry(&context, Some(error.message.clone()));
+}
+
+/// 记一条请求日志。
+///
+/// ── 记账为什么绝不能影响请求 ─────────────────────────────────
+/// `RequestStats::record` 本身不返回 `Result`：内部对写盘失败只打
+/// `[Stats] 统计写入失败`，锁中毒走 `poisoned.into_inner()` 继续用，
+/// 序列化失败跳过该条 —— 存储层已把「统计失败」全部收敛成「少记一条」，
+/// 没有任何 unwind 路径，所以这里不需要 `catch_unwind`。
+///
+/// ── 字段口径 ────────────────────────────────────────────────
+///   ts          请求**开始**时刻（不是记账时刻）：趋势图要按「用户什么时候
+///               发的请求」归日
+///   durationMs  收尾 - 开始（含排队、选路、上游等待、流下发）
+///   firstResponseMs  首帧到达 - 开始；全程没有帧到达时为 null
+///   attempts    旁路槽里累计的上游请求数；一次都没发出去时回落 1
+///   error       旁路槽里的原因优先（更接近根因），否则用调用方给的兜底文案
+pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
+    let snapshot = context.telemetry.snapshot();
+    // 收尾时刻只取一次：明细里的 durationMs 与日志里打的那一个是同一个值
+    let finished_at = logging::now_ms();
+    let duration_ms = finished_at - context.started_at;
+    let first_response_ms = snapshot
+        .first_response_at
+        .map(|at| (at - context.started_at).max(0));
+    let error = snapshot
+        .error
+        .or(fallback_error)
+        .map(|text| truncate_chars(&text, ERROR_SUMMARY_CHARS));
+    let attempts = snapshot.attempts.max(1);
+    let mut entry = NewRequestEntry::new(context.model.clone(), context.status);
+    entry.ts = Some(context.started_at);
+    // 关联 id：调试模式的原始报文按它取（见 `core::debug_traffic`）。
+    // 空串 = 该请求没生成 id（转发前就失败的路径），前端不显示详情入口。
+    entry.id = snapshot.id;
+    entry.duration_ms = duration_ms;
+    entry.first_response_ms = first_response_ms;
+    entry.attempts = attempts;
+    // 存储契约里这两个字段是 String（不是 Option），空串就是「没有账号」的表示
+    entry.account_id = snapshot.account_id;
+    entry.account_name = snapshot.account_name;
+    entry.provider = snapshot.provider;
+    // 下游名 / 上游名分记：下游名是客户端原值（context 带入），上游名是
+    // 实际发出的名字（telemetry 采集，空串 = 一次都没发出去）。两者都空时
+    // 前端回落显示 model 一行 —— 旧数据没有这两个键，同一口径。
+    entry.client_model = context.client_model.clone();
+    entry.upstream_model = snapshot.upstream_model;
+    entry.error = error;
+    entry.prompt_tokens = snapshot.prompt_tokens;
+    entry.completion_tokens = snapshot.completion_tokens;
+    entry.total_tokens = snapshot.total_tokens;
+    entry.cache_read_tokens = snapshot.cache_read_tokens;
+    context.stats.record(entry);
+    logging::verbose(
+        "[Stats]",
+        &format!(
+            "记一条请求: model={} status={} {duration_ms}ms 首响={} attempts={attempts} tokens={}+{}（缓存 {}）",
+            if context.model.is_empty() { "(未指定)" } else { &context.model },
+            context.status,
+            first_response_ms
+                .map(|value| format!("{value}ms"))
+                .unwrap_or_else(|| "-".to_string()),
+            snapshot.prompt_tokens,
+            snapshot.completion_tokens,
+            snapshot.cache_read_tokens,
+        ),
+    );
+}
+
+/// 按字符截断（超出部分用 `…` 收尾）。
+pub fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push('…');
+    out
+}
+
+/// 边透传边记账的响应流。
+///
+/// ── 为什么包一层（而不是在 handler 里记账）────────────────────
+/// 流式请求的「用户视角完成点」是**最后一个字节发完**，而 handler 在交出
+/// 响应头时就返回了。包一层之后，明细的 durationMs 覆盖整个下发过程，
+/// 客户端中途断开、上游断流这两种「非正常收尾」也能各记一条。
+///
+/// ── 透传是否受影响 ──────────────────────────────────────────
+/// 不影响：本类型对每个 `Item` 原样转发（只补一个「是不是到 None 了」的
+/// 观察），不读、不改、不缓存字节，也不吞错误。
+pub struct RecordingStream {
+    inner: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
+    /// 收尾上下文；`take()` 走即表示「已记账」（保证恰好记一条）
+    context: Option<RecordContext>,
+}
+
+impl RecordingStream {
+    pub fn new(
+        inner: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
+        context: RecordContext,
+    ) -> Self {
+        Self { inner, context: Some(context) }
+    }
+
+    /// 记账并清空上下文（幂等：第二次调用什么都不做）
+    fn settle(&mut self, fallback_error: Option<String>) {
+        if let Some(context) = self.context.take() {
+            record_entry(&context, fallback_error);
+        }
+    }
+}
+
+impl futures::Stream for RecordingStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use futures::StreamExt;
+        // 本类型的字段全部是 Unpin，自身也就 Unpin，get_mut 是安全的
+        let this = self.get_mut();
+        // 已记账（说明上游流已结束）→ 不再去 poll 上游，直接报结束
+        if this.context.is_none() {
+            return std::task::Poll::Ready(None);
+        }
+        let polled = this.inner.poll_next_unpin(cx);
+        // 首响采集：**下发的第一个字节**到达时记一次（挂在透传流上而不是
+        // 上游字节流上，于是各条转发路径在此收敛为同一处）
+        if let std::task::Poll::Ready(Some(_)) = &polled {
+            if let Some(context) = &this.context {
+                context.telemetry.note_first_frame();
+            }
+        }
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            this.settle(None);
+        }
+        polled
+    }
+}
+
+impl Drop for RecordingStream {
+    fn drop(&mut self) {
+        // 还能走到这里，说明响应流**没有**跑到 None 就被丢弃了
+        // （客户端断开 / 服务退出）。仍记一条 —— 请求确实发生了
+        self.settle(Some(STREAM_ABORTED.to_string()));
+    }
+}
+
+/// 把一条响应流包进「协议转换 + 记账」两层的通用装配。
+///
+/// ── 为什么顺序是「先转换、后记账」────────────────────────────
+/// `RecordingStream` 的职责是记账与首响采集，它必须看到**最终下发**的字节
+/// （客户端视角的完成点）。协议转换层（Responses / Anthropic 的流式状态机）
+/// 在它**里面**，于是：
+///   转换器 → RecordingStream → axum Body
+/// 首响时刻因此是「转换后的第一帧到达客户端」的时刻，与客户端感知一致。
+///
+/// `transform` 是一个「吃字节吐字节」的闭包：转换状态机自己持有，
+/// 本函数不认识任何协议。
+///
+/// ── 为什么收 `Box<dyn Stream>` 而不是泛型 `S` ────────────────
+/// 泛型要额外要求 `S: Unpin`（`flat_map` 的组合流不自动 Unpin），
+/// 而调用点手里本来就是 `ForwardOutcome::Stream` 给的装箱流 —— 直接收装箱
+/// 少一层泛型参数，也不必在调用点写 `Unpin` 约束。
+pub fn transformed_stream(
+    source: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
+    context: RecordContext,
+    mut transform: impl FnMut(&[u8]) -> Vec<Bytes> + Send + 'static,
+) -> Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> {
+    use futures::StreamExt;
+    // 上游字节流 → 转换后的帧流
+    let converted = source.flat_map(move |item| {
+        let frames = match item {
+            Ok(chunk) => transform(&chunk),
+            // 上游断流：把错误原样透出（由 axum 结束连接）
+            Err(error) => return futures::stream::iter(vec![Err(error)]).boxed(),
+        };
+        futures::stream::iter(frames.into_iter().map(Ok)).boxed()
+    });
+    Box::new(RecordingStream::new(Box::new(converted), context))
+}
+
+// ─── 响应构造 ───────────────────────────────────────────────
+
+/// 非流式响应：`Content-Type: application/json; charset=utf-8` + 200。
+///
+/// 状态码固定 200：上游非 2xx 时转发层已经抛出（不会走到这里），
+/// 与 Node 的 `res.writeHead(200, ...)` 一致。charset 显式写上 ——
+/// 响应体里有中文（错误文案/思考内容）。
+pub fn json_response(body: Value) -> Response {
+    let text = match serde_json::to_string(&body) {
+        Ok(text) => text,
+        Err(error) => {
+            // 序列化失败只可能是内部数据坏了：给一个 500，绝不 panic
+            let message = format!("响应序列化失败: {error}");
+            logging::log("[Model]", &format!("❌ {message}"));
+            return GatewayError::with_status(500, message).payload_response();
+        }
+    };
+    let mut response = Response::new(Body::from(text));
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+    response
+}
+
+/// 流式响应：`Content-Type: text/event-stream; charset=utf-8` +
+/// `Cache-Control: no-cache` + `Connection: keep-alive`，状态码透传。
+///
+/// 收 `StatusCode` 而不是 `u16`：调用点要先做一次「非法码落 200」的归一
+/// （记账要用同一个值），归一放在调用点、这里只负责下发。
+pub fn sse_response(
+    status: StatusCode,
+    stream: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
+) -> Response {
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+    response
+}
+
+/// 非 2xx 的转发错误 → 按协议形态下发的错误响应。
+///
+/// 三条入口的错误体形态不同（OpenAI / Responses / Anthropic），所以形态由
+/// 调用方给的闭包决定；本函数只负责把「状态码归一 + 记账」这两件共同的事做掉。
+///
+/// `convert` 收 `(status, error)`，返回该协议的错误响应体。
+pub fn error_response(
+    context: RecordContext,
+    error: &GatewayError,
+    convert: impl FnOnce(u16, &GatewayError) -> Response,
+) -> Response {
+    let status = error.http_status().as_u16();
+    // 记账里的状态码必须与客户端看到的那个一致
+    let recorded = RecordContext { status: i64::from(status), ..context };
+    record_entry(&recorded, Some(error.message.clone()));
+    convert(status, error)
+}
+
+// ─── 调试落盘 ───────────────────────────────────────────────
+
+/// 调试落盘：原始 body + 一行 meta（覆盖写；**失败不影响请求**）。
+///
+/// 与 Node 版一致：目录不存在时创建，任何 IO 失败都静默吞掉 ——
+/// 调试落盘是排障辅助，不能因为它失败就让用户的请求失败。
+pub fn write_debug_files(body: &[u8], method: &str, path: &str, user_agent: &str) {
+    let dir = config::config_dir().join(DEBUG_DIR);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = std::fs::write(dir.join(DEBUG_REQUEST_FILE), body);
+    let meta = format!(
+        "{} {method} {path} {}B ua={user_agent}",
+        iso_timestamp(),
+        body.len(),
+    );
+    let _ = std::fs::write(dir.join(DEBUG_META_FILE), meta);
+}
+
+/// ISO-8601 UTC 时间戳（对应 Node 的 `new Date().toISOString()`）
+pub fn iso_timestamp() -> String {
+    let millis = logging::now_ms();
+    match chrono::DateTime::from_timestamp_millis(millis) {
+        Some(utc) => utc.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        None => String::new(),
+    }
+}
+
+/// 请求体 sha256（十六进制小写）——去重键，对应 Node 的
+/// `createHash('sha256').update(rawBody).digest('hex')`
+pub fn sha256_hex(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(body);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}

@@ -57,6 +57,7 @@
 pub mod adapter;
 pub mod balance;
 pub mod blocks;
+pub mod catalog;
 pub mod conversation;
 pub mod credentials;
 pub mod decision;

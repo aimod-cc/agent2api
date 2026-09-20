@@ -548,6 +548,17 @@ async fn submit_round(
     }
     let body_bytes = serde_json::to_string(&body).map(|text| text.len()).unwrap_or(0);
     let started_at = logging::now_ms();
+    // ── 调试模式：采这一次 round 往返 ────────────────────────────
+    // CatPaw 是**会话式**：一次用户请求内部有多次上游往返（round → events
+    // 轮询 → turn/stop）。只有 round 承载对话内容，所以只采它 —— 控制类
+    // 往返（event / stop）与目录刷新都传 None（见 `post_json` 的说明）。
+    // 自愈重试会再走一次本函数，后一次覆盖前一次（`reset_request` 的
+    // 「最后一次为准」，与无状态路径的重试口径一致）。
+    // 开关关着时 `capture()` 为 None，整段不执行。
+    let capture = request
+        .telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.capture());
     post_json(
         &request.base_url,
         "/api/agent/conversation/round",
@@ -555,6 +566,7 @@ async fn submit_round(
         request.proxy.as_ref(),
         &Value::Object(body),
         REQUEST_TIMEOUT_MS,
+        capture.as_deref(),
     )
     .await?;
     logging::verbose(

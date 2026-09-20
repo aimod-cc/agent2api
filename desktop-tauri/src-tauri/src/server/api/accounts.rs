@@ -10,7 +10,9 @@
 //!   POST   /api/accounts/refresh        刷新指定（或当前）账号的 token { id? }
 //!   POST   /api/accounts/refresh-expiring 刷新**全部**已过期/临期的账号凭证（批量）
 //!   GET    /api/accounts/usage          逐账号查询积分/额度（并发，单账号失败不拖垮整批）
+//!                                       `?id=` 指定单个账号（**不看启用状态**，见 usage_query）
 //!   GET    /api/accounts/usage/snapshot 最近一次**定时查询**的结果快照（形状同 usage）
+//!   GET    /api/accounts/connections     逐账号活跃连接数（账号页「连接数」列，2 秒轮询）
 //!   POST   /api/accounts/checkin        签到（串行，跳过已禁用与国际版账号）{ id? }
 //!   PATCH  /api/accounts/{id}           修改账号属性 { name?, priority?, enabled?, proxy? }
 //!   POST   /api/accounts/{id}/move      与相邻账号交换优先级 { direction: 'up' | 'down' }
@@ -124,6 +126,10 @@ fn decode_segment(value: &str) -> String {
 pub async fn accounts_entry(State(state): State<ServerState>, request: axum::extract::Request) -> Response {
     let method = request.method().clone();
     let full_path = request.uri().path().to_string();
+    // 原始查询串（未解码的原文，由用到它的分支自行 `query_param` 解码）。
+    // 目前只有 `GET /api/accounts/usage?id=<id>` 用它 —— 那一支是「用户手点某一行
+    // 的积分按钮」，与批量的区别见 `core::usage_query::query_all` 的说明。
+    let query = request.uri().query().unwrap_or("").to_string();
     let body = match axum::body::to_bytes(request.into_body(), crate::server::http::MAX_BODY_SIZE)
         .await
     {
@@ -135,7 +141,7 @@ pub async fn accounts_entry(State(state): State<ServerState>, request: axum::ext
     // 判等，所以 `/api/accounts/` 落到最后的 404 分支，这里必须保留这个区分
     let suffix = full_path.strip_prefix("/api/accounts").unwrap_or("");
     let rest = suffix.strip_prefix('/').map(str::to_string);
-    dispatch(state, method, rest.as_deref(), &full_path, &body).await
+    dispatch(state, method, rest.as_deref(), &full_path, &query, &body).await
 }
 
 /// `/api/proxies` 与 `/api/proxies/test` 的入口（同样接受任意方法）
@@ -170,7 +176,9 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
 ///
 /// `rest` 为 `None` 表示精确命中 `/api/accounts`；`Some(...)` 是去掉一层前导斜杠后的
 /// 剩余段（`/api/accounts/` 得到的是 `Some("")` —— Node 严格判等，它属于子路径而非列表）。
-/// `full_path` 是原始完整路径（404 文案里要原样回显）。判定顺序**照抄 Node 版**：
+/// `full_path` 是原始完整路径（404 文案里要原样回显），`query` 是未解码的查询串
+/// （只有 `usage` 那一支用它取 `id`，见 `accounts_usage::accounts_usage`）。判定顺序
+/// **照抄 Node 版**：
 ///
 ///   ① 固定子路径（无尾段的一批）：GET/POST ``、GET export、POST import、
 ///      POST current、POST batch、POST refresh、GET usage、POST checkin
@@ -186,6 +194,7 @@ pub async fn dispatch(
     method: Method,
     rest: Option<&str>,
     full_path: &str,
+    query: &str,
     body: &Bytes,
 ) -> Response {
     // ① 精确命中 `/api/accounts`
@@ -209,12 +218,17 @@ pub async fn dispatch(
         ("POST", "batch") => return batch_accounts(&state, body).await,
         ("POST", "refresh") => return refresh_account(&state, body).await,
         ("POST", "refresh-expiring") => return refresh_expiring_accounts(&state).await,
-        // 余额 / 积分查询（四家混查）实现在 `api::accounts_usage`（拆分见那里的模块头）
-        ("GET", "usage") => return super::accounts_usage::accounts_usage(&state).await,
+        // 余额 / 积分查询（四家混查）实现在 `api::accounts_usage`（拆分见那里的模块头）。
+        // `?id=` 是「手点某一行积分按钮」的单查形态，语义见 accounts_usage 的说明。
+        ("GET", "usage") => {
+            return super::accounts_usage::accounts_usage(&state, query).await
+        }
         // 定时查询那一轮的结果快照（形状同 usage，多一个 `at`）
         ("GET", "usage/snapshot") => {
             return super::accounts_usage::accounts_usage_snapshot().await
         }
+        // 账号级活跃连接数（账号页「连接数」列；见 `core::upstream::connections`）
+        ("GET", "connections") => return account_connections(&state),
         ("POST", "checkin") => return accounts_checkin(&state, body).await,
         _ => {}
     }
@@ -327,6 +341,22 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             match crate::server::core::providers::qoder::auth::prepare_account(&payload).await {
                 Ok(credentials) => store.add_qoder_account(&credentials, import_name, "manual"),
                 Err(error) => Err(AccountStoreError::new(error.message, error.status_code)),
+            }
+        }
+        // Cline：粘贴 accessToken / refreshToken → 手动添加；
+        // `importDesktop: true` → 导入桌面端实时登录态（记录不落 token，
+        // 实时读 `~/.cline/data/settings/providers.json`）。
+        // 校验（token 非空 / 长度 / 补 `workos:` 前缀 / 从 JWT 取 expiresAt 与
+        // 展示名）都在 `add_cline_account` 里，与设备授权登录共用同一入口。
+        // **两个池各是一个 provider**（`cline-free` / `cline-pass`），添加时
+        // 由 body 的 `provider` 决定进哪一家 —— 不需要额外的池参数。
+        Some(kind @ (crate::server::core::providers::ProviderKind::ClineFree
+            | crate::server::core::providers::ProviderKind::ClinePass)) => {
+            let provider_id = crate::server::core::providers::kind_id(kind);
+            if import_desktop {
+                store.import_cline_desktop_account(provider_id, import_name)
+            } else {
+                store.add_cline_account(provider_id, &payload, import_name)
             }
         }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
@@ -492,6 +522,28 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     if state.store().qoder_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Qoder).await;
     }
+    // Cline 账号：与 AutoClaw 同一取舍 —— **桌面端实时登录态不主动刷新**。
+    // 网关与 Cline 客户端共用同一份 providers.json 里的 refreshToken，
+    // 网关侧刷新会让客户端那边的会话作废（两边都在轮换，后写的赢）。
+    // 手动账号（自己粘贴的凭证）走适配器的强制刷新链路。
+    //
+    // 「属于哪一家」由记录自己回答（两个池共用这条链路），因此判据是
+    // `cline_account_provider` 而不是某个写死的 provider id —— 池是记录上的
+    // 属性，刷新链路对它无差别。
+    if let Some(provider_id) = state.store().cline_account_provider(&id) {
+        if state.store().cline_is_desktop_account(&id) {
+            return management_error(
+                400,
+                "Cline 桌面端登录态由 Cline 客户端维护，网关不主动刷新：\
+                 请在 Cline 客户端重新登录后重新导入，或改用「填写凭证」添加",
+            );
+        }
+        let kind = match crate::server::core::providers::kind_from_id(&provider_id) {
+            Some(kind) => kind,
+            None => return management_error(400, format!("未知的提供商：{provider_id}")),
+        };
+        return refresh_provider_account(state, &id, kind).await;
+    }
     // 小浣熊账号：走它自己的刷新（结果由 `credentials::refresh` 回写）
     if state.store().raccoon_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Raccoon).await;
@@ -601,6 +653,31 @@ pub async fn accounts_checkin(state: &ServerState, body: &Bytes) -> Response {
         Ok(result) => ok_json(result),
         Err(error) => management_error(error.status_code, error.message),
     }
+}
+
+// ─── GET /api/accounts/connections ──────────────────────────
+
+/// 账号级活跃连接数（账号页「连接数」列）。
+///
+/// 响应 `{ counts: { <accountId>: <n> } }`：`counts` **只含非零项** ——
+/// 界面按「缺失即 0」处理，于是不必为几十个空闲账号各送一个 0，
+/// 轮询的响应体也小得多（2 秒一次）。
+///
+/// 口径是「此刻正在使用这个账号的下游请求数」（一个请求在账号间轮换时计数跟着走），
+/// 见 `core::upstream::connections` 的模块头。数据是**进程内内存计数**，
+/// 不读盘、不出网，所以这条接口足够便宜，能扛得住 2 秒一次的轮询。
+///
+/// 这条走 `protected` 分组（`http::router` 里 /api/accounts 整族都挂了 checkApiKey），
+/// 与同族的 usage 一致 —— 界面在配置 Key 之前也读不到它。
+pub fn account_connections(state: &ServerState) -> Response {
+    let counts = state
+        .upstream()
+        .connections()
+        .snapshot()
+        .into_iter()
+        .map(|(id, count)| (id, Value::from(count)))
+        .collect::<Map<String, Value>>();
+    ok_json(json!({ "counts": Value::Object(counts) }))
 }
 
 // ─── PATCH /api/accounts/{id} ───────────────────────────────

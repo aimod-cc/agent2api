@@ -2,7 +2,7 @@
 /* global workbuddyDesktop, wbApp */
 
 /**
- * 「请求日志」页的自持面板：网关每次转发到上游的请求明细。
+ * 「请求日志」页的自持面板：网关每次转发到上游的请求日志。
  * 与 logs-panel.js（系统事件）同构但互不依赖：两边数据源、筛选维度、
  * 分页口径都不同，拆成两个模块后各自的轮询与状态不再互相牵连。
  *
@@ -23,10 +23,11 @@
   const { esc, toast } = wbApp;
 
   /**
-   * 自动刷新间隔兜底值（毫秒）= 改造前的硬编码值：读不到配置时行为与改造前一致。
+   * 自动刷新间隔兜底值（毫秒）= 后端的默认间隔
+   * （`DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS`）：读不到配置时与用户没改过时一致。
    * 实际值由「定时任务」页决定（见模块头）。
    */
-  const DEFAULT_AUTO_REFRESH_MS = 10_000;
+  const DEFAULT_AUTO_REFRESH_MS = 1_000;
   let autoRefreshMs = DEFAULT_AUTO_REFRESH_MS;
   /**
    * 是否已经从后端读到过间隔配置。
@@ -38,6 +39,18 @@
   let autoSynced = false;
   /** 任务关闭时置 false：定时器不跑（区别于「间隔很大」） */
   let autoEnabled = true;
+  /**
+   * 是否有一次轮询触发的拉取还在途中。
+   *
+   * 定时器是 `setInterval`（不等上一次完成），而间隔可以调到 1 秒 ——
+   * 一次慢响应就会与后来的几拍叠在一起。本面板用 `seq` 只认最后一次响应，
+   * 所以叠了也不会显示错数据，但每次响应都会重绘一次列表；间隔这么密时
+   * 无谓的重绘会让正在看的人眼花。所以轮询撞上在途请求就跳过这一拍。
+   *
+   * 只挡轮询：用户翻页 / 换筛选是有意操作，不该被上一次自动刷新挡掉。
+   */
+  let polling = false;
+  let panelBusy = false;
 
   /** 每页条数：与后端 DEFAULT_LIMIT 一致 */
   const PAGE_SIZE = 50;
@@ -215,6 +228,42 @@
       + `<span class="req-usage-line sub">${esc(line2)}</span></span>`;
   }
 
+  /**
+   * 模型列。转发名与请求名一致（绝大多数请求）→ 单行，与既有显示完全一致；
+   * 不一致（映射 / 备援按家改写发生过）→ 两行：
+   *   ⬆️ 上游实际收到的模型名（主读数，在上）
+   *   ⬇️ 下游请求的模型名（次读数，淡一档，在下）
+   * 双名缺失时退回单行：`model` 缺失或旧数据没有 clientModel / upstreamModel
+   * （这两个键是后加的），请求没走到上游的那次失败也没有上游名。
+   */
+  function modelCell(entry) {
+    const client = String(entry.clientModel ?? '').trim();
+    const upstream = String(entry.upstreamModel ?? '').trim();
+    const shown = String(entry.model ?? '').trim();
+    if (!client || !upstream || upstream.toLowerCase() === client.toLowerCase()) {
+      return `<span class="req-model" title="${esc(shown)}">${esc(shown || '—')}</span>`;
+    }
+    return `<span class="req-model req-model-split">`
+      + `<span class="req-model-line" title="转发到上游的模型名">⬆️ ${esc(upstream)}</span>`
+      + `<span class="req-model-line sub" title="下游请求的模型名">⬇️ ${esc(client)}</span></span>`;
+  }
+
+  /**
+   * 详情入口：该条请求在调试模式下保存的**上游原始报文**（见后端
+   * `core::debug_traffic`）。
+   *
+   * 只有带 `id` 的行才有入口 —— 旧数据（本字段引入前落盘的行）与
+   * 「转发前就失败」的请求都没有 id，也就没有报文可看。按钮**不做可用性
+   * 预判**：调试模式是否开启、报文是否还在保留条数内，都由点击时的接口
+   * 回答（404 时弹窗里给出原因），这样界面不必跟着设置页的开关重绘。
+   */
+  function detailCell(entry) {
+    const id = entry.id ? String(entry.id) : '';
+    if (!id) return '<span class="req-none req-detail">-</span>';
+    return `<span class="req-detail"><button type="button" class="sm req-detail-btn"`
+      + ` data-detail="${esc(id)}" title="查看该请求的上游原始报文">详情</button></span>`;
+  }
+
   function rowHtml(entry) {
     const ok = isOk(entry);
     const error = entry.error ? String(entry.error) : '';
@@ -223,12 +272,13 @@
         ${targetCell(entry)}
         ${retryCell(entry)}
         ${statusCell(entry)}
-        <span class="req-model" title="${esc(entry.model)}">${esc(entry.model || '—')}</span>
+        ${modelCell(entry)}
         <span class="req-num req-dur"><span class="req-dur-line">${esc(formatDuration(entry.durationMs))}</span><span class="req-dur-line sub" title="首响：上游首帧到达的耗时">首响 ${esc(formatFirstResponse(entry.firstResponseMs))}</span></span>
         ${usageCell(entry)}
         ${error
           ? `<span class="req-error" title="${esc(error)}">${esc(error)}</span>`
           : '<span class="req-none req-error-cell">-</span>'}
+        ${detailCell(entry)}
       </div>`;
   }
 
@@ -249,6 +299,7 @@
       <span class="req-num req-dur">用时</span>
       <span class="req-usage">用量</span>
       <span class="req-error-cell">错误</span>
+      <span class="req-detail">详情</span>
     </div>`;
 
   function emptyText() {
@@ -347,7 +398,7 @@
       }
       render();
       // 换筛选（页码回 1）才回顶；普通刷新与翻页保留当前滚动位置，
-      // 否则每 10 秒就把正在看日志的人踢回页首
+      // 否则每隔一个刷新周期就把正在看明细的人踢回页首
       if (resetPage) setListScroll('req-list');
     } catch (error) {
       // 静默（轮询）时保留上一屏数据，只当没刷过：把读数清成 0 会让人以为明细被删了
@@ -379,7 +430,10 @@
     timer = setInterval(() => {
       // 只在本页可见时轮询，避免后台无谓请求
       if (document.hidden || wbApp.currentPage !== 'requests') return;
-      void load({ silent: true });
+      // 上一轮还没回来就跳过这一拍（见 `polling` 的说明）
+      if (polling) return;
+      polling = true;
+      void load({ silent: true }).finally(() => { polling = false; });
     }, autoRefreshMs);
   }
 
@@ -436,7 +490,7 @@
 
   // ─── 操作 ──────────────────────────────────
 
-  /** 请求明细翻页要真打接口（offset 是后端口径），到边界直接不发请求 */
+  /** 请求日志翻页要真打接口（offset 是后端口径），到边界直接不发请求 */
   function gotoPage(target) {
     const pageCount = Math.max(1, Math.ceil(matched / PAGE_SIZE));
     const next = Math.min(Math.max(1, target), pageCount);
@@ -445,6 +499,144 @@
     offset = nextOffset;
     setListScroll('req-list');   // 新一页从顶部开始读
     void load();
+  }
+
+  /** 统一忙碌守卫：按钮禁用 + 文案切换，避免重复点击（与 logs-panel 的 guard 同一写法） */
+  async function guard(button, label, action) {
+    if (panelBusy) return;
+    panelBusy = true;
+    const original = button?.textContent;
+    if (button) { button.disabled = true; if (label) button.textContent = label; }
+    try {
+      await action();
+    } catch (error) {
+      toast(`操作失败：${error.message}`, 'err');
+    } finally {
+      panelBusy = false;
+      if (button) { button.disabled = false; if (label) button.textContent = original; }
+    }
+  }
+
+  /**
+   * 清空用的筛选参数：与 queryParams 同一套条件（不含 offset/limit）。
+   * 带条件 = 只删命中的明细（受影响日期的按天聚合由后端重算）；
+   * 不带条件 = 全部清空，此时调用方要显式带 `all=1`（后端护栏，见 clearRequests）。
+   *
+   * 返回**查询串**（与 queryParams 一致）而不是 URLSearchParams 对象：
+   * 桥接层的 toQuery 只认字符串 / 普通对象，传对象会静默变成「没有参数」，
+   * 那样筛选清空就变成了全清 —— 这个 bug 已经踩过一次，别再踩。
+   */
+  function clearParams() {
+    const params = new URLSearchParams();
+    const start = rangeStart(range);
+    const status = $('req-status')?.value;
+    if (start !== null) params.set('start', String(start));
+    if (status) params.set('status', status);
+    return params.toString();
+  }
+
+  async function clearRequests() {
+    const query = clearParams();
+    const hasFilters = query.length > 0;
+    const message = hasFilters
+      ? `确定清空当前筛选出的 <strong>${matched}</strong> 条请求？按天聚合会随删除重算，此操作无法恢复。`
+      : '确定清空<strong>全部</strong>请求日志？按天聚合会一并清空，此操作无法恢复。';
+    // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），
+    // 危险确认一律走自绘弹窗（wbConfirm，见 confirm-dialog.js）
+    if (!(await window.wbConfirm?.ask?.({
+      title: '清空请求日志',
+      html: message,
+      okText: '清空',
+      okClass: 'danger',
+    }))) return;
+    await guard($('btn-req-clear'), '清空中…', async () => {
+      // 无筛选时显式带 all=1：后端要求「清空全部」必须显式声明，
+      // 免得哪天参数漏传又被当成全清（前端写错一次就是全部数据没了）
+      await api.clearStatsRequests(hasFilters ? query : 'all=1');
+      // 清空后没有「当前页」可言：回到第 1 页并把滚动位置一起归零
+      await load({ resetPage: true });
+      toast('请求日志已清空');
+    });
+  }
+
+  // ─── 详情弹窗（上游原始报文）─────────────────
+  //
+  // 报文由 `/api/debug/traffic?id=` 按需拉取：列表接口不带报文（一个完整 SSE
+  // 响应可达数百 KB，塞进列表会让每页体积爆掉）。取不到时后端给 404，弹窗里
+  // 如实说明原因（当时没开调试模式 / 已超出保留条数），而不是留一片空白。
+  //
+  // 内容按「请求 → 响应」分块展示，与排障时的阅读顺序一致；头是 JSON 对象
+  // （后端已把凭据类字段换成 [redacted]），体是原始文本（请求体是 JSON 文本，
+  // 响应体是上游 SSE 原文）。
+
+  /** 弹窗开着时按 Esc 关闭（与确认弹窗同一交互） */
+  function onDetailKeydown(event) {
+    if (event.key === 'Escape') closeDetail();
+  }
+
+  function closeDetail() {
+    $('req-detail-modal')?.classList.remove('open');
+    document.removeEventListener('keydown', onDetailKeydown);
+  }
+
+  /** 一个展示块：标题 + 等宽正文（正文是纯文本，用 textContent 写入） */
+  function detailBlock(title, text) {
+    if (!text) return '';
+    return `<section class="req-detail-block"><h3>${esc(title)}</h3>`
+      + `<pre class="req-detail-pre">${esc(text)}</pre></section>`;
+  }
+
+  /** 对象 → 缩进 JSON 文本；失败时给空串（不让展示层抛错） */
+  function jsonText(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch {
+      return '';
+    }
+  }
+
+  function renderDetail(data) {
+    const body = $('req-detail-body');
+    const hint = $('req-detail-hint');
+    if (!body) return;
+    const status = data.status === null || data.status === undefined ? '-' : String(data.status);
+    const lines = [
+      data.url ? `URL: ${data.url}` : '',
+      data.provider ? `提供商: ${data.provider}` : '',
+      `上游状态码: ${status}`,
+    ].filter(Boolean);
+    body.innerHTML =
+      `<div class="req-detail-meta">${lines.map(esc).join('<br>')}</div>`
+      + detailBlock('上游请求头（凭据类已脱敏）', jsonText(data.requestHeaders))
+      + detailBlock('上游请求体', jsonText(data.requestBody))
+      + detailBlock('上游响应头（凭据类已脱敏）', jsonText(data.responseHeaders))
+      + detailBlock('上游响应体', data.responseBody ? String(data.responseBody) : '');
+    if (hint) {
+      hint.textContent = data.truncated
+        ? '报文超过单条上限，请求体 / 响应体已按上限截断'
+        : '内容按原样保存，请求头中的凭据字段已替换为 [redacted]';
+    }
+  }
+
+  async function openDetail(id) {
+    const modal = $('req-detail-modal');
+    const body = $('req-detail-body');
+    const hint = $('req-detail-hint');
+    if (!modal || !body) return;
+    body.textContent = '正在读取…';
+    if (hint) hint.textContent = '—';
+    modal.classList.add('open');
+    document.addEventListener('keydown', onDetailKeydown);
+    try {
+      renderDetail(await api.getDebugTraffic(id));
+    } catch (error) {
+      // 404（没开调试模式 / 超出保留条数）与其它失败在这里收敛成同一块提示：
+      // 后端给的文案已经说清了原因，直接展示它
+      body.innerHTML = `<div class="req-detail-empty">${esc(error.message || '读取失败')}</div>`;
+      if (hint) hint.textContent = '在设置 → 通用里开启「调试模式」后，新发生的请求才会保存报文';
+    }
   }
 
   // ─── 事件绑定 ──────────────────────────────
@@ -467,11 +659,26 @@
     void load({ resetPage: true });
   });
 
-  $('btn-req-refresh').addEventListener('click', () => load().then(() => toast('请求日志已刷新')));
+  $('btn-req-clear').addEventListener('click', clearRequests);
   $('btn-req-prev').addEventListener('click', () => gotoPage(Math.floor(offset / PAGE_SIZE)));
   $('btn-req-next').addEventListener('click', () => gotoPage(Math.floor(offset / PAGE_SIZE) + 2));
   // 状态筛选会换掉结果集，页码必须回到第 1 页，否则停的位置没有意义
   $('req-status').addEventListener('change', () => load({ resetPage: true }));
+
+  // ─── 详情弹窗（上游原始报文）─────────────────
+  //
+  // 事件委托在列表容器上：行是每次重绘重建的，绑在按钮上会随重绘失效。
+  $('req-list')?.addEventListener('click', event => {
+    const button = event.target.closest('[data-detail]');
+    if (!button) return;
+    void openDetail(button.dataset.detail);
+  });
+  $('req-detail-close')?.addEventListener('click', closeDetail);
+  $('req-detail-cancel')?.addEventListener('click', closeDetail);
+  $('req-detail-modal')?.addEventListener('click', event => {
+    if (event.target === $('req-detail-modal')) closeDetail();
+  });
+
   window.wbRequestsPanel = {
     load,
     // 「定时任务」页改完间隔后推给本面板（见 applyAutoRefresh 的说明）

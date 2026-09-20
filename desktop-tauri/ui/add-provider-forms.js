@@ -184,8 +184,15 @@
       ],
       desktopNote: '读本机 AutoClaw 客户端当前的登录态（%APPDATA%/AutoClaw/auth.json，DPAPI + AES-GCM 解密）建一个「桌面端实时登录态」账号：凭证不落账号文件、每次实时读取（删掉这条记录不影响客户端登录态）。',
       desktopHint: '读取 %APPDATA%/AutoClaw/auth.json 并解密，仅 Windows',
+      // 这一家的登录态是 Electron safeStorage 密文，解密要走 DPAPI（仅 Windows），
+      // 因此 macOS 上整段收起（理由见 desktopImportAvailable）
+      desktopWindowsOnly: true,
     },
     window.wbQoderAddForm,
+    // Cline 是两家（免费池 / 订阅池各占一个 provider），所以这里**展开**而不是
+    // 一项：池已经是身份，界面上不再有「额度池」那一级选择（见 add-cline.js
+    // 的模块头）。两份配置的 provider id 各带池名，块 id 随之天然不撞。
+    ...(window.wbClineAddForms || []),
   ].filter(Boolean);
 
   /** 块 id / input id 的前缀与 provider id 同名，直接复用（少一处要维护的字段） */
@@ -202,6 +209,35 @@
   const desktopButtonOf = config => `<button id="${prefixOf(config)}-desktop-button"`
     + (config.desktopHint ? ` title="${esc(config.desktopHint)}"` : '')
     + `>从本机导入桌面端登录态</button>`;
+
+  /**
+   * 壳的编译目标平台（`'macos'` / `'windows'` / `'linux'`），由桥接脚本注入。
+   *
+   * 浏览器直开（没有壳）时拿不到它，退回空串 —— 此时按「不裁剪」处理：
+   * 浏览器直连网关本来就用不了这些壳侧功能，多显示一个选项不会误导谁，
+   * 而误裁掉一个**本来可用**的功能会让 Windows 用户莫名其妙少一项。
+   */
+  const platform = () => window.workbuddyDesktop?.platform || '';
+
+  /**
+   * 桌面端导入在这一家、这个平台是否可用。
+   *
+   * ── 为什么 AutoClaw 要按平台裁掉 ─────────────────────────────
+   * 它读的是 `%APPDATA%/AutoClaw/auth.json`，而那个文件里的 token 是
+   * Electron safeStorage 的密文，要先过 DPAPI（`CryptUnprotectData`）才能解出
+   * 密钥 —— DPAPI 只有 Windows 有。在 macOS 上这条链从「找文件」这一步就断了
+   * （后端 `default_user_data_dir()` 非 Windows 直接返回 None），点下去只会
+   * 得到一句「仅支持 Windows 平台」的错误。
+   *
+   * 另外三家（小浣熊 `~/.box-agent`、CatPaw `~/.meituan-catpaw`、
+   * Cline `~/.cline`）读的都是 `HOME` 下的明文 JSON，macOS 上照样能导入 ——
+   * 所以**只裁 AutoClaw**，不是「macOS 上没有导入功能」。
+   */
+  const desktopImportAvailable = config => {
+    if (config.desktop === false) return false;
+    if (config.desktopWindowsOnly && platform() === 'macos') return false;
+    return true;
+  };
 
   /** 支持「填表单添加」的提供商：其余家只显示「即将上线」占位 */
   const ADD_FORM_PROVIDERS = { workbuddy: ADD_WB_BLOCK_ID };
@@ -229,7 +265,7 @@
     if (method.id === 'sms') return Boolean(config.smsLogin);
     if (method.id === 'web') return config.webLogin
       && (!config.webLogin.region || regionOf(config) === config.webLogin.region);
-    if (method.id === 'desktop') return config.desktop !== false;
+    if (method.id === 'desktop') return desktopImportAvailable(config);
     return true;
   });
 
@@ -332,7 +368,7 @@
 
   /** 桌面端登录态导入段：只有能导入的家生成（Qoder 没有这个来源） */
   function desktopBlockOf(config) {
-    if (config.desktop === false || !config.desktopNote) return '';
+    if (!desktopImportAvailable(config) || !config.desktopNote) return '';
     const prefix = prefixOf(config);
     return `<div class="modal-section" id="${prefix}-desktop-block" hidden>
         <h3>从本机导入桌面端登录态</h3>
@@ -668,11 +704,14 @@
       busyText: config.webLogin.busyText,
       texts,
       // ── 传哪个 edition 给壳侧 ──────────────────────────────────
-      // 优先级：配置里写死的 `edition`（某一家若将来只支持单一站点就填它）
+      // 这个形参是**各家的变体选择器**，壳侧与后端按 provider 解释它：
+      // 优先级：配置里写死的 `edition`（某一家若将来只支持单一变体就填它）
       //  → 地区分段的当前值（Qoder：国际版 global / 中国版 cn，两站都要登录）
-      //  → 'cn'（小浣熊没有地区级，且后端那条链不读这个字段）。
-      // Qoder 的 `global` 由壳侧归一成 `intl`（`login.rs` 的 edition_id），
-      // 所以这里原样把分段值传出去即可，不必在这里翻译。
+      //  → 'cn'（小浣熊既没有地区级，且后端那条链不读这个字段）。
+      // Qoder 的 `global` 由壳侧归一成 `intl`（见 src-tauri/src/login.rs）。
+      //
+      // Cline 曾经也走这个位置传「额度池」，拆分后没有了：两个池是两个
+      // provider，池已在 `config.provider` 里，没有第二个旋钮。
       start: () => window.workbuddyDesktop.startLogin(
         config.webLogin.edition || regionOf(config) || 'cn',
         webModeOf(config) || 'embedded',
@@ -751,11 +790,16 @@
   });
 
   /**
-   * 两个「登录 / 添加账号」按钮：打开弹窗后同步提供商选项并复位到 WorkBuddy。
+   * 「登录 / 添加账号」按钮：打开弹窗后同步提供商选项并复位到 WorkBuddy。
    *
-   * add-account.js 把这两个按钮绑到它自己的 openModal（加 .open 类、复位 WorkBuddy 表单）。
+   * add-account.js 把按钮绑到它自己的 openModal（加 .open 类、复位 WorkBuddy 表单）。
    * 这里再挂一个监听，在它之后执行（add-account.js 先加载、监听先注册，同元素同事件按注册
    * 顺序触发），把「按摘要重建选项 + 复位提供商」补上。
+   *
+   * id 列表里仍留着 `btn-add-account`：报表页那个按钮已随会话状态卡片一起删除，
+   * 现在只有 `btn-add-account-2`（账号页）存在。不改成写死单个 id 是因为这里用
+   * 可选链遍历、多一个不存在的 id 只是空转一次 —— 而万一以后又在别处加了按钮，
+   * 沿用同名约定就能自动接上，不必回来改这一处。
    */
   for (const id of ['btn-add-account', 'btn-add-account-2']) {
     $(id)?.addEventListener('click', () => {

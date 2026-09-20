@@ -129,39 +129,86 @@ pub fn assert_downloadable(url: &str) -> Result<url::Url, UpdateError> {
     Ok(parsed)
 }
 
-/// 从 Release 资产里挑安装包：优先名字带 setup 的 exe，其次任意 exe
-/// （对应 Node 版 pickInstaller）。没有 exe 返回 None。
-pub fn pick_installer(assets: Option<&Value>) -> Option<Value> {
-    let list = assets.and_then(Value::as_array)?;
-    let exes: Vec<&Value> = list
-        .iter()
-        .filter(|item| {
-            // `String(item?.name || '')` 后判 /\.exe$/i
-            item.get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_lowercase()
-                .ends_with(".exe")
-        })
-        .collect();
-    if exes.is_empty() {
-        return None;
+/// 本平台的安装包后缀（小写，**不含点**）：Windows 是 NSIS 的 `exe`，
+/// macOS 是磁盘映像 `dmg`。
+///
+/// 一个 Release 里会同时挂着两个平台的产物（Windows 作业与 macOS 作业各自
+/// 上传），所以「挑哪个资产」必须按平台分流 —— 否则 macOS 版会去下 exe，
+/// 再被壳侧的 `verify_installer` 拦下来，表现为「明明有新版本却装不了」。
+///
+/// 编译期常量：目标平台在构建时就定了，没有运行期判断的余地。
+pub const fn installer_suffix() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "dmg"
+    } else {
+        "exe"
     }
-    // 首选：名字含 setup 或 install（Node 的 /setup|install/i）
-    let chosen = exes
+}
+
+/// 安装包的形态标识（给界面用的：文案里要不要提 UAC 由它决定）
+pub const fn installer_kind() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "dmg"
+    } else {
+        "nsis"
+    }
+}
+
+/// 资产的 `name` 字段（缺失或非字符串时给空串，与 Node 的 `String(item?.name || '')` 同）
+fn asset_name(item: &Value) -> &str {
+    item.get("name").and_then(Value::as_str).unwrap_or("")
+}
+
+/// 多个候选资产之间的择优顺序（按平台分流）。
+///
+/// ── Windows：优先 NSIS 安装器 ────────────────────────────────
+/// NSIS 的产物名带 `-setup`，Release 里偶尔还会附一个裸 exe（免安装的
+/// 主程序），那不是安装器 —— 装它不会建快捷方式、也不会登记卸载项。
+///
+/// ── macOS：按芯片优先级 ─────────────────────────────────────
+/// 一次 macOS 构建可能上传 aarch64 / x86_64 / universal 三种 dmg：
+///   - `universal` 两种芯片都能跑，最优；
+///   - `aarch64` 是 Apple Silicon 原生；
+///   - `x86_64` 只在 Intel 上能跑（Apple Silicon 要靠 Rosetta 转译）。
+/// 三个都没有（用户手工命名的资产）时退回第一个 —— 至少是个 dmg。
+fn pick_preferred<'a>(candidates: &[&'a Value]) -> Option<&'a Value> {
+    if cfg!(target_os = "macos") {
+        for keyword in ["universal", "aarch64", "arm64", "x86_64", "x64"] {
+            if let Some(found) = candidates
+                .iter()
+                .find(|item| asset_name(item).to_lowercase().contains(keyword))
+            {
+                return Some(*found);
+            }
+        }
+        return candidates.first().copied();
+    }
+    candidates
         .iter()
         .find(|item| {
-            let name = item
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_lowercase();
+            let name = asset_name(item).to_lowercase();
             name.contains("setup") || name.contains("install")
         })
         .copied()
-        .unwrap_or(exes[0]);
+        .or_else(|| candidates.first().copied())
+}
+
+/// 从 Release 资产里挑**本平台**的安装包。
+///
+/// 后缀按 [`installer_suffix`] 分流（Windows → exe，macOS → dmg），
+/// 多个候选时按 [`pick_preferred`] 的优先级取一个。没有匹配的资产返回 None
+/// （界面据此把「下载并安装」按钮藏起来，而不是给一个点了报错的按钮）。
+pub fn pick_installer(assets: Option<&Value>) -> Option<Value> {
+    let list = assets.and_then(Value::as_array)?;
+    // 带点的后缀拼一次放循环外（循环里每次 format 会白分配）
+    let suffix = format!(".{}", installer_suffix());
+    let candidates: Vec<&Value> = list
+        .iter()
+        .filter(|item| asset_name(item).to_lowercase().ends_with(&suffix))
+        .collect();
+    let chosen = pick_preferred(&candidates)?;
     Some(serde_json::json!({
-        "name": chosen.get("name").and_then(Value::as_str).unwrap_or(""),
+        "name": asset_name(chosen),
         // `Number(installer.size) || 0`：非数字/NaN/0 都得 0
         "size": chosen.get("size").and_then(Value::as_u64).unwrap_or(0),
         "url": chosen.get("browser_download_url").and_then(Value::as_str).unwrap_or(""),
@@ -180,7 +227,8 @@ fn js_trim(value: &str) -> &str {
 /// 文件名安全化：只取基名，去掉路径分隔符与可疑字符（对应 Node 版 safeFileName）。
 ///
 /// Node 是 `basename(name).replace(/[\\/:*?"<>|]/g, '_').trim()`，
-/// 空结果回落到 'workbuddy-update.exe'。注意 `basename` 在 Windows 上
+/// 空结果回落到 `workbuddy-update.exe`（本项目按平台取后缀，见 [`installer_suffix`]）。
+/// 注意 `basename` 在 Windows 上
 /// 同时识别 `\` 与 `/`，与 Node 的 path.basename（POSIX 语义，只认 `/`）
 /// 有差别 —— 但紧接着的替换会把残留的 `\` 变成 `_`，最终文件名同样不含路径分隔符，
 /// 安全性一致（这里是**有意**用 Windows 语义，避免把 `..\evil.exe` 原样留下）。
@@ -202,7 +250,9 @@ pub fn safe_file_name(name: &str) -> String {
         .collect();
     let cleaned = js_trim(&cleaned);
     if cleaned.is_empty() {
-        "workbuddy-update.exe".to_string()
+        // 兜底名也要带本平台的后缀：下游 `verify_installer` 会校验后缀，
+        // 给一个错后缀的兜底名等于把「资产名异常」变成「装不了」
+        format!("agent2api-update.{}", installer_suffix())
     } else {
         cleaned.to_string()
     }

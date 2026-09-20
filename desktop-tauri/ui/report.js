@@ -4,7 +4,7 @@
 /**
  * 独立于 app.js 的报表面板模块：自持时间范围、自持最近一次的后端数据。
  *
- * 与 logs-panel.js / settings-panel.js 同构：依赖 window.wbApp 的 esc / toast / currentPage，
+ * 与 logs-panel.js / settings-panel.js 同构：依赖 window.wbApp 的 esc / currentPage，
  * 通过 window.wbReport 暴露 load 给 app.js（切到本页时立即刷新）。
  *
  * 三张图都是手写 SVG（项目没有图表库，也不为一个页面引依赖）：
@@ -19,7 +19,7 @@
 (() => {
   const api = workbuddyDesktop;
   const $ = id => document.getElementById(id);
-  const { esc, toast } = wbApp;
+  const { esc } = wbApp;
 
   // ─── 常量 ──────────────────────────────────
 
@@ -45,6 +45,36 @@
   const TIP_LIMIT = 400;
 
   // ─── 状态 ──────────────────────────────────
+
+  /**
+   * 自动刷新间隔（毫秒），由「定时任务」页配置
+   * （`scheduledTasks.reportAutoRefresh`）。
+   *
+   * 与日志页 / 请求日志页同构：定时器长在本页，只在**本页可见时**才请求
+   * （`document.hidden` 与 `wbApp.currentPage` 都判），离开页面完全静默。
+   * 「定时任务」页改完会调 `applyAutoRefresh` 把新值推过来，本页启动时也自己
+   * 拉一次（见 `syncAutoRefresh`），于是无论用户先开哪一页都对得上。
+   *
+   * 兜底值 1 秒 = 后端的默认间隔（`DEFAULT_REPORT_AUTO_REFRESH_SECONDS`）。
+   */
+  const DEFAULT_AUTO_REFRESH_MS = 1_000;
+  let autoRefreshMs = DEFAULT_AUTO_REFRESH_MS;
+  /** 任务关闭时置 false：定时器不跑（区别于「间隔很大」） */
+  let autoEnabled = true;
+  /** 是否已经从后端读到过间隔配置（自读只做一次；推送来的值也算同步过） */
+  let autoSynced = false;
+  /** 页面同步定时器 */
+  let timer = null;
+  /**
+   * 是否有一次轮询触发的拉取还在途中。
+   *
+   * 定时器是 `setInterval`（不等上一次完成），而间隔可以是 1 秒 ——
+   * 一次慢响应就会与后来的几拍叠在一起。`load` 本身按序号只认最新结果
+   * （不会显示乱序数据），但**每次都会打一次接口**，白白压着后端；
+   * 所以轮询这一拍撞上在途请求时直接跳过，由下一拍补上
+   * （与 logs-panel / requests-panel 的 `polling` 同一处理）。
+   */
+  let polling = false;
 
   /** 最近一次成功拿到的 summary：容器尺寸变化时用它原地重绘，不再打请求 */
   let summary = null;
@@ -195,26 +225,63 @@
       </div>`).join('');
   }
 
-  // ─── 板块二：Top 提供商占比 ────────────────
+  // ─── 板块二：Top 提供商 / Top 账号排行 ──────
+  //
+  // 两张卡片（并排）共用同一套渲染：都是「一行一个主体 + 占比条 + 请求数 + 百分比」，
+  // 差别只在数据来源、名字怎么取、以及「其它」那一行怎么称呼。抽成一个函数传配置，
+  // 而不是写两份 —— 两份的列宽、tooltip 格式、排序口径迟早会漂，而这类漂移
+  // 不会报错，只会让两张并排的卡片看起来像两套设计。
 
   /**
-   * 数据来自 summary.providers（`[{id,label,requests,success,tokens}]`，按请求数降序）。
+   * 数据来自 summary.providers / summary.accounts
+   * （`[{id,label,requests,success,totalTokens}]`，按请求数降序）。
    *
-   * 整块的可见性由 providersHtml 的返回值决定：**契约里没有这个字段就整块隐藏**
+   * 整块的可见性由 paintRank 决定：**契约里没有这个字段就整块隐藏**
    * （旧后端 / 该维度还没接上），与「字段在但为空数组」不同 —— 后者是「这段时间
-   * 一条明细都没记 provider」（例如全部请求都没走到转发），此时给一句空态即可。
+   * 一条明细都没记下这一维」（例如全部请求都没走到转发），此时给一句空态即可。
    * 两者混在一起会让「版本落后」看起来像「今天没用量」。
    *
-   * 展示上只取前 5 家（超过就并进「其它」）：这块是概览不是明细表，家数一多
-   * 每行的条就细到看不出差别；完整数据本来也能在模型请求里按 provider 列核对。
+   * 展示上只取前 5 项（超过就并进「其它」）：这块是概览不是明细表，项数一多
+   * 每行的条就细到看不出差别；完整数据本来也能在模型请求里按列核对。
    */
-  const PROVIDER_TOP = 5;
+  const RANK_TOP = 5;
 
-  function providersHtml(list) {
+  /** 两张卡片的配置（渲染逻辑共用，差异全在这里） */
+  const RANK_CARDS = {
+    providers: {
+      panelId: 'report-providers-panel',
+      listId: 'report-providers',
+      labelId: 'report-providers-label',
+      // 「其它 N 家」：provider 的量词是「家」
+      restLabel: count => `其它 ${count} 家`,
+      emptyText: '所选范围内还没有请求记录',
+      // provider 的 id 是注册表里的短标识（workbuddy / qoder），tooltip 里值得带上
+      tipName: item => (item.id ? `${item.label}（${item.id}）` : item.label),
+    },
+    accounts: {
+      panelId: 'report-accounts-panel',
+      listId: 'report-accounts',
+      labelId: 'report-accounts-label',
+      // 「其它 N 个」：账号的量词是「个」，与账号页的称呼一致
+      restLabel: count => `其它 ${count} 个`,
+      emptyText: '所选范围内还没有账号用量',
+      // 账号名可能重复（两家都能叫「默认」），id 才是身份 —— tooltip 里带上它
+      tipName: item => (item.id ? `${item.label}（${item.id}）` : item.label),
+    },
+  };
+
+  /**
+   * 一组排行行 → HTML。
+   *
+   * 两条 `RANK_CARDS` 的 label 语义不同（provider 的由后端注册表现算，
+   * 账号的是聚合时留下的名字快照），但都已经是可直接显示的字符串，
+   * 所以这里按同一形态消费，不必分叉。
+   */
+  function rankHtml(list, config) {
     const rows = (Array.isArray(list) ? list : [])
       .map(item => ({
         id: String(item?.id ?? '').trim(),
-        // label 缺省用 id 兜底；两者都空的那一组是后端的「未知」（请求未走到转发）
+        // label 缺省用 id 兜底；两者都空的那一组是后端的「未知」
         label: String(item?.label ?? '').trim(),
         requests: Number(item?.requests) || 0,
         success: Number(item?.success) || 0,
@@ -222,7 +289,7 @@
       }))
       .filter(item => item.requests > 0 || item.tokens > 0);
 
-    if (!rows.length) return placeholder('所选范围内还没有请求记录');
+    if (!rows.length) return placeholder(config.emptyText);
 
     const total = rows.reduce((sum, item) => sum + item.requests, 0);
     // 总量为 0（只有 token 没有请求，理论上不该出现）时不给百分比：0/0 没有意义
@@ -231,51 +298,55 @@
     // 按请求数排序后截断，溢出的合并成「其它」一行 —— 合并后的条仍然按真实
     // 总量画，所以所有条加起来始终是 100%，不会因为截断而看起来缺一截
     const sorted = [...rows].sort((left, right) => right.requests - left.requests);
-    const head = sorted.slice(0, PROVIDER_TOP);
-    const rest = sorted.slice(PROVIDER_TOP);
+    const head = sorted.slice(0, RANK_TOP);
+    const rest = sorted.slice(RANK_TOP);
     if (rest.length) {
       head.push({
         id: '',
-        label: `其它 ${rest.length} 家`,
+        label: config.restLabel(rest.length),
         requests: rest.reduce((sum, item) => sum + item.requests, 0),
         success: rest.reduce((sum, item) => sum + item.success, 0),
         tokens: rest.reduce((sum, item) => sum + item.tokens, 0),
       });
     }
 
-    const items = head.map(item => {
+    return head.map(item => {
       const percent = share(item.requests);
       // 成功率只在有请求时给（0/0 没有意义），与概览里的口径一致
       const rate = item.requests ? `${((item.success / item.requests) * 100).toFixed(1)}%` : '—';
       const name = item.label || item.id || '未知';
+      // 「名字（id）」这一形态有两处用途：整行的气泡说明，以及名字列的原生 title
+      // （名字列可能被省略号截断，原生 title 是最直接的补救）。两者同源，
+      // 名字列的显示与身份标识不会各说各话。
+      const full = config.tipName({ ...item, label: name });
       // 条宽用百分比：容器宽度变化时条跟着伸缩，不必像 SVG 那样量宽度重绘
-      const tip = `${name}：${formatInt(item.requests)} 次请求 · 占 ${percent.toFixed(1)}%`
+      const tip = `${full}：${formatInt(item.requests)} 次请求 · 占 ${percent.toFixed(1)}%`
         + ` · 成功率 ${rate} · ${formatTokens(item.tokens)} tokens`;
-      return `<div class="provider-share" data-tip="${esc(tip)}">
-          <span class="name" title="${esc(item.id ? `${name}（${item.id}）` : name)}">${esc(name)}</span>
+      return `<div class="rank-row" data-tip="${esc(tip)}">
+          <span class="name" title="${esc(full)}">${esc(name)}</span>
           <span class="track"><span class="bar" style="width:${percent.toFixed(1)}%"></span></span>
           <span class="num">${formatInt(item.requests)}</span>
           <span class="pct">${percent.toFixed(1)}%</span>
         </div>`;
     }).join('');
-
-    return items;
   }
 
   /**
-   * 写入 Top 提供商区块，并决定整块的显隐。
+   * 写入一张排行卡片，并决定整块的显隐。
    *
-   * `summary.providers` 缺失（`undefined`）→ 整块隐藏：这是「这份后端还没有这一维」，
+   * 字段缺失（`undefined`）→ 整块隐藏：这是「这份后端还没有这一维」，
    * 不是「这一维没数据」。面板与页头的小标题一起藏，避免页面上留一个空卡片。
    */
-  function paintProviders(list) {
-    const panel = $('report-providers-panel');
+  function paintRank(key, list) {
+    const config = RANK_CARDS[key];
+    if (!config) return;
+    const panel = $(config.panelId);
     if (!panel) return;
     const has = Array.isArray(list);
     panel.hidden = !has;
     if (!has) return;
-    paint('report-providers', providersHtml(list));
-    paint('report-providers-label', esc(`${formatInt(
+    paint(config.listId, rankHtml(list, config));
+    paint(config.labelId, esc(`${formatInt(
       list.reduce((sum, item) => sum + (Number(item?.requests) || 0), 0))} 次请求`));
   }
 
@@ -734,8 +805,9 @@
     const rangeKey = RANGES.includes(summary.range) ? summary.range : range;
 
     paint('report-overview', overviewHtml(summary.overview, rangeKey, trend.length));
-    // Top 提供商：整块的显隐由 paintProviders 自己判断（字段缺失就藏起来）
-    paintProviders(summary.providers);
+    // 两张排行卡：整块的显隐由 paintRank 自己判断（各自字段缺失就藏起来）
+    paintRank('providers', summary.providers);
+    paintRank('accounts', summary.accounts);
     paint('report-heatmap', heatmapHtml(summary.heatmap));
     paint('report-cache-rates', cacheRatesHtml(summary.cacheRates));
     paint('report-cache-trend', cacheTrendHtml(summary.cacheTrend24h));
@@ -747,15 +819,18 @@
   /**
    * 加载失败：各板块各自显示错误态，而不是整页崩掉。
    * 每块都写、而不是只弹一个 toast —— 用户需要知道的是「这些数字现在不可信」。
-   * Top 提供商不在此列：它本来就要按「有没有这一维数据」决定显隐，
+   * 两张排行卡不在此列：它们本来就要按「有没有这一维数据」决定显隐，
    * 整页读取失败时留着上一轮的条反而会让人以为它还是可信的，所以一并藏起来。
    */
   function renderFailure(message) {
     const html = placeholder(`读取报表失败：${message}`, 'empty report-error');
     ['report-overview', 'report-heatmap', 'report-cache-rates', 'report-cache-trend', 'report-daily-trend']
       .forEach(id => paint(id, html));
-    const panel = $('report-providers-panel');
-    if (panel) panel.hidden = true;
+    // 两张排行卡一起藏（各自的 panelId 从同一份配置取，不在这里另写一遍 id）
+    Object.keys(RANK_CARDS).forEach(key => {
+      const panel = $(RANK_CARDS[key].panelId);
+      if (panel) panel.hidden = true;
+    });
   }
 
   function render(data) {
@@ -772,6 +847,10 @@
 
   /** silent：只压掉控制台噪音（首屏自持加载用），错误态照常显示 */
   async function load({ silent = false } = {}) {
+    // 兜一次间隔配置：冷启动时首次读取可能撞上「后端还没起来」而失败，
+    // 那时会把兜底值一直用下去（同步过一次就立刻返回，无额外开销）。
+    // 与 requests-panel 的 load 同一处理。
+    void syncAutoRefresh();
     // 不做互斥锁，而是「最后一次请求胜出」：用户连点几档范围时，
     // 用锁会把后面几次点击直接吞掉（界面停在旧数据上，看着像没反应）；
     // 这里让它们照常发出，只认最新那次的结果，先回来的旧响应一律作废。
@@ -791,6 +870,80 @@
       renderFailure(error.message || '未知错误');
       return null;
     }
+  }
+
+  // ─── 自动刷新（间隔由「定时任务」页配置，见文件头状态区的说明）────
+
+  /**
+   * 应用「定时任务」页推来的新配置（也用于启动时自读，见 `syncAutoRefresh`）。
+   *
+   * `task` 的形状 = `/api/scheduled-tasks` 里的一条（`{enabled, interval, unit}`）。
+   * 传 null / 形状不符时退回默认值 —— 界面不该因为一个读不到的配置就
+   * 完全停止刷新（那看起来像功能坏了）。
+   */
+  function applyAutoRefresh(task) {
+    // 配置已经由推送方给过，标上已同步：待重试的自读就不必再跑（更糟的是，
+    // 那次读若失败会把用户刚在定时任务页改好的间隔覆盖回兜底值）
+    autoSynced = true;
+    const interval = Number(task?.interval);
+    const valid = task && typeof task === 'object'
+      && Number.isFinite(interval) && interval > 0
+      && (task.unit === 'seconds' || task.unit === 'minutes');
+    if (!valid) {
+      autoEnabled = true;
+      autoRefreshMs = DEFAULT_AUTO_REFRESH_MS;
+    } else {
+      autoEnabled = task.enabled !== false;
+      autoRefreshMs = task.unit === 'minutes' ? interval * 60_000 : interval * 1000;
+    }
+    startAuto();
+  }
+
+  /**
+   * 启动时自己拉一次配置。
+   *
+   * 为什么本面板要自己拉而不是等「定时任务」页推：用户完全可能直接打开报表页
+   * （上次停留的页），而从未进过定时任务页 —— 那样推的动作永远不会发生，
+   * 间隔就一直是兜底值。与 logs-panel / requests-panel 同一处理。
+   *
+   * 读取失败**不**标记为已同步，于是切回本页时（`showPage` 里的重试）会再来
+   * 一次 —— 首次读取失败最常见的原因就是「后端还没起来」（冷启动），
+   * 一次失败就永久用兜底值，用户会以为「我在定时任务页改的间隔没生效」。
+   */
+  async function syncAutoRefresh() {
+    if (autoSynced) return;
+    try {
+      const list = await api.getScheduledTasks();
+      const task = (list?.tasks || []).find(item => item.id === 'reportAutoRefresh');
+      applyAutoRefresh(task || null);
+      // 请求成功就标记同步过（哪怕这一条不在清单里 —— 那是后端版本旧，
+      // 再重试也不会有，标记下来免得每次切页面都白跑一次请求）
+      autoSynced = Array.isArray(list?.tasks);
+    } catch (error) {
+      // 读不到就用兜底值继续跑（见 applyAutoRefresh 的说明），下次切进本页再试
+      console.warn('读取报表自动刷新间隔失败，按默认 1 秒:', error.message);
+      applyAutoRefresh(null);
+    }
+  }
+
+  function startAuto() {
+    stopAuto();
+    if (!autoEnabled || autoRefreshMs <= 0) return;
+    timer = setInterval(() => {
+      // 只在报表页可见时轮询，避免后台无谓请求
+      if (document.hidden || wbApp.currentPage !== 'overview') return;
+      // 上一轮还没回来就跳过这一拍（见 `polling` 的说明）
+      if (polling) return;
+      polling = true;
+      // silent：自动刷新是背景动作，偶发失败不该往控制台刷噪音
+      //（错误态照常显示在页面上，用户看得到）
+      void load({ silent: true }).finally(() => { polling = false; });
+    }, autoRefreshMs);
+  }
+
+  function stopAuto() {
+    if (timer) clearInterval(timer);
+    timer = null;
   }
 
   // ─── 时间范围 ──────────────────────────────
@@ -852,20 +1005,27 @@
     if (item && !item.disabled) setRange(item.dataset.range);
   });
 
-  $('btn-report-refresh')?.addEventListener('click', async event => {
-    const button = event.currentTarget;
-    button.disabled = true;
-    const data = await load();
-    button.disabled = false;
-    toast(data ? '✅ 报表已刷新' : '刷新失败，详见控制台', data ? 'ok' : 'err');
-  });
+  // 页头原先那颗「刷新」按钮已移除：本页现在按「定时任务」页配置的间隔自动
+  // 刷新（默认 1 秒，页面可见才跑），手动再点一次已经没有意义 —— 留着它反而
+  // 会让人以为「不点就不会更新」。要改节奏去「定时任务」页，要立刻看最新数据
+  // 切走再切回来即可（`showPage` 会调一次 load）。
 
   paint('report-heat-legend', heatLegendHtml());
   syncRangeButtons();
 
-  window.wbReport = { load, render, lastSummary: () => summary };
+  window.wbReport = {
+    load,
+    render,
+    lastSummary: () => summary,
+    // 「定时任务」页改完间隔后推过来（见 tasks-panel.js 的 pushAutoRefresh）
+    applyAutoRefresh,
+  };
 
   // 首屏自持加载：app.js 的 showPage 在本脚本加载前就执行过了（脚本排在 app.js 之后），
   // 若上次停留在报表页，那次调用还拿不到 window.wbReport，这里必须补一次
   if (wbApp.currentPage === 'overview') void load({ silent: true });
+
+  // 自动刷新：启动时自读一次配置（失败就按兜底值跑），随后由定时器接管。
+  // 不依赖「定时任务」页推 —— 用户完全可能一次都没进过那一页。
+  void syncAutoRefresh();
 })();

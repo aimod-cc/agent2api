@@ -53,7 +53,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::server::core::providers::adapter::{adapter_for, ProviderAdapter, UpstreamErrorClass};
+use crate::server::config;
+use crate::server::core::providers::adapter::{
+    adapter_for, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
+};
 use crate::server::core::providers::router::route_for_forward;
 use crate::server::core::providers::{kind_from_id, kind_id, meta, ProviderKind};
 use crate::server::errors::GatewayError;
@@ -62,8 +65,8 @@ use crate::server::logging;
 use super::payload::{send_body, ProviderContext};
 use super::request::{read_upstream_error, send_chat_request, TransportRequest};
 use super::{
-    account_display, account_label, describe_proxy, reset_hint, rotate, ForwardOutcome,
-    InFlightGuard, RouteTarget, UpstreamService, MAX_ROUTE_ATTEMPTS,
+    account_display, account_label, connections::ConnectionGuard, describe_proxy, reset_hint,
+    rotate, ForwardOutcome, InFlightGuard, RouteTarget, UpstreamService, MAX_ROUTE_ATTEMPTS,
 };
 
 /// 上游一次请求的失败（已分类 + 已构好给客户端的错误）。
@@ -78,18 +81,93 @@ struct OutboundFailure {
     error: GatewayError,
 }
 
+/// 一个「提供商阶段」的退避重试预算（见 `send_with_retry` 的说明）。
+///
+/// 为什么需要「阶段」这个概念：退避重试的次数分两档 —— 最初那家用
+/// `retryCount`，换到别家之后用 `retryCrossProviderCount`。而账号循环会在
+/// **同一家名下的多个账号**之间来回走，那些轮次属于**同一个阶段**、共用
+/// 一份预算；只有换到另一家才开一份新的。
+///
+/// `total` 只用于日志里的「第 n/N 次」，不参与判定 —— 判定看 `remaining`。
+#[derive(Clone, Copy, Debug)]
+struct RetryBudget {
+    /// 本阶段总共几次（日志用）
+    total: usize,
+    /// 本阶段还剩几次
+    remaining: usize,
+}
+
+impl RetryBudget {
+    fn new(total: usize) -> Self {
+        Self { total, remaining: total }
+    }
+
+    /// 本阶段已经用掉几次（适配器要这个来写文案）
+    fn used(&self) -> usize {
+        self.total.saturating_sub(self.remaining)
+    }
+}
+
+/// 瞬时 HTTP 状态码：适配器没声明专属重试时，按全局重试设置原样重发再看一眼。
+///
+/// 只收 408（请求超时）与 5xx（网关 / 服务器错误）—— 都是上游或链路自己的
+/// 抖动，重试才有意义。**不含 429**：那是限额，走「账号冷却 + 换号」的分类
+/// 动作（见模块头的三个动作），对同一账号原地重试只会白等一个间隔。
+const TRANSIENT_RETRY_STATUSES: &[u16] = &[408, 500, 502, 503, 504];
+
+/// 瞬时 HTTP 错误的统一退避建议（设置页「请求重试」的全局兜底）。
+///
+/// `remaining` 是本阶段**还剩几次**退避可用（见 `send_with_retry` 的说明）；
+/// 用尽即返回 None，由调用方收敛成终态错误。
+fn transient_retry_advice(status: u16, remaining: usize, total: usize) -> Option<RetryAdvice> {
+    let retry = config::retry_settings();
+    if remaining == 0 || !TRANSIENT_RETRY_STATUSES.contains(&status) {
+        return None;
+    }
+    Some(RetryAdvice {
+        delay_ms: retry.delay_ms(),
+        log_message: format!(
+            "⚠️ 上游瞬时错误（HTTP {status}），{} 秒后重试（第 {}/{} 次）",
+            retry.interval_seconds,
+            total - remaining + 1,
+            total,
+        ),
+    })
+}
+
+/// 传输层失败（DNS / 代理 / 连接）的统一退避建议：与瞬时 HTTP 错误同一套设置。
+fn transport_retry_advice(remaining: usize, total: usize) -> Option<RetryAdvice> {
+    let retry = config::retry_settings();
+    if remaining == 0 {
+        return None;
+    }
+    Some(RetryAdvice {
+        delay_ms: retry.delay_ms(),
+        log_message: format!(
+            "⚠️ 上游连接失败，{} 秒后重试（第 {}/{} 次）",
+            retry.interval_seconds,
+            total - remaining + 1,
+            total,
+        ),
+    })
+}
+
 /// 转发入口：在候选家的全部账号里按全局优先级逐个尝试。
 ///
 /// `slot` 是在途槽位凭证（`&mut` 是因为它只在**成功转为流式**时才被取走，
 /// 失败重试时仍由本函数持有；见 `InFlightGuard` 的说明）。
+/// `connections` 同理是账号级活跃连接的凭证：本函数按选中的账号改绑它，
+/// 成功转流式时移交给响应流。
 pub(super) async fn forward_with_providers(
     service: &UpstreamService,
     ctx: ProviderContext<'_>,
     slot: &mut Option<InFlightGuard>,
+    connections: &mut ConnectionGuard,
 ) -> Result<ForwardOutcome, GatewayError> {
     let model = model_of(ctx.body);
     // 候选家来自 `route_for_forward`（目录里没有这个模型名时会回落成默认
-    // provider 一家）—— 本函数是唯一消费方，日志也打在这里。
+    // provider 一家；模型有家承载但全被禁用时**不回落**，见那个函数）——
+    // 本函数是唯一消费方，日志也打在这里。
     let candidates = route_for_forward(&model);
     if crate::server::core::providers::catalog::providers_for_model(&model).is_empty() {
         logging::verbose(
@@ -101,15 +179,35 @@ pub(super) async fn forward_with_providers(
         );
     }
     if candidates.is_empty() {
-        // 注册表里连默认 provider 都没有时才会走到（见 `route_for_forward`）
+        // 空链有两条来源（见 `route_for_forward`）：注册表里连默认 provider 都
+        // 没有，或者这个名字的承载家**全被禁用**（那时不回落默认家）。后者是
+        // 用户可操作的，文案要指出去哪儿改，不能只说「没有可用的提供商」。
+        if crate::server::core::providers::catalog::model_blocked_everywhere(&model) {
+            return Err(GatewayError::with_status(
+                404,
+                format!(
+                    "模型已在网关中禁用: {model}。完整列表见 GET /v1/models"
+                ),
+            )
+            .with_code("model_not_found"));
+        }
         return Err(GatewayError::new("没有可用的提供商，无法转发"));
     }
     let provider_ids: Vec<&str> = candidates.iter().map(|kind| kind_id(*kind)).collect();
+    // 映射扩池的提示：链比本名承载家长，说明追加了映射的提供商（选路顺序仍是
+    // 原生优先）。用户看到请求落到映射家时，这里与发送侧的改写日志对得上。
+    let with_mapping = crate::server::core::model_rules::current()
+        .mappings_of(&model)
+        .len() > 0;
     logging::verbose(
         "[Upstream]",
-        &format!("候选提供商 {}（按账号全局优先级选路）", provider_ids.join(" / ")),
+        &format!(
+            "候选提供商 {}（按账号全局优先级选路{}）",
+            provider_ids.join(" / "),
+            if with_mapping { "，含映射" } else { "" },
+        ),
     );
-    attempt_queue(service, &ctx, &provider_ids, slot).await
+    attempt_queue(service, &ctx, &provider_ids, slot, connections).await
 }
 
 /// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
@@ -123,19 +221,42 @@ async fn attempt_queue(
     ctx: &ProviderContext<'_>,
     provider_ids: &[&str],
     slot: &mut Option<InFlightGuard>,
+    connections: &mut ConnectionGuard,
 ) -> Result<ForwardOutcome, GatewayError> {
     let model = model_of(ctx.body);
     let model_label = if model.is_empty() { "(默认)".to_string() } else { model.clone() };
     let mut tried_ids: Vec<String> = Vec::new();
-    // 各家的发送体：某一家即将发送前按作用范围决定一次，换到同一家的另一个账号
-    // 时复用（不重复处理、不重复统计）。勾选的家用处理副本，未勾选的用原始 body。
-    let mut send_cache: HashMap<&'static str, Cow<'_, Value>> = HashMap::new();
+    // ── 重试预算的两档怎么分（见 config::RetrySettings）─────────────────
+    // 用户描述的行为：「同一提供商重试 3 次，然后切换到下一个提供商，
+    // 在那边再重试 5 次」。落到这里就是一条规则 ——
+    // **这一轮的提供商与上一轮相同 → 沿用现有预算；不同 → 开一份新的**
+    // （新的一份用「切换提供商」档的次数，而不是接着上一档扣剩下的）。
+    //
+    // 两个推论都对得上直觉：
+    //   - 同一家名下换账号（A1 → A2）**不**重置预算，所以「同一提供商 3 次」
+    //     是该家总共 3 次，而不是每个账号各 3 次；
+    //   - A → B → A 的第三段算「换过家」，拿的是一份完整的 5 次
+    //     （而不是沿用 B 阶段的残额）。
+    //
+    // `last_provider` 为 None = 还没发过请求（首次选路），用「同一提供商」档。
+    let mut last_provider: Option<&'static str> = None;
+    let mut budget = RetryBudget::new(0);
+    // 各家的发送体：某一家即将发送前按作用范围决定一次，换到**同一家同池**的
+    // 另一个账号时复用（不重复处理、不重复统计）。键带账号的池（Cline 的账号
+    // 记录有 `free`/`pass`）：发送名跟着实际承载的账号所在池走
+    // （`wire_model_for_provider`），跨池账号的发送名不同，各算一份。
+    // 勾选的家用处理副本，未勾选的用原始 body。
+    let mut send_cache: HashMap<(&'static str, String), Cow<'_, Value>> = HashMap::new();
 
     // 标签是必需的：下面「429 降级到下一个账号」发生在**内层发送循环**里，
     // 裸 `continue` 会回到内层（用同一个账号再发一次，正好是要避免的事）。
     // `continue 'accounts` 才表达「换队列里的下一个账号」。
     'accounts: for _ in 0..=MAX_ROUTE_ATTEMPTS {
         let target = rotate::select_target_account(service, provider_ids, &model, &tried_ids).await?;
+        // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
+        // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
+        // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
+        connections.rebind(target.account_id.clone());
         let Some(kind) = kind_from_id(&target.provider) else {
             return Err(GatewayError::with_status(
                 503,
@@ -144,12 +265,20 @@ async fn attempt_queue(
         };
         let adapter = adapter_for(kind);
         let provider_id = kind_id(kind);
+        // 本轮的重试预算：与上一轮同一家 → 沿用（同一家名下换账号不重置）；
+        // 换了家（或这是第一轮）→ 开一份新的，用对应档位的完整次数。
+        // 第一轮用「同一提供商」档（`last_provider` 还是 None）。
+        let switched = matches!(last_provider, Some(previous) if previous != provider_id);
+        if switched || last_provider.is_none() {
+            budget = RetryBudget::new(config::retry_settings().budget(switched));
+        }
+        last_provider = Some(provider_id);
         if adapter.is_stateful() {
             // 会话式转发（CatPaw）内部没有轮换，但**队列的兜底仍然生效**：
             // 它失败了就把它记入已尝试、回到循环挑下一个账号 —— 可能已经换了一家。
             // 没有下一个可用账号时，把这个错误原样透传（它的文案最贴近真实原因）。
             let stateful_account_id = target.account_id.clone();
-            match attempt_stateful(service, ctx, kind, adapter, target, slot).await {
+            match attempt_stateful(service, ctx, kind, adapter, target, slot, connections).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
                     if let Some(account_id) = stateful_account_id {
@@ -258,10 +387,19 @@ async fn attempt_queue(
 
         // ── 内容处理：凭证已就绪、这一家**即将发送**，此刻才决定发送体 ────
         // 位置在选路/凭证之后：没有可用账号（上面的 503/401 提前返回）的请求
-        // 走不到这里，不会产生一次「已转发的处理」统计。
+        // 走不到这里，不会产生一次「已转发的处理」统计。账号的池进缓存键，
+        // 让发送名随实际承载的账号走（同池换账号复用，跨池各算一份）。
+        let account_pool = target
+            .account
+            .as_ref()
+            .and_then(|account| account.get("pool"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let body = send_cache
-            .entry(provider_id)
-            .or_insert_with(|| send_body(ctx, provider_id));
+            .entry((provider_id, account_pool))
+            .or_insert_with(|| send_body(ctx, provider_id, target.account.as_ref()));
 
         // ── 一次账号内的发送链：最多两次（首次 + 401 刷新后重试一次）────
         // 为什么把刷新重试并进同一个循环：重试**自己也可能是** 429
@@ -304,7 +442,16 @@ async fn attempt_queue(
                 payload,
                 proxy: target.proxy.clone(),
             };
-            match send_with_retry(adapter, &transport).await {
+            // ── 调试模式：抓一份即将发出去的原始报文 ──────────────────
+            // 位置在 `build_chat_request` 之后（URL / 头 / body 都已定稿）。
+            // 每次尝试前刷新一次（退避重试与 401 刷新重试都会走到这里），
+            // 于是留下的是**最终生效**的那一次往返。开关关着时 `capture`
+            // 为 None，这一段完全不执行（零开销）。
+            let capture = ctx.telemetry.capture();
+            if let Some(capture) = capture.as_deref() {
+                capture.reset_request(&transport.url, provider_id, &transport.headers, &plan.body);
+            }
+            match send_with_retry(adapter, &transport, &mut budget, capture.as_deref()).await {
                 Ok(response) => break response,
                 Err(failure) => {
                     // ── 动作 2：token 失效 → 刷新后同一账号重试一次 ──────
@@ -502,14 +649,24 @@ async fn attempt_queue(
             ),
         );
 
+        // ── 调试模式：响应头到手（必须在 consume response 之前）──────────
+        // 状态码与响应头在这里定稿；响应体由后续的流 / 聚合函数逐段补进同一个
+        // 采集器（见 `ForwardStream` / `aggregate_sse_completion`）。
+        if let Some(capture) = ctx.telemetry.capture() {
+            capture.attach_response(response.status().as_u16(), response.headers());
+        }
+
         if ctx.stream {
             let status = response.status().as_u16();
             return Ok(ForwardOutcome::Stream {
                 status,
-                // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者
+                // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者；
+                // 连接计数同样移交（`handoff` 转移所有权，本栈帧的凭证随即失效，
+                // 避免同一账号被两份凭证各算一次）
                 stream: Box::new(super::ForwardStream::new(
                     response,
                     slot.take(),
+                    connections.handoff(),
                     ctx.telemetry.clone(),
                     model_rewrite_of(adapter, &model),
                 )),
@@ -571,6 +728,7 @@ async fn attempt_queue(
 /// ── 在途槽位（去重队列）─────────────────────────────────────
 /// 无状态路径把槽位交给 `ForwardStream`；有状态路径把同一个凭证包进
 /// [`SlotHoldingStream`]，「槽位占到响应体发完」的语义在两家形态上一致。
+/// 账号级连接计数（`connections`）与它同一处理：成功转为流式时一同移交给流。
 async fn attempt_stateful(
     service: &UpstreamService,
     ctx: &ProviderContext<'_>,
@@ -578,6 +736,7 @@ async fn attempt_stateful(
     adapter: &dyn ProviderAdapter,
     target: RouteTarget,
     slot: &mut Option<InFlightGuard>,
+    connections: &mut ConnectionGuard,
 ) -> Result<ForwardOutcome, GatewayError> {
     let provider_id = kind_id(kind);
     let model = model_of(ctx.body);
@@ -611,7 +770,7 @@ async fn attempt_stateful(
     // ── 内容处理：凭证已就绪、这一家**即将发送**，此刻才决定发送体 ────────
     // 与无状态路径同一时机与同一判据：选路失败（503/401）的请求走不到这里，
     // 不会产生一次「已转发的处理」；未勾选的家拿到的是客户端原始请求体。
-    let body = send_body(ctx, provider_id);
+    let body = send_body(ctx, provider_id, target.account.as_ref());
     // 旁路记账：本 provider + 本账号是这一轮的实际承载者（attempts +1）。
     // 账号展示名的兜底链与无状态路径同（账号名 → 会话昵称 → 账号 id）；
     // 这里没有会话对象可传（会话还没建），用公开形态的名字。
@@ -659,7 +818,7 @@ async fn attempt_stateful(
                 "[Upstream]",
                 &format!("会话式转发完成（{}ms）", logging::now_ms() - started_at),
             );
-            Ok(attach_slot(outcome, slot))
+            Ok(attach_slot(outcome, slot, connections))
         }
         // 一律透传（Fatal 语义，核对结论见函数头）：不换账号、不冷却、不重试
         Err(error) => {
@@ -676,11 +835,24 @@ async fn attempt_stateful(
 /// （`InFlightGuard` 的说明）。有状态 provider 的下行帧由协议层的后台任务产出，
 /// 流对象本身是通用的 `Box<dyn Stream>`，于是这里包一层只为**持有那个凭证** ——
 /// 不读、不改、不缓存字节，透传语义逐字节不变。
-fn attach_slot(outcome: ForwardOutcome, slot: &mut Option<InFlightGuard>) -> ForwardOutcome {
+///
+/// 账号级连接凭证（`connections`）走**同一条规则**：流式时一起挂到流上，
+/// 非流式时随本函数返回析构。两条凭证的生命周期因此完全一致，不需要各自
+/// 维护释放时机。
+fn attach_slot(
+    outcome: ForwardOutcome,
+    slot: &mut Option<InFlightGuard>,
+    connections: &mut ConnectionGuard,
+) -> ForwardOutcome {
     match outcome {
         ForwardOutcome::Stream { status, stream } => ForwardOutcome::Stream {
             status,
-            stream: Box::new(SlotHoldingStream { inner: stream, _slot: slot.take() }),
+            stream: Box::new(SlotHoldingStream {
+                inner: stream,
+                _slot: slot.take(),
+                // handoff 转移所有权：本栈帧的凭证随即失效（见其说明）
+                _connection: connections.handoff(),
+            }),
         },
         other => {
             // 非流式：聚合已经完成，凭证在这里析构即放行（与无状态路径同）
@@ -690,13 +862,15 @@ fn attach_slot(outcome: ForwardOutcome, slot: &mut Option<InFlightGuard>) -> For
     }
 }
 
-/// 只为一个目的存在的流包装：**持有在途槽位凭证**（见 `attach_slot`）。
+/// 只为一个目的存在的流包装：**持有在途槽位与连接计数两份凭证**（见 `attach_slot`）。
 ///
 /// 逐项原样转发 `inner` 的每个 `Item`（含 `Err`），没有自己的缓冲与状态。
 struct SlotHoldingStream {
     inner: Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + Unpin>,
     /// 凭证：本流被 drop（流跑完 / 客户端断开 / 服务退出）时析构并放行等待者
     _slot: Option<InFlightGuard>,
+    /// 账号级连接凭证：同一时刻析构，把该账号的计数 -1
+    _connection: ConnectionGuard,
 }
 
 impl futures::Stream for SlotHoldingStream {
@@ -766,19 +940,46 @@ fn model_rewrite_of(adapter: &dyn ProviderAdapter, model: &str) -> Option<super:
     }
 }
 
-/// 发一次上游请求，含「可退避重试」循环（11128 之类；建议由适配器给出）。
+/// 发一次上游请求，含「可退避重试」循环（次数 / 间隔来自设置页的全局重试设置）。
 ///
 /// 成功的定义是 HTTP 2xx —— 与改造前 `request_with_waf_retry` 一致。
+///
+/// 重试判定分两档：
+///   - **适配器声明**（`retry_advice`）：provider 专属知识（workbuddy 的 11128），
+///     要不要退避、文案，全由适配器回答（见模块头）；
+///   - **统一兜底**（[`transient_retry_advice`] / [`transport_retry_advice`]）：
+///     瞬时 HTTP 状态码与传输层失败按同一套设置原样重发 —— 这是「重试设置
+///     对全部提供商生效」的入口，适配器没声明的家也能吃到同一份配置。
+///
+/// ── `budget` 为什么要 `&mut`（两档设置怎么落地）──────────────
+/// 退避重试的次数是**每个「提供商阶段」各一份**的：在最初那一家上用
+/// `retryCount`，换到别家之后用 `retryCrossProviderCount`（见
+/// `config::RetrySettings`）。而「换家」是**账号循环**才知道的事 ——
+/// 同一家名下可能有好几个账号，循环会在这几个账号之间来回走。
+///
+/// 所以预算不在这里从零算，而是由调用方按「本阶段还剩几次」传进来、由本函数
+/// **逐次扣减**：调用方在进入某个阶段时把该档的完整次数放进来，本函数每退避
+/// 一次就减一。这样同一家名下换账号不会重置预算（用户设的 3 次就是这一家总共
+/// 3 次），而换到另一家时调用方给的是一个**新的完整预算**（不是接着扣）——
+/// 「换家之后还能试 5 次」正是用户填那个数字时的直觉。
 async fn send_with_retry(
     adapter: &dyn ProviderAdapter,
     transport: &TransportRequest,
+    budget: &mut RetryBudget,
+    capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
 ) -> Result<reqwest::Response, OutboundFailure> {
-    let mut attempt = 0usize;
     loop {
         let response = match send_chat_request(transport).await {
             Ok(response) => response,
             Err(error) => {
-                // 传输层失败（DNS/代理/连接）：收敛成 502，与改造前一致
+                // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
+                // 次数用完才收敛成 502，与改造前的兜底一致
+                if let Some(advice) = transport_retry_advice(budget.remaining, budget.total) {
+                    budget.remaining -= 1;
+                    logging::log("[Upstream]", &advice.log_message);
+                    tokio::time::sleep(Duration::from_millis(advice.delay_ms)).await;
+                    continue;
+                }
                 let gateway = error.to_gateway_error();
                 return Err(OutboundFailure {
                     class: UpstreamErrorClass::Fatal {
@@ -794,13 +995,16 @@ async fn send_with_retry(
             return Ok(response);
         }
         let status = response.status().as_u16();
-        let detail = read_upstream_error(response).await;
+        let detail = read_upstream_error(response, capture).await;
         let body = detail.to_value();
-        // 退避重试：要不要退避、退多久、文案，全由适配器回答（见模块头）
-        if let Some(advice) = adapter.retry_advice(&body, attempt) {
+        // 退避重试：provider 专属判定优先，没声明时对瞬时状态码统一兜底
+        let advice = adapter
+            .retry_advice(&body, budget.used(), budget.total)
+            .or_else(|| transient_retry_advice(status, budget.remaining, budget.total));
+        if let Some(advice) = advice {
+            budget.remaining = budget.remaining.saturating_sub(1);
             logging::log("[Upstream]", &advice.log_message);
             tokio::time::sleep(Duration::from_millis(advice.delay_ms)).await;
-            attempt += 1;
             continue;
         }
         logging::log(

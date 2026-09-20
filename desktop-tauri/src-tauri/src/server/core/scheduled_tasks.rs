@@ -11,7 +11,7 @@
 //! ── 两类任务（区别是**谁来执行**，不是可配性）─────────────────
 //!   - `Runner::Backend`：凭证自动维护、定时查询积分、模型目录刷新、软件版本检查。
 //!     后端循环执行，因此有「上次执行 / 下次执行 / 立即执行」这些运行状态。
-//!   - `Runner::Frontend`：日志页与请求明细页的自动刷新。定时器天然长在页面上
+//!   - `Runner::Frontend`：日志页与请求日志页的自动刷新。定时器天然长在页面上
 //!     （只在页面可见时该走），后端只存开关与间隔，界面自己读；
 //!     因此它们没有运行状态，也不提供「立即执行」。
 //!
@@ -96,11 +96,13 @@ pub const TASK_UPDATE_CHECK: &str = config::KEY_UPDATE_CHECK;
 pub const TASK_USAGE_QUERY: &str = config::KEY_USAGE_QUERY;
 /// 日志页自动刷新（前端定时器）
 pub const TASK_LOGS_AUTO_REFRESH: &str = config::KEY_LOGS_AUTO_REFRESH;
-/// 请求明细页自动刷新（前端定时器）
+/// 请求日志页自动刷新（前端定时器）
 pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
+/// 报表页自动刷新（前端定时器）
+pub const TASK_REPORT_AUTO_REFRESH: &str = config::KEY_REPORT_AUTO_REFRESH;
 
 /// 任务清单（顺序 = 界面上的显示顺序：先后端、后前端，同类按重要性）
-pub const TASKS: [TaskDef; 6] = [
+pub const TASKS: [TaskDef; 7] = [
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
         label: "凭证自动维护",
@@ -159,13 +161,23 @@ pub const TASKS: [TaskDef; 6] = [
     },
     TaskDef {
         id: TASK_REQUESTS_AUTO_REFRESH,
-        label: "请求明细自动刷新",
-        description: "停留在「请求日志」页时按此间隔重新拉取请求明细；页面不可见时不请求。",
+        label: "请求日志自动刷新",
+        description: "停留在「请求日志」页时按此间隔重新拉取请求日志；页面不可见时不请求。",
         unit: "seconds",
         runner: Runner::Frontend,
         min: config::INTERVAL_MIN_SECONDS,
         max: config::INTERVAL_MAX_SECONDS,
         default_interval: config::DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS,
+    },
+    TaskDef {
+        id: TASK_REPORT_AUTO_REFRESH,
+        label: "报表自动刷新",
+        description: "停留在「报表」页时按此间隔重新拉取统计数据；页面不可见时不请求。",
+        unit: "seconds",
+        runner: Runner::Frontend,
+        min: config::INTERVAL_MIN_SECONDS,
+        max: config::INTERVAL_MAX_SECONDS,
+        default_interval: config::DEFAULT_REPORT_AUTO_REFRESH_SECONDS,
     },
 ];
 
@@ -316,6 +328,8 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         settings.logs_auto_refresh
     } else if id == TASK_REQUESTS_AUTO_REFRESH {
         settings.requests_auto_refresh
+    } else if id == TASK_REPORT_AUTO_REFRESH {
+        settings.report_auto_refresh
     } else {
         // 注册表与这里的分支必须同步（两者都由上面的 TASK_* 常量驱动）。
         // 走不到：调用方都先用 `find` 查过 id。给个默认值而不是 panic
@@ -503,9 +517,11 @@ async fn run_backend(
             // 全零轮次（没有任何临期账号）是常态，不写日志库：
             // 每轮一条「什么都没做」会把日志页淹掉（与维护模块自身同一取舍）
             if refreshed > 0 || failed > 0 {
-                logging::log(
+                // 全部成功是常态轮次：级别必须 info，不能让「失败 0 个」的文案把它抬成 error
+                logging::log_with_level(
                     "[Maintenance]",
                     &format!("凭证自动维护：刷新 {refreshed} 个，跳过 {skipped} 个，失败 {failed} 个"),
+                    if failed > 0 { "error" } else { "info" },
                 );
             }
             format!("刷新 {refreshed} 个，跳过 {skipped} 个，失败 {failed} 个")
@@ -525,9 +541,10 @@ async fn run_backend(
                 };
                 let (refreshed, skipped, failed) =
                     (count("refreshed"), count("skipped"), count("failed"));
-                logging::log(
+                logging::log_with_level(
                     "[Models]",
                     &format!("定时任务触发刷新模型清单：成功 {refreshed}，跳过 {skipped}，失败 {failed}"),
+                    if failed > 0 { "error" } else { "info" },
                 );
                 format!("成功 {refreshed} 家，跳过 {skipped} 家，失败 {failed} 家")
             } else {
@@ -575,7 +592,8 @@ async fn run_backend(
             // 「不点按钮也知道现在好不好」，把失败丢掉会让界面停在旧余额上，
             // 比显示失败更误导。摘要里同样带上失败数，且失败时写一条日志 ——
             // 余额全线查不通（凭证过期 / 上游改接口）是用户需要知道的事。
-            match crate::server::core::usage_query::query_all(store).await {
+            // `id = None`：定时这轮只查启用账号（禁用账号不参与定时轮询）。
+            match crate::server::core::usage_query::query_all(store, None).await {
                 Ok(report) => {
                     let (ok, failed) = crate::server::core::usage_query::store_snapshot(report);
                     if failed > 0 {

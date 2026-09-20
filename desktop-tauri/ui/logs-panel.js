@@ -3,7 +3,7 @@
 
 /**
  * 独立于 app.js 的日志面板模块：自持筛选条件、页码与轮询定时器。
- * 网关的模型请求明细已拆到「请求日志」页（requests-panel.js），本文件只管系统事件。
+ * 网关的模型请求已拆到「请求日志」页（requests-panel.js），本文件只管系统事件。
  *
  * 与 desensitize-panel.js 同构：依赖 window.wbApp 的 esc / toast / updateLogsBadge，
  * 通过 window.wbLogsPanel 暴露 load 给 app.js（切到日志页时立即刷新）。
@@ -31,9 +31,10 @@
    * `applyAutoRefresh` 把新值推过来，本面板启动时也自己拉一次
    * （见 `syncAutoRefresh`），于是无论用户先开哪一页都对得上。
    *
-   * 兜底值 10 秒 = 改造前的硬编码值：后端拿不到配置时行为与改造前一致。
+   * 兜底值 1 秒 = 后端的默认间隔（`DEFAULT_LOGS_AUTO_REFRESH_SECONDS`）：
+   * 后端拿不到配置时（冷启动首次请求失败）与用户没改过时的行为一致。
    */
-  const DEFAULT_AUTO_REFRESH_MS = 10_000;
+  const DEFAULT_AUTO_REFRESH_MS = 1_000;
   let autoRefreshMs = DEFAULT_AUTO_REFRESH_MS;
   /** 任务关闭时置 false：定时器不跑（区别于「间隔很大」） */
   let autoEnabled = true;
@@ -45,6 +46,17 @@
    * 间隔覆盖回兜底值。
    */
   let autoSynced = false;
+  /**
+   * 是否有一次轮询触发的拉取还在途中。
+   *
+   * 定时器是 `setInterval`（不等上一次完成），而间隔可以调到 1 秒 ——
+   * 一次慢响应就会与后来的几拍叠在一起，各自带着自己的页码 / 筛选快照乱序落地，
+   * 列表会来回跳。所以轮询这一拍撞上在途请求时直接跳过，由下一拍补上
+   * （间隔本来就是「最多晚一拍」，不累积延迟）。
+   *
+   * 只挡轮询：用户翻页 / 换筛选是有意操作，不该被上一次自动刷新挡掉。
+   */
+  let polling = false;
 
   /** 事件日志每页条数 */
   const PAGE_SIZE = 50;
@@ -141,12 +153,18 @@
 
   // ─── 事件日志：渲染 ──────────────────────────
 
-  /** 秒级时间：日志看的是“刚刚发生”，不需要日期 */
+  /**
+   * 时间 + 日期：日志按保留期存盘（最长可到 3650 天），只有时刻会对不出
+   * 「哪一天」。当年省年份（主要看「刚刚发生」），跨年带全日期。
+   */
   function formatLogTime(ts) {
     if (!ts) return '—';
     const d = new Date(ts);
     const pad = n => String(n).padStart(2, '0');
-    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const clock = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const date = `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    if (d.getFullYear() === new Date().getFullYear()) return `${date} ${clock}`;
+    return `${d.getFullYear()}-${date} ${clock}`;
   }
 
   const LEVEL_LABEL = { debug: '调试', info: '信息', warn: '警告', error: '错误' };
@@ -311,7 +329,7 @@
         api.getLogStats(),
       ]);
       // 重写 innerHTML 会把列表弹回顶部：轮询刷新时把读到的位置还回去，
-      // 否则每 10 秒就把正在看日志的人踢回页首。换筛选 / 页码被夹回则一律回顶。
+      // 否则每隔一个刷新周期就把正在看日志的人踢回页首。换筛选 / 页码被夹回则一律回顶。
       const pageBefore = page;
       const keepTop = resetPage ? 0 : ($('log-list')?.scrollTop || 0);
       if (result) fillCategories(result.categories);
@@ -339,7 +357,10 @@
     timer = setInterval(() => {
       // 只在日志页可见时轮询，避免后台无谓请求
       if (document.hidden || wbApp.currentPage !== 'logs') return;
-      void load({ silent: true });
+      // 上一轮还没回来就跳过这一拍（见 `polling` 的说明）
+      if (polling) return;
+      polling = true;
+      void load({ silent: true }).finally(() => { polling = false; });
     }, autoRefreshMs);
   }
 
@@ -434,10 +455,49 @@
     }
   }
 
+  /**
+   * 清空用的筛选参数：与 queryParams 同一套条件（不含 limit）。
+   * 「不看脱敏」不参与 —— 那是纯前端的显示开关，不是后端筛选条件；
+   * 清空永远按后端筛选口径执行，页面上被隐藏的命中条目也会一并清掉。
+   *
+   * 返回**查询串**（与 queryParams 一致）而不是 URLSearchParams 对象：
+   * 桥接层的 toQuery 只认字符串 / 普通对象，传对象会静默变成「没有参数」，
+   * 那样筛选清空就变成了全清 —— 这个 bug 已经踩过一次，别再踩。
+   */
+  function clearParams() {
+    const params = new URLSearchParams();
+    const level = $('logs-level')?.value;
+    const category = $('logs-category')?.value;
+    const keyword = $('logs-keyword')?.value.trim();
+    const start = rangeStart(eventRange);
+    if (level) params.set('level', level);
+    if (category) params.set('category', category);
+    if (keyword) params.set('keyword', keyword);
+    if (start !== null) params.set('start', String(start));
+    return params.toString();
+  }
+
   async function clearLogs() {
-    if (!confirm('确定清空运行日志？清空后无法恢复。')) return;
+    const query = clearParams();
+    // 提示语按「有没有筛选」分开说：带筛选删的是筛选结果，不带筛选才是全清 ——
+    // 用户必须知道即将删掉的是哪一批。条数用后端 matched（含被「不看脱敏」
+    // 藏起来的命中项，它们同样会被删，文案不给「比实际少」的数）
+    const hasFilters = query.length > 0;
+    const message = hasFilters
+      ? `确定清空当前筛选出的 <strong>${Number(current?.matched) || 0}</strong> 条日志？清空后无法恢复。`
+      : '确定清空<strong>全部</strong>运行日志？清空后无法恢复。';
+    // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），
+    // 危险确认一律走自绘弹窗（wbConfirm，见 confirm-dialog.js）
+    if (!(await window.wbConfirm?.ask?.({
+      title: '清空运行日志',
+      html: message,
+      okText: '清空',
+      okClass: 'danger',
+    }))) return;
     await guard($('btn-logs-clear'), '清空中…', async () => {
-      await api.clearLogs();
+      // 无筛选时显式带 all=1：后端要求「清空全部」必须显式声明，
+      // 免得哪天参数漏传又被当成全清（前端写错一次就是全部数据没了）
+      await api.clearLogs(hasFilters ? query : 'all=1');
       // 清空后没有「当前页」可言：回到第 1 页并把滚动位置一起归零
       await load({ resetPage: true });
       toast('运行日志已清空');
@@ -477,7 +537,6 @@
     void load({ resetPage: true });
   });
 
-  $('btn-logs-refresh').addEventListener('click', () => load().then(() => toast('日志已刷新')));
   $('btn-logs-clear').addEventListener('click', clearLogs);
   $('btn-logs-export').addEventListener('click', exportLogs);
   $('btn-logs-prev').addEventListener('click', () => gotoPage(page - 1));

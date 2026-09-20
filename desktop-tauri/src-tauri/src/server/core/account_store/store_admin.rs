@@ -5,18 +5,20 @@
 //!   clear_rate_limit       清除某模型的限额记录
 //!   import_legacy_session  旧版单账号 auth.json 迁移（仅账号列表为空时）
 //!   clear_all_rate_limits  清除账号全部模型的限额记录（账号页「全部清除」）
-//!   migrate_startup        启动时一次性数据迁移（provider 惰性补齐 + 优先级全局化 + 去重）
+//!   migrate_startup        启动时一次性数据迁移（provider 惰性补齐 + 优先级全局化
+//!                          + 去重 + Cline 拆池改名）
 //!   renumber_globally      优先级重编号内核（**全局一条队列**，migrate_startup 私有）
 //!
 //! 这些方法都是「低频、写入型」操作：放在单独文件是为了让 CRUD 文件聚焦在
 //! 用户可见的账号操作上，避免两者混在一起时看不清哪些是启动期做的事。
 //!
-//! ── 两条迁移为什么合成一次落盘 ──────────────────────────────
-//! `provider` 惰性补齐（架构文档 §3.2）与优先级去重（原 `migrate_priorities`）
-//! 都在启动时、都在同一份 state 上改字段。若各自读盘一次、写盘一次，第二次
-//! 迁移读到的就是第一次写过的文件 —— 结果没错，但会多一次全文件重写，而且
-//! 「补 provider 时把已经去重过的优先级又读成并列」这类交叉影响不容易看清。
-//! 因此两者由 `migrate_startup` 串起来：**一次读、一次改、一次写**。
+//! ── 几条迁移为什么合成一次落盘 ──────────────────────────────
+//! `provider` 惰性补齐（架构文档 §3.2）、优先级去重（原 `migrate_priorities`）
+//! 与 Cline 拆池改名都在启动时、都在同一份 state 上改字段。若各自读盘一次、
+//! 写盘一次，后面那条迁移读到的就是前面写过的文件 —— 结果没错，但会多几次
+//! 全文件重写，而且「补 provider 时把已经去重过的优先级又读成并列」这类交叉
+//! 影响不容易看清。因此它们由 `migrate_startup` 串起来：**一次读、一次改、
+//! 一次写**。
 
 use serde_json::{json, Map, Value};
 
@@ -165,17 +167,46 @@ impl AccountStore {
         count
     }
 
+    /// 记录账号**今天已签到**（登录页那枚按钮据此置灰）。
+    ///
+    /// `at` 是这次签到成功的毫秒时间戳。判定「今天签过没」由**读侧**按自然日比
+    /// （`checkinAt` 落在今天即算签过），所以这里只负责如实落时间 —— 不需要
+    /// 在写入时判重，跨过 0 点后同一个字段自然失效，不必任何定时器去重置。
+    ///
+    /// 与限额标记同族：都是「账号级的事实、低频写、失败不致命」。调用方是签到
+    /// 链路，写盘失败**不**影响签到结果本身（上游那边积分已经领到了），所以返回
+    /// bool 而不是 Result —— 调用方拿到 false 时最多记一条日志，绝不因此把
+    /// 一次成功的签到报成失败。
+    pub fn mark_checkin(&self, id: &str, at: i64) -> bool {
+        let _guard = self.guard();
+        let mut state = self.load(&_guard);
+        let Some(index) = state.accounts.iter().position(|item| item.id() == id) else {
+            return false;
+        };
+        state.accounts[index].set_checkin_at(at);
+        // 注意**不**动 updatedAt：那是「记录被改过」的时间，会显示在账号页的
+        // 「更新于 …」上；签到不是用户改配置那种「更新」，写进去会让这一栏
+        // 在每天自动签到后集体跳动一次。
+        self.save(&state, &_guard).is_ok()
+    }
+
     // ─── 迁移 ────────────────────────────────────────────────
 
     /// 启动时的一次性数据迁移（**唯一入口**，bootstrap 只调它）。
     ///
-    /// 三步在同一份 state 上完成、只落一次盘：
+    /// 四步在同一份 state 上完成、只落一次盘：
     ///   ① provider 惰性补齐（缺失/空值一律补 workbuddy）；
     ///   ② 优先级作用域从「按 provider 各排各的队」迁到「全局一条队列」——
     ///      文件里没有 `priorityScope: "global"` 标记时做一次：按旧版实际的转发
     ///      顺序（provider 路由优先级 → 组内优先级 → 加入时间）排好，再连续编号，
     ///      于是升级前后实际先用哪个账号完全一致，用户不会感到突变；
-    ///   ③ 全局去重（手工编辑出的并列号）。
+    ///   ③ 全局去重（手工编辑出的并列号）；
+    ///   ④ Cline 拆池改名（`provider: "cline"` + `pool` 字段 → 两家里的某一家）。
+    ///
+    /// 顺序上 ④ 必须在 ①②③ **之后**：前几步按 provider 分组时看到的还是旧 id
+    /// （一条 `cline` 组），改名后这一组被拆成两条；若反过来先改名，优先级整队
+    /// 会在两条新组上各排一遍，得出与升级前不同的相对顺序。放最后则与
+    /// 「先整好旧队、再改名」等价 —— 名字变了，号码与顺序原样。
     /// 返回 `{providerAdded, priorityChanged, assignments}` 供启动日志展示。
     pub fn migrate_startup(&self) -> Value {
         let _guard = self.guard();
@@ -203,7 +234,14 @@ impl AccountStore {
             state.priority_scope = Some(PRIORITY_SCOPE_GLOBAL.to_string());
         }
 
-        if provider_added == 0 && assignments.is_empty() && !scope_migrated {
+        // ④ Cline 拆池改名（见 `migrate_cline_accounts`）
+        let cline_renamed = Self::migrate_cline_accounts(&mut state);
+
+        if provider_added == 0
+            && assignments.is_empty()
+            && !scope_migrated
+            && cline_renamed == 0
+        {
             return json!({
                 "providerAdded": 0,
                 "priorityChanged": false,
@@ -217,6 +255,14 @@ impl AccountStore {
                 "priorityChanged": false,
                 "assignments": [],
             });
+        }
+        if cline_renamed > 0 {
+            logging::log(
+                "[Accounts]",
+                &format!(
+                    "🔀 Cline 已拆为 Cline Free / Cline Pass 两家，{cline_renamed} 个账号已按额度池归位"
+                ),
+            );
         }
         if !assignments.is_empty() {
             logging::log(
@@ -243,6 +289,66 @@ impl AccountStore {
                 }))
                 .collect::<Vec<_>>(),
         })
+    }
+
+    /// Cline 拆池改名：`provider: "cline"` + `pool` 字段 → 两家里的某一家，
+    /// 原地改 state（不落盘）。返回改名的记录条数。
+    ///
+    /// ── 为什么这一步不能省 ──────────────────────────────────────
+    /// `"cline"` 这个 provider id **已经不存在**（拆分后是 `cline-free` /
+    /// `cline-pass`）。不迁移的后果不是「少一条设置」而是**账号静默消失**：
+    /// 每处按 provider 找账号的路径（`accounts_for_provider` 的选路、账号页
+    /// 的分组、适配器按 id 找人）都拿不到它 —— 但它还在文件里，用户会看到
+    /// 「账号明明在，转发却说没有可用账号」。
+    ///
+    /// ── 池怎么判 ────────────────────────────────────────────────
+    /// 读记录里的 `pool` 字段，判据与口径**逐条沿用拆分前的实现**
+    /// （`cline::models::Pool::parse`：`free` → 免费池，其余/缺失/非法 → 订阅池）。
+    /// 用同一个函数而不是重写一个 match 是刻意的：池的归属直接决定用户能看到
+    /// 哪些模型，迁移前后必须逐字一致，否则升级一次就换了池。
+    ///
+    /// ── id 为什么要一起改 ──────────────────────────────────────
+    /// 旧 id 形如 `cline-usr-…`，**不带池**。若不改，同一个 Cline 账号之后想
+    /// 两个池各加一份时，第二次添加会算出同一个 id 而被当成「更新同一条」，
+    /// 第二个池永远加不进去。改成 `<provider>-<原后缀>`（`cline-free-usr-…`）
+    /// 之后两条才能并存 —— 与 `cline_accounts::record_id` 的拼法一致。
+    ///
+    /// 改名的判据是**旧 provider 值**而不是 id 前缀：id 是用户可见标识，
+    /// 有可能被手工改成别的样子（导出再导入也会重排），只有 provider 字段
+    /// 是这一版写进去的事实。
+    ///
+    /// `pool` 字段在最后**删掉**：池已经是 provider 身份的一部分，留着它
+    /// 就多了一处可能与 provider 不一致的事实（而读它的代码已经删光了）。
+    ///
+    /// 幂等：改完 provider 就不再命中第一条判据，再跑一遍无事发生。
+    fn migrate_cline_accounts(state: &mut AccountState) -> usize {
+        /// 拆分前的 Cline provider id（只出现在这里）
+        const LEGACY_CLINE_ID: &str = "cline";
+        let mut renamed = 0usize;
+        for record in state.accounts.iter_mut() {
+            if record.provider() != LEGACY_CLINE_ID {
+                continue;
+            }
+            let pool = crate::server::core::providers::cline::models::Pool::parse(
+                record.get("pool").and_then(Value::as_str).unwrap_or(""),
+            );
+            let provider = pool.provider_id();
+            let id = record.id().to_string();
+            // 已经被改成目标前缀的（理论不可能，但比对代价极低）就只换 provider，
+            // 不重复叠前缀 —— 否则会拼出 `cline-free-free-…` 这种废物 id
+            let new_id = if id.starts_with(&format!("{provider}-")) {
+                id
+            } else if let Some(rest) = id.strip_prefix(&format!("{LEGACY_CLINE_ID}-")) {
+                format!("{provider}-{rest}")
+            } else {
+                format!("{provider}-{id}")
+            };
+            record.set_provider(provider);
+            record.set("id", Value::String(new_id));
+            record.remove("pool");
+            renamed += 1;
+        }
+        renamed
     }
 
     /// 全局重新连续编号，**原地改 state**（不落盘）。

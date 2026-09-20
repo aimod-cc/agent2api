@@ -215,12 +215,24 @@ fn supports_usage(account: &Value) -> bool {
 /// 天然交错），且**结果顺序与 targets 一致** —— 与 `Promise.all` 语义相同。
 /// **超时由各适配器自己设**（15~20 秒）；这里不叠加第二层超时 —— 那会让
 /// 「上游慢」与「网关掐断」在日志里无法区分。
-pub async fn query_all(store: &AccountStore) -> Result<Value, TargetError> {
+///
+/// ── `id`：显式指定时**不看启用状态** ────────────────────────
+/// 批量路径只查启用账号是对的（禁用就是「别用它」，定时那一轮不该为它们发请求），
+/// 但**用户手点某一行账号的「积分」按钮**是另一个语义：那是在问「这个账号现在
+/// 还剩多少」。账号被禁用只说明它不参与转发，与其余额能不能查没有关系 ——
+/// 按启用状态把这次查询挡掉，界面只会得到一句「未返回余额数据」，用户看不出
+/// 是「禁用了」还是「上游挂了」。所以指定 id 时按 `resolve_batch_targets` 的
+/// 既有分支走（那条分支本就不做启用过滤），也不过滤 `supports_usage`：
+/// 能力过滤是给批量路径避免一整片 501 的，单查应当如实报「这家不支持」。
+///
+/// 未知 id 由 `resolve_batch_targets` 报 404「账号不存在」。
+pub async fn query_all(store: &AccountStore, id: Option<&str>) -> Result<Value, TargetError> {
+    let single = id.filter(|value| !value.is_empty());
     // `provider = None`：跨四家取目标（签到那条仍按 provider 过滤）
-    let (targets, skipped) = resolve_batch_targets(store, None, None)?;
+    let (targets, skipped) = resolve_batch_targets(store, None, single)?;
     let futures: Vec<_> = targets
         .iter()
-        .filter(|account| supports_usage(account))
+        .filter(|account| single.is_some() || supports_usage(account))
         .map(|account| query_usage_for(store, account))
         .collect();
     let results = futures::future::join_all(futures).await;

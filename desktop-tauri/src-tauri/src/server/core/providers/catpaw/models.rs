@@ -8,12 +8,21 @@
 //! 因此协议层用自己的 [`CatPawError`]，在返回给客户端前才降级成 `GatewayError`
 //! （`to_gateway`）。
 //!
-//! ── 模型表为什么是静态表而不是配置 ───────────────────────────
-//! 数字 `modelType` 是**上游的内部 ID**，客户端无从得知，只能由网关内置
-//! （架构文档 §9.3）。表的唯一事实来源是 `proxy-chat-utils.mjs` 的 `MODELS`，
-//! 表头注释里写明了每个 ID 的实测证据来源（见 [`MODELS`]）。
-//! 写错一个数字不会报错，只会让请求打到另一个模型 —— 所以这里刻意保留
-//! 「证据」注释，改动前必须回去核对源文件。
+//! ── 模型表为什么是静态表而不是配置（以及它现在的分工）─────────
+//! 数字 `modelType` 是**上游的内部 ID**，写错一个不会报错，只会让请求打到
+//! 另一个模型 —— 所以这里刻意保留「证据」注释，改动前必须回去核对源文件。
+//!
+//! 这张表**不再是模型清单的唯一来源**：上游有远程目录
+//! （`POST /api/agent/maas/model-types`，见 [`catalog`]），「有哪些模型、
+//! 倍率多少」由它负责。静态表留在原地的理由是它能提供**远程条目给不出的
+//! 两样东西**：
+//!   1. `host_model_id` —— 实测坐实的上游数字 ID（远程条目也带 `modelTypeId`，
+//!      但只有表里这两个是我们逐条验证过能力与档位的）；
+//!   2. `context_windows` / `default_context_window` —— `context` 参数的
+//!      合法档位（远程把这些藏在 `parameterDefinitions` 的 ENUM 里）。
+//! [`resolve_model_request`] 因此是「静态表 → 远程目录 → 纯数字」三档判定。
+//!
+//! [`catalog`]: super::catalog
 
 use serde_json::Value;
 
@@ -217,6 +226,14 @@ pub struct ModelResolution {
 ///      默认模型 —— 客户端要的模型与实际跑的不是一个，属于静默错答。
 ///      客户端模型名的合法性在更早的入口（聚合目录）已校验过一次，走到这里
 ///      还失配说明目录与猫爪表不同步，报错比猜测好。
+///
+/// ── 三档判定顺序（远程目录接上后新增第 2 档）────────────────
+///   1. **静态表**命中 → 用它实测过的数字 ID 与 context 档位（最可靠：
+///      档位校验需要 `ModelSpec`，远程条目给不出）；
+///   2. **远程目录**命中 → 用它自带的 `modelType`。没有这一档就会出现
+///      「`/v1/models` 里列着、请求却报 400」的自相矛盾 —— 远程目录会广告
+///      静态表里没有的模型；
+///   3. 纯数字 → 原样当上游 ID（`entry` 为 None，context 校验会据此拒绝）。
 pub fn resolve_model_request(model: &Value) -> Result<ModelResolution, CatPawError> {
     let requested = match model {
         Value::Number(number) => number.to_string(),
@@ -230,6 +247,26 @@ pub fn resolve_model_request(model: &Value) -> Result<ModelResolution, CatPawErr
             entry: Some(entry),
         });
     }
+    // 远程目录里的模型：数字 ID 用它自带的（entry 仍为 None —— 档位信息
+    // 在 `ModelSpec` 里，远程条目没有同形态的数据）。
+    // `display_name` 取**目录里的规范 id**：客户端可能传的是展示名，
+    // 而回写与日志该用规范名（与静态表分支 `entry.id` 的取向一致）。
+    if !requested.is_empty() {
+        if let Some(item) = super::catalog::find_remote(&requested) {
+            if let Some(model_type) = item.get("modelType").and_then(Value::as_i64) {
+                let canonical = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&requested)
+                    .to_string();
+                return Ok(ModelResolution {
+                    model_type,
+                    display_name: canonical,
+                    entry: None,
+                });
+            }
+        }
+    }
     if !requested.is_empty() && requested.chars().all(|ch| ch.is_ascii_digit()) {
         if let Ok(model_type) = requested.parse::<i64>() {
             // 数字 ID 直接可用（上游按数字识别模型），只是我们不知道它的档位与
@@ -241,7 +278,7 @@ pub fn resolve_model_request(model: &Value) -> Result<ModelResolution, CatPawErr
             });
         }
     }
-    let names = MODELS.iter().map(|entry| entry.id).collect::<Vec<_>>().join("、");
+    let names = super::catalog::known_ids().join("、");
     Err(CatPawError::bad_request(format!(
         "CatPaw 上游不支持模型 {}（可用: {names}）",
         if requested.is_empty() { "(未指定)" } else { &requested },

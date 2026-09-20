@@ -326,6 +326,110 @@ impl LoginService {
         Ok(handle)
     }
 
+    /// 发起一次 **Cline 设备授权登录**（WorkOS RFC 8628）。
+    ///
+    /// ── 与前两条链路的区别（为什么是第三种形态）─────────────────
+    ///   - `start`（workbuddy）：起后台任务问上游要 state/authUrl，**上游推**
+    ///     authUrl 过来；
+    ///   - `start_web_login`（小浣熊）：本地拼授权地址，等**浏览器回调**带 code；
+    ///   - 本方法（Cline）：**同步问上游要 user_code 与授权页地址**（一次
+    ///     POST），然后把地址回给界面；用户确认后由后台任务**轮询**换令牌。
+    ///
+    /// 三种形态的共同点是「前端只认 `{state, authUrl}` 这两个键」，因此对界面
+    /// 而言它们是同一个东西：给一个 URL 去打开、等 `/wait` 返回结果。
+    /// Cline 的 `authUrl` 用上游给的 `verification_uri_complete`（已带 user_code，
+    /// 用户点开就免手输），`state` 用设备授权返回的 `deviceCode` 指纹 ——
+    /// 它既是任务的表键，也是轮询时认这一轮的凭据。
+    ///
+    /// ── 后台任务为什么必须有 ────────────────────────────────────
+    /// 用户确认是在浏览器里发生的，网关这边只能轮询。所以拿完 user_code 就要
+    /// 起任务去轮询（`poll_and_register` 会一直等到确认 / 超时 / 取消），
+    /// 结果写回任务句柄，前端照 `/wait` 的既有协议取。
+    ///
+    /// ── `provider` 传什么 ───────────────────────────────────────
+    /// `"cline-free"` / `"cline-pass"` —— 登录落账号时进哪一家。
+    /// **登录流程本身与池无关**（只有 api.cline.bot 一台站点、一套设备授权），
+    /// 池只决定落的账号记录属于哪家、能广告哪批模型。
+    pub async fn start_cline_device_login(
+        &self,
+        provider: &str,
+        name: Option<String>,
+    ) -> Result<LoginTaskHandle, String> {
+        let label = crate::server::core::providers::label_of(provider);
+        // 第一步要拿 user_code：这一步是同步等待的（一次 POST，30 秒超时在
+        // `cline::login` 里），因为它决定 authUrl —— 拿不到就没有页面可给用户开。
+        let start = crate::server::core::providers::cline::login::start()
+            .await
+            .map_err(|error| error.message)?;
+        // state 用 device_code 的前缀：够稳定（同一轮设备授权唯一）、够短
+        // （进表键与日志），且不把完整的 device_code 暴露到界面上
+        let state = format!(
+            "cline-{}",
+            crate::server::core::account_store::store_util::truncate_text(&start.device_code, 12)
+        );
+        let auth_url = start
+            .verification_uri_complete
+            .clone()
+            .unwrap_or_else(|| start.verification_uri.clone());
+        let info = resolve_edition(Some(DEFAULT_EDITION));
+        let handle = self.new_handle_for_provider(info, provider);
+        handle.update(|task| {
+            task.state = Some(state.clone());
+            task.auth_url = Some(auth_url.clone());
+        });
+        self.tasks.register(&state, handle.clone());
+        logging::log(
+            "[Login]",
+            &format!("发起{label}设备授权登录（授权码 {}）", start.user_code),
+        );
+        // 后台轮询：用户确认后换令牌、落账号、写回句柄
+        let service = self.clone();
+        let task_state = state.clone();
+        let task_provider = provider.to_string();
+        tokio::spawn(async move {
+            let store = service.store.clone();
+            let result = crate::server::core::providers::cline::login::poll_and_register(
+                &store,
+                &start,
+                &task_provider,
+                name.as_deref(),
+            )
+            .await;
+            let Some(handle) = service.tasks.get(&task_state) else {
+                // 任务已被 cancel / 过期回收：结果无处可写（账号已经落地，
+                // 用户下次刷新列表就能看到 —— 这里只记一条日志）
+                logging::verbose(
+                    "[Login]",
+                    "Cline 登录任务已不在表中，结果未写回（账号仍已保存）",
+                );
+                return;
+            };
+            match result {
+                Ok(account_id) => {
+                    let account = store
+                        .cline_account_record(&task_provider, &account_id)
+                        .and_then(|record| {
+                            record
+                                .get("account")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    // 复用 workbuddy 那条链路的会话摘要形状，前端不需要新分支
+                    finish_task(
+                        &handle,
+                        &json!({
+                            "account": { "uid": account_id, "nickname": account },
+                            "edition": "",
+                        }),
+                    );
+                }
+                Err(error) => finish_task_error(&handle, &error.message),
+            }
+        });
+        Ok(handle)
+    }
+
     /// 等 authUrl（对应 Node 版 `/api/session/login/start` 的 15 秒等待）。
     ///
     /// 返回 `(state, authUrl, edition)`；超时或任务提前失败时返回错误原因。

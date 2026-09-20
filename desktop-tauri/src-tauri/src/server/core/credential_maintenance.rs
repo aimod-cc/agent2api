@@ -194,9 +194,11 @@ pub async fn refresh_expiring_accounts(store: &AccountStore) -> Vec<Value> {
 
     let results: Vec<Value> = slots.into_iter().flatten().collect();
     let (refreshed, skipped_count, failed) = summarize(&results);
-    logging::log(
+    // 汇总级别跟结果走：「失败 0 个」是正常收尾，不能因文案带「失败」被抬成 error
+    logging::log_with_level(
         "[Accounts]",
         &format!("凭证自动维护完成：成功 {refreshed}，跳过 {skipped_count}，失败 {failed}"),
+        if failed > 0 { "error" } else { "info" },
     );
     results
 }

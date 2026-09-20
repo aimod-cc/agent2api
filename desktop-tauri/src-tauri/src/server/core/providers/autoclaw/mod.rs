@@ -11,8 +11,10 @@
 //!                   移植来源：`autoclaw-local-auth.mjs`
 //!   refresh.rs      token 刷新（单飞 + 400002 降级重试；**只读不回写**），
 //!                   移植来源：`autoclaw-upstream-client.mjs` 的刷新链
-//!   models.rs       模型路由表（纯静态映射 + `zai_auto` 回退规则），
-//!                   移植来源：`autoclaw-models.mjs`
+//!   models.rs       模型路由表（静态映射 + `zai_auto` 回退规则 + **远程目录**
+//!                   的读取侧），移植来源：`autoclaw-models.mjs`
+//!   catalog.rs      模型目录的**远程拉取**（`GET .../proxy/autoclaw-model-config`），
+//!                   移植来源：AutoClaw 桌面端 `app.asar` 的 `/out/main/index.js`
 //!   adapter.rs      **ProviderAdapter 实现**（T-c2）：请求构造（双模型标识头 +
 //!                   X-Authorization）/ 错误分类 / 凭证 / SSE model 回写声明，
 //!                   移植来源：`autoclaw-upstream-client.mjs` 的转发链
@@ -78,6 +80,7 @@
 
 pub mod adapter;
 pub mod balance;
+pub mod catalog;
 pub mod checkin;
 pub mod crypto;
 pub mod credentials;

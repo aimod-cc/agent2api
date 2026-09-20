@@ -17,11 +17,18 @@ use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
 use serde_json::{json, Value};
 
 use super::clock::{date_key, hour_floor, hour_key, ms_to_local};
-use super::record::{DailyEntry, ModelAccum, ProviderAccum, RequestEntry};
+use super::record::{AccountAccum, DailyEntry, ModelAccum, ProviderAccum, RequestEntry};
 
 /// 未知 provider 的展示名（`id` 为空串的那一组：旧版本写出的明细、
 /// 以及「一次都没发出去就失败」的请求）。前端也会用同样的文案做降级显示。
 pub(super) const UNKNOWN_PROVIDER_LABEL: &str = "未知";
+
+/// 未知账号的展示名（没有账号身份的那一组）。
+///
+/// 与 provider 那条是**两个独立的常量**而不是共用一个：两者的「未知」
+/// 成因不同（前者是没记下承载的家，后者是没走账号列表），文案将来若分叉，
+/// 共用会让改一处等于改两处。
+pub(super) const UNKNOWN_ACCOUNT_LABEL: &str = "未知账号";
 
 /// 热力图固定返回的天数（与 range 解耦）
 pub(super) const HEATMAP_DAYS: i64 = 365;
@@ -77,7 +84,7 @@ pub(super) fn range_bounds(
     (date_key(start), date_key(end))
 }
 
-/// 区间内的总量与按模型 / 按 provider 累计（overview 的原料）
+/// 区间内的总量与按模型 / 按 provider / 按账号累计（overview 的原料）
 pub(super) struct RangeTotals {
     pub requests: i64,
     pub successful: i64,
@@ -85,6 +92,7 @@ pub(super) struct RangeTotals {
     pub active_days: i64,
     pub model_totals: Vec<ModelAccum>,
     pub provider_totals: Vec<ProviderAccum>,
+    pub account_totals: Vec<AccountAccum>,
 }
 
 /// 按区间累计聚合行。`BTreeMap::range` 直接按日期键取闭区间 ——
@@ -101,6 +109,7 @@ pub(super) fn range_totals(
         active_days: 0,
         model_totals: Vec::new(),
         provider_totals: Vec::new(),
+        account_totals: Vec::new(),
     };
     // 闭区间 [start, end]：定长日期串的字典序即时间序，所以直接按键取范围。
     // 这里构造两个 String 边界是有意的取舍 —— 报表调用频率是「用户点一下」级别，
@@ -125,6 +134,16 @@ pub(super) fn range_totals(
                 acc.tokens,
             );
         }
+        for acc in &day.account_stats {
+            push_account_accum(
+                &mut totals.account_totals,
+                &acc.account_id,
+                &acc.account_name,
+                acc.requests,
+                acc.successful,
+                acc.tokens,
+            );
+        }
     }
 
     // ── 旧聚合行的余量归属 ──────────────────────────────────────
@@ -143,6 +162,23 @@ pub(super) fn range_totals(
     // || tokens > 0`），所以不会凭空冒出空的「未知」项
     push_provider_accum(
         &mut totals.provider_totals,
+        "",
+        (totals.requests - covered_requests).max(0),
+        (totals.successful - covered_successful).max(0),
+        (totals.tokens - covered_tokens).max(0),
+    );
+
+    // ── 账号维度同理 ────────────────────────────────────────────
+    // `accountStats` 是本次新增的键，**所有**已有聚合行都没有它，所以这一段
+    // 在这里比 provider 那一段更常命中：升级后第一次打开报表，区间内几乎全部
+    // 请求都会落进「未知账号」组。这是如实反映「那些行没记账号身份」，
+    // 而不是我们丢数据 —— 明细里其实有，但聚合要跨过年份，只能按聚合算。
+    let covered_requests: i64 = totals.account_totals.iter().map(|item| item.requests).sum();
+    let covered_successful: i64 = totals.account_totals.iter().map(|item| item.successful).sum();
+    let covered_tokens: i64 = totals.account_totals.iter().map(|item| item.tokens).sum();
+    push_account_accum(
+        &mut totals.account_totals,
+        "",
         "",
         (totals.requests - covered_requests).max(0),
         (totals.successful - covered_successful).max(0),
@@ -188,6 +224,48 @@ pub(super) fn push_provider_accum(
         }
         None => list.push(ProviderAccum {
             provider: provider.to_string(),
+            requests,
+            successful,
+            tokens,
+        }),
+    }
+}
+
+/// 把一批（一条或一天的）请求并进按账号的累计表。
+///
+/// ── 身份只认 account_id ─────────────────────────────────────
+/// 匹配按 `account_id` 走，**名字不参与判等**：账号可以在账号页改名，
+/// 按名字匹配会让同一个账号在改名前后的两条聚合行分家，报表里出现两个半份的
+/// 「同一账号」。名字在这里只承担一件事：**首次建组时留下的展示名快照**。
+/// 后续同一账号的累计里若带了新名字，就更新快照（账号改名后报表跟着显示新名字，
+/// 这也正是账号页的观感），而不是保留旧名。
+///
+/// ── 空 id 的处理 ─────────────────────────────────────────────
+/// 与 `push_provider_accum` 同一取舍：`account_id` 为空串时**照常建组**，不丢弃 ——
+/// 走默认登录态转发的请求、以及旧版本写出的行都落在这一组里，
+/// 丢掉它们会让「各账号之和」对不上区间总量。
+pub(super) fn push_account_accum(
+    list: &mut Vec<AccountAccum>,
+    account_id: &str,
+    account_name: &str,
+    requests: i64,
+    successful: i64,
+    tokens: i64,
+) {
+    match list.iter_mut().find(|item| item.account_id == account_id) {
+        Some(item) => {
+            item.requests += requests;
+            item.successful += successful;
+            item.tokens += tokens;
+            // 名字只做「快照刷新」：非空才覆盖，绝不清空已有的名字
+            // （某些请求拿不到名字而另一些拿到了，取有名字的那一份）
+            if !account_name.is_empty() {
+                item.account_name = account_name.to_string();
+            }
+        }
+        None => list.push(AccountAccum {
+            account_id: account_id.to_string(),
+            account_name: account_name.to_string(),
             requests,
             successful,
             tokens,
@@ -251,6 +329,52 @@ pub(super) fn build_providers(totals: &[ProviderAccum]) -> Vec<Value> {
                 "requests": item.requests,
                 // failures 由减法得出而不是另存一列：见 record::ProviderAccum 的注释。
                 // max(0) 兜住手改文件造成的负数
+                "success": item.successful,
+                "failures": (item.requests - item.successful).max(0),
+                "totalTokens": item.tokens,
+            })
+        })
+        .collect()
+}
+
+/// 区间级的按账号汇总 → `/api/stats/summary` 的 `accounts` 数组。
+///
+/// 与 `build_providers` 同形同序（requests 降序 → tokens 降序 → 身份升序）：
+/// 两张排行并排显示时，排序口径一致才不会被误读成「一个按请求数、一个按别的」。
+///
+/// ── 与 providers 的两处差异 ─────────────────────────────────
+///   1. 身份字段是 `id` + `label` 两个：provider 的 `label` 由注册表**现算**，
+///      而账号的展示名是**聚合时留下的快照**（账号可能已被删除，注册表里查不到）。
+///      取名字的优先级是「快照名 → id」，两者都空的那一组用「未知账号」。
+///   2. 没有 `providerLabel` 那种「id → 现算 label」的派生：账号名不是派生值，
+///      就是数据本身，所以直接原样给出。
+pub(super) fn build_accounts(totals: &[AccountAccum]) -> Vec<Value> {
+    // 与 build_providers 同一取舍：全零的组不返回
+    let mut rows: Vec<&AccountAccum> = totals
+        .iter()
+        .filter(|item| item.requests > 0 || item.tokens > 0)
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .requests
+            .cmp(&left.requests)
+            .then(right.tokens.cmp(&left.tokens))
+            .then(left.account_id.cmp(&right.account_id))
+    });
+    rows.into_iter()
+        .map(|item| {
+            // 展示名取「快照名 → id」；两者都空才是真正的未知（默认登录态转发）
+            let label = if !item.account_name.is_empty() {
+                item.account_name.clone()
+            } else if !item.account_id.is_empty() {
+                item.account_id.clone()
+            } else {
+                UNKNOWN_ACCOUNT_LABEL.to_string()
+            };
+            json!({
+                "id": item.account_id,
+                "label": label,
+                "requests": item.requests,
                 "success": item.successful,
                 "failures": (item.requests - item.successful).max(0),
                 "totalTokens": item.tokens,

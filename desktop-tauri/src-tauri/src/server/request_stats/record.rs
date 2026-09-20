@@ -60,11 +60,17 @@ impl Retention {
     }
 }
 
-/// 一条请求明细。
+/// 一条请求日志。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestEntry {
     /// 请求发起时刻（毫秒 Unix 时间戳）
     pub ts: i64,
+    /// 本条请求的关联 id（调试模式的原始报文按它关联，见 `core::debug_traffic`）。
+    ///
+    /// 旧行没有这个键（本字段引入前落盘的），`default` 读成空串 ——
+    /// 前端据此不显示「详情」入口。
+    #[serde(default)]
+    pub id: String,
     pub model: String,
     #[serde(rename = "accountId", default)]
     pub account_id: String,
@@ -120,6 +126,22 @@ pub struct RequestEntry {
     /// 于是「有没有这个键」不再是前端要判的第三种情况。
     #[serde(default)]
     pub provider: String,
+    /// **下游请求的**模型名（客户端请求体里的原值，映射 / 默认注入生效前；
+    /// 空串 = 客户端没点名，或该行来自还没有此字段的旧版本）。
+    ///
+    /// 请求日志用它与 `upstreamModel` 分两行展示「⬆️ 转发的什么 / ⬇️ 请求的
+    /// 什么」。**不要**把它与 `model` 混用：`model` 是解析后的名字（默认回落
+    /// 与映射都已生效），报表按模型聚合的历史口径跟着 `model` 走。
+    #[serde(rename = "clientModel", default)]
+    pub client_model: String,
+    /// 实际发给上游的模型名（映射 + 备援按家改写后的最终值；空串 =
+    /// 一次都没发出去就失败了，或该行来自还没有此字段的旧版本）。
+    ///
+    /// 与 `model` 的差别只在「改写发生过」时出现：下游请求 `gpt-4o` 映射到
+    /// `deepseek-v4-pro`、或请求名经备援落到别家时，`model` 记请求侧解析名，
+    /// 这里记上游真正收到、也真正认识的名字。
+    #[serde(rename = "upstreamModel", default)]
+    pub upstream_model: String,
 }
 
 /// `attempts` 的 serde 默认值（载入缺该字段的旧行时按 1 次算）
@@ -142,6 +164,30 @@ impl RequestEntry {
     pub(super) fn is_success(&self) -> bool {
         (200..300).contains(&self.status) && self.error.is_none()
     }
+
+    /// 按**当前**口径归一后的副本：失败请求的 token 一律清零。
+    ///
+    /// ── 为什么需要它 ────────────────────────────────────────────
+    /// 正常路径用不到 —— 明细落盘前已经过 `NewRequestEntry::normalize`。
+    /// 但**载入进来的历史明细可能来自更早的版本**：1.x 的 `normalize` 只做
+    /// 数值夹取，没有「失败清零」这一段，那时失败的请求也照记 token
+    /// （旧文件里确有这类行：`status: 200` + 流未完整下发的摘要 + 六位数 token）。
+    /// 回填聚合要拿这些旧行重算，必须先把它们过一遍今天的口径，
+    /// 否则报表会把「失败也算用量」这个旧规则带进 token 曲线 ——
+    /// 而当前契约是「失败的请求不产生用量」。
+    ///
+    /// 幂等：已归一的条目再走一遍结果不变（失败的那几个字段恒为 0）。
+    pub(super) fn normalized_for_aggregate(&self) -> Self {
+        if self.is_success() {
+            return self.clone();
+        }
+        let mut copy = self.clone();
+        copy.prompt_tokens = 0;
+        copy.completion_tokens = 0;
+        copy.total_tokens = 0;
+        copy.cache_read_tokens = 0;
+        copy
+    }
 }
 
 /// `record` 的入参。
@@ -152,6 +198,8 @@ impl RequestEntry {
 #[derive(Clone, Debug)]
 pub struct NewRequestEntry {
     pub ts: Option<i64>,
+    /// 本条请求的关联 id（调试模式原始报文的关联键；空串 = 不采）
+    pub id: String,
     pub model: String,
     pub account_id: String,
     pub account_name: String,
@@ -172,6 +220,10 @@ pub struct NewRequestEntry {
     /// `None` = 一次都没发出去就失败了（请求体非法 / 模型不存在 / 无可用账号），
     /// 落盘时归一成空串，聚合层归入「未知」组。
     pub provider: Option<String>,
+    /// 下游请求的模型名（客户端原值；空串 = 未点名 / 未记录）
+    pub client_model: String,
+    /// 实际发给上游的模型名（空串 = 一次都没发出去 / 未记录）
+    pub upstream_model: String,
 }
 
 impl NewRequestEntry {
@@ -193,6 +245,9 @@ impl NewRequestEntry {
             total_tokens: 0,
             cache_read_tokens: 0,
             provider: None,
+            client_model: String::new(),
+            upstream_model: String::new(),
+            id: String::new(),
         }
     }
 
@@ -224,6 +279,8 @@ impl NewRequestEntry {
             .unwrap_or_default();
         RequestEntry {
             ts,
+            // 关联 id 透传（trim 的理由同 provider）：空串 = 没生成 / 旧行
+            id: self.id.trim().to_string(),
             model: self.model,
             account_id: self.account_id,
             account_name: self.account_name,
@@ -239,6 +296,10 @@ impl NewRequestEntry {
             total_tokens: token(self.total_tokens),
             cache_read_tokens: token(self.cache_read_tokens),
             provider,
+            // 双名透传（trim 的理由与 provider 相同：空白不该造出一个
+            // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去
+            client_model: self.client_model.trim().to_string(),
+            upstream_model: self.upstream_model.trim().to_string(),
         }
     }
 }
@@ -282,6 +343,12 @@ pub struct DailyEntry {
     /// 键名不沿用 `*Tokens` 是因为它承载的语义比 tokens 宽（请求数与成功数）。
     #[serde(rename = "providerStats", default, skip_serializing_if = "Vec::is_empty")]
     pub provider_stats: Vec<ProviderAccum>,
+    /// 当天的按账号累计（**契约之外的补充字段**）。
+    ///
+    /// 与 `providerStats` 同一理由：区间级的账号用量排行要跨过明细的 30 天
+    /// 保留期，只有明细的话 `all` / `month` 会在明细到期后突然少掉一大段。
+    #[serde(rename = "accountStats", default, skip_serializing_if = "Vec::is_empty")]
+    pub account_stats: Vec<AccountAccum>,
 }
 
 impl DailyEntry {
@@ -296,6 +363,7 @@ impl DailyEntry {
             cache_input_tokens: 0,
             model_tokens: Vec::new(),
             provider_stats: Vec::new(),
+            account_stats: Vec::new(),
         }
     }
 }
@@ -322,6 +390,34 @@ pub struct ModelAccum {
 pub struct ProviderAccum {
     #[serde(default)]
     pub provider: String,
+    #[serde(default)]
+    pub requests: i64,
+    #[serde(default)]
+    pub successful: i64,
+    #[serde(default)]
+    pub tokens: i64,
+}
+
+/// 单个账号在某天的累计（聚合行的组成部分）。
+///
+/// 与 `ProviderAccum` 同形（requests / successful / tokens + 身份），
+/// 因为两份累计回答的是同一个问题的两个视角：「谁承载的」与「哪个账号承载的」。
+/// 失败数同样由减法得出，不另存一列（理由见 `ProviderAccum`）。
+///
+/// ── 为什么同时存 id 与 name ──────────────────────────────────
+/// `accountId` 是身份、`accountName` 是**当时的展示名快照**：账号可以在账号页
+/// 改名，名字变了不该把它拆成两行，所以身份只认 id（见 `push_account_accum`
+/// 的匹配规则）；但名字也要留在文件里 —— 账号被删除后（明细与聚合的寿命
+/// 都长于账号记录）报表仍要显示一个可读的名字，而不是一串 id。
+///
+/// 两个字段都为空表示「不知道是谁承载的」：走默认登录态转发（未配置账号列表）
+/// 或旧版本写出的行。与 provider 的空串同一口径，由展示层给占位文案。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AccountAccum {
+    #[serde(rename = "accountId", default)]
+    pub account_id: String,
+    #[serde(rename = "accountName", default)]
+    pub account_name: String,
     #[serde(default)]
     pub requests: i64,
     #[serde(default)]

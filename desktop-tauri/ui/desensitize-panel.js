@@ -329,7 +329,12 @@
     if (button) removeTerm(button.dataset.term);
   });
   $('btn-reset-terms').addEventListener('click', async () => {
-    if (!confirm('恢复为内置默认词表？当前自定义的词会被替换掉。')) return;
+    if (!(await window.wbConfirm?.ask?.({
+      title: '恢复默认词表',
+      html: '恢复为内置默认词表？当前自定义的词会被替换掉。',
+      okText: '恢复默认',
+      okClass: 'danger',
+    }))) return;
     await guard($('btn-reset-terms'), '恢复中…', async () => {
       apply(await api.resetDesensitizeTerms());
       toast('✅ 已恢复默认词表');

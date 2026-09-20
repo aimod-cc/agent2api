@@ -54,8 +54,63 @@ use crate::state::ActiveLogin;
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// WorkBuddy 国际版登录页「只留 OneID/邮箱」的强制样式 id。
+///
+/// 上游前端（`index-*.js`）在 `enable_oneid_only_login` 为 true 时，把这段样式
+/// 注入登录 iframe 的 head，隐藏 `#kc-social-providers`（Google / GitHub / X
+/// 三个按钮的容器）并强制切到邮箱 tab。开关来自：
+///   GET https://www.workbuddy.ai/v2/plugin/login/entry-policy
+///   → {"data":{"enable_oneid_only_login":true}}
+/// 按钮本身与 Keycloak 的 broker 通道都是好的（实测 `broker/google/login`
+/// 能正常跳 accounts.google.com），所以摘掉这段样式即可恢复入口。
+const SOCIAL_HIDDEN_STYLE_ID: &str = "oneid-only-login-style";
+
+/// 摘掉上面那段样式，恢复 Google / GitHub / X 入口。
+///
+/// ── 为什么用 `for_all_frames` 注入 ──────────────────────────
+/// 登录页是**两层**结构：外层 `www.workbuddy.ai/login` 只是个壳，真正的
+/// Keycloak 授权页在内层 iframe 里，样式也由外壳注进那个 iframe。注入脚本要
+/// 在 iframe 的文档里生效，就必须用 `initialization_script_for_all_frames`
+/// （wry 在 Windows 上走 `AddScriptToExecuteOnDocumentCreated`，覆盖所有 frame）。
+///
+/// ── 为什么是「反复摘」而不是「摘一次」 ────────────────────────
+/// 注入不止一次：每次 iframe 重新加载（登录中途跳转回来、语言切换）外壳都会
+/// 再插一遍，且注入方先判断「有没有这个 id」——所以我们必须**持续**盯着并移除，
+/// 而不是只处理一次。用一个 setInterval 轮询是最省事且不依赖 DOM 事件顺序的做法：
+/// 样式可能在 DOMContentLoaded 之前就进了 head，事件监听容易错过那一拍。
+/// 间隔 200ms 只做一个 getElementById，开销可以忽略。
+///
+/// ── 边界 ──────────────────────────────────────────────────
+///   1. 只在 `workbuddy.ai` 域名上动手：登录窗口会跳到 accounts.google.com /
+///      github.com，那些页面不该被注入任何东西。
+///   2. 只移除**那一个 id** 的 style，不碰别的节点，也不改 `switchTab` 行为 ——
+///      用户的默认落点仍是上游决定的那个 tab，我们只是不再隐藏入口。
+fn social_restore_script() -> String {
+    // 样式 id 从常量注入，避免这里再写一份字面量（两处一旦不一致就是
+    // 「脚本在跑但什么都没摘掉」这种没有任何报错的静默失效）。
+    format!(
+        r#"
+(function () {{
+  var STYLE_ID = '{style_id}';
+  if (!/(^|\.)workbuddy\.ai$/.test(location.hostname)) return;
+  function strip() {{
+    var el = document.getElementById(STYLE_ID);
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+  }}
+  strip();
+  setInterval(strip, 200);
+}})();
+"#,
+        style_id = SOCIAL_HIDDEN_STYLE_ID,
+    )
+}
+
 /// workbuddy 登录窗口允许导航的域名，取自两版 cli/product.json 的
 /// internalDomain / externalDomain / iOADomain，外加扫码登录所需的微信/QQ 域名。
+///
+/// **第三方身份提供方（Google / GitHub / X）不在这张表里**：它们是可选入口，
+/// 只有勾选「恢复第三方入口」时才额外放行，见 [`SOCIAL_IDENTITY_HOSTS`]
+/// 与 [`host_allowed`]。
 const WORKBUDDY_ALLOWED_HOSTS: &[&str] = &[
     "copilot.tencent.com",
     "staging-copilot.tencent.com",
@@ -70,6 +125,34 @@ const WORKBUDDY_ALLOWED_HOSTS: &[&str] = &[
     "wechat.com",
     "weixin.qq.com",
     "tenpay.com",
+];
+
+/// 「恢复 Google / GitHub 入口」勾选时额外放行的第三方身份提供方域名。
+///
+/// ── 为什么必须放行 ────────────────────────────────────────
+/// 恢复出来的按钮点击后**不在 iframe 内跳转**：登录页的 `handleAuthLogin` 做的是
+/// `window.parent.location.href = url`（顶层跳转，实测）。也就是整个登录窗口会
+/// 走去 Google / GitHub，登录完成后再经 Keycloak broker 回调跳回 workbuddy.ai。
+/// 这些域名不在白名单里就会被 `host_allowed` 静默拦下，症状是「点了 Google 登录
+/// 窗口一片空白」——正是 `allowed_hosts` 注释里警告过的那类难查故障。
+///
+/// ── 名单怎么来的 ──────────────────────────────────────────
+/// 实测点击 Google 登录后的落点是 `accounts.google.com`（授权页），GitHub 同理
+/// 走 `github.com`。其余条目是两家登录链路上的常规跳转与静态资源域
+/// （Google 的 gstatic 承载登录页资源，GitHub 的 githubusercontent 承载头像等），
+/// 少了它们会出现「页面能到、但资源加载不全」的半残状态。
+const SOCIAL_IDENTITY_HOSTS: &[&str] = &[
+    "accounts.google.com",
+    "accounts.youtube.com",
+    "google.com",
+    "gstatic.com",
+    "googleusercontent.com",
+    "github.com",
+    "githubusercontent.com",
+    "githubassets.com",
+    "twitter.com",
+    "x.com",
+    "twimg.com",
 ];
 
 /// 小浣熊登录窗口允许导航的域名。
@@ -126,9 +209,13 @@ const RACCOON_CALLBACK_PATH: &str = "/callback";
 fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
     match provider {
         "raccoon" => Some(RACCOON_ALLOWED_HOSTS),
-        // CatPaw 与 Qoder 都不设限（理由见上）；**新加 provider 时不要让它落到
-        // 默认分支** —— 那会静默沿用 WorkBuddy 的白名单，症状是登录窗口白屏。
-        "catpaw" | "qoder" => None,
+        // CatPaw / Qoder / Cline 都不设限（理由见上）；**新加 provider 时不要让它
+        // 落到默认分支** —— 那会静默沿用 WorkBuddy 的白名单，症状是登录窗口白屏。
+        //
+        // Cline 尤其要注意：它的授权页在 `authkit.cline.bot`，而确认动作可能被
+        // 身份提供方接管（WorkOS AuthKit 会按账号配置跳到 Google / GitHub / SSO
+        // 等不可穷举的主机）—— 与 Qoder 同一情形，白名单列不全。
+        "catpaw" | "qoder" | "cline-free" | "cline-pass" => None,
         _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
@@ -139,7 +226,10 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
 /// 必须先判回调再判白名单 —— 顺序反了会把回调当成非法导航拒掉，而那种拒绝
 /// 和「拦下回调」在 WebView2 眼里是同一个动作，日志里看不出区别，
 /// 最终表现为「用户登录成功了但网关一直没拿到 code」。
-fn host_allowed(url: &url::Url, provider: &str) -> bool {
+///
+/// `social_restore` 勾选时对 workbuddy 额外放行 [`SOCIAL_IDENTITY_HOSTS`]：
+/// 恢复出来的 Google / GitHub 按钮做的是顶层跳转，不放行就会白屏（理由见该常量）。
+fn host_allowed(url: &url::Url, provider: &str, social_restore: bool) -> bool {
     match url.scheme() {
         "about" | "data" => true,
         "https" | "http" => {
@@ -151,9 +241,12 @@ fn host_allowed(url: &url::Url, provider: &str) -> bool {
                 return false;
             };
             let host = host.to_lowercase();
-            allowed
-                .iter()
-                .any(|item| host == *item || host.ends_with(&format!(".{item}")))
+            let matched = |list: &[&str]| {
+                list.iter()
+                    .any(|item| host == *item || host.ends_with(&format!(".{item}")))
+            };
+            matched(allowed)
+                || (social_restore && provider == "workbuddy" && matched(SOCIAL_IDENTITY_HOSTS))
         }
         // 非 http(s) 的其它协议一律拒绝（除了上面的 about / data）：
         // 白名单之外的自定义协议在 WebView2 里会被交给系统处理，不该由登录页触发
@@ -182,13 +275,20 @@ fn is_login_callback(url: &url::Url, provider: &str) -> bool {
     url.scheme() == RACCOON_CALLBACK_SCHEME && host_matches && url.path() == RACCOON_CALLBACK_PATH
 }
 
-/// 归一化前端传来的 provider id（缺省 workbuddy，只认这四家）。
+/// 归一化前端传来的 provider id（缺省 workbuddy，只认这五家）。
+///
+/// ── 为什么 Cline 只列「网页登录」这一条路 ─────────────────────
+/// 它的设备授权登录走的就是这条 IPC（壳侧把授权页开出来、后端轮询换令牌），
+/// 与 Qoder 的设备授权同形；手工填凭证与导入桌面端登录态都不经过这里
+/// （那两条走 `POST /api/accounts`）。
 fn normalize_provider(provider: &str) -> Result<&'static str, String> {
     match provider.trim() {
         "" | "workbuddy" => Ok("workbuddy"),
         "raccoon" => Ok("raccoon"),
         "qoder" => Ok("qoder"),
         "catpaw" => Ok("catpaw"),
+        "cline-free" => Ok("cline-free"),
+        "cline-pass" => Ok("cline-pass"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -285,11 +385,15 @@ pub async fn cancel(app: &AppHandle) -> Result<(), String> {
 ///
 /// `provider` 缺省（空串）按 workbuddy 处理 —— 老版本界面不会传它，
 /// 那条链的行为必须逐字保持。
+///
+/// `social_restore`：是否恢复 WorkBuddy 登录页的 Google / GitHub / X 入口
+/// （见 [`social_restore_script`]）。界面默认不勾选，故缺省 false。
 pub async fn start(
     app: &AppHandle,
     edition: String,
     mode: String,
     provider: String,
+    social_restore: bool,
 ) -> Result<serde_json::Value, String> {
     if current_login(app).is_some() {
         return Err("已有登录流程在进行，请先完成当前登录或等待超时".to_string());
@@ -309,14 +413,25 @@ pub async fn start(
 
     // Qoder 的设备授权两站同构（见 core::login::qoder），`cn` 原样透传给后端 ——
     // 由它决定授权页与轮询地址打哪一站。这里不再拦截国内版。
-    let edition_id = if provider == "qoder" {
-        if edition == "intl" || edition == "global" { "intl" } else { "cn" }
-    } else if edition == "intl" { "intl" } else { "cn" };
+    //
+    // ── Cline 不再走这个形参传池（拆分后删掉的一段）────────────
+    // 早先 `cline` 借用 `edition` 这个位置传额度池（`pass` / `free`），因为那时
+    // 池是**账号的属性**、得由界面选一次。现在两个池是**两个 provider**
+    // （`cline-free` / `cline-pass`），池已经在 provider id 里，没有第二个旋钮 ——
+    // 这里再算一遍 edition 就是多余的一处状态（还会与 provider 冲突时说不清谁算数）。
+    let edition_id = match provider {
+        "qoder" => {
+            if edition == "intl" || edition == "global" { "intl" } else { "cn" }
+        }
+        _ => {
+            if edition == "intl" { "intl" } else { "cn" }
+        }
+    };
     let edition_label = if edition_id == "intl" { "国际版" } else { "国内版" };
-    // 系统浏览器模式只对 workbuddy 与 qoder 开放：两家的判定都在后端（前者轮询
-    // 上游 auth/token，后者轮询设备令牌），浏览器在哪登录都行。小浣熊**只有内嵌
-    // 窗口**能收回调（自定义协议深链要靠系统注册，见模块头），给它这个选项只会
-    // 制造一个永远等不到回调的卡死。
+    // 系统浏览器模式对 workbuddy / qoder / cline 都开放：三家的判定都在后端
+    // （轮询上游 auth/token、轮询设备令牌、轮询设备授权），浏览器在哪登录都行。
+    // 小浣熊**只有内嵌窗口**能收回调（自定义协议深链要靠系统注册，见模块头），
+    // 给它这个选项只会制造一个永远等不到回调的卡死。
     let use_external = mode == "external" && provider != "raccoon";
 
     let started = gateway::call(
@@ -356,12 +471,35 @@ pub async fn start(
         },
     );
 
-    let provider_label = if provider == "qoder" { "Qoder" } else { "WorkBuddy" };
-    let title = format!("登录 {provider_label} {edition_label}账号");
+    // 窗口标题里的品牌名。缺省 WorkBuddy 是历史契约（老客户端只走那一家），
+    // 其余家各自点名 —— 少写一家只会让标题显示成「登录 WorkBuddy 国内版账号」
+    // 而实际打开的是别家的页面，用户第一眼就会以为是点错了按钮。
+    let provider_label = match provider {
+        "qoder" => "Qoder",
+        "cline-free" => "Cline Free",
+        "cline-pass" => "Cline Pass",
+        "catpaw" => "CatPaw",
+        "raccoon" => "小浣熊",
+        _ => "WorkBuddy",
+    };
+    // 窗口标题：Cline 两家的池已经在品牌名里，不再拼 edition 后缀
+    // （否则会出现「登录 Cline Free 国内版账号」这种说不通的标题）
+    let title = if matches!(provider, "cline-free" | "cline-pass") {
+        format!("登录 {provider_label} 账号")
+    } else {
+        format!("登录 {provider_label} {edition_label}账号")
+    };
+    // 第三方入口恢复只对**国际版 WorkBuddy** 有意义，在这里就把条件算完整，
+    // 传给 run_embedded 的就是「这次登录要不要恢复入口」的最终答案：
+    //   ① 只有 workbuddy 的登录链有这个概念（小浣熊 / CatPaw / Qoder 另有分流）；
+    //   ② 只有国际版登录页被上游隐藏了入口 —— 国内版登录页是微信 / 手机号 /
+    //      邮箱 / SSO，既没有 Google / GitHub 按钮，也没有那段隐藏样式（实测），
+    //      对它放行 google.com 之类的域名属于没有必要的放宽。
+    let social_restore = social_restore && provider == "workbuddy" && edition_id == "intl";
     let result = if use_external {
         open_external(app, &auth_url, edition_label, &login_state).await
     } else {
-        run_embedded(app, provider, &auth_url, &title, &login_state).await
+        run_embedded(app, provider, &auth_url, &title, &login_state, social_restore).await
     };
 
     if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
@@ -413,7 +551,10 @@ async fn start_raccoon(app: &AppHandle) -> Result<serde_json::Value, String> {
         },
     );
 
-    let result = run_embedded(app, "raccoon", &auth_url, "登录小浣熊账号", &login_state).await;
+    // social_restore 传 false：第三方入口恢复只针对 WorkBuddy 的登录页
+    // （`run_embedded` 里也只对 provider == "workbuddy" 注入脚本），小浣熊
+    // 没有这个开关概念，直传 false 表明「不参与这项能力」。
+    let result = run_embedded(app, "raccoon", &auth_url, "登录小浣熊账号", &login_state, false).await;
     if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
         let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
     }
@@ -479,7 +620,8 @@ async fn start_catpaw(
         // 传空串会得到「已完成登录，但等待超时」这种缺主语的句子。
         open_external(app, &auth_url, "CatPaw 官方登录页", &login_state).await
     } else {
-        run_embedded(app, "catpaw", &auth_url, "登录 CatPaw 账号", &login_state).await
+        // social_restore 传 false：与小浣熊同理，这项能力只属于 WorkBuddy 的登录页。
+        run_embedded(app, "catpaw", &auth_url, "登录 CatPaw 账号", &login_state, false).await
     };
     if result.as_ref().map(|value| value.get("ok").and_then(serde_json::Value::as_bool)) != Ok(Some(true)) {
         let _ = gateway::call("POST", "/api/session/login/cancel", Some(&json!({ "state": login_state }))).await;
@@ -553,12 +695,17 @@ async fn open_external(
 ///
 /// `provider` 决定白名单与回调识别（小浣熊要捕获 `office-raccoon://` 深链）；
 /// `title` 由调用方给出（两家窗口标题不同）。
+///
+/// `social_restore` 是**已经算好的结论**（调用方已按 provider 与版本收窄，见 `start`）：
+/// 为 true 时注入 [`social_restore_script`] 并放行第三方域名 —— 两项必须成对生效：
+/// 只注入不放行，点了 Google 登录会因导航被拦而白屏。
 async fn run_embedded(
     app: &AppHandle,
     provider: &'static str,
     auth_url: &str,
     title: &str,
     login_state: &str,
+    social_restore: bool,
 ) -> Result<serde_json::Value, String> {
     let window_label = login_window_label(login_state);
     // ── 每次登录一个独立环境（修复：第二次添加账号会看到上一个账号的登录态）──
@@ -599,7 +746,21 @@ async fn run_embedded(
         .title(title.to_string())
         .inner_size(1100.0, 820.0)
         .min_inner_size(760.0, 560.0)
-        .center()
+        .center();
+
+    // 恢复第三方登录入口：登录页按上游开关把 Google / GitHub / X 隐藏了，
+    // 注入脚本持续摘掉那段样式（理由与边界见 social_restore_script）。
+    //
+    // 用 for_all_frames：目标样式在**内层 iframe** 的 head 里，只注入主 frame
+    // 够不着它。脚本自身再按 hostname 限一次，避免跳去 accounts.google.com
+    // 之后还在那边空转。
+    let window = if social_restore {
+        window.initialization_script_for_all_frames(social_restore_script())
+    } else {
+        window
+    };
+
+    let window = window
         // 登录页只允许在上游白名单域名之间跳转：登录页会经过 SSO 中转，
         // 若页面被注入任意跳转，凭据可能被带到第三方站点。
         //
@@ -621,7 +782,7 @@ async fn run_embedded(
                 }
                 return false;
             }
-            host_allowed(url, provider)
+            host_allowed(url, provider, social_restore)
         })
         // 弹出窗口（window.open）也是回调的可能入口：有的登录页在拿到授权码后会用
         // `window.open('office-raccoon://…')` 而不是直接改 location —— 那样它就只

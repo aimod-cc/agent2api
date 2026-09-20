@@ -27,7 +27,7 @@
 //! JSON 字段名与 Node 版一致：`id/ts/level/category/message/data`。
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{Duration as ChronoDuration, Local, TimeZone};
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,67 @@ fn level_rank(level: &str) -> usize {
     LEVELS.iter().position(|item| *item == level).unwrap_or(1)
 }
 
+impl Query {
+    /// 这条日志是否命中本查询的**筛选**条件。
+    ///
+    /// `query()` 与 `clear_where()` 共用这一份过滤链 —— 查询里看到的「筛选出
+    /// N 条」与删除时删掉的那 N 条必须是同一批，两处手写必然漂移。
+    /// `limit` 是分页参数不算筛选，不在其中。
+    fn matches(&self, item: &LogEntry) -> bool {
+        // 级别下限：与 Node 版一致，未知级别不参与过滤
+        if let Some(rank) = self
+            .level
+            .as_deref()
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| LEVELS.contains(&value.as_str()))
+            .map(|value| level_rank(&value))
+        {
+            if level_rank(&item.level) < rank {
+                return false;
+            }
+        }
+        // 分类：同样要求是已知分类才过滤
+        if let Some(want) = self
+            .category
+            .as_deref()
+            .map(|value| value.trim().to_lowercase())
+            .filter(|value| CATEGORIES.iter().any(|(key, _)| *key == *value))
+        {
+            if item.category != want {
+                return false;
+            }
+        }
+        if let Some(want) = self
+            .keyword
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase)
+        {
+            if !item.message.to_lowercase().contains(&want) {
+                return false;
+            }
+        }
+        if let Some(from) = self.since_id {
+            if item.id <= from {
+                return false;
+            }
+        }
+        // 时间区间：闭开 [start, end)
+        if let Some(from) = self.start {
+            if item.ts < from {
+                return false;
+            }
+        }
+        if let Some(to) = self.end {
+            if item.ts >= to {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// 分类归一：未知值一律 server（对应 Node 版 normalizeCategory）
 fn normalize_category(value: &str) -> String {
     let lower = value.trim().to_lowercase();
@@ -196,8 +257,10 @@ fn clamp_message(text: &str) -> String {
 
 /// 日志存储本体。所有公开方法都取 `&self`，内部 `Mutex` 串行化。
 pub struct LogStore {
-    directory: PathBuf,
-    file: PathBuf,
+    /// 保存目录。包 `RwLock` 是为了**运行中换目录**（迁移，见 `relocate`）：
+    /// 普通写路径都持 `inner` 锁后才碰文件，锁序恒为 inner → directory，
+    /// 不会互等；文件路径不另存字段 —— 它永远由目录派生，两处必然一致。
+    directory: RwLock<PathBuf>,
     /// 保留天数回调。**每次裁剪时动态调用**，于是设置改完天数下一次写入
     /// 就用新值，不需要重启进程（与 `RequestStats::get_retention` 同一模式）。
     /// 用 `Arc` 是为了让 `LogStore` 本身仍能放进 `OnceLock`（不需要 `&self` 生命周期）
@@ -232,11 +295,9 @@ impl LogStore {
         directory: impl AsRef<Path>,
         get_retention_days: impl Fn() -> i64 + Send + Sync + 'static,
     ) -> Self {
-        let directory = directory.as_ref().to_path_buf();
-        let file = directory.join(FILE_NAME);
+        let directory = RwLock::new(directory.as_ref().to_path_buf());
         let store = Self {
             directory,
-            file,
             get_retention_days: Arc::new(get_retention_days),
             inner: Mutex::new(Inner {
                 entries: Vec::new(),
@@ -249,11 +310,25 @@ impl LogStore {
         store
     }
 
+    /// 当前保存目录（迁移会换它，读侧每次都取现值而不是缓存）
+    fn directory_of(&self) -> PathBuf {
+        match self.directory.read() {
+            Ok(guard) => guard.clone(),
+            // 中毒恢复：目录路径是纯数据，继续用内部值（与 inner 的取向一致）
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// 当前日志文件的完整路径（由目录派生）
+    fn file_path(&self) -> PathBuf {
+        self.directory_of().join(FILE_NAME)
+    }
+
     /// 当前保留期的毫秒下界（本地时区「今天往前推 N-1 天」的零点）。
     ///
     /// 保留 N 天 = 含今天在内的 N 个自然日，所以往前推 N-1 天 ——
     /// 与 `RequestStats::retention_bounds` 的口径**逐字一致**：
-    /// 事件日志与请求明细的「30 天」必须是同一个 30 天。
+    /// 事件日志与请求日志的「30 天」必须是同一个 30 天。
     /// 取值范围复用 `config` 的两个常量（那里是唯一事实来源，读侧夹紧与
     /// 写侧校验共用同一组边界，手改 config.json 写个天文数字也不会让裁剪空转）。
     fn retention_cutoff_ms(&self) -> i64 {
@@ -272,14 +347,14 @@ impl LogStore {
     /// （stats() 的 `file` 字段已表达同一事实，这里保留供直读）。
     #[allow(dead_code)]
     pub fn file(&self) -> PathBuf {
-        self.file.clone()
+        self.file_path()
     }
 
     /// 载入历史：逐行解析，损坏行跳过（不影响其余日志）；
     /// 载入后按两个保留约束收敛（先时间后容量），文件比内存多时标 dirty，
     /// 下次写入把文件收敛回同样的集合。
     fn load(&self) {
-        let Ok(text) = std::fs::read_to_string(&self.file) else {
+        let Ok(text) = std::fs::read_to_string(self.file_path()) else {
             // 文件不存在是正常情况（首次运行），不打扰用户
             return;
         };
@@ -448,11 +523,11 @@ impl LogStore {
 
     /// 整文件覆盖写（环形收敛与清空用）
     fn write_all(&self, text: &str) {
-        if let Err(error) = std::fs::create_dir_all(&self.directory) {
+        if let Err(error) = std::fs::create_dir_all(self.directory_of()) {
             eprintln!("[Logs] 日志写入失败: {error}");
             return;
         }
-        if let Err(error) = std::fs::write(&self.file, text) {
+        if let Err(error) = std::fs::write(self.file_path(), text) {
             eprintln!("[Logs] 日志写入失败: {error}");
         }
     }
@@ -460,14 +535,14 @@ impl LogStore {
     /// 追加一行（正常路径）
     fn write_append(&self, line: &str) {
         use std::io::Write;
-        if let Err(error) = std::fs::create_dir_all(&self.directory) {
+        if let Err(error) = std::fs::create_dir_all(self.directory_of()) {
             eprintln!("[Logs] 日志写入失败: {error}");
             return;
         }
         let result = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.file)
+            .open(self.file_path())
             .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()));
         if let Err(error) = result {
             eprintln!("[Logs] 日志写入失败: {error}");
@@ -487,59 +562,9 @@ impl LogStore {
         };
         let total = guard.entries.len();
 
-        // 级别下限：与 Node 版一致，未知级别不参与过滤
-        let min_rank = query
-            .level
-            .as_deref()
-            .map(|value| value.trim().to_lowercase())
-            .filter(|value| LEVELS.contains(&value.as_str()))
-            .map(|value| level_rank(&value));
-
-        // 分类：同样要求是已知分类才过滤
-        let category = query
-            .category
-            .as_deref()
-            .map(|value| value.trim().to_lowercase())
-            .filter(|value| CATEGORIES.iter().any(|(key, _)| *key == *value));
-
-        let keyword = query
-            .keyword
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_lowercase);
-
-        let filtered: Vec<&LogEntry> = guard
-            .entries
-            .iter()
-            .filter(|item| match min_rank {
-                Some(rank) => level_rank(&item.level) >= rank,
-                None => true,
-            })
-            .filter(|item| match category.as_deref() {
-                Some(want) => item.category == want,
-                None => true,
-            })
-            .filter(|item| match keyword.as_deref() {
-                Some(want) => item.message.to_lowercase().contains(want),
-                None => true,
-            })
-            .filter(|item| match query.since_id {
-                Some(from) => item.id > from,
-                None => true,
-            })
-            // 时间区间：闭开 [start, end)。放在最后一段是跟着「筛选强度」排的 ——
-            // 它与 since_id 一样是廉价比较，放在关键词（要转小写、做子串匹配）
-            // 之后能少做几次昂贵的匹配
-            .filter(|item| match query.start {
-                Some(from) => item.ts >= from,
-                None => true,
-            })
-            .filter(|item| match query.end {
-                Some(to) => item.ts < to,
-                None => true,
-            })
-            .collect();
+        // 过滤链在 `Query::matches`（与 clear_where 共用一份，口径不会漂）
+        let filtered: Vec<&LogEntry> =
+            guard.entries.iter().filter(|item| query.matches(item)).collect();
 
         let matched = filtered.len();
         // limit 缺省 200，并夹在 [1, MAX_ENTRIES]（对应 Node 版 Math.min/Math.max）
@@ -548,6 +573,78 @@ impl LogStore {
         let mut entries: Vec<LogEntry> = filtered[start..].iter().map(|item| (*item).clone()).collect();
         entries.reverse();
         QueryResult { entries, total, matched }
+    }
+
+    /// 按筛选条件删除：返回（删除条数，删除后的统计）。
+    ///
+    /// 与 `clear()` 的差别：只删命中的条目，未命中的保留；**id 不回退**
+    /// （保持单调递增）—— 已读水位（导航徽标）依赖「新条目 id > 旧水位」，
+    /// 删除后这条性质依然成立。文件在持锁期间整体重写：
+    /// 内存里留下的就是文件里该有的。
+    pub fn clear_where(&self, query: &Query) -> (usize, Stats) {
+        let Ok(mut guard) = self.inner.lock() else {
+            return (0, self.stats());
+        };
+        let before = guard.entries.len();
+        guard.entries.retain(|item| !query.matches(item));
+        let removed = before - guard.entries.len();
+        if removed > 0 {
+            let text = render_jsonl(&guard.entries);
+            self.write_all(&text);
+            guard.dirty = false;
+            guard.appends_since_compact = 0;
+        }
+        let stats = self.stats();
+        (removed, stats)
+    }
+
+    /// 迁移到新目录：按内存整份写出到新位置，成功后切换目录并删除旧文件。
+    ///
+    /// 为什么是「按内存重写」而不是「复制文件」：内存就是**有效全集**
+    /// （载入时已按保留期 / 上限裁剪，文件里多出来的旧行本就该被下次写入收敛），
+    /// 重写一遍顺带把新位置的文件收敛到位。
+    ///
+    /// 全程持 `inner` 锁：迁移期间的写入会等到迁移完成（日志是低频事件，
+    /// 秒级阻塞可接受）。`progress(已写字节, 总字节)` 供界面画进度条；
+    /// 写新文件**中途失败**时不切目录、不动旧文件 —— 本次迁移安全失败，
+    /// 新目录里可能留下的半截文件会被下一次成功的迁移覆盖（File::create 截断）。
+    pub fn relocate(
+        &self,
+        new_dir: &Path,
+        progress: impl Fn(u64, u64) + Send + Sync,
+    ) -> Result<(), String> {
+        let old_dir = self.directory_of();
+        let old_file = old_dir.join(FILE_NAME);
+        let new_dir = new_dir.to_path_buf();
+        if old_dir == new_dir {
+            return Err("新目录与当前保存位置相同".to_string());
+        }
+        let Ok(mut guard) = self.inner.lock() else {
+            return Err("日志库正被占用，请稍后重试".to_string());
+        };
+        let text = render_jsonl(&guard.entries);
+        let total = text.len() as u64;
+        progress(0, total);
+        std::fs::create_dir_all(&new_dir).map_err(|error| format!("创建目录失败: {error}"))?;
+        let new_file = new_dir.join(FILE_NAME);
+        write_chunked(&new_file, text.as_bytes(), &progress)?;
+        // 两个关键步骤都成功才切目录：此后写入都落新文件，
+        // dirty 计数清零（新文件刚按当前内存整份写出，两边一致）
+        if let Ok(mut directory) = self.directory.write() {
+            *directory = new_dir.clone();
+        }
+        guard.dirty = false;
+        guard.appends_since_compact = 0;
+        drop(guard);
+        // 旧文件删掉，「搬家」不留歧义；删失败不回滚 —— 数据已在新位置，
+        // 旧文件顶多留一份历史副本（下次手动清掉即可）
+        if let Err(error) = std::fs::remove_file(&old_file) {
+            crate::server::logging::console_line(
+                "[Logs]",
+                &format!("⚠️ 旧日志文件删除失败（数据已在新位置生效）: {error}"),
+            );
+        }
+        Ok(())
     }
 
     /// 各级别 / 分类计数
@@ -568,7 +665,7 @@ impl LogStore {
                 by_level,
                 by_category,
                 last_id: 0,
-                file: self.file.to_string_lossy().to_string(),
+                file: self.file_path().to_string_lossy().to_string(),
             };
         };
         for item in &guard.entries {
@@ -585,7 +682,7 @@ impl LogStore {
             by_level,
             by_category,
             last_id: guard.entries.last().map(|item| item.id).unwrap_or(0),
-            file: self.file.to_string_lossy().to_string(),
+            file: self.file_path().to_string_lossy().to_string(),
         }
     }
 
@@ -597,9 +694,9 @@ impl LogStore {
             guard.dirty = false;
             guard.appends_since_compact = 0;
         }
-        if let Err(error) = std::fs::create_dir_all(&self.directory) {
+        if let Err(error) = std::fs::create_dir_all(self.directory_of()) {
             eprintln!("[Logs] 日志清空失败: {error}");
-        } else if let Err(error) = std::fs::write(&self.file, "") {
+        } else if let Err(error) = std::fs::write(self.file_path(), "") {
             eprintln!("[Logs] 日志清空失败: {error}");
         }
         self.stats()
@@ -644,6 +741,29 @@ fn render_jsonl(entries: &[LogEntry]) -> String {
         }
     }
     text
+}
+
+/// 分块写文件并回报进度，`progress(已写字节, 总字节)`。
+///
+/// 迁移的数据量可能到几 MB（请求明细上限 2 万条）：一次性 write 也就是一瞬，
+/// 但分块让进度回调有东西可画，代价只是几轮循环。`pub(crate)` 供
+/// `RequestStats::relocate` 复用 —— 两个存储的迁移共用同一份「怎么写、怎么报」。
+pub(crate) fn write_chunked(
+    path: &Path,
+    bytes: &[u8],
+    progress: &impl Fn(u64, u64),
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path).map_err(|error| format!("创建文件失败: {error}"))?;
+    let total = bytes.len() as u64;
+    let mut written = 0u64;
+    for block in bytes.chunks(256 * 1024) {
+        file.write_all(block).map_err(|error| format!("写入文件失败: {error}"))?;
+        written += block.len() as u64;
+        progress(written, total);
+    }
+    file.flush().map_err(|error| format!("写入文件失败: {error}"))?;
+    Ok(())
 }
 
 /// `append` 的入参：借用了外部字符串，避免调用方为每条日志都构造 String。

@@ -62,7 +62,7 @@
         <button class="nav-item" data-page="desensitize" data-icon="desensitize"><span class="ico"></span><span class="label">脱敏</span></button>
 
         <div class="nav-group-label">诊断</div>
-        <button class="nav-item" data-page="requests" data-icon="requests"><span class="ico"></span><span class="label">请求日志</span></button>
+        <button class="nav-item" data-page="requests" data-icon="requests"><span class="ico"></span><span class="label">请求日志</span><span class="count" id="nav-count-requests" style="display:none">0</span></button>
         <button class="nav-item" data-page="logs" data-icon="logs"><span class="ico"></span><span class="label">日志</span><span class="count" id="nav-count-logs" style="display:none">0</span></button>
         <button class="nav-item" data-page="tasks" data-icon="tasks"><span class="ico"></span><span class="label">定时任务</span></button>
         <button class="nav-item" data-page="settings" data-icon="settings"><span class="ico"></span><span class="label">设置</span><span class="count" id="nav-count-update" style="display:none">新</span></button>
@@ -127,7 +127,7 @@
         <section class="page active" data-page="overview">
           <div class="page-head">
             <h2>报表</h2>
-            <p class="intro">会话状态与请求统计。时间范围只影响概览、缓存四窗口与按天 Token 趋势；热力图固定近 365 天、缓存趋势固定近 24 小时。</p>
+            <p class="intro">请求统计。时间范围只影响概览、缓存四窗口与按天 Token 趋势；热力图固定近 365 天、缓存趋势固定近 24 小时。本页按「定时任务」页设置的间隔自动刷新（默认 1 秒，仅在本页可见时请求）。</p>
             <div class="head-actions">
               <div class="seg" id="report-range" role="tablist" aria-label="报表时间范围">
                 <button class="seg-item" data-range="today">今天</button>
@@ -136,51 +136,8 @@
                 <button class="seg-item" data-range="month">本月</button>
                 <button class="seg-item" data-range="all">全部</button>
               </div>
-              <button id="btn-report-refresh" title="重新拉取全部报表数据">刷新</button>
             </div>
           </div>
-
-          <section class="panel">
-            <div class="panel-head">
-              <h2>会话状态</h2>
-              <span id="session-badge" class="badge">检测中…</span>
-              <span class="panel-sub">登录态信息</span>
-              <div class="head-actions">
-                <button id="btn-refresh-state">刷新状态</button>
-                <button id="btn-refresh-token">刷新 Token</button>
-                <button id="btn-logout" class="danger">退出登录</button>
-                <button id="btn-add-account" class="primary">登录 / 添加账号</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div class="field-grid">
-                <div class="field">
-                  <div class="label">账号昵称</div>
-                  <div class="value" id="session-nickname">—</div>
-                </div>
-                <div class="field">
-                  <div class="label">账号 UID
-                    <button class="copy-btn" data-copy-from="session-uid" title="复制 UID">⧉</button>
-                  </div>
-                  <div class="value mono" id="session-uid">—</div>
-                </div>
-                <div class="field">
-                  <div class="label">上游端点
-                    <button class="copy-btn" data-copy-from="session-endpoint" title="复制端点">⧉</button>
-                  </div>
-                  <div class="value mono" id="session-endpoint">—</div>
-                </div>
-                <div class="field">
-                  <div class="label">Token 过期时间</div>
-                  <div class="value" id="session-expires">—</div>
-                </div>
-              </div>
-
-              <p class="hint">
-                「设为首选」只调整账号的全局优先级，不改变启用状态。每次请求仍按模型支持情况、账号启用状态与限额选择账号；此处为登录态信息，不代表正在处理请求的账号。
-              </p>
-            </div>
-          </section>
 
           <!-- ── 统计概览 ── -->
           <section class="panel">
@@ -195,22 +152,39 @@
             </div>
           </section>
 
-          <!-- ── Top 提供商占比 ──
-               数据来自 /api/stats/summary 的顶层 providers 数组（契约见架构文档 §5）：
-               `[{id,label,requests,success,tokens}]`，按请求数降序。
-               后端较老 / 该字段缺失时整块隐藏（不给空态、不报错）——
+          <!-- ── Top 提供商 / Top 账号（并排两张卡）──
+               数据来自 /api/stats/summary 的顶层 providers / accounts 数组
+               （契约见架构文档 §5）：
+               `[{id,label,requests,success,totalTokens}]`，按请求数降序。
+               provider 是「哪一家在承载」，account 是「具体哪个登录态在出力」——
+               后者更细：一家可以挂多个账号，所以两张排行并不重复。
+               后端较老 / 对应字段缺失时整块隐藏（不给空态、不报错）——
                「没有这一维数据」与「这一维里没有数据」是两件事，
-               前者是版本落后，摆一个空卡片只会让人以为哪里坏了。 -->
-          <section class="panel" id="report-providers-panel" hidden>
-            <div class="panel-head">
-              <h2>Top 提供商</h2>
-              <span class="tip-q" data-tip="所选范围内每个提供商各承载了多少请求。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。百分比按本区间的总请求数算；「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了（请求体非法、模型不存在、没有可用账号）。此后新产生的请求都会记上具体的提供商。"></span>
-              <span class="panel-sub" id="report-providers-label">—</span>
-            </div>
-            <div class="panel-body">
-              <div class="provider-shares" id="report-providers"></div>
-            </div>
-          </section>
+               前者是版本落后，摆一个空卡片只会让人以为哪里坏了。
+               两张卡各自独立判断显隐（字段是两个，可能一新一旧）。 -->
+          <div class="report-rank-grid">
+            <section class="panel" id="report-accounts-panel" hidden>
+              <div class="panel-head">
+                <h2>Top 账号</h2>
+                <span class="tip-q" data-tip="所选范围内每个账号各承载了多少请求。账号是比提供商更细的一维：同一家可以挂多个账号，转发时按优先级在候选链上依次尝试，所以这里反映的是「具体哪个登录态在出力」。百分比同样按本区间的总请求数算。「未知账号」是指那批请求没有账号身份：走默认登录态转发（未配置账号列表）时会这样；这一维上线前写出的旧聚合行也没有账号明细，但它们会在启动时按明细自动补算回来 —— 只有明细已被保留期清掉（默认 30 天）的那几天补不回来，仍留在「未知账号」里，那是确实无从恢复的部分。"></span>
+                <span class="panel-sub" id="report-accounts-label">—</span>
+              </div>
+              <div class="panel-body">
+                <div class="rank-shares" id="report-accounts"></div>
+              </div>
+            </section>
+
+            <section class="panel" id="report-providers-panel" hidden>
+              <div class="panel-head">
+                <h2>Top 提供商</h2>
+                <span class="tip-q" data-tip="所选范围内每个提供商各承载了多少请求。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。百分比按本区间的总请求数算。「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了（请求体非法、模型不存在、没有可用账号）。这一维与账号那一维不同：旧明细里根本没有「哪家承载」的信息（早期版本只有单一上游，但那是配置事实而非逐条记录），所以无法回算，旧数据会一直留在「未知」里；此后新产生的请求都会记上具体的提供商。"></span>
+                <span class="panel-sub" id="report-providers-label">—</span>
+              </div>
+              <div class="panel-body">
+                <div class="rank-shares" id="report-providers"></div>
+              </div>
+            </section>
+          </div>
 
           <!-- ── 热力图（固定 365 天，与时间范围筛选解耦）── -->
           <section class="panel">
@@ -387,11 +361,13 @@
             </div>
             <div class="models-table-wrap">
               <table class="models-table">
-                <colgroup><col class="c-model"><col class="c-rate"><col class="c-alias"><col class="c-state"><col class="c-act"></colgroup>
+                <!-- data-col：列宽拖动（table-columns.js）靠它把 <col>、<th> 与列绑定，
+                     不依赖列序 —— 以后在中间插一列，存过的列宽不会错位 -->
+                <colgroup><col class="c-model" data-col="model"><col class="c-rate" data-col="rate"><col class="c-source" data-col="source"><col class="c-alias" data-col="alias"><col class="c-state" data-col="state"><col class="c-act" data-col="act"></colgroup>
                 <thead><tr>
-                  <th>上游模型</th><th>倍率</th><th>对外映射名（下游可用这些名字请求）</th><th>启用</th><th class="r">操作</th>
+                  <th data-col="model">上游模型</th><th data-col="rate">倍率</th><th data-col="source">来源</th><th data-col="alias">对外映射名（下游可用这些名字请求）</th><th data-col="state">启用</th><th class="r" data-col="act">操作</th>
                 </tr></thead>
-                <tbody id="models"><tr><td colspan="5" class="empty">暂无模型</td></tr></tbody>
+                <tbody id="models"><tr><td colspan="6" class="empty">暂无模型</td></tr></tbody>
               </table>
             </div>
             <div class="panel-body" style="padding-top:8px">
@@ -399,7 +375,7 @@
               <div class="models-refresh-note" id="models-refresh-note"></div>
             </div>
             <div class="panel-foot">
-              <span>禁用的模型不会出现在 <code>/v1/models</code>，请求它会返回 404 · 映射名与上游 ID 同时可用，同一映射名只能指向一个上游模型 · 删除只是从清单隐藏，可在「已删除」筛选里恢复</span>
+              <span>禁用的模型不会出现在 <code>/v1/models</code>，请求它会返回 404 · 映射名与上游 ID 同时可用，同一映射名只能指向一个上游模型 · 删除只是从清单隐藏，可在「已删除」筛选里恢复 · 「来源」列标注该家清单是远程目录拉取的还是内置静态表（后者在上游目录拉不到时兜底，点「刷新模型清单」可重试） · 挂不到任何一行的映射会集中在表尾「未挂载的映射」里（右上角标出原因：名字不存在，或该家当前没广告它），可在那里删除</span>
             </div>
           </section>
         </section>
@@ -411,22 +387,73 @@
             <p class="intro">可创建多把 Key 分发给不同客户端，任一启用的 Key 即可通过鉴权；一把启用的都没有时不鉴权（仅监听 127.0.0.1，建议本机使用可不设）。</p>
           </div>
 
-          <!-- 接口条：一行三段，地址随真实端口刷新（app.js 的 paintGatewayAddress） -->
-          <section class="panel ep-strip">
-            <div class="ep">
-              <span class="k">Base URL</span>
-              <code class="v" id="api-base">—</code>
-              <button class="copy-btn" data-copy-from="api-base" title="复制地址">⧉</button>
+          <!-- 接口条：一行一条端点（地址随真实端口刷新，见 port-panel.js 的 paintGatewayAddress）。
+               对话协议三种并列写出：客户端按自己支持的那种选一行填，三家共用同一套
+               模型与账号池 —— 换协议不用换配置。 -->
+          <section class="panel ep-panel">
+            <div class="panel-head">
+              <h2>接口地址</h2>
+              <span class="tip-q" data-tip="Base URL 填进客户端的「API 地址 / Base URL」栏；对话协议按客户端支持的类型三选一（Chat Completions / Responses / Anthropic Messages），三者共用同一套模型与账号池，可随时切换；鉴权用「API Key 列表」里的任一启用 Key。"></span>
             </div>
-            <div class="ep">
-              <span class="k">对话</span>
-              <code class="v" id="api-chat">—</code>
-              <button class="copy-btn" data-copy-from="api-chat" title="复制地址">⧉</button>
-            </div>
-            <div class="ep">
-              <span class="k">模型列表</span>
-              <code class="v" id="api-models">—</code>
-              <button class="copy-btn" data-copy-from="api-models" title="复制地址">⧉</button>
+            <div class="ep-list">
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">Base URL</span>
+                  <span class="ep-note">填进客户端的「API 地址 / Base URL」</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-base">—</code>
+                  <button class="copy-btn" data-copy-from="api-base" title="复制地址">⧉</button>
+                </div>
+              </div>
+
+              <div class="ep-group">对话协议（按客户端支持的类型选一行）</div>
+
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">OpenAI Chat Completions</span>
+                  <span class="ep-note">多数 OpenAI 兼容客户端的默认协议</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-chat">—</code>
+                  <button class="copy-btn" data-copy-from="api-chat" title="复制地址">⧉</button>
+                </div>
+              </div>
+
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">OpenAI Responses</span>
+                  <span class="ep-note">OpenAI 新协议（Codex、新版 SDK）</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-responses">—</code>
+                  <button class="copy-btn" data-copy-from="api-responses" title="复制地址">⧉</button>
+                </div>
+              </div>
+
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">Anthropic Messages</span>
+                  <span class="ep-note">Claude Code / Anthropic SDK（token 计数：/v1/messages/count_tokens）</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-messages">—</code>
+                  <button class="copy-btn" data-copy-from="api-messages" title="复制地址">⧉</button>
+                </div>
+              </div>
+
+              <div class="ep-group">模型清单</div>
+
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">模型列表</span>
+                  <span class="ep-note">客户端自动拉取可用模型</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-models">—</code>
+                  <button class="copy-btn" data-copy-from="api-models" title="复制地址">⧉</button>
+                </div>
+              </div>
             </div>
           </section>
 
@@ -440,8 +467,8 @@
             </div>
             <div class="models-table-wrap">
               <table class="models-table keys-table">
-                <colgroup><col class="k-name"><col class="k-key"><col class="k-time"><col class="k-state"><col class="k-act"></colgroup>
-                <thead><tr><th>名称</th><th>Key</th><th>创建时间</th><th>启用</th><th class="r">操作</th></tr></thead>
+                <colgroup><col class="k-name" data-col="name"><col class="k-key" data-col="key"><col class="k-time" data-col="time"><col class="k-state" data-col="state"><col class="k-act" data-col="act"></colgroup>
+                <thead><tr><th data-col="name">名称</th><th data-col="key">Key</th><th data-col="time">创建时间</th><th data-col="state">启用</th><th class="r" data-col="act">操作</th></tr></thead>
                 <tbody id="keys-list"><tr><td colspan="5" class="empty">还没有 Key</td></tr></tbody>
               </table>
             </div>
@@ -542,14 +569,14 @@
         </section>
 
         <!-- ─── 日志 ───
-             只承载系统事件：网关的模型请求明细已拆到独立的「请求日志」页
+             只承载系统事件：网关的模型请求已拆到独立的「请求日志」页
              （两边数据源、筛选维度、分页口径都不同，页内 .seg 切换的形态随拆分取消）。
              原先页头的「自动刷新」开关已迁到「定时任务」页：它改的是本页轮询的
              间隔，与那几个后台任务同属「定时」这一类，收在一处才好对照调整。 -->
         <section class="page" data-page="logs">
           <div class="page-head">
             <h2>运行日志</h2>
-            <p class="intro">记录登录、token 刷新、账号切换、模型目录刷新、限额自动切换（429）等系统事件；网关每次转发到上游的请求明细见「请求日志」页。本页的自动刷新间隔在「定时任务」页设置。</p>
+            <p class="intro">记录登录、token 刷新、账号切换、模型目录刷新、限额自动切换（429）等系统事件；网关每次转发到上游的请求见「请求日志」页。本页的自动刷新间隔在「定时任务」页设置。</p>
           </div>
 
           <!-- ── 视图一：系统事件 ── -->
@@ -558,7 +585,6 @@
               <h2>系统事件</h2>
               <span id="logs-badge" class="badge">—</span>
               <div class="head-actions">
-                <button id="btn-logs-refresh">刷新</button>
                 <button id="btn-logs-export">导出</button>
                 <button id="btn-logs-clear" class="danger">清空</button>
               </div>
@@ -611,12 +637,15 @@
         </section>
 
         <!-- ─── 定时任务 ───
-             到点自动干活的任务集中在这里：自动签到（每天定点）+ 六条等间隔任务
+             到点自动干活的任务集中在这里：自动签到（每天定点）+ 七条等间隔任务
              （凭证自动维护 / 定时查询积分 / 模型目录刷新 / 软件版本检查 /
-             日志页自动刷新 / 请求明细自动刷新）。
+             日志页自动刷新 / 请求日志自动刷新 / 报表自动刷新）。
              两类走不同的接口（签到是「每天某时刻」，间隔型是「每 N 分钟 / 秒」），
              但同属「定时」这一类，收在一页才好对照着调。
-             整个列表由 tasks-panel.js 渲染，这里只留容器。 -->
+             整个列表由 tasks-panel.js 渲染，这里只留容器。
+             排布（见 tasks-panel.js 的 cardsHtml 与 page-tasks.css 的 .task-grid）：
+             自动签到与凭证自动维护整行铺开，其余六条分两栏各三条 —— 左栏是后端
+             任务（带「立即执行」），右栏是页面自动刷新（执行者是页面自己）。 -->
         <section class="page" data-page="tasks">
           <div class="page-head">
             <h2>定时任务</h2>
@@ -645,7 +674,7 @@
         </section>
 
         <!-- ─── 请求日志 ───
-             网关每次转发到上游的请求明细（后端按保留期存盘，默认 30 天，见 /api/retention）。
+             网关每次转发到上游的请求日志（后端按保留期存盘，默认 30 天，见 /api/retention）。
              列形态参考 OmniProxy 的请求日志：时间 / 提供商·账号 / 重试 / 状态 / 模型 /
              用时 / 用量 / 错误。后端 /api/stats/requests 只支持时间区间、状态与
              模型名精确匹配，分页是 offset 真分页，条数没有前端上限。
@@ -658,11 +687,11 @@
 
           <section class="panel">
             <div class="panel-head">
-              <h2>请求明细</h2>
+              <h2>请求日志列表</h2>
               <span id="req-badge" class="badge">—</span>
               <span class="panel-sub">按时间倒序，保留期在设置页可调</span>
               <div class="head-actions">
-                <button id="btn-req-refresh">刷新</button>
+                <button id="btn-req-clear" class="danger">清空</button>
               </div>
             </div>
 
@@ -765,6 +794,79 @@
                     <div class="settings-state" id="units-state">—</div>
                   </div>
                 </section>
+
+                <!-- ── 通用：请求重试 ──
+                     三项读写的都是后端 config.json（经 /api/retry，HTTP 桥），
+                     转发层对上游瞬时错误与传输层失败按这里设置退避重发。
+                     次数分两档（同一提供商 / 切换提供商），分界与判定见
+                     config.rs 的 RetrySettings 说明。
+                     行样式复用数据保留那一套（.retention-*，见 page-settings.css）。 -->
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>请求重试</h2>
+                    <span class="tip-q" data-tip="请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11128 敏感词拦截），网关会等一段间隔后原样重发。次数分两档：先用「同一提供商」的次数在最初那家反复试（该家名下换账号不重置），用尽后切换到下一个提供商，再按「切换提供商」的次数试一轮。设为 0 表示该档不重试。账号级限额（429）不在此列 —— 那类失败由「冷却该账号并换下一个账号」处理，与这里的原地重试是两条路。"></span>
+                    <span id="retry-badge" class="badge">检测中…</span>
+                    <div class="head-actions">
+                      <button id="btn-retry-refresh">刷新</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="retention-list">
+                      <div class="retention-row">
+                        <label for="settings-retry-count">同一提供商重试次数</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-retry-count" min="0" max="10" step="1" inputmode="numeric">
+                          <span class="unit">次</span>
+                        </span>
+                        <div class="hint">在最初选中的提供商上重试几次（该家名下换账号不重置这个计数），0 表示该档不重试，可填 0–10。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="settings-retry-cross-provider-count">切换提供商重试次数</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-retry-cross-provider-count" min="0" max="10" step="1" inputmode="numeric">
+                          <span class="unit">次</span>
+                        </span>
+                        <div class="hint">同一提供商那档用尽、切换到下一个提供商后，再重试几次（换一家就重新计一份），可填 0–10。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="settings-retry-interval">重试间隔</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-retry-interval" min="0" max="300" step="1" inputmode="numeric">
+                          <span class="unit">秒</span>
+                        </span>
+                        <div class="hint">两次重试之间的等待时间，两档共用，可填 0–300 秒。</div>
+                      </div>
+                    </div>
+                    <div class="hint retention-note">保存后立即生效，不用重启；次数用尽仍失败时，错误原样返回给客户端。</div>
+                  </div>
+                </section>
+
+                <!-- ── 通用：调试模式 ──
+                     开关读写后端 config.json（经 /api/debug，HTTP 桥）。
+                     开启后转发层把**发给上游的请求与上游返回的响应**完整落盘
+                     （凭据类请求头一律脱敏），请求日志页的「详情」列据此展示。
+                     报文单独存一个文件，存放位置在「数据 → 保存位置」里可改。 -->
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>调试模式</h2>
+                    <span class="tip-q" data-tip="开启后，网关会把每次转发**发给上游的请求**（请求头 + 请求体）与**上游返回的响应**（状态码 + 响应头 + 响应体）完整保存到本地，供请求日志页的「详情」查看。请求头里的 Authorization、Cookie、API Key 等凭据字段一律替换成 [redacted]，不会明文落盘；请求体与响应体按原样保存（可能包含你的对话内容）。报文只保留最近 500 条，超出后丢弃最旧的。这是排障用的临时开关，不需要时建议关闭。"></span>
+                    <span id="debug-badge" class="badge">检测中…</span>
+                    <div class="head-actions">
+                      <button id="btn-debug-refresh">刷新</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="settings-switches">
+                      <label class="switch">
+                        <input type="checkbox" id="settings-debug-mode">
+                        <span class="track"></span>
+                        <span>保存上游原始报文（请求头、请求体、响应头、响应体）</span>
+                      </label>
+                    </div>
+                    <div class="settings-state" id="debug-state">—</div>
+                    <div class="hint retention-note">开启后新发生的请求才会被记录（已经过去的请求补不回来）。报文单独存放，位置可在左侧「数据 → 保存位置」里更改。</div>
+                  </div>
+                </section>
               </div>
 
               <!-- ── 账号：导入 / 导出 ── -->
@@ -794,7 +896,7 @@
                 <section class="panel">
                   <div class="panel-head">
                     <h2>数据保留</h2>
-                    <span class="tip-q" data-tip="三类数据各自独立计时，超出保留天数的部分会被删除：事件日志是登录、账号切换、429 切换这类系统事件；请求明细是「请求日志」页里的逐条记录；按天聚合供报表页的热力图与按天趋势使用。把某一档改小（例如 30 天改成 7 天）保存后会立即删除超出的历史数据，此操作不可恢复；改大或保持不变不会删除任何数据。三项的可填范围均为 1–3650 天。"></span>
+                    <span class="tip-q" data-tip="三类数据各自独立计时，超出保留天数的部分会被删除：事件日志是登录、账号切换、429 切换这类系统事件；请求日志是网关每次转发到上游的逐条记录；按天聚合供报表页的热力图与按天趋势使用。把某一档改小（例如 30 天改成 7 天）保存后会立即删除超出的历史数据，此操作不可恢复；改大或保持不变不会删除任何数据。三项的可填范围均为 1–3650 天。"></span>
                     <span id="retention-badge" class="badge">检测中…</span>
                     <div class="head-actions">
                       <button id="btn-retention-refresh">刷新</button>
@@ -811,7 +913,7 @@
                         <div class="hint">登录 / 账号切换 / 429 切换等系统事件，可填 1–3650 天。</div>
                       </div>
                       <div class="retention-row">
-                        <label for="settings-retention-request">请求明细保留天数</label>
+                        <label for="settings-retention-request">请求日志保留天数</label>
                         <span class="retention-input">
                           <input type="number" id="settings-retention-request" min="1" max="3650" step="1" inputmode="numeric">
                           <span class="unit">天</span>
@@ -828,6 +930,47 @@
                       </div>
                     </div>
                     <div class="hint retention-note">保存后立即生效：改小保留天数会立刻删除超出的历史数据，且不可恢复。</div>
+                  </div>
+                </section>
+
+                <!-- ── 数据：保存位置 ──
+                     两类数据各自可换保存目录（config.json 的 logDir / requestStatsDir，
+                     经 /api/storage 读写）。更改时由后端把现有数据迁移到新目录，
+                     迁移弹窗期间界面锁定，进度条经 /api/storage/progress 轮询。 -->
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>保存位置</h2>
+                    <span class="tip-q" data-tip="事件日志与请求日志各自可以指定保存目录：数据会迁移到新目录，迁移完成后立即生效，不需要重启程序。空间不足或想集中管理数据时才需要改它；不改就保存在默认的配置目录里。迁移期间请保持程序运行，不要关闭窗口。"></span>
+                    <span id="storage-badge" class="badge">检测中…</span>
+                  </div>
+                  <div class="panel-body">
+                    <div class="retention-list">
+                      <div class="retention-row">
+                        <label for="storage-log-path">事件日志保存位置</label>
+                        <span class="storage-line">
+                          <span class="storage-path" id="storage-log-path">—</span>
+                          <button id="btn-storage-log">更改…</button>
+                        </span>
+                        <div class="hint">logs.jsonl 的所在目录（系统事件，最多 500 条）。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="storage-req-path">请求日志保存位置</label>
+                        <span class="storage-line">
+                          <span class="storage-path" id="storage-req-path">—</span>
+                          <button id="btn-storage-req">更改…</button>
+                        </span>
+                        <div class="hint">requests.jsonl 与 request-daily.jsonl 的所在目录（逐条请求与按天聚合）。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="storage-debug-path">调试报文保存位置</label>
+                        <span class="storage-line">
+                          <span class="storage-path" id="storage-debug-path">—</span>
+                          <button id="btn-storage-debug">更改…</button>
+                        </span>
+                        <div class="hint">debug-traffic.jsonl 的所在目录（调试模式保存的上游原始报文，最多 500 条）。</div>
+                      </div>
+                    </div>
+                    <div class="hint retention-note">更改位置时会把现有数据迁移到新目录，迁移期间请保持程序运行；迁移完成后立即生效。</div>
                   </div>
                 </section>
               </div>
@@ -923,6 +1066,15 @@
               <button type="button" class="seg-item active" data-value="embedded" role="radio" aria-checked="true" tabindex="0">内嵌窗口</button>
               <button type="button" class="seg-item" data-value="external" role="radio" aria-checked="false" tabindex="-1">系统默认浏览器</button>
             </div>
+            <!-- 恢复第三方登录入口：国际版登录页自己按上游开关把 Google / GitHub / X
+                 隐藏了（见 login.rs 的 social_restore_script）。勾选后壳侧在内嵌窗口
+                 里摘掉那段样式，入口就回来了。默认**不勾选**：不勾选时与官方登录页
+                 当前形态完全一致，要用第三方入口再自己打开。 -->
+            <label class="switch" title="国际版登录页默认只显示邮箱登录，勾选后恢复 Google / GitHub / X 入口">
+              <input type="checkbox" id="add-social-restore">
+              <span class="track"></span>
+              <span>恢复 Google / GitHub 入口</span>
+            </label>
           </div>
           <p>系统浏览器可复用你已有的登录态（国际版推荐）；内嵌窗口与你日常浏览器隔离，更干净。</p>
           <div class="field-row">
@@ -1048,6 +1200,74 @@
 
   <div id="toast" role="status" aria-live="polite"></div>
 
+  <!-- ─── 通用确认弹窗（confirm-dialog.js 驱动）───
+       替代原生 confirm()：Tauri 的 WebView 里原生 confirm 不弹窗直接放行，
+       危险操作（清空 / 删除）必须走这个。确认键样式与文案由调用方给，
+       危险操作传 okClass="danger"；Promise 化，用法与 confirm() 同构。 -->
+  <div id="confirm-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
+    <div class="modal modal-confirm">
+      <div class="modal-head">
+        <h2 id="confirm-modal-title">确认操作</h2>
+        <button id="confirm-modal-close" title="关闭">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="danger-zone" id="confirm-modal-text">—</div>
+      </div>
+
+      <div class="modal-foot">
+        <div class="spacer"></div>
+        <button id="confirm-modal-cancel">取消</button>
+        <button id="confirm-modal-ok" class="primary">确定</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── 更改保存位置 / 迁移弹窗（settings-panel.js 驱动）───
+       两段状态共用一个弹窗：迁移未开始时是确认框（可取消 / 可关闭）；
+       点「开始迁移」后进入迁移态 —— 关闭按钮与取消隐藏、点遮罩与 Esc 不生效、
+       确认键变成禁用的「迁移中…」，进度条经 /api/storage/progress 轮询驱动，
+       迁移结束（接口返回）才恢复可关。 -->
+  <div id="storage-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="storage-modal-title">
+    <div class="modal modal-confirm">
+      <div class="modal-head">
+        <h2 id="storage-modal-title">更改保存位置</h2>
+        <button id="storage-modal-close" title="关闭">✕</button>
+      </div>
+
+      <div class="modal-body">
+        <div id="storage-modal-text">—</div>
+        <div class="progress" id="storage-progress" hidden><div class="bar" style="width:0%"></div></div>
+        <div class="detail" id="storage-modal-state" style="display:none">正在迁移，请不要关闭程序…</div>
+      </div>
+
+      <div class="modal-foot">
+        <div class="spacer"></div>
+        <button id="storage-modal-cancel">取消</button>
+        <button id="storage-modal-ok" class="primary">开始迁移</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── 请求详情弹窗（requests-panel.js）───
+       展示调试模式保存的**上游原始报文**：请求头（凭据类已脱敏）、请求体、
+       响应头、响应体。报文由 /api/debug/traffic?id= 按需拉取（列表接口不带
+       报文，见后端 debug_api 的模块头）。 -->
+  <div id="req-detail-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="req-detail-title">
+    <div class="modal modal-wide">
+      <div class="modal-head">
+        <h2 id="req-detail-title">请求详情</h2>
+        <button id="req-detail-close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body" id="req-detail-body">正在读取…</div>
+      <div class="modal-foot">
+        <span class="hint" id="req-detail-hint">—</span>
+        <div class="spacer"></div>
+        <button id="req-detail-cancel">关闭</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ─── 添加模型映射弹窗（models-panel.js）─── -->
   <!-- 检测到更新弹窗：定时版本检查发现新版本时弹出。
        「跳过此次更新」按版本号记在 localStorage；「取消」只是关掉，
@@ -1127,19 +1347,36 @@
       </div>
       <div class="modal-body">
         <div class="modal-section">
-          <div class="mapping-row">
+          <div class="mapping-row mapping-row-single">
+            <div class="mapping-col">
+              <label for="mapping-provider">提供商</label>
+              <select id="mapping-provider"></select>
+            </div>
+          </div>
+          <div class="mapping-row" style="margin-top:10px">
             <div class="mapping-col">
               <label for="mapping-alias">对外映射名（下游请求时用）</label>
               <input id="mapping-alias" type="text" maxlength="128" placeholder="例如 gpt-4o" autocomplete="off">
             </div>
             <div class="mapping-arrow">→</div>
             <div class="mapping-col">
-              <label for="mapping-target">转发到上游模型</label>
-              <select id="mapping-target"></select>
+              <label for="mapping-upstream">转发到上游模型</label>
+              <!-- 只能是这一家清单里的模型（下拉）。这里曾经还有一个「手动输入
+                   上游模型 ID」的开关，已删除：映射的对外名只有在**目标模型已被
+                   广告**时才会跟着进广告视图（catalog::models_response 遍历已
+                   广告的模型再补别名），而入口校验以广告视图为准 —— 手输一个
+                   清单里没有的名字，映射建了也永远调不通，白白让用户以为配好了。
+                   要用清单外的模型，正确做法是让那家的清单收录它（刷新远程目录，
+                   或修该家的静态表），而不是绕过清单。 -->
+              <select id="mapping-upstream"></select>
             </div>
           </div>
           <div class="mapping-preview" id="mapping-preview"></div>
-          <p class="detail">映射名不能与上游模型 ID 或已有映射名重复；支持字母、数字与 <code>- _ . / :</code>。</p>
+          <p class="detail">
+            对外名可自由命名，允许与上游模型 ID 同名（同名时该上游的原生路由优先，映射作兜底）；
+            支持字母、数字与 <code>- _ . / :</code>。同一对外名可在多个提供商各添加一条：
+            下游用同一个名字请求，网关按账号优先级主备切换，失败自动落到下一个提供商。
+          </p>
         </div>
         <div class="detail" id="mapping-modal-status" style="min-height:18px"></div>
       </div>
@@ -1240,8 +1477,17 @@
   <script src="usage-actions.js"></script>
   <script src="accounts-table.js"></script>
   <script src="accounts-columns.js"></script>
+  <!-- 列宽拖动（模型管理 / 网关 Key / 请求日志三张表）：与 accounts-columns.js 并列，
+       各管各的列宽口径（账号表是定宽像素预算，这三张是相对宽度）。
+       它启动时就把表头把手插好并绑好委托，所以排在靠后（DOM 里的表格与列表都已存在）；
+       请求日志的表头是整块重绘的，它自己用 MutationObserver 补把手，不依赖面板脚本。 -->
+  <script src="table-columns.js"></script>
   <script src="accounts-filters.js"></script>
   <script src="accounts-view.js"></script>
+  <!-- 通用确认弹窗：替代原生 confirm（Tauri WebView 里原生 confirm 不弹窗直接放行）。
+       排在所有可能调它的面板之前 —— 它只暴露 wbConfirm.ask，点击时才用，
+       但先加载让依赖关系一眼可见。 -->
+  <script src="confirm-dialog.js"></script>
   <script src="desensitize-panel.js"></script>
   <script src="logs-panel.js"></script>
   <script src="requests-panel.js"></script>
@@ -1256,11 +1502,12 @@
   <script src="report.js"></script>
   <script src="proxy-form.js"></script>
   <!-- 「登录 / 添加账号」弹窗的提供商分叉（提供商分段控件 / 各家的表单块 / 弹窗内 .seg 的交互）。
-       add-qoder.js 先于 add-provider-forms.js：后者在加载期读它的表单配置。
+       add-qoder.js / add-cline.js 先于 add-provider-forms.js：后者在加载期读它们的表单配置。
        两者都必须在 account-panel.js 之前：它们自带加载期绑定（mountAddProviderUi
-       等，需要 #add-modal 已解析），且两个「登录 / 添加账号」按钮的监听要按
+       等，需要 #add-modal 已解析），且「登录 / 添加账号」按钮的监听要按
        「add-account.js → 本文件 → account-panel.js」的顺序注册（同元素同事件按注册顺序触发）。 -->
   <script src="add-qoder.js"></script>
+  <script src="add-cline.js"></script>
   <script src="add-provider-forms.js"></script>
   <script src="account-panel.js"></script>
   <!-- Markdown 渲染器：更新日志用。纯函数、无依赖，只认白名单语法（见文件头说明）；

@@ -51,7 +51,7 @@
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::proxies::ResolvedProxy;
@@ -62,13 +62,13 @@ use crate::server::errors::GatewayError;
 // 跨层导入用全路径（本文件在 `providers/catpaw/` 下，`super` 是本目录）：
 // trait 与注册表工具都在上一层，写全路径比堆两层 super 更好读。
 use super::conversation::{run_conversation, CatPawCredentials, ConversationRequest};
-use super::models::MODELS;
 use super::registry::AccountIdentity;
-use super::{conversation, credentials};
+use super::{catalog, conversation, credentials};
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
 use crate::server::core::providers::{kind_id, ProviderKind};
+use crate::server::logging;
 
 /// CatPaw 适配器（无状态单例：会话状态在 `conversation::registry()` 的进程级
 /// 句柄里，凭证在账号存储 / auth.json / 环境变量里，本结构不持有任何字段）。
@@ -90,55 +90,24 @@ impl ProviderAdapter for CatPawAdapter {
         true
     }
 
-    /// 静态模型清单（`models.rs` 的 `MODELS` 表 → 聚合目录认的条目形态）。
+    /// 模型清单：**远程目录优先**，远程不可用时回落到 `MODELS` 静态表。
     ///
     /// ── 键名映射（对齐 `raccoon::models::listing_entry` 的口径）──
     ///   聚合层的 `models::list_item` 读的是：`id`（模型 id）+ `name`（展示名）
     ///   + `maxInputTokens` / `maxOutputTokens` / `supportsImages` /
-    ///   `supportsReasoning` / `supportsToolCall` / `kind`。
-    ///   本表提供的键是 `id` / `name` / `host_model_id` / `context_windows` /
-    ///   `default_context_window`，于是这里做三件事：
-    ///   1. `id` / `name` 直接搬（`glm-5.3-flash` / `kimi-k3` 就是**上游认的名字**，
-    ///      `models::resolve_model_request` 按它反查 `modelType`，不做任何改写）；
-    ///   2. 上下文窗口 → `maxInputTokens`：取该模型的档位上限
-    ///      （`context_windows` 的最大值；没有档位的模型不输出该键 ——
-    ///      `kimi-k3` 就是不支持 context 参数的那个，报 0 会让前端显示错误的容量）；
-    ///   3. 能力位来自 `MODELS` 表（原表 `supportImage` / `supportThinking` 为真；
-    ///      工具调用是这套协议的固有能力 —— round/turn 请求体每次都带
-    ///      `toolConfigs` / `availableTools`，见 `conversation::build_turn_body`）。
+    ///   `supportsReasoning` / `supportsToolCall` / `credits` / `kind`。
+    ///   两条来源都由 `catalog::list()` 归一到这个形态（见那里的字段说明），
+    ///   本方法只做转发 —— 「远程还是静态」的分支不该散进适配器。
     ///
-    /// 为什么不做「远程刷新」：上游不提供模型目录接口（原项目也只有一个写死的
-    /// `MODELS` 表），见 `refresh_models`。
+    /// ── 与 `models.rs` 静态表的分工（原「为什么不做远程刷新」已过时）──
+    /// 那个结论建立在「上游不提供模型目录接口」之上，而**该前提是错的**：
+    /// 上游 2026 年就有 `POST /api/agent/maas/model-types`（表单形态看错了 ——
+    /// `tenant/scene/env` 是 POST body 不是 query，见 `catalog.rs` 模块头）。
+    /// 现在远程负责「有哪些模型、倍率多少」这些会变的信息，静态表继续提供
+    /// 「上游数字 ID 与 context 档位」这些**必须实测坐实**的信息：
+    /// 数字 ID 写错不会报错，只会让请求打到另一个模型。
     fn list_models(&self) -> Vec<Value> {
-        MODELS
-            .iter()
-            .map(|model| {
-                let mut entry = json!({
-                    "id": model.id,
-                    "name": model.name,
-                    "supportsImages": model.support_image,
-                    "supportsReasoning": model.support_thinking,
-                    "supportsToolCall": true,
-                    "kind": "chat",
-                    // 上游数字 modelType：进清单条目只为排障（前端不渲染它），
-                    // 但少了它「清单里的名字 ↔ 上游模型」这层对照只能翻源码
-                    "modelType": model.host_model_id,
-                });
-                // 上下文窗口取档位上限：默认档位是「不显式请求时用哪个」，
-                // 上限才是这个模型真正能吃下的量（客户端按 max_input_tokens 估算截断）
-                if let Some(window) = model
-                    .context_windows
-                    .iter()
-                    .filter_map(|text| text.parse::<i64>().ok())
-                    .max()
-                {
-                    if let Some(object) = entry.as_object_mut() {
-                        object.insert("maxInputTokens".to_string(), Value::from(window));
-                    }
-                }
-                entry
-            })
-            .collect()
+        catalog::list()
     }
 
     /// **防御性报错**：CatPaw 走会话式转发，不走单请求路径（模块头）。
@@ -213,33 +182,48 @@ impl ProviderAdapter for CatPawAdapter {
         })
     }
 
-    /// 无操作：清单是**静态表**（上游不提供模型目录接口，原项目同样写死
-    /// `proxy-chat-utils.mjs` 的 `MODELS`）。模型 id（`kimi-k3` /
-    /// `glm-5.3-flash`）是固定的，没有「重新拉取」这件事。
+    /// 拉取远程模型目录（`POST /api/agent/maas/model-types`，见 `catalog.rs`）。
     ///
-    /// §4.2 约定刷新失败不返回错误；这里连失败都谈不上 —— 返回
-    /// `unchanged()`（没刷、也不是错误），让自动路径遍历到本家时零副作用。
+    /// 凭证取**当前账号**（与转发同一套 `Cookie: X-Passport-Token`）；
+    /// 没有可用登录态时返回 `unchanged()`（不是错误 —— 脚本 / CI 用户走
+    /// 环境变量旁路时本就不该刷目录）。
     ///
-    /// `force` 在本家**没有可绕过的缓存**：没有远程目录，就没有缓存。
-    /// 即使调用方传 `true`（手动刷新路径），结果同样是「没有新清单可拿」——
-    /// 手动路径不会走到这里（`supports_model_refresh()` 为 false，先被拦成
-    /// `skipped`），本实现是给自动路径的零副作用保证，以及「万一有人直接调
-    /// 也不会有副作用」的兜底。
+    /// §4.2 约定刷新失败不返回错误：失败时保留现有清单（`catalog::refresh`
+    /// 内部就是这么做的，与另外三家一致），用户该看到的是「为什么没变」。
+    ///
+    /// `force` 一路透传给 `catalog::refresh`：`false` 走 15 分钟 TTL 早退
+    /// （自动路径），`true` 真打上游（用户手动点了「刷新模型清单」）。
     fn refresh_models<'a>(
         &'a self,
-        _store: &'a AccountStore,
-        _force: bool,
+        store: &'a AccountStore,
+        force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     > {
-        Box::pin(async { ModelRefreshOutcome::unchanged() })
+        Box::pin(async move {
+            // 凭证解析失败（没账号、也没桌面端登录态）→ 「没刷」而不是「失败」：
+            // 一个不用 CatPaw 的用户点刷新时，红色失败会让他以为哪里坏了
+            let credentials = match credentials::snapshot_for(store, "") {
+                Ok(credentials) => credentials,
+                Err(error) => {
+                    logging::verbose(
+                        "[Models]",
+                        &format!("CatPaw 模型目录刷新跳过：{}", error.message),
+                    );
+                    return ModelRefreshOutcome::unchanged();
+                }
+            };
+            let proxy = proxy_of(store);
+            catalog::refresh(&credentials, proxy.as_ref(), force).await
+        })
     }
 
-    /// CatPaw **不支持**刷新模型清单：上游没有模型目录接口（美团 CatPaw 的
-    /// 模型 id 是固定的，原项目也只有一个写死的 `MODELS` 表）。
-    /// 保持默认 false，界面对这家如实说明「使用固定清单」。
+    /// CatPaw **有**远程模型目录（`POST /api/agent/maas/model-types`）。
+    ///
+    /// 这条声明曾经是 false，理由是「上游没有目录接口」—— 那个前提后来被
+    /// 证伪（接口一直都在，只是形态看错了，见 `catalog.rs` 模块头）。
     fn supports_model_refresh(&self) -> bool {
-        false
+        true
     }
 
     /// 环境变量旁路（`CATPAW_COOKIE`，原项目 `runtimeConfig` 的 explicitAuth）。
@@ -417,4 +401,13 @@ fn resolve_credentials(
         &credentials.uid,
     );
     Ok(credentials)
+}
+
+/// 当前账号的出网代理（目录刷新用；与转发链路同一套账号级代理）。
+///
+/// 与 `raccoon::proxy_of` 同一分工：账号级代理对**所有 provider 生效**
+/// （架构文档 §2），目录刷新是出网请求，因此也要走它。
+fn proxy_of(store: &AccountStore) -> Option<ResolvedProxy> {
+    let entry = store.current_entry_for_provider(kind_id(ProviderKind::CatPaw))?;
+    crate::server::core::proxies::session_proxy(&entry.session)
 }

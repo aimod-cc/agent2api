@@ -44,6 +44,7 @@
 //! SSE 流的中断（客户端断开、上游断开）是**正常路径**，一律用 Result/Option。
 
 pub mod aggregate;
+pub mod connections;
 pub mod request;
 mod payload;
 mod provider_loop;
@@ -68,6 +69,7 @@ use crate::server::core::proxies::ResolvedProxy;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
+use self::connections::{ConnectionGuard, Connections};
 use self::sse::{ModelRewrite, ReasoningCoalescer};
 
 /// 去重等待上限（对照 Node 的 INFLIGHT_WAIT_MS）
@@ -151,6 +153,8 @@ pub struct UpstreamService {
     pub(super) auth: AuthService,
     /// 在途请求表：sha256(body) → 完成信号（去重队列，见 `wait_for_in_flight`）
     in_flight: Arc<Mutex<HashMap<String, Arc<InFlight>>>>,
+    /// 账号级活跃连接计数（账号页「连接数」列的数据源，见 `connections.rs`）
+    connections: Connections,
 }
 
 /// 一次转发的入参
@@ -197,7 +201,20 @@ pub(super) struct RouteTarget {
 
 impl UpstreamService {
     pub fn new(store: AccountStore, auth: AuthService) -> Self {
-        Self { store, auth, in_flight: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            store,
+            auth,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+            connections: Connections::new(),
+        }
+    }
+
+    /// 账号级活跃连接计数句柄（`api::accounts` 的 `/api/accounts/connections` 读它）。
+    ///
+    /// 返回克隆（内部 `Arc`）而不是引用：`ServerState` 的 handler 各持一份克隆，
+    /// 读到的都是同一张表。
+    pub fn connections(&self) -> Connections {
+        self.connections.clone()
     }
 
     /// 转发一次对话请求。
@@ -210,7 +227,25 @@ impl UpstreamService {
     ///     一个卡住的前序请求被无限期挂住。
     ///   - **槽位一直占到大半个响应结束**（流式请求也一样，见 InFlightGuard）。
     pub async fn forward(&self, request: ForwardRequest) -> Result<ForwardOutcome, GatewayError> {
+        // ── 调试模式：为本次请求装一个原始报文采集器 ─────────────────
+        // 装在这里（转发入口）而不是各家适配器里：四条路径（流式 / 非流式 ×
+        // 无状态 / 有状态）都要采，装一次全都覆盖到。开关关着时**不创建**
+        // 采集器 —— 后续所有 `capture()` 都返回 None，采集代码整段跳过。
+        // 只带 id：URL / 头 / 体等真正发送时才由 `reset_request` 填上。
+        if crate::server::core::debug_traffic::enabled() {
+            let id = request.telemetry.id();
+            if !id.is_empty() {
+                request.telemetry.set_capture(std::sync::Arc::new(
+                    crate::server::core::debug_traffic::TrafficCapture::begin(&id),
+                ));
+            }
+        }
         let mut slot = self.begin_slot(&request.dedupe_key).await;
+        // 账号级活跃连接计数：**本请求**的凭证，随选路改绑到实际使用的账号。
+        // 建在这里（而不是选路处）是因为它必须活到响应体发完 —— 流式路径由
+        // `handoff()` 把归属移进响应流，非流式路径随本函数返回而析构释放。
+        // 于是「连接数」与去重槽位共享同一条生命周期，不会有第二条释放路径。
+        let mut connections = ConnectionGuard::new(self.connections.clone());
         // 无论客户端要不要流式，上游都必须以 stream:true 请求
         let mut upstream_body = request.body.clone();
         if let Some(object) = upstream_body.as_object_mut() {
@@ -227,7 +262,7 @@ impl UpstreamService {
             telemetry: &request.telemetry,
             desensitize_scope: &desensitize_scope,
         };
-        provider_loop::forward_with_providers(self, context, &mut slot).await
+        provider_loop::forward_with_providers(self, context, &mut slot, &mut connections).await
     }
 
     /// 等待同 body 的在途请求完成，然后占住槽位。
@@ -308,8 +343,19 @@ pub struct ForwardStream {
     /// 在途槽位凭证：本流被 drop 时释放（含客户端断开、上游断开两条路径）。
     /// `Option` 只是为了让它能在结构里可选传入，实际总是 Some。
     _slot: Option<InFlightGuard>,
+    /// 账号级活跃连接凭证：与槽位同一生命周期 —— 本流跑完 / 被 drop 时才把
+    /// 该账号的计数 -1。**不是** `Option` 的语义区别，它同样总是 Some，
+    /// 只是「无账号的转发」（环境变量旁路）里那个凭证的 `account_id` 是 None，
+    /// 增减都是空操作，所以不必特判。
+    _connection: ConnectionGuard,
     /// usage / 尝试次数的旁路槽：与合并器共用同一份（见 `ForwardStream::new`）
     telemetry: Arc<usage::RequestTelemetry>,
+    /// 调试模式的采集器（构造时取一次，None = 未开启调试模式）。
+    ///
+    /// 在这里缓存而不是每个分片现取（`telemetry.capture()`）：采集发生在
+    /// **每个上游 chunk** 上，每次都加锁取一遍是纯浪费；而一条请求的采集器
+    /// 在转发开始时就装好了，中途不会变。
+    capture: Option<Arc<crate::server::core::debug_traffic::TrafficCapture>>,
 }
 
 impl ForwardStream {
@@ -318,9 +364,12 @@ impl ForwardStream {
     pub(super) fn new(
         response: reqwest::Response,
         slot: Option<InFlightGuard>,
+        connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
         model_rewrite: Option<ModelRewrite>,
     ) -> Self {
+        // 采集器在构造时取一次（见字段说明）
+        let capture = telemetry.capture();
         Self {
             inner: Box::pin(response.bytes_stream()),
             coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone())
@@ -328,7 +377,9 @@ impl ForwardStream {
             upstream_done: false,
             pending: std::collections::VecDeque::new(),
             _slot: slot,
+            _connection: connection,
             telemetry,
+            capture,
         }
     }
 }
@@ -357,6 +408,12 @@ impl Stream for ForwardStream {
                     }
                 }
                 std::task::Poll::Ready(Some(Ok(bytes))) => {
+                    // 调试模式：把**上游原始字节**旁路给采集器 —— 在合并器
+                    // 之前，因为用户要看的是上游原样吐出来的东西，而不是
+                    // 我们改写 / 合并后的帧（那正是「上游到底发了什么」要回答的）
+                    if let Some(capture) = &self.capture {
+                        capture.push(&bytes);
+                    }
                     for frame in self.coalescer.push(&bytes[..]) {
                         self.pending.push_back(frame);
                     }
@@ -372,7 +429,7 @@ impl Stream for ForwardStream {
                     let detail = crate::server::core::egress::describe_error_detail(&error);
                     let message = format!("上游流中断: {detail}");
                     logging::log("[Model]", &format!("❌ {message}"));
-                    // 旁路记账：断流原因要进请求明细（客户端此时已收到部分内容，
+                    // 旁路记账：断流原因要进请求日志（客户端此时已收到部分内容，
                     // HTTP 状态早就是 200，只有这里能解释「为什么这条是失败的」）
                     self.telemetry.note_error(&message);
                     self.pending.push_back(self::sse::sse_frame(&json!({

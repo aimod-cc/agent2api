@@ -74,35 +74,10 @@
 .acct-table thead th .th-hint { font-weight: 400; letter-spacing: 0; opacity: .7; }
 
 /* ─── 列宽拖动把手 ───
-   每个可拖列的 th 右缘一枚：平时隐形，悬停浮出 1px 竖线，按住时变主色加粗。
+   把手本身的样式（.col-grip / body.col-resizing）已挪到 components.css ——
+   模型管理、网关 Key、请求日志三张表共用同一枚把手，放在页面级文件里
+   会让另外三张表依赖账号页的样式文件。这里只留定位的前提条件：
    th 是 position: sticky（本身就是定位元素），把手直接绝对定位在它内側右缘。 */
-.col-grip {
-  position: absolute;
-  top: 0;
-  right: -4px;
-  width: 9px;
-  height: 100%;
-  cursor: col-resize;
-  z-index: 3;
-}
-
-.col-grip::after {
-  content: "";
-  position: absolute;
-  left: 4px;
-  top: 6px;
-  bottom: 6px;
-  width: 1px;
-  background: var(--border-strong);
-  opacity: 0;
-  transition: opacity .12s;
-}
-
-th:hover .col-grip::after { opacity: 1; }
-.col-grip.active::after { left: 3.5px; width: 2px; background: var(--primary); opacity: 1; }
-
-/* 拖动中：全局换光标并禁用选中（拖过文本会触发原生的拖选，把手就「断」了） */
-body.col-resizing { cursor: col-resize; user-select: none; }
 
 /* 单元格：上下内边距压到 7px，让一行落在一个接近 40px 的高度上 ——
    这是「能舒服点到里面的按钮」与「一屏多放几行」之间的折中
@@ -123,6 +98,10 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 .acct-table td.cell-pick { padding-inline: 0; text-align: center; }
 .cell-priority { width: 132px; }
 .cell-provider { width: 132px; }
+.cell-connections { width: 56px; }
+/* 表头与单元格一起居中：数字居中而标题左对齐时，视线要从标题左端跳到格子中央 */
+.acct-table th.cell-connections,
+.acct-table td.cell-connections { text-align: center; }
 .cell-status { width: 80px; }
 .cell-limits { width: 148px; }
 .cell-expiry { width: 80px; }
@@ -323,6 +302,20 @@ body.col-resizing { cursor: col-resize; user-select: none; }
 .order-btns button + button { margin-left: -1px; }
 .order-btns button:hover:not(:disabled) { position: relative; z-index: 1; }
 .order-btns button:disabled { opacity: .3; }
+
+/* ─── 连接数列 ───
+   只在有连接时显示一个绿色数字（与 OmniProxy 上游管理页的「连接」列同款观感），
+   为 0 时整格留空 —— 见 accounts-table.js 的 connectionsHtml。
+   对齐在列宽那一节统一声明（表头与单元格一起居中）：数字居中而标题左对齐时，
+   视线要从标题左端跳到格子中央。
+   不给边框与底色：整张表里已经有开关、徽章、按钮三种带框元素，再加一种
+   会让账号页显得更碎；而这一列的用途恰恰是「扫一眼看见谁在动」。 */
+.cell-connections .conn-count {
+  color: var(--ok);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ─── 状态列 ───
    开关在上、健康徽章在下，两行竖排。并排放不下：开关的轨道 36px，

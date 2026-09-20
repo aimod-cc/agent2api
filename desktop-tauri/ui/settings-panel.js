@@ -18,8 +18,14 @@
  *   · 软件更新 —— 读回来展示、改完写回去（实际由 update-panel.js 负责，这里只调它的 load）；
  *   · 数据保留天数（getRetention / saveRetention → /api/retention）——
  *     三项保留期存在后端 config.json 里，改小会让后端**立即删除**超出的历史数据
- *     （接口语义见 server/api/stats_api.rs），所以它在保存前多一道二次确认。
- *   两类共用同一套姿势：读失败降级展示、写成功以接口返回值为准重读。
+ *     （接口语义见 server/api/stats_api.rs），所以它在保存前多一道二次确认；
+ *   · 请求重试（getRetry / saveRetry → /api/retry）—— 转发层退避的两档次数
+ *     与间隔，同样存在后端 config.json 里，无副作用（接口语义见
+ *     server/api/retry_api.rs）；
+ *   · 调试模式（getDebug / saveDebug → /api/debug）—— 上游原始报文的采集开关，
+ *     开启后请求日志页的「详情」列才有内容可看（接口语义见
+ *     server/api/debug_api.rs）。
+ * 后三类共用同一套姿势：读失败降级展示、写成功以接口返回值为准重读。
  *
  * 定时任务（自动签到 + 四条间隔型任务）**不在本文件**：它们已迁到独立的
  * 「定时任务」页（tasks-panel.js）—— 那是「到点自动干活」的一类东西，
@@ -155,6 +161,9 @@
     await Promise.all([
       loadSettings(),
       loadRetention(),
+      loadRetry(),
+      loadDebug(),
+      loadStorage(),
       window.wbUpdatePanel?.load?.(),
     ]);
   }
@@ -287,7 +296,7 @@
    */
   const RETENTION_FIELDS = [
     { key: 'logRetentionDays', inputId: 'settings-retention-log', label: '事件日志保留天数' },
-    { key: 'requestRetentionDays', inputId: 'settings-retention-request', label: '请求明细保留天数' },
+    { key: 'requestRetentionDays', inputId: 'settings-retention-request', label: '请求日志保留天数' },
     { key: 'dailyRetentionDays', inputId: 'settings-retention-daily', label: '按天聚合保留天数' },
   ];
   // 与后端 RETENTION_MIN_DAYS / RETENTION_MAX_DAYS 同源（非法值后端会 400）
@@ -513,6 +522,360 @@
     await commitRetention(field, input, parsed.days, shrinking);
   }
 
+  // ─── 请求重试：两档次数与间隔 ──────────────
+
+  /**
+   * 三个重试字段的字段名 / 控件 id / 展示名只在这里对齐一次：
+   * 字段名必须与后端 `config.rs` 的 KEY_RETRY_* 完全一致（大小写也一样），
+   * 否则 PUT 会被当成「不认识的键」静默忽略 —— 界面提示保存成功，值却没变。
+   * 交互与数据保留同构，只是**没有**二次确认：改重试设置不删任何数据。
+   *
+   * 两档次数的含义（同一提供商 / 切换提供商）见 `config.rs` 的 RetrySettings
+   * 与 index.html 里那段 tooltip —— 前端只负责如实读写，不自己解释语义。
+   */
+  const RETRY_FIELDS = [
+    { key: 'retryCount', inputId: 'settings-retry-count', label: '同一提供商重试次数', min: 0, max: 10 },
+    { key: 'retryCrossProviderCount', inputId: 'settings-retry-cross-provider-count', label: '切换提供商重试次数', min: 0, max: 10 },
+    { key: 'retryIntervalSeconds', inputId: 'settings-retry-interval', label: '重试间隔', min: 0, max: 300 },
+  ];
+
+  /** 最近一次从后端读到的生效值；为 null 表示后端不可用（此时输入框保持禁用） */
+  let retry = null;
+
+  function retryInputs() {
+    return RETRY_FIELDS.map(field => $(field.inputId)).filter(Boolean);
+  }
+
+  /**
+   * 按后端返回值回填（与 renderRetention 同一套口径）：传 null 整块标
+   * 「不可用」并锁住输入；传对象只采纳范围内的整数，缺字段沿用上一轮的
+   * 有效值；正在编辑的那一项不回填，避免冲掉用户敲到一半的数字。
+   */
+  function renderRetry(data) {
+    const badge = $('retry-badge');
+    const inputs = retryInputs();
+    if (!badge || inputs.length !== RETRY_FIELDS.length) return;
+
+    if (!data || typeof data !== 'object') {
+      retry = null;
+      badge.className = 'badge bad';
+      badge.textContent = '不可用';
+      inputs.forEach(input => { input.value = ''; input.disabled = true; });
+      return;
+    }
+
+    const next = { ...(retry || {}) };
+    RETRY_FIELDS.forEach(field => {
+      const value = Number(data[field.key]);
+      if (Number.isInteger(value) && value >= field.min && value <= field.max) {
+        next[field.key] = value;
+      }
+    });
+
+    // 三项都拿不到有效值（换壳后接口形状变了之类）：按不可用处理，
+    // 不让两只空输入框留在页面上
+    if (!RETRY_FIELDS.some(field => Number.isInteger(next[field.key]))) {
+      renderRetry(null);
+      return;
+    }
+
+    retry = next;
+    RETRY_FIELDS.forEach((field, index) => {
+      const input = inputs[index];
+      const value = next[field.key];
+      if (!Number.isInteger(value)) return;
+      input.disabled = false;
+      if (document.activeElement !== input) input.value = String(value);
+    });
+    badge.className = 'badge ok';
+    badge.textContent = '已生效';
+  }
+
+  async function loadRetry() {
+    try {
+      renderRetry(await api.getRetry());
+    } catch (error) {
+      console.warn('读取请求重试设置失败:', error.message);
+      renderRetry(null);
+    }
+  }
+
+  /** 回滚到已知的生效值；从未成功读到过就留空，不编一个假值填回去 */
+  function revertRetryInput(field) {
+    const input = $(field.inputId);
+    if (!input) return;
+    const known = retry?.[field.key];
+    input.value = Number.isInteger(known) ? String(known) : '';
+  }
+
+  /**
+   * 前端校验：0–max 的整数（后端也会挡，这里先挡省一次往返）。
+   * 与 parseRetentionDays 同一写法：用 /^\d+$/ 而不是 Number()，
+   * 把 "1e2" / "0x10" 这类非直觉输入直接判非法。
+   */
+  function parseRetryValue(field, raw) {
+    const text = String(raw ?? '').trim();
+    if (!text) return { ok: false, message: `${field.label}不能为空（可填 ${field.min}–${field.max}）` };
+    if (!/^\d+$/.test(text)) return { ok: false, message: `${field.label}必须是整数` };
+    const value = Number(text);
+    if (value < field.min || value > field.max) {
+      return { ok: false, message: `${field.label}必须在 ${field.min}–${field.max} 之间（当前填的是 ${text}）` };
+    }
+    return { ok: true, value };
+  }
+
+  /** 单个输入框的提交流程：校验 → 提交，失败回滚原值（保留期同款，少一道确认） */
+  async function saveRetryField(field, input) {
+    if (panelBusy) { revertRetryInput(field); return; }
+
+    const parsed = parseRetryValue(field, input.value);
+    if (!parsed.ok) {
+      toast(parsed.message, 'err');
+      revertRetryInput(field);
+      return;
+    }
+
+    const known = retry?.[field.key];
+    // 值与后端一致就不发请求：数字框里换个写法（如 05）也会触发 change
+    if (Number.isInteger(known) && parsed.value === known) { input.value = String(known); return; }
+
+    panelBusy = true;
+    // 乐观写入待保存的值（理由同 commitRetention：disabled 触发的 blur 可能
+    // 补发 change，不先记新值会看到「刚改的数字闪回旧值」）
+    if (retry) retry = { ...retry, [field.key]: parsed.value };
+    const inputs = retryInputs();
+    inputs.forEach(element => { element.disabled = true; });
+    try {
+      const saved = await api.saveRetry({ [field.key]: parsed.value });
+      // PUT 契约上返回生效后的**三项**值（见 retry_api.rs 的 put_retry），
+      // 正常情况下用响应刷新即可，不必再跑一趟 GET
+      renderRetry(saved);
+      // 显式回填一次做规范化（用户可能敲了 "05" 或带空格）：renderRetry 会
+      // 跳过正在编辑的输入框，而失败时焦点多半还在这个框上
+      const applied = retry?.[field.key];
+      if (Number.isInteger(applied)) input.value = String(applied);
+      toast(`✅ 已保存：${field.label} ${applied ?? parsed.value}`);
+    } catch (error) {
+      // 400 的 message（点名哪个字段、超出多少）比自造一句更指向具体问题
+      toast(`保存失败：${error.message}`, 'err');
+      await loadRetry(); // 回滚到后端的真实值
+      revertRetryInput(field);
+    } finally {
+      panelBusy = false;
+      // 逐个按「有没有已知值」解禁：后端不可用时 renderRetry 会把它们留在禁用态
+      RETRY_FIELDS.forEach(item => {
+        if (Number.isInteger(retry?.[item.key])) {
+          const element = $(item.inputId);
+          if (element) element.disabled = false;
+        }
+      });
+    }
+  }
+
+  // ─── 数据保存位置（事件日志 / 请求日志 / 调试报文的迁移） ──────
+
+  /**
+   * 三类数据的保存目录各自独立（config.json 的 logDir / requestStatsDir /
+   * debugDir，经 /api/storage 读写）。读概况 → 点「更改…」弹系统目录选择框 →
+   * 确认弹窗 → 调 /api/storage/relocate **同步迁移**，等待期间轮询
+   * /api/storage/progress 画进度条。迁移中弹窗不可关闭（关窗路径全部收口在
+   * storageModalBusy 旗标上）。
+   */
+  const STORAGE_TARGETS = [
+    { target: 'logs', label: '事件日志', pathId: 'storage-log-path', buttonId: 'btn-storage-log' },
+    { target: 'requests', label: '请求日志', pathId: 'storage-req-path', buttonId: 'btn-storage-req' },
+    { target: 'debug', label: '调试报文', pathId: 'storage-debug-path', buttonId: 'btn-storage-debug' },
+  ];
+  /** 最近一次从后端读到的概况；null = 后端不可用（按钮仍可用，点了会提示） */
+  let storage = null;
+  /** 确认 / 迁移弹窗的状态。resolve 非空 = 弹窗开着；busy = 迁移中（不可关闭） */
+  let storageModalResolve = null;
+  let storageModalBusy = false;
+  let storageProgressTimer = null;
+  /** 迁移请求在途：挡住「更改…」的重入（一个存储同一时间只跑一次迁移） */
+  let storageBusy = false;
+
+  function renderStorage(data) {
+    if (data !== undefined) storage = data;
+    const badge = $('storage-badge');
+    if (!badge) return;
+    if (!storage || typeof storage !== 'object') {
+      badge.className = 'badge bad';
+      badge.textContent = '不可用';
+      STORAGE_TARGETS.forEach(item => {
+        const el = $(item.pathId);
+        if (el) el.textContent = '—';
+      });
+      return;
+    }
+    badge.className = 'badge ok';
+    badge.textContent = '已生效';
+    STORAGE_TARGETS.forEach(item => {
+      const el = $(item.pathId);
+      const info = storage?.[item.target];
+      const dir = info && typeof info === 'object' ? String(info.dir || '') : '';
+      if (el) {
+        el.textContent = dir || '—';
+        el.title = dir ? (info?.custom ? `${dir}（自定义目录）` : `${dir}（默认配置目录）`) : '';
+      }
+      const button = $(item.buttonId);
+      if (button) button.disabled = !dir;
+    });
+  }
+
+  async function loadStorage() {
+    try {
+      renderStorage(await api.getStorage());
+    } catch (error) {
+      console.warn('读取数据保存位置失败:', error.message);
+      renderStorage(null);
+    }
+  }
+
+  /** 字节数 → 可读大小（概况里给用户看「要迁移多大」） */
+  function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '几乎为空';
+    if (bytes < 1024) return `${bytes} B`;
+    const kb = bytes / 1024;
+    if (kb < 1024) return `${kb.toFixed(1)} KB`;
+    const mb = kb / 1024;
+    if (mb < 1024) return `${mb.toFixed(1)} MB`;
+    return `${(mb / 1024).toFixed(2)} GB`;
+  }
+
+  /** 收掉弹窗（可带进度轮询一起停）。调用即视为「弹窗已关」，resolver 收尾 */
+  function closeStorageModal() {
+    storageModalBusy = false;
+    stopStorageProgress();
+    const resolve = storageModalResolve;
+    storageModalResolve = null;
+    $('storage-modal')?.classList.remove('open');
+    if (resolve) resolve(false);
+  }
+
+  /** 确认 / 关闭 / 遮罩 / Esc 五条关窗出口统一走这里；迁移中一律不受理 */
+  function resolveStorageModal(accepted) {
+    if (storageModalBusy) return;
+    const resolve = storageModalResolve;
+    storageModalResolve = null;
+    $('storage-modal')?.classList.remove('open');
+    if (resolve) resolve(accepted);
+  }
+
+  /** 迁移态的界面切换：按钮隐藏 / 确认键变禁用文案 / 进度条显隐 */
+  function setStorageModalBusy(busy) {
+    // 迁移中把「关闭 / 取消」直接藏起来：disabled 还留着视觉残影，
+    // 藏掉更明确 —— 此刻没有任何关闭路径，这是要传达的承诺
+    $('storage-modal-close')?.style.setProperty('display', busy ? 'none' : '');
+    $('storage-modal-cancel')?.style.setProperty('display', busy ? 'none' : '');
+    const ok = $('storage-modal-ok');
+    if (ok) {
+      ok.disabled = busy;
+      ok.textContent = busy ? '迁移中…' : '开始迁移';
+    }
+    const progress = $('storage-progress');
+    if (progress) progress.hidden = !busy;
+    const state = $('storage-modal-state');
+    if (state) state.style.display = busy ? '' : 'none';
+  }
+
+  /** 起 / 停进度轮询：400ms 一拍，接口说没在迁了就把条推满（收尾瞬间的观感） */
+  function startStorageProgress() {
+    stopStorageProgress();
+    const bar = $('storage-progress')?.querySelector('.bar');
+    const tick = async () => {
+      try {
+        const state = await api.storageProgress();
+        if (bar) bar.style.width = `${state?.active ? Number(state.percent) || 0 : 100}%`;
+      } catch {
+        // 进度读不到就不动条：迁移本体在 POST 上，返回值才是结果
+      }
+    };
+    void tick();
+    storageProgressTimer = setInterval(tick, 400);
+  }
+
+  function stopStorageProgress() {
+    if (storageProgressTimer) clearInterval(storageProgressTimer);
+    storageProgressTimer = null;
+  }
+
+  /** 更改一个存储的保存位置：选目录 → 确认 → 迁移（锁弹窗 + 进度）→ 刷新 */
+  async function changeStorage(item) {
+    if (storageBusy || storageModalResolve) return;
+    const current = storage?.[item.target]?.dir;
+    if (!current) {
+      toast('读不到当前保存位置，请稍后重试', 'err');
+      return;
+    }
+    let picked = null;
+    try {
+      picked = await api.pickDirectory(`选择「${item.label}」的保存位置`);
+    } catch (error) {
+      toast(error.message, 'err');
+      return;
+    }
+    if (!picked || picked.canceled) return;
+    const dir = String(picked.path || '').trim();
+    if (!dir) return;
+    if (dir === current) {
+      toast('新位置与当前保存位置相同');
+      return;
+    }
+
+    // 确认段：说清「从哪搬到哪、迁多大」，此刻还能取消
+    const info = storage?.[item.target] || {};
+    const sizeText = formatBytes((Number(info.bytes) || 0) + (Number(info.dailyBytes) || 0));
+    const countText = Number(info.count) || 0;
+    const text = $('storage-modal-text');
+    if (text) {
+      text.innerHTML = `「${esc(item.label)}」将从 <strong>${esc(current)}</strong>`
+        + ` 迁移到 <strong>${esc(dir)}</strong>。<br>`
+        + `将迁移 ${countText} 条记录（约 ${sizeText}），迁移期间转发与日志写入会短暂排队，`
+        + `请保持程序运行，不要关闭窗口。`;
+    }
+    const progress = $('storage-progress');
+    if (progress) progress.hidden = true;
+    const stateEl = $('storage-modal-state');
+    if (stateEl) stateEl.style.display = 'none';
+    const ok = $('storage-modal-ok');
+    if (ok) {
+      ok.disabled = false;
+      ok.textContent = '开始迁移';
+    }
+    $('storage-modal')?.classList.add('open');
+    $('storage-modal-cancel')?.focus();
+
+    const accepted = await new Promise(resolve => {
+      // 理论上同时只有一个弹窗（changeStorage 顶部已挡重入），这里仍兜一层
+      if (storageModalResolve) {
+        const old = storageModalResolve;
+        storageModalResolve = null;
+        old(false);
+      }
+      storageModalResolve = resolve;
+    });
+    if (!accepted) return;
+
+    // 迁移段：接口是同步语义（resolve 即迁移结束），等待期间锁弹窗 + 画进度
+    storageBusy = true;
+    storageModalBusy = true;
+    setStorageModalBusy(true);
+    startStorageProgress();
+    try {
+      await api.relocateStorage({ target: item.target, dir });
+      closeStorageModal();
+      toast(`✅ ${item.label}已迁移到 ${dir}`);
+    } catch (error) {
+      closeStorageModal();
+      // 失败时旧数据原封不动（后端搬迁失败不切目录），界面读一次现状即可
+      toast(`迁移失败：${error.message}`, 'err');
+    } finally {
+      storageBusy = false;
+      await loadStorage();
+    }
+  }
+
   // ─── 事件绑定 ──────────────────────────────
 
   $('settings-close-to-tray').addEventListener('change', event => saveToggles(event.target));
@@ -554,14 +917,127 @@
     if (event.target === $('retention-modal')) resolveRetentionConfirm(false);
   });
   // Esc 关窗：app.js 也挂了一个全局 Esc（只关「添加账号」弹窗，没收开窗状态就不动作），
-  // 这里按「确认框是否开着」判断，两者互不干扰
+  // 这里按「确认框 / 保存位置弹窗是否开着」判断，三者互不干扰
   document.addEventListener('keydown', event => {
-    if (event.key === 'Escape' && retentionConfirm) resolveRetentionConfirm(false);
+    if (event.key !== 'Escape') return;
+    if (retentionConfirm) resolveRetentionConfirm(false);
+    if (storageModalResolve) resolveStorageModal(false);
   });
 
   $('btn-retention-refresh')?.addEventListener('click', () => loadRetention().then(() => toast('保留天数已刷新')));
 
-  window.wbSettingsPanel = { load, render: renderSettings, renderRetention };
+  // 重试设置与保留天数同一交互：change 提交、回车等价失焦（理由见上）
+  RETRY_FIELDS.forEach(field => {
+    const input = $(field.inputId);
+    if (!input) return;
+    input.addEventListener('change', event => saveRetryField(field, event.target));
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter') input.blur();
+    });
+  });
+
+  $('btn-retry-refresh')?.addEventListener('click', () => loadRetry().then(() => toast('重试设置已刷新')));
+
+  // ─── 调试模式（上游原始报文的采集开关）──────────────────────
+
+  /**
+   * 开关读写后端 config.json（经 /api/debug）。开启后转发层把发给上游的请求
+   * 与上游返回的响应完整落盘（凭据类头一律脱敏，见后端 core::debug_traffic），
+   * 请求日志页的「详情」列据此展示。
+   *
+   * 交互比请求重试更简单：只有一个布尔开关，没有数字校验与回滚区间；
+   * 读失败时锁住开关（与 renderRetry 的「不可用」同一姿势）。
+   */
+  /** 最近一次从后端读到的开关状态；null = 后端不可用（开关保持禁用） */
+  let debug = null;
+
+  function renderDebug(data) {
+    if (data !== undefined) debug = data;
+    const badge = $('debug-badge');
+    const toggle = $('settings-debug-mode');
+    if (!badge || !toggle) return;
+
+    if (!debug || typeof debug !== 'object') {
+      badge.className = 'badge bad';
+      badge.textContent = '不可用';
+      toggle.disabled = true;
+      $('debug-state').textContent = '未能读取调试模式设置，请稍后重试';
+      return;
+    }
+
+    const on = debug.debugMode === true;
+    toggle.disabled = false;
+    toggle.checked = on;
+    badge.className = 'badge ok';
+    badge.textContent = '已生效';
+    const count = Number(debug.count);
+    const limit = Number(debug.limit);
+    const stored = Number.isInteger(count) && Number.isInteger(limit)
+      ? `已保存 ${count} / ${limit} 条报文（超出后丢弃最旧的）。`
+      : '';
+    $('debug-state').textContent = on
+      ? `正在保存上游原始报文：${stored}凭据类请求头已脱敏。`
+      : '未开启，转发时不保存任何原始报文。';
+  }
+
+  async function loadDebug() {
+    try {
+      renderDebug(await api.getDebug());
+    } catch (error) {
+      console.warn('读取调试模式设置失败:', error.message);
+      renderDebug(null);
+    }
+  }
+
+  async function saveDebug(toggle) {
+    if (panelBusy) {
+      // 已知状态按状态回滚，未知状态只把刚切的这项切回去（与 revertToggles 同）
+      toggle.checked = debug && typeof debug === 'object' ? debug.debugMode === true : !toggle.checked;
+      return;
+    }
+    const wanted = toggle.checked;
+    panelBusy = true;
+    toggle.disabled = true;
+    try {
+      const saved = await api.saveDebug(wanted);
+      renderDebug(saved);
+      toast(wanted ? '✅ 调试模式已开启' : '✅ 调试模式已关闭');
+    } catch (error) {
+      toast(`保存失败: ${error.message}`, 'err');
+      await loadDebug(); // 回滚到后端的真实值
+    } finally {
+      panelBusy = false;
+    }
+  }
+
+  $('settings-debug-mode')?.addEventListener('change', event => saveDebug(event.target));
+  $('btn-debug-refresh')?.addEventListener('click', () => loadDebug().then(() => toast('调试模式设置已刷新')));
+
+  // 保存位置：两个「更改…」按钮走同一个流程（target 不同而已）；
+  // 弹窗的确认 / 取消 / 关闭 / 遮罩 / Esc 五条出口都收口到 resolveStorageModal，
+  // 迁移中（storageModalBusy）它会直接吞掉 —— 那时弹窗不可关闭
+  STORAGE_TARGETS.forEach(item => {
+    $(item.buttonId)?.addEventListener('click', () => changeStorage(item));
+  });
+  $('storage-modal-ok')?.addEventListener('click', () => resolveStorageModal(true));
+  $('storage-modal-cancel')?.addEventListener('click', () => resolveStorageModal(false));
+  $('storage-modal-close')?.addEventListener('click', () => resolveStorageModal(false));
+  $('storage-modal')?.addEventListener('click', event => {
+    if (event.target === $('storage-modal')) resolveStorageModal(false);
+  });
+
+  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderStorage };
+
+  // 重试设置同样在首次读到后端值之前保持禁用：空输入框既能被误改，
+  // 也会让「值与后端是否一致」的判断失真。读成功后由 renderRetry 解禁，
+  // 读失败则维持禁用并挂上「不可用」徽标
+  retryInputs().forEach(input => { input.disabled = true; });
+  // 调试模式开关同理：读到后端值之前不许切（否则会出现「切了但不知道
+  // 后端原本是什么」的状态，回滚也没依据）
+  {
+    const debugToggle = $('settings-debug-mode');
+    if (debugToggle) debugToggle.disabled = true;
+  }
 
   // 保留天数在首次读到后端值之前保持禁用：空输入框既能被误改，也没法参与
   // 「新值是否小于旧值」的判断（见 saveRetentionField 里 previous 为 null 的分支）。

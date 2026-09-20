@@ -70,8 +70,21 @@ impl UpstreamErrorDetail {
 }
 
 /// 上游错误响应 → `{code, message}`（对照 Node 的 readUpstreamError）。
-pub async fn read_upstream_error(response: reqwest::Response) -> UpstreamErrorDetail {
+///
+/// `capture`：调试模式的采集器（None = 未开启）。**必须在这里采** —— 本函数
+/// 用 `response.text()` 把响应体整个吃掉，调用方拿不到第二份；不在这里顺手
+/// 旁路，错误响应体就永远进不了调试报文（而失败现场恰恰是最需要看的那一半）。
+pub async fn read_upstream_error(
+    response: reqwest::Response,
+    capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
+) -> UpstreamErrorDetail {
+    if let Some(capture) = capture {
+        capture.attach_response(response.status().as_u16(), response.headers());
+    }
     let text = response.text().await.unwrap_or_default();
+    if let Some(capture) = capture {
+        capture.push(text.as_bytes());
+    }
     let mut code = None;
     let mut message: String = text.chars().take(500).collect();
     if let Ok(payload) = serde_json::from_str::<Value>(&text) {

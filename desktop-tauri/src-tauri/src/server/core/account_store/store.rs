@@ -599,6 +599,9 @@ impl AccountStore {
             self.to_autoclaw_public_account(record)
         } else if record.provider() == super::QODER_PROVIDER_ID {
             self.to_qoder_public_account(record)
+        } else if super::is_cline_family(&record.provider()) {
+            // 两个池（`cline-free` / `cline-pass`）共用这一份公开形态
+            self.to_cline_public_account(record)
         } else {
             self.to_public_account(record)
         };
@@ -617,6 +620,18 @@ impl AccountStore {
                     "chatSupported".to_string(),
                     Value::Bool(forwards_requests(record)),
                 );
+                // 最近一次签到成功的时刻（0 = 从未签过）。跨家统一注入的理由与上面
+                // 两条相同：它是「这条账号的签到状态」这一个事实，五家的存放位置
+                // 一致（`checkinAt`），界面不必按 provider 查表。
+                //
+                // 给出的是**时间戳**而不是「今天签过没」的布尔：自然日的边界要按
+                // 用户本地时区算，而那个判定在界面上已有同款实现（限流恢复时间的
+                // 「今天 / 明天」也是本地自然日，见 accounts-model.js 的 startOfDay）。
+                // 传原始时间戳还让界面能显示「今天 08:30 已签到」这类信息。
+                //
+                // 恒为数字（无记录时 0）而不是缺键：界面按 `Number(...) || 0` 读，
+                // 两种形态都能吃，但恒定的形状让「字段缺失」与「值为 0」不再需要分开判。
+                fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
                 Value::Object(fields)
             }
             // 各家形状恒为对象；真出现异常形态时原样透出，不在这里改语义
@@ -712,6 +727,21 @@ pub(crate) fn live_desktop_credentials(record: &StoredAccount) -> Option<(String
             crate::server::core::providers::autoclaw::credentials::local_credentials().ok()?;
         return Some((
             credentials.token,
+            credentials.refresh_token,
+            credentials.expires_at.unwrap_or(0.0),
+        ));
+    }
+    // Cline 桌面端登录态：实时读 `~/.cline/data/settings/providers.json`。
+    // 少了这一支，桌面端账号的会话里 `auth.accessToken` 会是空串 ——
+    // 记录里**按设计不落 token**（见 `cline_accounts.rs` 的模块头），
+    // 于是转发会以「账号缺少 accessToken」401 收场，而账号看着一切正常。
+    if super::is_cline_family(&record.provider()) && record.is_desktop() {
+        let credentials =
+            crate::server::core::providers::cline::credentials::read_desktop_credentials()
+                .ok()
+                .flatten()?;
+        return Some((
+            credentials.access_token,
             credentials.refresh_token,
             credentials.expires_at.unwrap_or(0.0),
         ));
