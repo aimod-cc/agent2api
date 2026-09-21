@@ -31,7 +31,6 @@ OpenAI client / any SDK
 
 - [Quick Start](#quick-start)
 - [Data Storage](#data-storage)
-- [Gateway API](#gateway-api)
 - [Project Layout](#project-layout)
 - [Development & Build](#development--build)
 - [Usage Notice](#usage-notice)
@@ -41,17 +40,15 @@ OpenAI client / any SDK
 
 ## Quick Start
 
-Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\Program Files\Agent2API` by default, and needs administrator approval during setup), then launch it — **no Node or any other runtime required**:
+Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\Program Files\Agent2API` by default, and needs administrator approval during setup), then launch it — **no Node or any other runtime required**.
 
-> When upgrading from the 1.x "install for current user" layout (`%LOCALAPPDATA%\<product name>`), the new version cleans up that old installation on first launch: it first confirms the directory really holds this product's main executable, then removes the directory, the Start Menu / desktop shortcuts, the uninstall registry entry and any dead run-at-login registration; if the old directory is still in use (cannot be deleted) or is not this product, it is skipped. This cleanup runs in release builds only — running `tauri dev` during development will not touch the official build installed on your machine. The data directory is unaffected (migration copies).
-
-1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If the 1.x data directory `~/.workbuddy-proxy` is detected, it is **copied wholesale** to `~/.agent2api` (the old directory is kept, so you can roll back). Account and history import is described in [Data Storage](#data-storage) above: if JSON / JSONL data files from an older version are found, a dialog appears at startup and waits for you to press "Upgrade" — after that, the old account data from all providers (the old gateway account file plus each vendor's desktop login state) is imported as well.
-2. Click "Login / Add account" on the Report or Accounts page and **pick a provider in the dialog** (WorkBuddy / Raccoon / CatPaw / AutoClaw / Qoder), then finish that vendor's login or fill in its credentials. WorkBuddy only supports web login (embedded window or system browser); Raccoon supports web login, pasting a token, and "import desktop login state from this machine"; CatPaw supports web login, pasting credentials, and "import desktop login state from this machine"; AutoClaw supports SMS code login, pasting credentials, and "import desktop login state from this machine"; Qoder supports web login (both the Global and China sites) and a personal access token (PAT) — web login and the Global / China sites are one and the same device-authorization flow, so whichever site you pick is the site you sign in to. Importing desktop login state reuses the desktop client's own login-state file directly: no token is stored in the account record, and the gateway follows as soon as the client signs in again (Qoder has no such option).
+1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If an older version's data directory or data files are found, a dialog walks you through the migration (see [Data Storage](#data-storage) for details).
+2. Click "Login / Add account" on the Report or Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw / Qoder / Cline), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again).
 3. Set your OpenAI client's `base_url` to `http://127.0.0.1:3065/v1` and put anything in `api_key` (for example `sk-local`; the server does not check it while authentication is disabled).
 
 Closing the window only minimizes to the tray by default, and the gateway keeps forwarding in the background; to quit for real, right-click the tray icon and choose "Exit".
 
-All five providers' accounts sit in one **global queue**: priority is globally unique (the smaller number is tried first), "Set as preferred" moves an account to the head of the queue, and new accounts go to the tail. The list does not mark which account a request is currently using. When forwarding, candidates are tried in ascending priority order, skipping accounts that are disabled, do not offer that model, or are in a rate-limit cooldown for that model — so "which provider goes first" is decided by account priority alone, with no second layer of provider routing priority. When an account hits a 429 on a model, that account × model pair is marked for cooldown and the request falls back to the next candidate; only when every candidate is unavailable is the last real error passed through.
+Accounts sit in one **global queue** and are tried in ascending priority order, skipping accounts that are disabled, do not offer that model, or are in a rate-limit cooldown for that model; when an account hits a 429 on a model the request falls back to the next candidate, and only when every candidate is unavailable is the last real error passed through.
 
 ### Verification
 
@@ -93,27 +90,6 @@ The database runs in WAL mode, so while the app is running you will also see `ag
 
 ---
 
-## Gateway API
-
-Outward-facing there is only the OpenAI-compatible chat path (by default `http://127.0.0.1:3065`):
-
-| Method | Path | Description |
-| --- | --- | --- |
-| POST | `/v1/chat/completions` | Chat. `stream: true` streams SSE straight through; `stream: false` is aggregated by the gateway and returned as one JSON body |
-| GET | `/v1/models` | Aggregated model list (OpenAI `list` format, with context length and capability flags; `owned_by` is the provider that actually serves it) |
-| GET | `/health` | Health check (whether login state is configured, upstream address, token expiry) |
-
-- **Model names use the upstream's original names by default**; the gateway adds no prefix. The list is the aggregate across providers: when two providers share a model name, the entry keeps the one earlier in registry order (`owned_by` records the provider actually serving it), but which provider a request goes to is decided by **account priority** — the candidate chain is "every account offering that model, ordered by global priority", tried one by one, and only when all fail is the last real error passed through.
-- A model you name must actually exist in the catalog, otherwise the gateway returns 400 (`code: "model_not_found"`) with a near-name suggestion — silently swapping `deepseek-v4.1-flash` for another model would cause hard-to-notice incidents like "requesting A but actually running B", so there is no silent fallback.
-- **The model management page can define mappings**: give an upstream model an external alias (alias → target); when a downstream request uses the alias, the gateway rewrites it to the target model before forwarding. The alias also appears in `/v1/models` as its own entry (`is_default` is always false). An alias may point to only one target and must not collide with any upstream model id. Disabled or deleted models do not appear in `/v1/models`, and requesting one returns 400 `model_not_found` (deleting only hides it from the list; it can be restored from the "Deleted" filter on the management page).
-- **The list contains chat models only** (internal completion / tool models, image and video models never appear in the outward catalog), and it **advertises only providers that currently have usable login state**.
-- Only the chat path is implemented: completion, embeddings, image and video paths have no forwarding implementation (they return 404).
-- On upstream rate limiting (HTTP 429) the error body carries `type: "rate_limit_exceeded"` together with `reset_at` (a timestamp) and `reset_at_text` (local-time text).
-
-The desktop UI's own `/api/*` management endpoints (account CRUD, model management, gateway keys, proxy, redaction, logs, reports, updates) are an internal contract that evolves with the interface and is not documented here.
-
----
-
 ## Project Layout
 
 Both the gateway and the desktop app live under `desktop-tauri/`: the backend is a Rust in-process HTTP server under `src-tauri/`, the frontend is plain HTML/CSS/JS under `ui/`.
@@ -130,7 +106,7 @@ agent2api/
 │  │  │  ├─ request_stats.rs + request_stats/   Statistics time windows, writes, aggregation and trimming
 │  │  │  ├─ core/
 │  │  │  │  ├─ providers/        ★ Multi-provider layer (the heart of this work)
-│  │  │  │  │  ├─ mod.rs        ProviderKind (the five providers) + PROVIDERS registry + id lookups
+│  │  │  │  │  ├─ mod.rs        ProviderKind (six vendors; Cline split into two pools) + PROVIDERS registry + id lookups
 │  │  │  │  │  ├─ adapter.rs    ProviderAdapter trait + adapter_for + implemented_kinds
 │  │  │  │  │  ├─ router.rs     Model name → set of candidate providers (aggregate catalog)
 │  │  │  │  │  ├─ catalog.rs    Aggregate model catalog (list merging / same-name dedup / availability)
