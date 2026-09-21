@@ -355,12 +355,36 @@ impl ProviderAdapter for ClineAdapter {
     /// 时，凭证天然不可刷新 —— 少这道判定会被维护任务每轮都算成「待刷新」，
     /// 然后稳定失败并往日志里灌错误（与 AutoClaw 的 `openclaw.json` 来源同一
     /// 取舍）。
+    ///
+    /// ── 判不出过期时间时的兜底（本次修复）───────────────────────
+    /// 凭证里既没有可解析的 `expiresAt`、access token 也不是带 `exp` 的 JWT
+    /// （例如用户粘贴了 opaque token）时，`is_expiring()` 恒为 false ——
+    /// 于是**主动续期链路完全静默失效**，只能等 401。官方 CLI 对这种情况用
+    /// 25 分钟周期兜底刷（见 `credentials::UNKNOWN_EXP_REFRESH_INTERVAL_MS`），
+    /// 这里在维护任务这条路上对齐同一语义。
+    ///
+    /// 只在**本方法**兜底、不在 `is_expiring()` 里改：后者被转发链路的
+    /// `ensure_fresh` 每请求调用一次，在那里返回 true 会让每个请求都打一次
+    /// 续期接口。维护任务每 10 分钟才问一次，节流后实际每 25 分钟才刷一次。
     fn credentials_expiring(&self, store: &AccountStore, account_id: &str) -> bool {
         if account_id.is_empty() {
             return false;
         }
         match refresh::snapshot(store, account_id) {
-            Ok(credentials) => credentials.can_refresh() && credentials.is_expiring(),
+            Ok(credentials) => {
+                if !credentials.can_refresh() {
+                    return false;
+                }
+                if credentials.is_expiring() {
+                    return true;
+                }
+                // 有续期手段、但判不出过期时间 → 按官方口径定期兜底刷一次
+                credentials.expires_at.is_none()
+                    && credentials::unknown_exp_refresh_due(
+                        account_id,
+                        crate::server::logging::now_ms(),
+                    )
+            }
             Err(_) => false,
         }
     }

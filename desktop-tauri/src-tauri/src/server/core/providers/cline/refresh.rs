@@ -246,6 +246,8 @@ async fn refresh_request(credentials: &ClineCredentials) -> Result<ClineCredenti
         expires_at,
         account,
         name: credentials.name.clone(),
+        // 来源的缓存键原样带过来：写回缓存时要用它比对「登录态是否被换过」
+        cache_key: credentials.cache_key.clone(),
     })
 }
 
@@ -353,32 +355,63 @@ fn upstream_error_message(payload: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// 刷新结果回写（**只回写手动账号**，且只在真的刷新了的时候）。
+/// 刷新结果回写（桌面端文件来源写进程缓存、账号记录来源写账号库）。
 ///
-/// ── 桌面端账号拒绝回写（与另外几家同一纪律）─────────────────
+/// ── 桌面端文件来源：不落盘，但写进程缓存（本次修复）────────────
 /// 桌面端来源的凭证在 `~/.cline/data/settings/providers.json`，那是 **Cline 客户端
 /// 自己的文件**：网关回写会与客户端自己的续期互相顶掉（两边都在轮换，
-/// 后写的赢，先写的那个 session 就废了）。因此这条来源只读。
-/// 判据是**记录上的 `desktop` 标记**（`store.cline_is_desktop_account`），
-/// 不是 id 字面量 —— 拆分后桌面端账号的 id 带池前缀（`cline-free-desktop`
-/// 这类），写死任何一个 id 都会漏判。
+/// 后写的赢，先写的那个 session 就废了）。因此这条来源**不落盘**。
 ///
-/// ── 三个写盘前提 ────────────────────────────────────────────
+/// 但**不落盘不等于丢掉结果**。早先的实现直接 `return`，于是 401 之后的
+/// 「刷新 → 重取会话 → 重试」里，重取会话又去实时读文件，拿回同一个刚被拒绝的
+/// 旧 token，重试必然再 401 —— 刷新白做。现在改为写进 `credentials` 的进程级
+/// 缓存（`store_cached_if_current`）：后续取凭证先命中缓存拿到新 token，
+/// 文件一变（客户端重新登录 / 客户端自己续期）缓存键失配即自动作废。
+/// 设计意图（不抢客户端的文件）与修复目标（刷新结果对后续请求可见）两者兼顾。
+///
+/// **分流依据是 `cache_key`，不是「记录带 desktop 标记」**：桌面端文件来源有
+/// 两种进入方式 —— 带 `desktop` 标记的账号记录（`store.cline_is_desktop_account`），
+/// 以及「没有任何 Cline 账号记录、直接用客户端登录态」的兜底路径（此时 `id`
+/// 为空串）。两者都要走缓存，而 `cache_key` 恰好精确刻画了「凭证是从那个文件
+/// 读来的」，用它分流两种方式都不会漏。
+///
+/// ── 三个写盘前提（只对账号记录来源）─────────────────────────
 ///   1. **没刷新就不写**：token 逐字相同直接返回 —— 避免每个请求都整库重写；
 ///   2. **只在成功时写**：调用方只在 Ok 分支调用本函数；
 ///   3. **比较-再写**：`update_cline_account_tokens_if_current` 在同一把账号锁内
 ///      确认记录里仍是刷新前那份凭证才写入（期间用户换了账号 / 重导入时，
-///      旧结果不得覆盖新凭证）。
+///      旧结果不得覆盖新凭证）。缓存那条走 `store_cached_if_current`，同一语义。
 ///
 /// 失败只记日志：刷新本身已经成功，回写失败不该让本次请求失败。
 fn persist_refresh(store: &AccountStore, previous: &ClineCredentials, refreshed: &ClineCredentials) {
-    if previous.id.is_empty() || store.cline_is_desktop_account(&previous.id) {
-        return;
-    }
-    // 前提 1：没有任何新信息 → 不写盘
+    // 前提 1：没有任何新信息 → 不做任何写入（缓存与账号库都不必动）
     if refreshed.access_token == previous.access_token
         && refreshed.refresh_token == previous.refresh_token
     {
+        return;
+    }
+    // 桌面端文件来源 → 只写进程缓存，不碰客户端的文件。
+    //
+    // **判据是 `cache_key` 而不是「记录带 desktop 标记」**：这条来源有两种进入
+    // 方式 —— 桌面端账号记录（`store.cline_is_desktop_account` 为真），以及
+    // 「没有任何 Cline 账号记录、直接用客户端登录态」的兜底路径（此时
+    // `previous.id` 是空串）。后者同样需要把刷新结果落进缓存，否则它和前者
+    // 一样会掉进「刷新成功 → 重取会话 → 重读文件拿回旧 token → 再 401」的坑。
+    // `cache_key` 恰好精确刻画了「凭证是从那个文件读来的」，两种方式都覆盖到。
+    if let Some(cache_key) = previous.cache_key.as_deref() {
+        if !credentials::store_cached_if_current(cache_key, previous, refreshed) {
+            logging::verbose(
+                "[Cline]",
+                &format!(
+                    "账号 {} 的续期结果未写入缓存（登录态已被更换）",
+                    previous.id
+                ),
+            );
+        }
+        return;
+    }
+    // 账号记录来源：没有 id 就无处可写（正常不会走到 —— 记录来源必带 id）
+    if previous.id.is_empty() {
         return;
     }
     match store.update_cline_account_tokens_if_current(

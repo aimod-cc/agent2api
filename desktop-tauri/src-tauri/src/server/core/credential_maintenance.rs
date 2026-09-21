@@ -10,7 +10,7 @@
 //! 「过期时间在哪个字段、什么算临期」是**各家的知识**：workbuddy 的过期时间在
 //! 会话的 `auth.expiresAt`、小浣熊在 JWT 的 `exp`（公开形态里叫 `tokenExpiresAt`）、
 //! AutoClaw 在凭证的 `expiresAt`，三家的临期窗口还各不相同（5 分钟 / 5 分钟 /
-//! 2 分钟）。壳侧曾按「顶层 `expiresAt`」这一个字段名做判断，于是小浣熊账号
+//! 5 分钟）。壳侧曾按「顶层 `expiresAt`」这一个字段名做判断，于是小浣熊账号
 //! （字段名不同）**永远被判成无需刷新** —— 全部过期也不刷，且界面上看不出原因。
 //! 现在这条判断收进 `ProviderAdapter::credentials_expiring`，加一家 provider
 //! 不必再改本模块，也不会再出现「字段名对不上」的静默失效。

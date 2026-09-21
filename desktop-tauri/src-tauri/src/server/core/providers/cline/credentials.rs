@@ -38,6 +38,8 @@
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件绝不 unwrap/expect/panic，取值走 Option 链。
 
+use std::sync::{Mutex, OnceLock};
+
 use serde_json::Value;
 
 use crate::server::errors::GatewayError;
@@ -128,6 +130,9 @@ pub struct ClineCredentials {
     pub account: String,
     /// 备注名（用户可改；空则用 account）
     pub name: String,
+    /// **内部用**：桌面端登录态的内存刷新覆盖键（`providers:<文件 mtime>`）。
+    /// 账号记录来源为 None —— 那条来源的刷新结果直接回写账号库，不走缓存。
+    pub cache_key: Option<String>,
 }
 
 impl ClineCredentials {
@@ -354,6 +359,44 @@ fn base64_url_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// 「判不出过期时间」账号的刷新节流窗口：25 分钟。
+///
+/// ── 这个数字来自官方（不是拍的）─────────────────────────────
+/// 官方 CLI 的续期调度器对「JWT 里没有 `exp`、也没有 `expiresAt`」的凭证用
+/// `UNKNOWN_EXP_REFRESH_INTERVAL_MS = 25 分钟` 兜底刷一次（本机 auth 日志里
+/// 实测打印 `unknown_exp_refresh_interval_ms: 1500000`），而不是像对待已知
+/// 过期时间那样只看临期窗口。网关没有那个常驻定时器，因此把同样的周期放在
+/// **维护任务**这一层兜底（见 `adapter::credentials_expiring`）。
+///
+/// ── 为什么不能直接在 `is_expiring_at` 里返回 true ─────────────
+/// `is_expiring_at` 还被转发链路的 `ensure_fresh`（每个请求一次）调用，
+/// 在那里把「判不出」当成「已临期」会让**每个请求都去打一次续期接口**。
+/// 官方的调用点是「每次会话启动」，不存在这个放大效应；网关必须分开处理，
+/// 所以节流状态与判据都只挂在维护任务那一条路上。
+const UNKNOWN_EXP_REFRESH_INTERVAL_MS: i64 = 25 * 60 * 1000;
+
+/// 「判不出过期时间的账号」本轮是否该兜底刷一次（进程级节流）。
+///
+/// 键是账号记录 id（不是凭证指纹）：同一个账号反复刷新失败时也要被节流住，
+/// 否则会退化成每轮维护都打一次上游。首次调用即视为「到期」（该账号刚出现，
+/// 值得刷一次确认它到底还能不能用）。
+pub(crate) fn unknown_exp_refresh_due(account_id: &str, now_ms: i64) -> bool {
+    use std::collections::HashMap;
+    static LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    let table = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match table.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.get(account_id) {
+        Some(last) if now_ms.saturating_sub(*last) < UNKNOWN_EXP_REFRESH_INTERVAL_MS => false,
+        _ => {
+            guard.insert(account_id.to_string(), now_ms);
+            true
+        }
+    }
+}
+
 /// 从账号记录（accounts.json 的一条）解析凭证。
 ///
 /// ── 与其他几家的键名口径一致 ────────────────────────────────
@@ -413,6 +456,9 @@ pub fn credentials_from_record(record: &Value) -> Result<ClineCredentials, Gatew
         expires_at,
         account,
         name,
+        // 账号记录来源的刷新结果直接回写账号库（见 `refresh::persist_refresh`），
+        // 不经过进程缓存 —— 缓存只服务「凭证在客户端文件里」那条来源
+        cache_key: None,
     })
 }
 
@@ -471,14 +517,127 @@ pub fn credentials_from_desktop_settings(root: &Value) -> Result<ClineCredential
     Ok(credentials)
 }
 
+// ─── 凭证缓存（桌面端登录态的内存刷新覆盖）───────────────────
+
+/// 进程级凭证缓存：`(缓存键, 解析好的凭证)`，只有一格。
+///
+/// ── 这个缓存解决什么问题（本次修复）─────────────────────────
+/// 桌面端账号的凭证**不回写文件**（`refresh::persist_refresh` 对这类账号早退，
+/// 理由是 providers.json 属于 Cline 客户端，两边都轮换会互相顶掉）。但「不回写」
+/// 不等于「刷新结果应该丢掉」：401 之后的重试链路刷新成功 → 重取会话 → 会话
+/// 构造又去**实时读文件**（`account_store::store::live_desktop_credentials`）→
+/// 拿回同一个刚被拒绝的旧 token → 必然再 401。用户看到的是「刷新了却还是失败」。
+///
+/// 因此刷新结果写进这份缓存：后续取凭证时先看缓存，命中就用它。**仍然不落盘**，
+/// 所以「不与客户端抢文件」的设计意图原样保留；重启后缓存消失，回到读文件，
+/// 也仍然能跟上客户端自己的续期。
+///
+/// ── 缓存键为什么带 mtime ────────────────────────────────────
+/// 键是 `providers:<文件 mtime>`。文件一变（用户在 Cline 客户端重新登录、
+/// 或客户端自己续期写盘）键就失配 → 自动回到「重新读文件」，不需要额外的
+/// 失效逻辑。这正是 AutoClaw 那边 `auth:<mtime>` 的同款语义（见
+/// `autoclaw::credentials` 的模块说明），两家的取舍保持一致。
+///
+/// 之所以是**一格**：桌面端登录态全局只有一份（`~/.cline/data/settings/providers.json`）。
+fn credentials_cache() -> &'static Mutex<Option<(String, ClineCredentials)>> {
+    static CACHE: OnceLock<Mutex<Option<(String, ClineCredentials)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 桌面端登录态文件的缓存键（`providers:<mtime>`）；文件取不到时给 None。
+fn desktop_cache_key() -> Option<String> {
+    let path = desktop_settings_path().ok()?;
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return None;
+    }
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    Some(format!("providers:{modified}"))
+}
+
+/// 查缓存（锁在返回前释放 → 调用方不会持锁跨 await）
+fn lookup_cached(cache_key: &str) -> Option<ClineCredentials> {
+    let guard = match credentials_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .as_ref()
+        .filter(|(key, _)| key == cache_key)
+        .map(|(_, credentials)| credentials.clone())
+}
+
+/// 写缓存（**读盘成功后**与刷新成功后共用）。
+///
+/// 读盘路径必须写它 —— 这不只是为了省一次解析：`store_cached_if_current`
+/// 的「比较」是拿缓存里的当前值当基准的，缓存为空时它会判定「无法确认当前
+/// 登录态」而拒绝写入（见那里的说明）。少了这一步，刷新结果永远落不进缓存，
+/// 本次修复就退化成没有效果。
+fn store_cached(cache_key: &str, credentials: &ClineCredentials) {
+    let mut guard = match credentials_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some((cache_key.to_string(), credentials.clone()));
+}
+
+/// **比较-再写**：只有缓存里仍是刷新前那份凭证、且来源文件也没变过时才写入。
+///
+/// 返回 `true` = 已写入；`false` = 登录态已被替换（客户端重新登录 → mtime 变 →
+/// 缓存键变，或另一轮刷新先落地），此时**不写** —— 旧结果不得盖掉新登录态。
+///
+/// 为什么还要看文件：缓存里的键可能一直没被读盘路径刷新，此时「键 + 内容都还是
+/// 旧值」会骗过纯缓存比较；多查一次文件 mtime 才能在落缓存前确认来源确实没变。
+/// 文件被删/损坏时同样拒绝写入（没有可确认的原文件，不替用户猜）。
+pub(crate) fn store_cached_if_current(
+    cache_key: &str,
+    expected: &ClineCredentials,
+    credentials: &ClineCredentials,
+) -> bool {
+    if desktop_cache_key().as_deref() != Some(cache_key) {
+        return false;
+    }
+    let mut guard = match credentials_cache().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some((current_key, current)) = guard.as_ref() else {
+        // 缓存已被清空：无法确认当前登录态是否仍是刷新前那份，不写入
+        return false;
+    };
+    if current_key != cache_key
+        || current.access_token != expected.access_token
+        || current.refresh_token != expected.refresh_token
+    {
+        return false;
+    }
+    *guard = Some((cache_key.to_string(), credentials.clone()));
+    true
+}
+
 /// 读取本机桌面端登录态文件并解析。
 ///
 /// 返回 `Ok(None)` = 文件不存在（没装 / 没登录过 Cline，不是错误）；
 /// `Ok(Some(..))` = 读到了；`Err` = 文件在但内容不可用（解析失败 / 缺凭证）。
+///
+/// ── 先查缓存（本次修复）─────────────────────────────────────
+/// 刷新成功的结果落在进程缓存里（见 [`credentials_cache`]），命中就直接返回它，
+/// 这样 401 后的重试才拿得到**新** token 而不是重读文件拿回旧的那份。
 pub fn read_desktop_credentials() -> Result<Option<ClineCredentials>, GatewayError> {
     let path = desktop_settings_path()?;
     if !path.exists() {
         return Ok(None);
+    }
+    let cache_key = desktop_cache_key();
+    if let Some(key) = cache_key.as_deref() {
+        if let Some(credentials) = lookup_cached(key) {
+            return Ok(Some(credentials));
+        }
     }
     let text = std::fs::read_to_string(&path).map_err(|error| {
         GatewayError::with_status(
@@ -492,9 +651,16 @@ pub fn read_desktop_credentials() -> Result<Option<ClineCredentials>, GatewayErr
             format!("本机 Cline 登录态文件格式无效: {error}"),
         )
     })?;
-    let credentials = credentials_from_desktop_settings(&root)?;
+    let mut credentials = credentials_from_desktop_settings(&root)?;
     // id 的填充留给调用方（账号层按 provider 拼 `cline-free-desktop` 这类 id，
     // 见 `desktop_account_id`）—— 桌面登录态本身不属于任何一个池，两个池都能用。
+    credentials.cache_key = cache_key.clone();
+    // 读盘成功后落缓存：既省掉后续请求的重复解析，也让「比较-再写」有基准
+    // （见 `store_cached` 的说明）。cache_key 为 None（文件不可 stat）时不写，
+    // 那种情况下刷新结果也确实无处可落。
+    if let Some(key) = cache_key.as_deref() {
+        store_cached(key, &credentials);
+    }
     Ok(Some(credentials))
 }
 

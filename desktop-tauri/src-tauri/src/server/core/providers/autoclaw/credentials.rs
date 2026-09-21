@@ -72,11 +72,23 @@ const MAX_AUTH_FILE_SIZE: u64 = 256 * 1024;
 /// 鉴权接口请求超时（源实现 `REQUEST_TIMEOUT_MS`）
 pub(crate) const REQUEST_TIMEOUT_MS: u64 = 30_000;
 
-/// 临期主动刷新窗口：过期前 2 分钟（源实现 `PROACTIVE_REFRESH_MARGIN_MS`）。
+/// 临期主动刷新窗口：过期前 5 分钟（本次修复，对齐官方
+/// `DESKTOP_REFRESH_AHEAD_MS = 5 * 60 * 1000`）。
 ///
-/// 注意与小浣熊的 5 分钟**不同**：AutoClaw 这条 120 秒是源项目自己的值，
-/// 照抄不改 —— 窗口开大只会让我们更早用掉一次 refresh_token 轮换。
-pub(crate) const PROACTIVE_REFRESH_MARGIN_MS: f64 = 120_000.0;
+/// ── 为什么从 2 分钟改成 5 分钟 ──────────────────────────────
+/// 原值是 120 秒（移植自源项目 `PROACTIVE_REFRESH_MARGIN_MS`），但那个值在官方
+/// 客户端里是**配合 60 秒一轮的扫描**用的：窗口 2 分钟、每 60 秒看一次，
+/// 进入窗口后最多等一轮就被刷掉，不会漏。
+///
+/// 网关没有那个 60 秒定时器，负责这条判定的是**维护任务**，默认间隔 10 分钟 ——
+/// 比窗口本身还宽。于是「token 进入 2 分钟窗口」与「下一轮维护到来」之间经常
+/// 错过：一个刚过窗口的 token 最长要等一整轮（10 分钟）才被处理，而它可能
+/// 早就过期了。窗口调到 5 分钟与官方口径一致（`DESKTOP_REFRESH_AHEAD_MS`），
+/// 同时也让小浣熊 / Cline 两家的窗口与维护间隔重新匹配（那两家是 5 / 10 分钟）。
+///
+/// 代价是更早用掉一次 refresh_token 轮换 —— 与「漏刷导致 401」相比，
+/// 这个代价是可接受的（官方的 5 分钟正是这个取舍的结果）。
+pub(crate) const PROACTIVE_REFRESH_MARGIN_MS: f64 = 300_000.0;
 
 /// 刷新签名校验失败的业务码（源实现 `REFRESH_FALLBACK_CODE`）：
 /// 收到它说明 `/userapi/v1/refresh` 的签名校验没过，改用 `agent-refresh` 再试一次。
@@ -139,11 +151,52 @@ impl CredentialOrigin {
     }
 }
 
+/// 每小时**强制**刷新的间隔（本次修复；对齐官方 `HOURLY_REFRESH_INTERVAL_MS`）。
+///
+/// ── 为什么需要这个「不看窗口」的刷新 ─────────────────────────
+/// 官方桌面端除了「临期前 5 分钟刷」，还有一条**每小时无条件刷一次**的调度
+/// （`reason: "hourly_forced"`，本机 auth 日志里能看到 `09:12→10:12→11:12`
+/// 这样的整点记录）。它的作用不是「token 快过期了」，而是把 refresh_token
+/// **温着**：AutoClaw 服务端会轮换 refresh_token，长期不用的那一份可能被判定
+/// 失效，此后网关再拿它去刷就是硬失败、只能重新登录。
+///
+/// 网关原先只有「进入 2 分钟窗口才刷」这一条路，而维护任务的间隔是 10 分钟 ——
+/// 窗口比间隔还窄，长期闲置的账号可能连续几天不触发一次刷新。这里补上官方那条
+/// 每小时强制刷新的语义。
+const HOURLY_FORCED_REFRESH_INTERVAL_MS: i64 = 60 * 60 * 1000;
+
+/// 某账号是否到了「每小时强制刷新」的时刻（进程级节流）。
+///
+/// 键是账号记录 id：刷新失败时也要被节流住，否则会退化成每轮维护都打一次上游。
+/// 首次调用即视为「到期」（账号刚出现，刷一次是合理的）。
+///
+/// ── 为什么状态在进程里而不落盘 ──────────────────────────────
+/// 它是「上次刷了没有」的调度状态，不是凭证的一部分：重启后重新计一小时，
+/// 最坏后果只是多重启几次就多刷几次，不会让凭证失效或丢失。
+pub(crate) fn hourly_forced_refresh_due(account_id: &str, now_ms: i64) -> bool {
+    use std::collections::HashMap;
+    static LAST: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    let table = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match table.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.get(account_id) {
+        Some(last) if now_ms.saturating_sub(*last) < HOURLY_FORCED_REFRESH_INTERVAL_MS => false,
+        _ => {
+            guard.insert(account_id.to_string(), now_ms);
+            true
+        }
+    }
+}
+
 impl AutoClawCredentials {
     /// 现在是否需要刷新（源实现 `currentCredentials` 的 `expiring` 判定）。
     ///
     /// `expires_at` 缺失时不刷新：没有依据就说「临期」会让每个请求都去打一次
     /// 刷新接口（源实现同样是 `credentials.expiresAt && ...` 的短路写法）。
+    /// 「判不出过期时间也要定期刷」的兜底走 [`hourly_forced_refresh_due`]，
+    /// 只挂在维护任务那条低频路径上 —— 见那里的说明。
     pub fn is_expiring(&self) -> bool {
         match self.expires_at {
             Some(expires_at) => expires_at - PROACTIVE_REFRESH_MARGIN_MS <= logging::now_ms() as f64,

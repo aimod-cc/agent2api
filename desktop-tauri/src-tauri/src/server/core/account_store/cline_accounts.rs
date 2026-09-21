@@ -701,8 +701,28 @@ impl AccountStore {
             // token（凭证实时读 providers.json），只认 has_token 会把它标成不可用
             Value::Bool(record.enabled() && record.has_credentials()),
         );
-        if let Some(expires) = value.get("expiresAt").filter(|value| !value.is_null()) {
-            out.insert("expiresAt".to_string(), expires.clone());
+        // 有效期：桌面端账号读**实时**值（本次修复），其余用记录里的快照。
+        //
+        // 桌面端账号的记录里**按设计不落 token、也不更新 expiresAt**，用的是
+        // 导入那一刻写下的值。不读实时值的话，账号页会一直显示那个早已过去的
+        // 时间（「已过期」），而转发其实是好的 —— 因为转发链路走
+        // `live_desktop_credentials` 实时读文件。界面与转发看到两个状态，
+        // 用户就会报「token 过期了却不续期」。
+        //
+        // 读不到实时值（客户端没登录 / 文件损坏）时**回落到记录里的快照**：
+        // 这是展示路径，不该因为客户端文件的问题而让整张账号表读不出来。
+        let live_expires = if record.is_desktop() {
+            crate::server::core::account_store::store::live_desktop_credentials(record)
+                .map(|(_, _, expires_at)| expires_at)
+                .filter(|expires_at| *expires_at > 0.0)
+        } else {
+            None
+        };
+        let expires = live_expires
+            .map(Value::from)
+            .or_else(|| value.get("expiresAt").filter(|value| !value.is_null()).cloned());
+        if let Some(expires) = expires {
+            out.insert("expiresAt".to_string(), expires);
         }
         Value::Object(out)
     }

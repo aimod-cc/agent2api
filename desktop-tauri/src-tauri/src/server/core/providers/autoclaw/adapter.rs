@@ -222,9 +222,10 @@ impl ProviderAdapter for AutoClawAdapter {
 
     /// 取可用 access token：**凭证快照 + 临期主动刷新**（源实现 `currentCredentials`）。
     ///
-    /// 临期窗口是 **120 秒**（`credentials::PROACTIVE_REFRESH_MARGIN_MS`，源实现
-    /// `PROACTIVE_REFRESH_MARGIN_MS = 120_000`）—— 与小浣熊的 5 分钟**不同**，
-    /// 照抄 AutoClaw 源项目的值（窗口开大只会更早用掉一次 refresh_token 轮换）。
+    /// 临期窗口是 **5 分钟**（`credentials::PROACTIVE_REFRESH_MARGIN_MS`，对齐官方
+    /// `DESKTOP_REFRESH_AHEAD_MS`）—— 原先是移植源项目的 120 秒，但那个值在官方
+    /// 客户端里配的是 60 秒一轮的扫描，而网关这条判定由 10 分钟一轮的维护任务
+    /// 驱动，2 分钟的窗口会被整轮错过。见常量处的完整说明。
     ///
     /// 账号解析顺序（源实现 `resolveCredentials`）：指定账号 → 账号组内的当前
     /// 账号 → 桌面端实时登录态 → `AUTOCLAW_TOKEN` 环境变量。见
@@ -360,7 +361,7 @@ impl ProviderAdapter for AutoClawAdapter {
         true
     }
 
-    /// 临期判定：取凭证快照，用凭证自己的 `is_expiring()`（2 分钟窗口）与
+    /// 临期判定：取凭证快照，用凭证自己的 `is_expiring()`（5 分钟窗口）与
     /// `can_refresh()` 判一次 —— 与 `ensure_access_token` 里
     /// `refresh::ensure_fresh` 用的是同一对判据。
     ///
@@ -372,12 +373,31 @@ impl ProviderAdapter for AutoClawAdapter {
     ///
     /// 桌面端 / 环境变量来源同理：没有 refreshToken 就返回 false。
     /// 取快照失败（账号不存在 / 凭证不可用）返回 false（见 trait 契约）。
+    ///
+    /// ── 每小时强制刷新（本次修复）───────────────────────────────
+    /// 除了临期窗口，这里还接上官方那条「每小时无条件刷一次」的语义
+    /// （见 `credentials::HOURLY_FORCED_REFRESH_INTERVAL_MS`）：目的不是等 token
+    /// 快过期，而是把 refresh_token 温着 —— AutoClaw 服务端会轮换它，长期闲置
+    /// 的那一份可能被判失效，之后只能重新登录。
+    ///
+    /// 只在**本方法**做、不在 `is_expiring()` 里做：后者被转发链路的
+    /// `ensure_fresh` 每请求调用一次，在那里「每小时强制一次」会退化成
+    /// 「每个请求都刷」。维护任务每 10 分钟才问一次，节流后正好是每小时一次。
     fn credentials_expiring(&self, store: &AccountStore, account_id: &str) -> bool {
         if account_id.is_empty() {
             return false;
         }
         match resolve_credentials(store, account_id) {
-            Ok(credentials) => credentials.can_refresh() && credentials.is_expiring(),
+            Ok(credentials) => {
+                if !credentials.can_refresh() {
+                    return false;
+                }
+                credentials.is_expiring()
+                    || credentials::hourly_forced_refresh_due(
+                        account_id,
+                        crate::server::logging::now_ms(),
+                    )
+            }
             Err(_) => false,
         }
     }
