@@ -1,19 +1,36 @@
 //! 内容脱敏（对照 Node 版 src/workbuddy-desensitize.mjs 全量移植）。
 //!
 //!   engine.rs  纯函数：词表清洗、匹配构造、文本改写、content/messages/body 遍历
+//!   sql.rs     `kv` 表里 `desensitize` 键的行级读写（本模块唯一出现 SQL 的文件）
+//!   state.rs   持久化状态的形态：序列化 / 解析 / 迁移项的两个入口
 //!   mod.rs     状态化：词表读写、默认词表迁移、命中统计（本文件）
 //!
-//! ── 与 Node 版的数据契约 ────────────────────────────────────
-//! 词表持久化在 `{config_dir}/desensitize.json`，字段顺序与缩进**逐字节对齐**
-//! Node 的 `JSON.stringify({enabled,terms,roles,defaultsVersion}, null, 2) + "\n"`
-//! （Agent2API 改造新增 `providers` 键，见下）：两边写出的文件内容完全一致
-//! （serde_json 的 Map 会按字母序输出，所以这里手工拼）。
+//! ── 持久化：`kv` 表的 `desensitize` 键（本切片从 desensitize.json 迁过来）──
+//! 改造前是一整份 JSON 文件 `{config_dir}/desensitize.json`；现在一整份状态
+//! （开关 / 词表 / 角色 / 作用提供商 / 已合并的默认词表版本）就是 `kv` 表的一行，
+//! 读是一次主键查询、写是一条 UPSERT（语句只在 `sql.rs`）。旧文件由
+//! `db::migrate::import_desensitize` 一次性搬入。
+//!
+//! ── 「逐字节对齐 Node 文件格式」这条约束随本次改造消失 ──────────
+//! 改造前那条约束是**真实**的：`desensitize.json` 会被 Node 版与 Rust 版
+//! **交替读写**，字段顺序与缩进飘一格，在对方眼里就是「文件被改过」，所以
+//! 当时的 `serialize_state` 手工拼字符串（`JSON.stringify(x, null, 2) + "\n"`
+//! 的逐字节复刻），连空数组渲染成 `[]` 而不换行都要对齐 —— serde_json 的 Map
+//! 按字母序输出，不能直接用。
+//! 进数据库后这份状态**只被本进程读写**：`kv` 那一行没有第二个读者（排障时
+//! 用 `sqlite3` 看它、改它，而不是让另一个程序去读写它），「格式兼容」不再有
+//! 任何消费者。于是手工拼装整体删除，改用普通序列化（`json!` +
+//! `serde_json::to_string`）：字段顺序变成字母序、缩进消失，都不再有意义。
+//! **保留下来的东西要看清**：五个键名（`enabled` / `terms` / `roles` /
+//! `providers` / `defaultsVersion`）一字不改，`parse_state` 的宽容口径也一字
+//! 不改 —— 迁移项读旧文件与运行期读库里的值走的是**同一份解析实现**，
+//! 于是「迁移前的文件」与「迁移后的库」在行为上不可能分叉。
 //!
 //! ── providers：脱敏的作用提供商（Agent2API 改造 §3.5）────────
-//! `desensitize.json` 新增 `providers: ["workbuddy"]`，取值为 `core::providers`
-//! 注册表里的 provider id。缺省（旧文件没有这个键）按 `["workbuddy"]` 处理 ——
-//! **读侧兜底、不强制写回**：只在用户真的改了配置（或改了词表触发保存）时
-//! 才把键写进文件，不因为「读到旧格式」就改写用户的文件。
+//! 状态里的 `providers: ["workbuddy"]`，取值为 `core::providers` 注册表里的
+//! provider id。缺省（记录里没有这个键）按 `["workbuddy"]` 处理 ——
+//! **读侧兜底、不强制写回**：只在用户真的改了配置（或改了词表触发保存）时才
+//! 把键写进记录，不因为「读到一份缺键的旧记录」就改写它。
 //!
 //! 「转发前要不要脱敏」的**判定**不在本模块的算法里：转发层在**每家 provider
 //! 真正发送前**按作用范围逐家判定（见 `process_body_for_provider`）——
@@ -23,17 +40,25 @@
 //! 句柄内部一把 `RwLock`，克隆共享同一份状态（与 ModelCatalog 同构）。
 //! 硬约束：**热路径不持锁做重活** —— 转发时会话先克隆出 `Arc<TermMatcher>`
 //! 快照再放锁，脱敏计算全程在锁外，最后只在写锁里合并一次计数。
-//! 写盘（低频的用户操作）在写锁内完成，与 Node 单线程下的「改内存 → 写盘」
+//! 持久化（低频的用户操作）在写锁内完成，与 Node 单线程下的「改内存 → 落盘」
 //! 语义等价：不会出现两个并发请求把旧快照写回去的情况。
+//!
+//! **热路径零数据库调用**（改造前是零文件 IO，这条性质必须原样保持）：脱敏发生在
+//! 每个转发的请求体上，词表只在「用户改了配置」时才变，所以 `process_body` /
+//! `process_body_for_provider` 全程只用内存快照（`matcher` 是 `Arc`），不碰 `Db`。
+//! 数据库只在三处出现：构造时读一次（`load`）、用户改配置时写一次
+//! （`save_locked`）、迁移项搬旧文件（`import_legacy`）。
 
 mod engine;
+mod sql;
+mod state;
 
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use serde_json::{json, Value};
 
 use crate::server::core::providers::{DEFAULT_PROVIDER_ID, PROVIDERS};
+use crate::server::db::Db;
 use crate::server::logging;
 
 // 只再导出有实际调用点的符号（ZWSP / VALID_ROLES / desensitize_text /
@@ -42,18 +67,22 @@ use crate::server::logging;
 pub use engine::{
     compile_terms, desensitize_body, normalize_roles, normalize_terms, utf16_len, Counter,
     TermMatcher, DEFAULT_ROLES, DEFAULT_TERM_MIGRATIONS, DEFAULT_TERMS, DEFAULT_TERMS_VERSION,
-    FILE_NAME, MAX_TERM_LENGTH, MAX_TERMS,
+    MAX_TERM_LENGTH, MAX_TERMS,
 };
 /// 词/角色归一化用的 JS trim（删词路径复用，保证「加得进 == 删得掉」）
 use engine::js_trim;
+/// 持久化状态的两个入口（迁移项用；`load` / `save_locked` 也走它们的内部件）
+pub(crate) use state::{import_legacy, legacy_present};
+use state::{parse_state, state_value, PersistedState};
 
 /// 统计快照里 topTerms 的默认条数（对应 Node 的 `statsSnapshot({top = 20})`）
 const TOP_TERMS: usize = 20;
 
-/// 脱敏 json 里的作用提供商键（架构文档 §3.5）
+/// 脱敏 json 里的作用提供商键（架构文档 §3.5）。
+/// **值一字不改**：迁移项读旧文件、`load` 读库里的值都按这个键名取。
 const KEY_PROVIDERS: &str = "providers";
 
-/// 缺省作用提供商（旧文件没有 `providers` 键时按它处理）。
+/// 缺省作用提供商（记录里没有 `providers` 键时按它处理）。
 ///
 /// 取值是 `DEFAULT_PROVIDER_ID`（= workbuddy）而不是另写字面量：
 /// 「老数据默认属于 workbuddy」这条口径在账号迁移与脱敏这里必须是同一个字符串。
@@ -64,8 +93,8 @@ pub fn default_provider_scope() -> Vec<String> {
 /// 作用提供商列表归一：按**注册表顺序**取交集（与 `normalize_roles` 同一手法）。
 ///
 /// 规则：
-///   - 非数组 / 全部项都不认识 → 回落缺省 `["workbuddy"]`（旧文件兜底）；
-///   - 未知 id 静默丢弃（读侧宽容：手改文件写错一个 id 不该让脱敏整体失效）；
+///   - 非数组 / 全部项都不认识 → 回落缺省 `["workbuddy"]`（旧记录兜底）；
+///   - 未知 id 静默丢弃（读侧宽容：手改库里的状态写错一个 id 不该让脱敏整体失效）；
 ///   - 去重（手写 `["workbuddy","workbuddy"]` 不产生重复项）。
 ///
 /// **写接口（`/api/desensitize/providers`）另做严格校验**：未知 id 给 400
@@ -132,7 +161,6 @@ struct Inner {
     matcher: Option<Arc<TermMatcher>>,
     /// 已合并到的默认词表版本（可能带小数：Node 存的是 Number）
     defaults_version: f64,
-    file: PathBuf,
     stats: Stats,
 }
 
@@ -149,21 +177,49 @@ pub struct ProcessOutcome {
     pub term_counts: Vec<(String, usize)>,
 }
 
+/// 转发期入口（[`Desensitizer::process_body_for_provider`]）的返回：
+/// 处理后的请求体副本 + 这一家的命中明细。
+///
+/// ── 为什么把两样打包返回，而不是各给一个方法 ────────────────
+/// 命中明细只在**处理发生的同一瞬间**存在（`process_body` 的返回值里），
+/// 拆成两个方法会让调用方要么处理两遍（词表匹配是热路径上最贵的部分）、
+/// 要么自己把中间结果存起来 —— 那还不如由本模块一次交清。
+/// 结构体也让将来「处理还要额外透出什么」有个自然的落点，不必再改签名。
+pub struct ProcessedBody {
+    /// 处理后的请求体（未勾选的家根本走不到这里，见上面那个方法）
+    pub body: Value,
+    /// 命中的词与次数（按次数降序；空表 = 这一家处理过但一个词都没命中）
+    ///
+    /// 它同时也是「有没有命中」的判据（`is_empty()`），所以不再单给一个
+    /// `Changed` 字段：`changed` 与「`term_counts` 非空」在当前实现里等价
+    /// （`process_body` 只在 `counter.total == 0` 时返回 changed=false），
+    /// 多一个字段就多一处可能对不上的状态。
+    pub term_counts: Vec<(String, usize)>,
+}
+
 /// 脱敏服务句柄：内部一把 `RwLock`，克隆共享同一份状态。
 #[derive(Clone)]
 pub struct Desensitizer {
     inner: Arc<RwLock<Inner>>,
+    /// 统一库句柄。**不参与脱敏计算**（热路径零数据库调用，见模块头），
+    /// 只被构造时的读、用户改配置时的写用到。`None` = 库不可用。
+    db: Option<Db>,
 }
 
 impl Desensitizer {
-    /// 构造脱敏器并读盘（对应 `createDesensitizer({directory, log})`）。
+    /// 构造脱敏器并读库（对应 `createDesensitizer({directory, log})`）。
     ///
-    /// 默认启用（无配置文件时即默认开启），词表为内置默认词表。
-    pub fn new(directory: PathBuf) -> Self {
-        let file = directory.join(FILE_NAME);
+    /// 默认启用（库里还没有这份状态时即默认开启），词表为内置默认词表。
+    ///
+    /// ── 签名为什么从 `new(directory)` 改成接 `Db` ──────────────
+    /// 词表不再有「自己的目录」：状态在统一库 `kv` 表的一行里，路径这件事由
+    /// `Db` 唯一持有（`Db::file()`）。与 `AccountStore::with_db` /
+    /// `LogStore::with_db` / `RequestStats::with_db` 同一形态，四个 store 的
+    /// 构造方式保持一致；`Option<Db>` 也一致（库打不开时仍能构造，只是降级）。
+    pub fn with_db(db: Option<Db>) -> Self {
         let terms: Vec<String> = DEFAULT_TERMS.iter().map(|term| term.to_string()).collect();
-        // 构造即编译一次默认词表：load() 在「没有词表文件」时直接返回，
-        // 若这里留 None，全新用户（还没有 desensitize.json）会静默不脱敏 ——
+        // 构造即编译一次默认词表：load() 在「库里还没有这份状态」时直接返回，
+        // 若这里留 None，全新用户（还没保存过词表）会静默不脱敏 ——
         // Node 版是把 compileTerms 放在闭包初始化里，行为等价
         let matcher = Self::rebuild(&terms);
         let service = Self {
@@ -171,23 +227,37 @@ impl Desensitizer {
                 enabled: true,
                 terms,
                 roles: DEFAULT_ROLES.iter().map(|role| role.to_string()).collect(),
-                // 全新用户（还没有 desensitize.json）：作用范围就是 workbuddy
+                // 全新用户（库里还没有这份状态）：作用范围就是 workbuddy
                 // （等于改造前的实际行为 —— 那时只有 workbuddy 一个上游）
                 providers: default_provider_scope(),
                 matcher,
-                // 已合并到的默认词表版本：无配置文件（新用户）时直接视为最新，无需迁移
+                // 已合并到的默认词表版本：没有记录（新用户）时直接视为最新，无需迁移
                 defaults_version: DEFAULT_TERMS_VERSION as f64,
-                file,
                 stats: Stats::default(),
             })),
+            db,
         };
         service.load();
         service
     }
 
-    /// 词表文件完整路径（界面展示用）
-    pub fn file(&self) -> PathBuf {
-        self.with_read(|guard| guard.file.clone())
+    /// 词表数据所在的文件（**就是库文件**；界面展示用）。
+    ///
+    /// 语义从「词表文件路径」变成「装着这份状态的库文件」—— 与 T2~T5 对
+    /// `AccountStore::file()` / `LogStore::file()` / `RequestStats::request_file()`
+    /// / `debug_traffic::file()` 的处理一致。前端 `ui/desensitize-panel.js` 直接
+    /// 把这个字符串显示成「词表保存在 …」，进库后正确的说法就是库路径。
+    ///
+    /// 库不可用时给约定路径（而不是 `Option`）：与 `LogStore::file()` 同一取舍 ——
+    /// 本方法的返回类型是被两个调用方（`api::desensitize` 的 `state().file` 与
+    /// 启动日志）直接 `.display()` 的 `PathBuf`，改成 `Option` 会让它们各自
+    /// 编一套「没有路径时显示什么」。约定路径是**排障时该看的地方**，即使本次
+    /// 运行库没打开，那句话也仍然指向正确的文件（用户据此知道去哪找）。
+    pub fn file(&self) -> std::path::PathBuf {
+        match self.db.as_ref() {
+            Some(db) => db.file().to_path_buf(),
+            None => crate::server::config::config_dir().join(crate::server::db::FILE_NAME),
+        }
     }
 
     /// 只读访问内部状态。锁中毒（持锁 panic）时接管内部数据继续用 ——
@@ -205,23 +275,43 @@ impl Desensitizer {
         compile_terms(terms).map(Arc::new)
     }
 
-    // ─── 读盘 / 写盘 / 迁移 ─────────────────────────────────
+    // ─── 读库 / 写库 / 默认词表迁移 ─────────────────────────
 
-    /// 读词表文件并做默认词表迁移（对应 Node 的 load()）。
+    /// 读状态并做默认词表迁移（对应 Node 的 load()）。
     ///
-    /// 文件不存在时**什么都不做**：保持默认词表与默认启用态，也不打日志
-    /// （Node 同样直接 return，启动日志只在真有文件时出现）。
+    /// 库里没有这个键时**什么都不做**：保持默认词表与默认启用态，也不打日志
+    /// （Node 同样直接 return，启动日志只在真有状态记录时出现）。
+    ///
+    /// ── 为什么解析逻辑在 `parse_state`（而它同时被迁移项调用）──────
+    /// 「一份状态记录长什么样、哪些值要宽容」是**数据契约**：迁移项读旧文件、
+    /// 运行期读库里的值，两处必须得到完全一致的结果。各写一份解析迟早分叉，
+    /// 分叉的后果是「同一个词表，经迁移落库与直接读库得到不同的行为」
+    /// （与 T4 的 `parse_*`、T5 的 `parse_legacy_jsonl` 同一取舍）。
     fn load(&self) {
-        let file = self.file();
-        let Ok(text) = std::fs::read_to_string(&file) else {
+        let Some(db) = self.db.as_ref() else {
             return;
         };
-        let parsed: Value = match serde_json::from_str(&text) {
-            Ok(value) => value,
+        let text = match db.with(sql::load_text) {
+            Some(Ok(Some(text))) => text,
+            // 没有这个键 = 全新用户 / 还没保存过，保持默认态
+            Some(Ok(None)) | None => return,
+            Some(Err(error)) => {
+                // 读失败只回退、不清空：当前内存里还是内置默认词表，
+                // 接下来 migrate_defaults 也不会把用户的状态写坏
+                logging::log(
+                    "[Desensitize]",
+                    &format!("词表读取失败，回退默认词表: {error}"),
+                );
+                return;
+            }
+        };
+        let state = match parse_state(&text) {
+            Ok(state) => state,
             Err(error) => {
-                // 解析失败只回退、不清空：当前内存里还是内置默认词表，
-                // 加下来 migrate_defaults 也不会把用户的文件写坏
-                logging::log("[Desensitize]", &format!("词表读取失败，回退默认词表: {error}"));
+                logging::log(
+                    "[Desensitize]",
+                    &format!("词表读取失败，回退默认词表: {error}"),
+                );
                 return;
             }
         };
@@ -230,23 +320,7 @@ impl Desensitizer {
             let Ok(mut guard) = self.inner.write() else {
                 return;
             };
-            if let Some(flag) = parsed.get("enabled").and_then(Value::as_bool) {
-                guard.enabled = flag;
-            }
-            if let Some(items) = parsed.get("terms").and_then(Value::as_array) {
-                guard.terms = normalize_terms(&string_list(items));
-            }
-            if let Some(items) = parsed.get("roles") {
-                guard.roles = normalize_roles(Some(items));
-            }
-            // providers：旧文件没有这个键 → normalize_providers 回落缺省
-            // （**读侧兜底、不写回**：不因为读到旧格式就改写用户的文件，
-            //  见模块头「providers」一节）
-            guard.providers = normalize_providers(parsed.get(KEY_PROVIDERS));
-            // 老版本写出的文件没有该字段，视为版本 1（只有初版默认词表）
-            let version = js_number(parsed.get("defaultsVersion").unwrap_or(&Value::Null));
-            guard.defaults_version = if version >= 1.0 { version } else { 1.0 };
-            guard.matcher = Self::rebuild(&guard.terms);
+            apply_state(&mut guard, state);
             (guard.terms.len(), guard.enabled)
         };
         self.migrate_defaults();
@@ -261,10 +335,10 @@ impl Desensitizer {
     }
 
     /// 默认词表补词迁移（一次性）：把 defaults_version 之后各版本登记的新默认词条
-    /// 补进当前词表。只在 load() 里、读盘之后调用。
+    /// 补进当前词表。只在 load() 里、读状态之后调用。
     ///
-    /// 合并完无论是否真的补了词，都把版本标记推进到最新并落盘，避免每次启动
-    /// 重复比对、重复写盘。用户主动删掉的词条不会被补回：这里只处理
+    /// 合并完无论是否真的补了词，都把版本标记推进到最新并落库，避免每次启动
+    /// 重复比对、重复写库。用户主动删掉的词条不会被补回：这里只处理
     /// 「比用户已合并版本更新」的登记词条（对照 Node 的 migrateDefaults）。
     fn migrate_defaults(&self) {
         let current = self.with_read(|guard| guard.defaults_version);
@@ -319,33 +393,54 @@ impl Desensitizer {
         );
     }
 
-    /// 写盘（对应 Node 的 save()）。调用方必须持有写锁 —— 这样并发保存是
+    /// 落库（对应 Node 的 save()）。调用方必须持有写锁 —— 这样并发保存是
     /// 串行的，不会出现「旧快照覆盖新快照」。失败只打日志、不影响请求。
     ///
-    /// 缩进与字段顺序按 Node 的 `JSON.stringify(x, null, 2) + "\n"` 手工拼，
-    /// 详见 `serialize_state`。
+    /// ── 日志为什么在锁外打（这是本方法最容易改错的地方）────────
+    /// `db.with` 拿的是**全局唯一那把连接锁**，而 `logging::log` 的入库那一路
+    /// 要往同一个库 `append` 一条日志（`logs` 表），它会再去取同一把锁 ——
+    /// `std::sync::Mutex` 不可重入，**在闭包里打日志等于当场死锁**。
+    /// 所以这里只在闭包内取得 `Result`，出了闭包再按结果打日志
+    /// （`logs_store/sql.rs` 模块头与各 store 的「硬约束」说的都是这条）。
+    ///
+    /// 闭包内还**只做数据库写**、不打印任何东西：`eprintln!` 虽然不碰库，
+    /// 但把它放进去会让「锁内到底做了什么」需要逐行核对，不如统一移出。
     fn save_locked(&self, inner: &Inner) -> bool {
-        // file = 目录.join(FILE_NAME)，parent 必然存在；真取不到就按配置目录兜底
-        let dir = match inner.file.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-            _ => crate::server::config::config_dir(),
-        };
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            logging::log("[Desensitize]", &format!("词表保存失败: {error}"));
+        let Some(db) = self.db.as_ref() else {
+            // 库不可用：内存状态照改（本次运行内生效），持久化静默失败。
+            // 与改造前「写文件失败」的处理一致 —— 失败只影响「重启后还在不在」，
+            // 不该让正在跑的请求或被改的配置报错。
             return false;
-        }
-        let text = serialize_state(
+        };
+        let text = match serde_json::to_string(&state_value(
             inner.enabled,
             &inner.terms,
             &inner.roles,
             &inner.providers,
             inner.defaults_version,
-        );
-        if let Err(error) = std::fs::write(&inner.file, text) {
-            logging::log("[Desensitize]", &format!("词表保存失败: {error}"));
-            return false;
+        )) {
+            Ok(text) => text,
+            // Value 序列化失败在实践中不可达（没有非字符串键、没有 NaN 以外的
+            // 非法值），留一条明确的分支而不是 unwrap
+            Err(error) => {
+                logging::log(
+                    "[Desensitize]",
+                    &format!("词表保存失败: 序列化失败（{error}）"),
+                );
+                return false;
+            }
+        };
+        match db.with(|conn| sql::save(conn, &text)) {
+            Some(Ok(())) => true,
+            Some(Err(error)) => {
+                logging::log("[Desensitize]", &format!("词表保存失败: {error}"));
+                false
+            }
+            None => {
+                logging::log("[Desensitize]", "词表保存失败: 数据库不可用");
+                false
+            }
         }
-        true
     }
 
     // ─── 主入口：处理一次入站请求体 ─────────────────────────
@@ -400,7 +495,7 @@ impl Desensitizer {
     ///   - provider 不在作用范围内 → 返回 None：调用方用**客户端原始请求体**，
     ///     既不处理也不计数（未勾选的提供商不会多记命中）；
     ///   - 在范围内 → 用现有 [`Self::process_body`] 处理**副本**并打命中日志，
-    ///     返回处理后的副本（原始 body 不被改动）。
+    ///     返回 [`ProcessedBody`]（处理后的副本 + 命中明细）。
     ///
     /// `scope` 是**本次请求**的作用范围快照（调用方在请求开始时用
     /// [`Self::provider_scope`] 取一次），于是同一次请求里各家 provider 的判定
@@ -408,12 +503,22 @@ impl Desensitizer {
     ///
     /// 本方法只做「范围判定 + 调用现有处理 + 打日志」这三件事：词表、匹配与
     /// 改写算法全在 engine.rs，未做任何改动。
+    ///
+    /// ── 返回值为什么从 `Option<Value>` 变成 `Option<ProcessedBody>` ──
+    /// `process_body` 早就算出了 `term_counts`（按次数降序的每词命中数），
+    /// 但改造前只有**聚合统计**（`stats.term_hits` 里跨请求累加的那一份）与
+    /// 一行日志消费它 —— 逐条请求的「这次命中了哪些词」当场就丢了。
+    /// 于是请求日志那边只能显示一个「命中了敏感词」的布尔事实，
+    /// 用户看到命中却不知道命中了什么（要去设置页的聚合统计里反推，
+    /// 而那里面混着所有请求的累计值）。
+    /// 把这份明细原样带出来交给转发层，让它顺手记进请求日志 ——
+    /// **不改任何判定与改写逻辑**，只是不再把已经算出来的结果扔掉。
     pub fn process_body_for_provider(
         &self,
         provider_id: &str,
         scope: &[String],
         body: &Value,
-    ) -> Option<Value> {
+    ) -> Option<ProcessedBody> {
         // 作用范围是 provider id 的精确匹配（与注册表里的 id 同一字符串）
         if !scope.iter().any(|item| item == provider_id) {
             return None;
@@ -423,7 +528,12 @@ impl Desensitizer {
         if outcome.changed {
             logging::log("[Desensitize]", &hit_log_line(&outcome));
         }
-        Some(processed)
+        Some(ProcessedBody {
+            body: processed,
+            // 未命中时 `term_counts` 是空表（`process_body` 的 unchanged 分支），
+            // 于是「处理过但没命中」与「命中了」在调用侧可以用 `is_empty()` 分开
+            term_counts: outcome.term_counts,
+        })
     }
 
     /// 累加一次请求的统计（对应 Node 里 `stats.*` 的几处自增）
@@ -461,7 +571,13 @@ impl Desensitizer {
     ///
     /// `providers` 是 Agent2API 改造新增的字段（作用提供商，架构文档 §3.5）：
     /// 与 terms/roles 同级透出，前端设置页的「作用提供商」多选直接读它。
+    ///
+    /// `file` 现在报的是**库文件路径**（`file()` 的说明）：字段名与位置一字不改
+    /// （前端 `ui/desensitize-panel.js` 直接读它塞进「词表保存在 …」那一行）。
+    /// 它在闭包外取：`file()` 读的是 `Db` 而不是 `Inner`，不占这把读锁，也就不必
+    /// （也不该）在持锁期间再去做一次与状态无关的取值。
     pub fn state(&self) -> Value {
+        let file = self.file().to_string_lossy().to_string();
         self.with_read(|guard| {
             json!({
                 "enabled": guard.enabled,
@@ -476,7 +592,7 @@ impl Desensitizer {
                     "providers": default_provider_scope(),
                     "version": DEFAULT_TERMS_VERSION,
                 },
-                "file": guard.file.to_string_lossy(),
+                "file": file,
                 "stats": guard.stats.snapshot(),
             })
         })
@@ -634,121 +750,89 @@ fn hit_log_line(outcome: &ProcessOutcome) -> String {
 /// 句柄本身是 `Clone` 的轻量 Arc，ServerState 里那份与全局这份是**同一实例**。
 static GLOBAL: OnceLock<Desensitizer> = OnceLock::new();
 
-/// 初始化进程级脱敏器并读盘（启动时调用一次，幂等）。
-pub fn init(directory: &Path) -> Desensitizer {
-    let service = Desensitizer::new(directory.to_path_buf());
+/// 初始化进程级脱敏器并读库（启动时调用一次，幂等）。
+///
+/// ── 签名为什么从 `init(directory)` 改成接 `Db` ──────────────
+/// 与 `Desensitizer::with_db` 同一条理由：状态在统一库里，目录参数不再有任何
+/// 消费者。调用点 `ServerState::bootstrap` 手里就是那个 `Option<Db>`（先 `clone`
+/// 传给日志库与报文存储，这里再传一份 —— `Db` 是 `Arc` 句柄，克隆共享同一连接）。
+/// `Option` 的语义：打不开库时脱敏器照常装起来（用默认词表与默认开关），
+/// 只是改配置落不了库 —— 「库的问题不该让转发不可用」。
+pub fn init(db: Option<Db>) -> Desensitizer {
+    let service = Desensitizer::with_db(db);
     let _ = GLOBAL.set(service.clone());
     service
 }
 
-/// 取进程级脱敏器；未初始化时用配置目录即时构造一份（保证任何调用顺序都不 panic）。
+/// 取进程级脱敏器；未初始化时即时构造一份（保证任何调用顺序都不 panic）。
+///
+/// 兜底那份**没有库句柄**：它取默认词表与默认开关，改配置只在内存里生效
+/// （`save_locked` 在 `db` 为 `None` 时返回 false）。这个分支只会在
+/// 「`bootstrap` 还没跑到脱敏初始化、转发层就被人调到」时出现，而正常启动顺序
+/// 下 `init` 总是先跑；给它一个约定路径去读写库反而更危险（那会绕过 `Db` 的
+/// 单连接约定，凭空多出第二个连接）。
 pub fn global() -> Desensitizer {
     if let Some(service) = GLOBAL.get() {
         return service.clone();
     }
-    let service = Desensitizer::new(crate::server::config::config_dir());
+    let service = Desensitizer::with_db(None);
     let _ = GLOBAL.set(service.clone());
     service
 }
 
-// ─── 文件格式与 JS 数值语义 ─────────────────────────────────
-
-/// 从 JSON 数组里取字符串项（对应 normalizeTerms 的 `typeof raw !== 'string'`
-/// 过滤：非字符串项直接跳过，不报错）。
-fn string_list(items: &[Value]) -> Vec<String> {
-    items
-        .iter()
-        .filter_map(|item| item.as_str().map(str::to_string))
-        .collect()
-}
-
-/// JS `Number(x)` 语义：null/非法 → NaN，布尔 → 0/1，字符串走 JS 数字语法
-/// （空串与纯空白都是 0）。只用于 defaultsVersion 这一处比较，无需完整实现。
-fn js_number(value: &Value) -> f64 {
-    match value {
-        Value::Number(number) => number.as_f64().unwrap_or(f64::NAN),
-        Value::Bool(flag) => {
-            if *flag {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        Value::Null => f64::NAN,
-        Value::String(text) => {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return 0.0;
-            }
-            trimmed.parse::<f64>().unwrap_or(f64::NAN)
-        }
-        Value::Array(_) | Value::Object(_) => f64::NAN,
-    }
-}
-
-/// 按 JS `JSON.stringify(value, null, 2)` 的格式序列化词表文件。
+/// 重读库里的状态并替换内存快照（**数据迁移跑完之后**由调用点补一次）。
 ///
-/// 手工拼而不是用 serde_json：Map 会按字母序输出，而文件顺序是
-/// `enabled / terms / roles / providers / defaultsVersion`（`providers` 是
-/// Agent2API 改造新增的键，插在 roles 之后、版本号之前）—— 文件会被用户与
-/// 排障脚本直接打开看，字段顺序与缩进必须逐字节一致才能叫「格式兼容」。
-fn serialize_state(
-    enabled: bool,
-    terms: &[String],
-    roles: &[String],
-    providers: &[String],
-    version: f64,
-) -> String {
-    let mut out = String::with_capacity(64 + terms.len() * 16);
-    out.push_str("{\n");
-    out.push_str(&format!("  \"enabled\": {enabled},\n"));
-    push_string_array(&mut out, "terms", terms);
-    out.push_str(",\n");
-    push_string_array(&mut out, "roles", roles);
-    out.push_str(",\n");
-    push_string_array(&mut out, KEY_PROVIDERS, providers);
-    out.push_str(",\n");
-    out.push_str(&format!(
-        "  \"defaultsVersion\": {}\n",
-        js_number_text(version)
-    ));
-    out.push_str("}\n");
-    out
+/// ── 为什么需要它（与 `config::reload` 同一条理由）─────────────
+/// 本模块的状态是**启动时读一次库、之后只吃内存快照**的（热路径零数据库调用，
+/// 见模块头）。而用户点「升级」导入旧数据这件事发生在启动**之后** ——
+/// 那时 `init` 早就跑完了，内存里装的还是「库里什么都没有」时的默认词表。
+/// 不重载的后果很具体：用户升级前配的词表进不了内存，脱敏按**默认词表**跑，
+/// 界面上显示的还是默认词条（用户会以为自己的词表在升级里丢了）。
+///
+/// ── 为什么不能改用 `set_terms` 之类的写入口 ──────────────────
+/// 那些入口的语义是「把这份词表写回库」（`save_locked`）。拿当前内存里的默认
+/// 词表去写，正好**覆盖掉刚导进来的用户词表** —— 那是不可逆的数据破坏。
+/// 重载必须是「读库 → 装进内存」这一个方向，所以单独一个入口。
+///
+/// ── 与 `init` 的关系 ────────────────────────────────────────
+/// `init` 的 `OnceLock::set` 在已初始化时是**空操作**（保留旧实例），所以它
+/// 做不到重载；而 `GLOBAL` 里的句柄是 `Clone` 的轻量 Arc，`load()` 又是
+/// 「读库 → 应用状态」的完整实现，直接复用它即可。
+///
+/// 未初始化时**什么都不做**（`GLOBAL` 为空 = 正常启动顺序下还没跑到脱敏初始化，
+/// 而那时也没有「升级后需要重载」这回事 —— 迁移由界面按钮触发，必然在初始化
+/// 之后）。这里不去 `with_db(None)` 造一个兜底实例：那会让真正的 `init` 之后
+/// 拿不到它（`OnceLock` 已被占），反而制造出一个没有库句柄的脱敏器。
+pub fn reload() {
+    if let Some(service) = GLOBAL.get() {
+        service.load();
+    }
 }
 
-/// 追加一个字符串数组字段（JS 的空数组渲染成 `[]`，不换行）
-fn push_string_array(out: &mut String, key: &str, items: &[String]) {
-    if items.is_empty() {
-        out.push_str(&format!("  \"{key}\": []"));
-        return;
+// ─── 状态形态与 JS 数值语义（在 state.rs）──────────────────
+//
+//   这里的「一份状态记录长什么样、怎么解析、怎么序列化」以及迁移项用的两个
+//   入口（`legacy_present` / `import_legacy`）都在 `state.rs` —— 那组函数不依赖
+//   任何句柄，运行期与迁移项两边共用同一份实现（理由见该文件模块头）。
+
+/// 把解析出的状态施加到一个 `Inner` 上（`load` 用）。
+///
+/// 「缺项保持当前值」这条口径在这里落地：`enabled` / `terms` 是 `Option`（`None`
+/// 时**不动**当前值，而不是清空词表或强行打开开关）；`roles` / `providers` 交给
+/// normalize 自己兜底（它们对非数组本来就有回落默认的实现）。
+fn apply_state(guard: &mut Inner, state: PersistedState) {
+    if let Some(flag) = state.enabled {
+        guard.enabled = flag;
     }
-    out.push_str(&format!("  \"{key}\": [\n"));
-    for (index, item) in items.iter().enumerate() {
-        out.push_str("    ");
-        out.push_str(&json_string(item));
-        if index + 1 < items.len() {
-            out.push(',');
-        }
-        out.push('\n');
+    if let Some(terms) = state.terms {
+        guard.terms = terms;
     }
-    out.push_str("  ]");
+    guard.roles = normalize_roles(state.roles.as_ref());
+    // providers：记录里没有这个键 → normalize_providers 回落缺省
+    // （**读侧兜底、不写回**：不因为读到一份缺键的旧记录就改写它，
+    //  见模块头「providers」一节）
+    guard.providers = normalize_providers(state.providers.as_ref());
+    guard.defaults_version = state.defaults_version;
+    guard.matcher = Desensitizer::rebuild(&guard.terms);
 }
 
-/// JS `JSON.stringify(字符串)` 的转义规则（与 serde_json 对普通文本一致：
-/// 只转义 `"` `\` 与控制字符，不转义 `/` 与非 ASCII）
-fn json_string(value: &str) -> String {
-    serde_json::to_string(&Value::String(value.to_string()))
-        .unwrap_or_else(|_| "\"\"".to_string())
-}
-
-/// JS 数字转文本：整数不带小数点（`JSON.stringify(2)` → "2"），
-/// 其它走 f64 的短表示；NaN/Infinity 在 JSON 里是 null。
-fn js_number_text(value: f64) -> String {
-    if !value.is_finite() {
-        return "null".to_string();
-    }
-    if value.fract() == 0.0 && value.abs() < 9.007_199_254_740_992e15 {
-        return format!("{}", value as i64);
-    }
-    format!("{value}")
-}

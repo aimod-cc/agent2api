@@ -17,7 +17,7 @@
 //! ── 映射的候选链展开（modelRules.mappings，照抄 OmniProxy）────
 //! `route_for_forward` 在本名承载家之后**追加**各映射条目的提供商（同一家去重）：
 //!   - 带 `provider` 的条目 → 直接追加该家（发送时 model 用该条目的 target，
-//!     改写见 `catalog::wire_model_for_provider`）；
+//!     改写见 `catalog::wire_target_for_provider`）；
 //!   - 旧版无 `provider` 的条目 → 追加「承载 target 的所有家」（与升级前的
 //!     「改写后路由」逐字等价，见 `model_rules` 模块头的兼容说明）。
 //! 顺序语义：本名承载家（注册表序）→ 各映射条目按配置顺序。账号全局优先级

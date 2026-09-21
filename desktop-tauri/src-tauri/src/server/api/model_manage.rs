@@ -1,11 +1,18 @@
 //! 模型管理 API（模型管理页）：
 //!
-//! - `GET  /api/models/manage`          → `{models, mappings}`（含禁用 / 隐藏条目）
+//! - `GET  /api/models/manage`          → `{models, mappings, reasoningLevels}`（含禁用 / 隐藏条目）
 //! - `POST /api/models/state`           `{id, enabled?, hidden?}` 启停 / 隐藏（删除）/ 恢复
-//! - `POST /api/models/mappings`        `{alias, target}` 新增映射（同名 alias 覆盖）
+//! - `POST /api/models/mappings`        `{alias, target, reasoning?}` 新增映射 / 改思考等级
 //! - `POST /api/models/mappings/remove` `{alias, target, provider?}` 删除映射
 //!
-//! 写接口都返回最新的 `{models, mappings}`，前端就地重绘、不必再拉一次。
+//! 写接口都返回最新的 `{models, mappings, reasoningLevels}`，前端就地重绘、不必再拉一次。
+//!
+//! `reasoning` 是「照抄 OmniProxy 的手动思考等级绑定」（表见
+//! `model_rules::REASONING_LEVELS`，随 manage 响应一并发给前端，前端不自己
+//! 抄一份）。**绑定已接入转发**：等级跟着它所在的那条映射走，由承载那家的
+//! 适配器翻译成本家上游认识的档位字段（各家的规则与「哪些情况故意不注入」见
+//! `model_rules::reasoning` 的模块头）。接口形状与转发无关 —— 转发侧读的是
+//! `ModelRules` 里的同一条映射，这里一行都不用改。
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -94,11 +101,21 @@ pub async fn set_state(State(state): State<ServerState>, body: Bytes) -> Respons
 
 /// POST /api/models/mappings
 ///
-/// 新增映射（照抄 OmniProxy 的模型映射）：`{alias, target, provider?}`。
+/// 新增映射（照抄 OmniProxy 的模型映射）：`{alias, target, provider?, reasoning?}`。
 /// `alias` 是对外名，**自由命名** —— 允许与任何上游模型 id 同名（同名时该
 /// 上游的原生路由仍然优先，映射是追加的兜底路）；同一 alias 可以在不同提供商
 /// 各建一条，路由时一起进候选链主备切换。`provider` 是 target 所属的家；
 /// 旧版前端不传（全局语义：由所有承载 target 的家接收），行为不变。
+///
+/// ── `reasoning` 的三态（与 `provider` 的二态写法不同，别简写）──────
+/// 前端在**改已有映射的等级**时走的也是这条接口（三元组相同 = 命中同一条），
+/// 所以「请求体里有没有这个键」必须能被区分出来：
+///   - 键**缺失**     → `None`，不动已有的等级（旧前端与老调用点的行为）；
+///   - 键给空串/null  → `Some(None)`，显式清成「不覆盖」；
+///   - 键给字符串     → `Some(Some(x))`，设成 x（表外自定义值也放行，
+///                       由 `model_rules::normalize_reasoning` 只做长度约束）。
+/// 一律按「空 = 清空」处理会让旧前端（它不传这个键）每次建映射都把可能存在的
+/// 绑定顺手清掉 —— 那是静默的数据丢失。
 pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Response {
     let object = match body_object(&body) {
         Ok(object) => object,
@@ -121,12 +138,34 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
             return errors::management_error(400, format!("未知的提供商: {kind}"));
         }
     }
-    model_rules::add_mapping(&alias, &target, provider_opt);
+    // 思考等级的三态见函数头；超长的值在这里就拒掉（落盘前拦截，不留一条
+    // 读回来会被 `normalize_reasoning` 丢掉的脏数据）
+    let reasoning = match object.get("reasoning") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            if text.is_empty() {
+                Some(None)
+            } else if model_rules::normalize_reasoning(text).is_none() {
+                return errors::management_error(400, "思考等级过长（最多 32 个字符）");
+            } else {
+                Some(Some(text))
+            }
+        }
+        Some(_) => return errors::management_error(400, "reasoning 必须是字符串或 null"),
+    };
+    model_rules::add_mapping(&alias, &target, provider_opt, reasoning);
     let subject = match provider_opt {
         Some(name) => format!("{alias} → {target}（{name}）"),
         None => format!("{alias} → {target}"),
     };
-    logging::log("[Models]", &format!("新增映射 {subject}"));
+    // 日志把等级一并写出来（改等级走的也是这条接口，不说出来日志里看不出区别）
+    let reasoning_text = match reasoning.flatten() {
+        Some(level) => format!("，思考等级 {level}"),
+        None => String::new(),
+    };
+    logging::log("[Models]", &format!("保存映射 {subject}{reasoning_text}"));
     ok_json(catalog::manage_view(state.store()))
 }
 

@@ -25,6 +25,8 @@
 //!                        路由见 `api::scheduled_tasks`）
 //!   usage_query.rs       余额 / 积分查询（目标集合解析 + 跨账号并发 + 定时那一轮的
 //!                        结果快照；查询逻辑在 core 是为了让手动与定时共用一份）
+//!   key_scope.rs         本次请求命中的网关 Key 及其可用提供商 / 可用模型限制
+//!                        （R9；中间件放入请求扩展，handler 与转发层读出）
 //!   update/              软件更新（版本/出网/下载状态机）（workbuddy-update.mjs）
 //!
 //! ── 模型清单的三个层次（Agent2API 改造 W2a-T2）─────────────
@@ -50,6 +52,7 @@ pub mod debug_traffic;
 pub mod desensitize;
 pub mod egress;
 pub mod endpoints;
+pub mod key_scope;
 pub mod login;
 pub mod model_rules;
 pub mod models;

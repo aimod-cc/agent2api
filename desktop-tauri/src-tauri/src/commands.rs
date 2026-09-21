@@ -273,23 +273,6 @@ pub async fn cancel_login(app: AppHandle) -> Result<Value, String> {
     Ok(json!({ "canceled": true }))
 }
 
-/// 弹系统目录选择框（更改数据保存位置用），返回所选目录的绝对路径。
-#[tauri::command]
-pub fn pick_directory(app: AppHandle, title: Option<String>) -> Result<Value, String> {
-    let mut dialog = app.dialog().file();
-    let title = title.as_deref().unwrap_or("").trim();
-    if !title.is_empty() {
-        dialog = dialog.set_title(title);
-    }
-    let Some(target) = dialog.blocking_pick_folder() else {
-        return Ok(json!({ "canceled": true }));
-    };
-    let path = target
-        .into_path()
-        .map_err(|error| format!("所选路径无效: {error}"))?;
-    Ok(json!({ "path": path.to_string_lossy() }))
-}
-
 /// 导出运行日志：拉取 JSONL 原文，弹系统保存框落盘。
 #[tauri::command]
 pub async fn export_logs(app: AppHandle) -> Result<Value, String> {

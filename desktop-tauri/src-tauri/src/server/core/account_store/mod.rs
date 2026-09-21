@@ -1,16 +1,23 @@
 //! 账号存储（对照 Node 版 src/workbuddy-account-store.mjs 全量移植）。
 //!
-//! 持久化文件 `{config_dir}/accounts.json`：
-//!   `{ accounts: [{ id, provider, name, uid, nickname, type, enterpriseId,
+//! ── 持久化：SQLite `accounts` 表（本切片从 accounts.json 迁过来）────
+//! 数据落在 `{config_dir}/agent2api.db` 的 `accounts` 表里（表结构见
+//! `server/db/schema.rs`）。每条记录一行，`data` 列存**整条账号记录的 JSON
+//! 原文**（下面不变量 1 的实现方式），另有 `id` / `provider` / `priority` /
+//! `enabled` / `added_at` 五列是从 JSON 派生的**查询投影**（排序/筛选/唯一性
+//! 校验用），派生规则与读写粒度见 `sql.rs` 的模块头。
+//! 记录形状不变，仍是：
+//!   `[{ id, provider, name, uid, nickname, type, enterpriseId,
 //!     enterpriseName, accessToken, refreshToken, expiresAt, refreshExpiresAt,
 //!     domain, tokenTail, prefixPath, endpoint, platform, edition, addedAt,
-//!     updatedAt, priority, enabled, proxy, rateLimits: { [modelId]: {...} } }] }`
+//!     updatedAt, priority, enabled, proxy, rateLimits: { [modelId]: {...} } }]`
 //!
 //! ── 三条不变量（改代码前务必读）──────────────────────────────
 //!   1. **未知字段全量保留**：账号记录用强类型字段 + `extra` 兜底，写回时合并。
 //!      用户升级时绝不能丢账号里的任何字段（旧版遗留的 currentAccountId、
 //!      手工加的备注、未来版本新增的字段都在这条兜底里）。
 //!      新增的 `provider` 是**已知字段**，同样不许在重建记录时丢掉。
+//!      数据库形态下这条落在 `data` 列的「整条 JSON 原文」上。
 //!   2. **优先级全局唯一**（所有提供商共用一条队列）：数值小的先用（主备式）。
 //!      写入侧冲突一律拒绝（409），启动时对既有数据做一次性迁移
 //!      （`migrate_startup`：旧版按家分队的号码按旧顺序合并成全局队列 + 去重）。
@@ -34,16 +41,24 @@
 //! 添加与导入路径）仍按 id 判定，那属于「这一家的特殊实现」而非白名单。
 //!
 //! ── 并发模型 ──────────────────────────────────────────────
-//! Node 版是单线程事件循环；这里整个 store 用一把 `std::sync::Mutex` 包住
-//! 全部状态与文件读写，锁粒度不精细但语义等价。硬约束：**持锁期间绝不做
-//! 网络请求**（会阻塞所有管理 API）—— 需要出网的调用（token 刷新、积分查询）
-//! 一律先在锁内取出快照，释放锁后再发请求，回头再单独写回。
+//! Node 版是单线程事件循环；这里整个 store 用一把 `std::sync::Mutex` 串行化
+//! 整个「读-改-写」周期，锁粒度不精细但语义等价。它保护的**不是文件**了：
+//! 以前是「整份文件读-改-写」，现在是「数据库上的一次读改写周期」——账号层的
+//! 「读一条 → 在 Rust 里改 → 写回」跨了多条语句，SQLite 的事务管不到这段
+//! （"改"发生在 Rust 内存里），所以这把锁仍然必需（详见 `store.rs` 的说明）。
+//! 硬约束：**持锁期间绝不做网络请求**（会阻塞所有管理 API）—— 需要出网的调用
+//! （token 刷新、积分查询）一律先在锁内取出快照，释放锁后再发请求，回头再
+//! 单独写回。
 //!
 //! 子模块分工（对照 Node 版的单文件拆分）：
 //!   priority.rs  优先级号段规则（归一/排序/找号/整队，按 provider 分组使用）
 //!   state.rs     记录结构（JSON 原样持有 + 容错访问器 + 磁盘形态 + provider 分组工具）
+//!   sql.rs       行级 SQL 访问层：一行 ↔ StoredAccount 的编解码、按需查询、
+//!                单行增删改与整份状态的差异写入（本模块唯一出现 SQL 的文件）
 //!   store_util.rs JS 语义工具（`x || y` / `Number(x)` / `JSON.stringify` 比较…）
-//!   store.rs     AccountStore 句柄：打开/锁/读写、当前账号派生、公开形态、provider 摘要
+//!   store.rs     AccountStore 句柄：打开/锁/连接、装载与保存、当前账号派生、
+//!                按 id / provider 的按需读取
+//!   store_view.rs 公开形态（各家形状分派 + 跨家事实注入）、列表快照、provider 摘要
 //!   store_crud.rs 增删改查（add/remove/promote/update/move 与 apply_patch 内核）
 //!   store_batch.rs 批量操作（batch_update / batch_remove）
 //!   store_admin.rs token 回写、限额标记、启动迁移（provider 补齐 + 优先级去重）
@@ -60,6 +75,10 @@
 //!                AutoClaw 公开形态（userId / deviceId / tokenTail）
 //!   autoclaw_import.rs   AutoClaw 旧数据一次性导入（~/.autoclaw-proxy/accounts.json
 //!                + 桌面端登录态；§10.2）
+//!   cline_accounts.rs    Cline 账号（两个额度池）：手动添加、桌面端登录态、
+//!                续期回写、Cline 公开形态
+//!   qoder_accounts.rs    Qoder 账号（地区 + userId 识别）：添加、凭证刷新回写、
+//!                Qoder 公开形态
 
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
@@ -70,12 +89,14 @@ pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
 pub mod raccoon_import;
+pub mod sql;
 pub mod state;
 pub mod store;
 pub mod store_admin;
 pub mod store_batch;
 pub mod store_crud;
 pub mod store_util;
+pub mod store_view;
 
 pub use store::{AccountStore, AccountStoreError};
 

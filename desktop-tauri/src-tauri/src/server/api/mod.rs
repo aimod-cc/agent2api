@@ -23,6 +23,8 @@
 //!   scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务的开关 / 间隔 / 立即执行）
 //!   update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
 //!   endpoints.rs  GET /api/endpoints（接口清单）
+//!   storage_api.rs GET /api/storage（统一库的位置、大小与各表条数，只读）
+//!   upgrade_api.rs GET /api/upgrade、POST /api/upgrade/run（旧数据 → SQLite 库）
 //!
 //! 管理 API 已全部就位（切片 1-6）。stats_api 是统计报表任务新增的唯一模块
 //! （切片 7 之后的路由扩展），照同样的分工：新文件 + `http::router` 里登记，
@@ -53,3 +55,4 @@ pub mod session;
 pub mod stats_api;
 pub mod storage_api;
 pub mod update;
+pub mod upgrade_api;

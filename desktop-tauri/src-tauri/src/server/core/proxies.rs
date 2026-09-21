@@ -73,7 +73,8 @@ fn valid_port(value: Option<&Value>) -> Option<u16> {
 /// 归一账号代理配置（来自 API 的原始输入）。
 ///
 /// 返回 `Ok(None)`（无代理）或 `Ok(Some(标准形态))`；非法输入抛 ProxyConfigError
-/// （→ HTTP 400）。`source` 缺省时按字段推断，便于手工编辑 accounts.json。
+/// （→ HTTP 400）。`source` 缺省时按字段推断，便于手工编辑账号记录
+/// （库里的 `data` 列，或导出文件的 JSON）。
 pub fn normalize_account_proxy(input: &Value) -> Result<Option<Value>, ProxyConfigError> {
     if input.is_null() || input.as_str() == Some("") {
         return Ok(None);
@@ -184,10 +185,11 @@ impl ResolvedProxy {
     ///
     /// 三态：`Ok(None)` = 没有代理（直连）；`Ok(Some(...))` = 可用出口；
     /// `Err(原因)` = **配了代理但数据坏了**（缺主机 / 端口非法）。
-    /// 第三态必须与「没配代理」分开：手工编辑 accounts.json 写出 `port: "abc"`
-    /// 时，Node 会带着 `NaN` 端口去建 ProxyAgent 并失败（出口测试显示
-    /// 「❌ 无法连接」）—— 若这里静默按直连处理，用户会看到「✅ 出口可用」，
-    /// 那是在骗人。出网侧的调用方遇到 Err 时按直连兜底（可用性优先），
+    /// 第三态必须与「没配代理」分开：手工编辑账号记录（库里 `data` 列的
+    /// `proxy` 字段，或导出文件）写出 `port: "abc"` 时，Node 会带着 `NaN`
+    /// 端口去建 ProxyAgent 并失败（出口测试显示「❌ 无法连接」）—— 若这里
+    /// 静默按直连处理，用户会看到「✅ 出口可用」，那是在骗人。
+    /// 出网侧的调用方遇到 Err 时按直连兜底（可用性优先），
     /// 但**出口测试**要把原因如实报出来。
     pub fn from_json(value: &Value) -> Result<Option<Self>, String> {
         if value.is_null() {
@@ -256,7 +258,7 @@ fn js_truthy(value: &Value) -> bool {
 
 /// JS 模板串里插值的等效渲染：`a` 缺失是 `undefined`、显式 null 是 `null`、
 /// 其余按 `String(a)` 的字面量（对象/数组在 JS 里是 `[object Object]` /
-/// 逗号拼接，这里用 JSON 文本近似 —— 这些形态只可能来自手工改坏的 accounts.json，
+/// 逗号拼接，这里用 JSON 文本近似 —— 这些形态只可能来自手工改坏的账号记录，
 /// 近似的目的是「不要把值吞掉」，而不是逐字复刻 JS 的 toString）。
 /// 只用于复刻 Node 拼接 label / 报错文案的行为（见 `resolve_account_proxy`）。
 fn js_interpolation(value: Option<&Value>) -> String {
@@ -339,7 +341,7 @@ pub fn resolve_account_proxy(config: Option<&Value>) -> Option<ProxyResolution> 
         return None;
     }
     // 非对象（字符串/数字/数组）在 JS 里取 `.source` 得 undefined，
-    // 于是落到「不支持的代理来源: undefined」—— 手工编辑 accounts.json
+    // 于是落到「不支持的代理来源: undefined」—— 手工编辑账号记录
     // 写错形状时就是这条文案，照抄不改成更「友好」的提示
     let Some(object) = config.as_object() else {
         return Some(ProxyResolution::Failed("不支持的代理来源: undefined".to_string()));

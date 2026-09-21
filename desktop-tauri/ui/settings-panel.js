@@ -27,6 +27,12 @@
  *     server/api/debug_api.rs）。
  * 后三类共用同一套姿势：读失败降级展示、写成功以接口返回值为准重读。
  *
+ * 例外一之补：数据存储概况（getStorage → /api/storage）**只读**。
+ * 数据全部在配置目录的 `agent2api.db` 里，改造前那三个「更改保存位置」的按钮
+ * 与配套弹窗随单库语义一起删除（后端那两条写路由也不存在了）——
+ * 一个点了必然报错的按钮比没有按钮更糟。换位置的正路是设置环境变量
+ * AGENT2API_PROXY_HOME 后重启，页面上的提示原样写着这句话。
+ *
  * 定时任务（自动签到 + 四条间隔型任务）**不在本文件**：它们已迁到独立的
  * 「定时任务」页（tasks-panel.js）—— 那是「到点自动干活」的一类东西，
  * 混在设置页里既不好找，也没法和同类任务对照着调。
@@ -672,69 +678,25 @@
     }
   }
 
-  // ─── 数据保存位置（事件日志 / 请求日志 / 调试报文的迁移） ──────
+  // ─── 数据存储概况（只读） ──────────────────────
+  //
+  // ── 为什么这里没有「更改…」按钮（T8 收尾）────────────────────
+  // 改造前这里有三个按钮，各自把一类数据（事件日志 / 请求日志 / 调试报文）
+  // 迁到用户挑的目录。数据全部进统一库 `{config_dir}/agent2api.db` 之后，
+  // 「把某一类数据单独搬到另一个文件」在数据模型上已经不成立：那会造出第二份
+  // 真相（库里的还在），下一个请求写日志时两份立刻分叉。后端那两条写路由
+  // （/api/storage/relocate、/api/storage/progress）连同三个 store 的
+  // `relocate` 一起删掉了，所以按钮留着也只会得到一次必然失败的请求 ——
+  // 一个点了必然报错的按钮比没有按钮更糟，这正是本页改成只读的原因。
+  //
+  // 想换位置的正路是设置环境变量 AGENT2API_PROXY_HOME 后重启，见页面上那句提示。
 
-  /**
-   * 三类数据的保存目录各自独立（config.json 的 logDir / requestStatsDir /
-   * debugDir，经 /api/storage 读写）。读概况 → 点「更改…」弹系统目录选择框 →
-   * 确认弹窗 → 调 /api/storage/relocate **同步迁移**，等待期间轮询
-   * /api/storage/progress 画进度条。迁移中弹窗不可关闭（关窗路径全部收口在
-   * storageModalBusy 旗标上）。
-   */
-  const STORAGE_TARGETS = [
-    { target: 'logs', label: '事件日志', pathId: 'storage-log-path', buttonId: 'btn-storage-log' },
-    { target: 'requests', label: '请求日志', pathId: 'storage-req-path', buttonId: 'btn-storage-req' },
-    { target: 'debug', label: '调试报文', pathId: 'storage-debug-path', buttonId: 'btn-storage-debug' },
-  ];
-  /** 最近一次从后端读到的概况；null = 后端不可用（按钮仍可用，点了会提示） */
+  /** 最近一次从后端读到的概况；null = 后端不可用 */
   let storage = null;
-  /** 确认 / 迁移弹窗的状态。resolve 非空 = 弹窗开着；busy = 迁移中（不可关闭） */
-  let storageModalResolve = null;
-  let storageModalBusy = false;
-  let storageProgressTimer = null;
-  /** 迁移请求在途：挡住「更改…」的重入（一个存储同一时间只跑一次迁移） */
-  let storageBusy = false;
 
-  function renderStorage(data) {
-    if (data !== undefined) storage = data;
-    const badge = $('storage-badge');
-    if (!badge) return;
-    if (!storage || typeof storage !== 'object') {
-      badge.className = 'badge bad';
-      badge.textContent = '不可用';
-      STORAGE_TARGETS.forEach(item => {
-        const el = $(item.pathId);
-        if (el) el.textContent = '—';
-      });
-      return;
-    }
-    badge.className = 'badge ok';
-    badge.textContent = '已生效';
-    STORAGE_TARGETS.forEach(item => {
-      const el = $(item.pathId);
-      const info = storage?.[item.target];
-      const dir = info && typeof info === 'object' ? String(info.dir || '') : '';
-      if (el) {
-        el.textContent = dir || '—';
-        el.title = dir ? (info?.custom ? `${dir}（自定义目录）` : `${dir}（默认配置目录）`) : '';
-      }
-      const button = $(item.buttonId);
-      if (button) button.disabled = !dir;
-    });
-  }
-
-  async function loadStorage() {
-    try {
-      renderStorage(await api.getStorage());
-    } catch (error) {
-      console.warn('读取数据保存位置失败:', error.message);
-      renderStorage(null);
-    }
-  }
-
-  /** 字节数 → 可读大小（概况里给用户看「要迁移多大」） */
+  /** 字节数 → 可读大小（库主文件通常几百 KB 到几十 MB，四档够用） */
   function formatBytes(bytes) {
-    if (!Number.isFinite(bytes) || bytes <= 0) return '几乎为空';
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
     if (bytes < 1024) return `${bytes} B`;
     const kb = bytes / 1024;
     if (kb < 1024) return `${kb.toFixed(1)} KB`;
@@ -743,136 +705,73 @@
     return `${(mb / 1024).toFixed(2)} GB`;
   }
 
-  /** 收掉弹窗（可带进度轮询一起停）。调用即视为「弹窗已关」，resolver 收尾 */
-  function closeStorageModal() {
-    storageModalBusy = false;
-    stopStorageProgress();
-    const resolve = storageModalResolve;
-    storageModalResolve = null;
-    $('storage-modal')?.classList.remove('open');
-    if (resolve) resolve(false);
+  /** 条数 → 带千分位的文本（用户对着看更省事） */
+  function formatCount(value) {
+    const count = Number(value);
+    if (!Number.isFinite(count) || count < 0) return '—';
+    return count.toLocaleString('zh-CN');
   }
 
-  /** 确认 / 关闭 / 遮罩 / Esc 五条关窗出口统一走这里；迁移中一律不受理 */
-  function resolveStorageModal(accepted) {
-    if (storageModalBusy) return;
-    const resolve = storageModalResolve;
-    storageModalResolve = null;
-    $('storage-modal')?.classList.remove('open');
-    if (resolve) resolve(accepted);
+  /** 写一个元素的文本（元素可能不在当前 DOM 里，静默跳过） */
+  function setStorageText(id, text) {
+    const el = $(id);
+    if (el) el.textContent = text;
   }
 
-  /** 迁移态的界面切换：按钮隐藏 / 确认键变禁用文案 / 进度条显隐 */
-  function setStorageModalBusy(busy) {
-    // 迁移中把「关闭 / 取消」直接藏起来：disabled 还留着视觉残影，
-    // 藏掉更明确 —— 此刻没有任何关闭路径，这是要传达的承诺
-    $('storage-modal-close')?.style.setProperty('display', busy ? 'none' : '');
-    $('storage-modal-cancel')?.style.setProperty('display', busy ? 'none' : '');
-    const ok = $('storage-modal-ok');
-    if (ok) {
-      ok.disabled = busy;
-      ok.textContent = busy ? '迁移中…' : '开始迁移';
-    }
-    const progress = $('storage-progress');
-    if (progress) progress.hidden = !busy;
-    const state = $('storage-modal-state');
-    if (state) state.style.display = busy ? '' : 'none';
-  }
-
-  /** 起 / 停进度轮询：400ms 一拍，接口说没在迁了就把条推满（收尾瞬间的观感） */
-  function startStorageProgress() {
-    stopStorageProgress();
-    const bar = $('storage-progress')?.querySelector('.bar');
-    const tick = async () => {
-      try {
-        const state = await api.storageProgress();
-        if (bar) bar.style.width = `${state?.active ? Number(state.percent) || 0 : 100}%`;
-      } catch {
-        // 进度读不到就不动条：迁移本体在 POST 上，返回值才是结果
-      }
-    };
-    void tick();
-    storageProgressTimer = setInterval(tick, 400);
-  }
-
-  function stopStorageProgress() {
-    if (storageProgressTimer) clearInterval(storageProgressTimer);
-    storageProgressTimer = null;
-  }
-
-  /** 更改一个存储的保存位置：选目录 → 确认 → 迁移（锁弹窗 + 进度）→ 刷新 */
-  async function changeStorage(item) {
-    if (storageBusy || storageModalResolve) return;
-    const current = storage?.[item.target]?.dir;
-    if (!current) {
-      toast('读不到当前保存位置，请稍后重试', 'err');
+  /**
+   * 渲染概况。形状是后端的**单库语义**：
+   * `{ configDir, database: { file, bytes, available, accounts, logs, requests, dailyDays, debug } }`。
+   * 改造前是三个同形对象（logs / requests / debug），前端把 requests 的
+   * bytes 与 dailyBytes 相加 —— 而那两个字段指向同一个库文件，字节数被算了
+   * 两遍。现在只有一个 database 对象，那种重复计算在形状上就不可能发生。
+   */
+  function renderStorage(data) {
+    if (data !== undefined) storage = data;
+    const badge = $('storage-badge');
+    if (!badge) return;
+    const info = storage && typeof storage === 'object' ? storage.database : null;
+    // 后端起不来（网络 / 桥失败）与库打不开是两件事，但对这一页的结论相同：
+    // 现在读不到存储概况，展示「不可用」而不是一排看着正常的 0
+    if (!info || typeof info !== 'object') {
+      badge.className = 'badge bad';
+      badge.textContent = '不可用';
+      setStorageText('storage-db-path', '—');
+      setStorageText('storage-db-size', '—');
+      ['storage-count-accounts', 'storage-count-logs', 'storage-count-requests',
+        'storage-count-daily', 'storage-count-debug']
+        .forEach(id => setStorageText(id, '—'));
       return;
     }
-    let picked = null;
+
+    const available = info.available !== false;
+    badge.className = `badge ${available ? 'ok' : 'bad'}`;
+    badge.textContent = available ? '已生效' : '数据库不可用';
+
+    const file = String(info.file || '');
+    const pathEl = $('storage-db-path');
+    if (pathEl) {
+      pathEl.textContent = file || '—';
+      // 悬停看完整路径（元素上是折行显示的，长路径会被截成好几行）
+      pathEl.title = file;
+    }
+    setStorageText('storage-db-size', available ? formatBytes(Number(info.bytes) || 0) : '—');
+
+    // 库不可用时各计数都是后端回落出来的 0，与「真的没有数据」在数字上无法
+    // 区分 —— 所以整排显示「—」，不误导用户以为数据丢了
+    const count = value => (available ? formatCount(value) : '—');
+    setStorageText('storage-count-accounts', count(info.accounts));
+    setStorageText('storage-count-logs', count(info.logs));
+    setStorageText('storage-count-requests', count(info.requests));
+    setStorageText('storage-count-daily', count(info.dailyDays));
+    setStorageText('storage-count-debug', count(info.debug));
+  }
+
+  async function loadStorage() {
     try {
-      picked = await api.pickDirectory(`选择「${item.label}」的保存位置`);
+      renderStorage(await api.getStorage());
     } catch (error) {
-      toast(error.message, 'err');
-      return;
-    }
-    if (!picked || picked.canceled) return;
-    const dir = String(picked.path || '').trim();
-    if (!dir) return;
-    if (dir === current) {
-      toast('新位置与当前保存位置相同');
-      return;
-    }
-
-    // 确认段：说清「从哪搬到哪、迁多大」，此刻还能取消
-    const info = storage?.[item.target] || {};
-    const sizeText = formatBytes((Number(info.bytes) || 0) + (Number(info.dailyBytes) || 0));
-    const countText = Number(info.count) || 0;
-    const text = $('storage-modal-text');
-    if (text) {
-      text.innerHTML = `「${esc(item.label)}」将从 <strong>${esc(current)}</strong>`
-        + ` 迁移到 <strong>${esc(dir)}</strong>。<br>`
-        + `将迁移 ${countText} 条记录（约 ${sizeText}），迁移期间转发与日志写入会短暂排队，`
-        + `请保持程序运行，不要关闭窗口。`;
-    }
-    const progress = $('storage-progress');
-    if (progress) progress.hidden = true;
-    const stateEl = $('storage-modal-state');
-    if (stateEl) stateEl.style.display = 'none';
-    const ok = $('storage-modal-ok');
-    if (ok) {
-      ok.disabled = false;
-      ok.textContent = '开始迁移';
-    }
-    $('storage-modal')?.classList.add('open');
-    $('storage-modal-cancel')?.focus();
-
-    const accepted = await new Promise(resolve => {
-      // 理论上同时只有一个弹窗（changeStorage 顶部已挡重入），这里仍兜一层
-      if (storageModalResolve) {
-        const old = storageModalResolve;
-        storageModalResolve = null;
-        old(false);
-      }
-      storageModalResolve = resolve;
-    });
-    if (!accepted) return;
-
-    // 迁移段：接口是同步语义（resolve 即迁移结束），等待期间锁弹窗 + 画进度
-    storageBusy = true;
-    storageModalBusy = true;
-    setStorageModalBusy(true);
-    startStorageProgress();
-    try {
-      await api.relocateStorage({ target: item.target, dir });
-      closeStorageModal();
-      toast(`✅ ${item.label}已迁移到 ${dir}`);
-    } catch (error) {
-      closeStorageModal();
-      // 失败时旧数据原封不动（后端搬迁失败不切目录），界面读一次现状即可
-      toast(`迁移失败：${error.message}`, 'err');
-    } finally {
-      storageBusy = false;
-      await loadStorage();
+      console.warn('读取数据存储概况失败:', error.message);
+      renderStorage(null);
     }
   }
 
@@ -917,11 +816,10 @@
     if (event.target === $('retention-modal')) resolveRetentionConfirm(false);
   });
   // Esc 关窗：app.js 也挂了一个全局 Esc（只关「添加账号」弹窗，没收开窗状态就不动作），
-  // 这里按「确认框 / 保存位置弹窗是否开着」判断，三者互不干扰
+  // 这里只管保留天数那道确认框，两者互不干扰
   document.addEventListener('keydown', event => {
     if (event.key !== 'Escape') return;
     if (retentionConfirm) resolveRetentionConfirm(false);
-    if (storageModalResolve) resolveStorageModal(false);
   });
 
   $('btn-retention-refresh')?.addEventListener('click', () => loadRetention().then(() => toast('保留天数已刷新')));
@@ -1013,18 +911,10 @@
   $('settings-debug-mode')?.addEventListener('change', event => saveDebug(event.target));
   $('btn-debug-refresh')?.addEventListener('click', () => loadDebug().then(() => toast('调试模式设置已刷新')));
 
-  // 保存位置：两个「更改…」按钮走同一个流程（target 不同而已）；
-  // 弹窗的确认 / 取消 / 关闭 / 遮罩 / Esc 五条出口都收口到 resolveStorageModal，
-  // 迁移中（storageModalBusy）它会直接吞掉 —— 那时弹窗不可关闭
-  STORAGE_TARGETS.forEach(item => {
-    $(item.buttonId)?.addEventListener('click', () => changeStorage(item));
-  });
-  $('storage-modal-ok')?.addEventListener('click', () => resolveStorageModal(true));
-  $('storage-modal-cancel')?.addEventListener('click', () => resolveStorageModal(false));
-  $('storage-modal-close')?.addEventListener('click', () => resolveStorageModal(false));
-  $('storage-modal')?.addEventListener('click', event => {
-    if (event.target === $('storage-modal')) resolveStorageModal(false);
-  });
+  // 保存位置是**只读展示**，没有按钮要绑事件（三个「更改…」入口随单库语义
+  // 一起删除，理由见上面那一节的注释）。这里只留一个「刷新」出口：用户手工
+  // 改过配置目录后能立刻重读一次，不必重开程序。
+  $('btn-storage-refresh')?.addEventListener('click', () => loadStorage().then(() => toast('存储概况已刷新')));
 
   window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderStorage };
 

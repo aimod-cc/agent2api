@@ -60,6 +60,12 @@
         <button class="nav-item" data-page="gateway" data-icon="gateway"><span class="ico"></span><span class="label">模型管理</span></button>
         <button class="nav-item" data-page="keys" data-icon="key"><span class="ico"></span><span class="label">网关 Key</span></button>
         <button class="nav-item" data-page="desensitize" data-icon="desensitize"><span class="ico"></span><span class="label">脱敏</span></button>
+        <!-- 文档：接口地址（Base URL / 三种对话协议 / 模型列表）与将来的使用说明。
+             它原先在「网关 Key」页里，R8 按需求搬成独立一级菜单 —— 接口地址是
+             「接客户端」这件事本身要查的东西，与「管理 Key」不是同一类操作，
+             混在一页里用户要在两件事之间来回滚。图标用 logs（文档 + 文本行），
+             语义上就是「文档」，不新画 SVG（见 icons.js）。 -->
+        <button class="nav-item" data-page="docs" data-icon="logs"><span class="ico"></span><span class="label">文档</span></button>
 
         <div class="nav-group-label">诊断</div>
         <button class="nav-item" data-page="requests" data-icon="requests"><span class="ico"></span><span class="label">请求日志</span><span class="count" id="nav-count-requests" style="display:none">0</span></button>
@@ -155,7 +161,10 @@
           <!-- ── Top 提供商 / Top 账号（并排两张卡）──
                数据来自 /api/stats/summary 的顶层 providers / accounts 数组
                （契约见架构文档 §5）：
-               `[{id,label,requests,success,totalTokens}]`，按请求数降序。
+               `[{id,label,requests,success,totalTokens}]`，后端按请求数降序。
+               前端只取 totalTokens 这一维来排序与展示（见 report.js 的 rankHtml）：
+               这两张卡回答的是「用量花在谁身上」，而用量就是 Token —— 请求次数
+               与成功率在概览卡片与请求日志里能精确查到，不在这里重复一份。
                provider 是「哪一家在承载」，account 是「具体哪个登录态在出力」——
                后者更细：一家可以挂多个账号，所以两张排行并不重复。
                后端较老 / 对应字段缺失时整块隐藏（不给空态、不报错）——
@@ -166,7 +175,7 @@
             <section class="panel" id="report-accounts-panel" hidden>
               <div class="panel-head">
                 <h2>Top 账号</h2>
-                <span class="tip-q" data-tip="所选范围内每个账号各承载了多少请求。账号是比提供商更细的一维：同一家可以挂多个账号，转发时按优先级在候选链上依次尝试，所以这里反映的是「具体哪个登录态在出力」。百分比同样按本区间的总请求数算。「未知账号」是指那批请求没有账号身份：走默认登录态转发（未配置账号列表）时会这样；这一维上线前写出的旧聚合行也没有账号明细，但它们会在启动时按明细自动补算回来 —— 只有明细已被保留期清掉（默认 30 天）的那几天补不回来，仍留在「未知账号」里，那是确实无从恢复的部分。"></span>
+                <span class="tip-q" data-tip="所选范围内每个账号各消耗了多少 Token，按 Token 用量从多到少排。账号是比提供商更细的一维：同一家可以挂多个账号，转发时按优先级在候选链上依次尝试，所以这里反映的是「具体哪个登录态在出力」。百分比按本区间的总 Token 数算（这一块只看用量，请求次数与成功率在概览卡片里）。「未知账号」是指那批请求没有账号身份：走默认登录态转发（未配置账号列表）时会这样；这一维上线前写出的旧聚合行也没有账号明细，但它们会在启动时按明细自动补算回来 —— 只有明细已被保留期清掉（默认 30 天）的那几天补不回来，仍留在「未知账号」里，那是确实无从恢复的部分。"></span>
                 <span class="panel-sub" id="report-accounts-label">—</span>
               </div>
               <div class="panel-body">
@@ -177,7 +186,7 @@
             <section class="panel" id="report-providers-panel" hidden>
               <div class="panel-head">
                 <h2>Top 提供商</h2>
-                <span class="tip-q" data-tip="所选范围内每个提供商各承载了多少请求。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。百分比按本区间的总请求数算。「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了（请求体非法、模型不存在、没有可用账号）。这一维与账号那一维不同：旧明细里根本没有「哪家承载」的信息（早期版本只有单一上游，但那是配置事实而非逐条记录），所以无法回算，旧数据会一直留在「未知」里；此后新产生的请求都会记上具体的提供商。"></span>
+                <span class="tip-q" data-tip="所选范围内每个提供商各消耗了多少 Token，按 Token 用量从多到少排。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。百分比按本区间的总 Token 数算（这一块只看用量，请求次数与成功率在概览卡片里）。「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了（请求体非法、模型不存在、没有可用账号）。这一维与账号那一维不同：旧明细里根本没有「哪家承载」的信息（早期版本只有单一上游，但那是配置事实而非逐条记录），所以无法回算，旧数据会一直留在「未知」里；此后新产生的请求都会记上具体的提供商。"></span>
                 <span class="panel-sub" id="report-providers-label">—</span>
               </div>
               <div class="panel-body">
@@ -387,76 +396,6 @@
             <p class="intro">可创建多把 Key 分发给不同客户端，任一启用的 Key 即可通过鉴权；一把启用的都没有时不鉴权（仅监听 127.0.0.1，建议本机使用可不设）。</p>
           </div>
 
-          <!-- 接口条：一行一条端点（地址随真实端口刷新，见 port-panel.js 的 paintGatewayAddress）。
-               对话协议三种并列写出：客户端按自己支持的那种选一行填，三家共用同一套
-               模型与账号池 —— 换协议不用换配置。 -->
-          <section class="panel ep-panel">
-            <div class="panel-head">
-              <h2>接口地址</h2>
-              <span class="tip-q" data-tip="Base URL 填进客户端的「API 地址 / Base URL」栏；对话协议按客户端支持的类型三选一（Chat Completions / Responses / Anthropic Messages），三者共用同一套模型与账号池，可随时切换；鉴权用「API Key 列表」里的任一启用 Key。"></span>
-            </div>
-            <div class="ep-list">
-              <div class="ep-row">
-                <div class="ep-head">
-                  <span class="ep-name">Base URL</span>
-                  <span class="ep-note">填进客户端的「API 地址 / Base URL」</span>
-                </div>
-                <div class="ep-line">
-                  <code class="ep-value" id="api-base">—</code>
-                  <button class="copy-btn" data-copy-from="api-base" title="复制地址">⧉</button>
-                </div>
-              </div>
-
-              <div class="ep-group">对话协议（按客户端支持的类型选一行）</div>
-
-              <div class="ep-row">
-                <div class="ep-head">
-                  <span class="ep-name">OpenAI Chat Completions</span>
-                  <span class="ep-note">多数 OpenAI 兼容客户端的默认协议</span>
-                </div>
-                <div class="ep-line">
-                  <code class="ep-value" id="api-chat">—</code>
-                  <button class="copy-btn" data-copy-from="api-chat" title="复制地址">⧉</button>
-                </div>
-              </div>
-
-              <div class="ep-row">
-                <div class="ep-head">
-                  <span class="ep-name">OpenAI Responses</span>
-                  <span class="ep-note">OpenAI 新协议（Codex、新版 SDK）</span>
-                </div>
-                <div class="ep-line">
-                  <code class="ep-value" id="api-responses">—</code>
-                  <button class="copy-btn" data-copy-from="api-responses" title="复制地址">⧉</button>
-                </div>
-              </div>
-
-              <div class="ep-row">
-                <div class="ep-head">
-                  <span class="ep-name">Anthropic Messages</span>
-                  <span class="ep-note">Claude Code / Anthropic SDK（token 计数：/v1/messages/count_tokens）</span>
-                </div>
-                <div class="ep-line">
-                  <code class="ep-value" id="api-messages">—</code>
-                  <button class="copy-btn" data-copy-from="api-messages" title="复制地址">⧉</button>
-                </div>
-              </div>
-
-              <div class="ep-group">模型清单</div>
-
-              <div class="ep-row">
-                <div class="ep-head">
-                  <span class="ep-name">模型列表</span>
-                  <span class="ep-note">客户端自动拉取可用模型</span>
-                </div>
-                <div class="ep-line">
-                  <code class="ep-value" id="api-models">—</code>
-                  <button class="copy-btn" data-copy-from="api-models" title="复制地址">⧉</button>
-                </div>
-              </div>
-            </div>
-          </section>
-
           <section class="panel">
             <div class="panel-head">
               <h2>API Key 列表</h2>
@@ -473,7 +412,7 @@
               </table>
             </div>
             <div class="panel-foot">
-              <span>客户端请求需带 <code>Authorization: Bearer &lt;key&gt;</code> 或 <code>x-api-key: &lt;key&gt;</code>；修改后立即生效，本程序自身会自动使用第一把启用的 Key。</span>
+              <span>客户端请求需带 <code>Authorization: Bearer &lt;key&gt;</code> 或 <code>x-api-key: &lt;key&gt;</code>；修改后立即生效，本程序自身会自动使用第一把启用的 Key。每把 Key 可单独限制<b>可用提供商</b>与<b>可用模型</b>（行内「可用范围」）：留空 = 不限制，两个都设时按交集生效 —— 被限制的模型对这把 Key 表现为「不存在」（拉 /v1/models 也看不到它），提供它的家不在可用列表里时请求同样被拒。</span>
             </div>
           </section>
         </section>
@@ -568,6 +507,92 @@
           </section>
         </section>
 
+        <!-- ─── 文档 ───
+             R8：「把网关 Key 的接口地址这一段直接搬到文档页面去」。
+             这一节就是从「网关 Key」页整块搬来的（DOM 的 class 与 id 一字未改，
+             所以 port-panel.js 的 paintGatewayAddress 与 clipboard.js 的
+             data-copy-from 委托都不用改一行）。搬家的理由见导航项上的注释。
+             地址随真实端口刷新：元素 id 不变，刷新逻辑照旧命中（见 port-panel.js）。 -->
+        <section class="page" data-page="docs">
+          <div class="page-head">
+            <h2>文档</h2>
+            <p class="intro">接入客户端需要的地址与协议。这里列出的地址随网关实际监听端口实时刷新，复制后直接粘进客户端的对应输入框即可。</p>
+          </div>
+
+          <!-- 接口条：一行一条端点（地址随真实端口刷新，见 port-panel.js 的 paintGatewayAddress）。
+               对话协议三种并列写出：客户端按自己支持的那种选一行填，三家共用同一套
+               模型与账号池 —— 换协议不用换配置。 -->
+          <section class="panel ep-panel">
+            <div class="panel-head">
+              <h2>接口地址</h2>
+              <span class="tip-q" data-tip="Base URL 填进客户端的「API 地址 / Base URL」栏；对话协议按客户端支持的类型三选一（Chat Completions / Responses / Anthropic Messages），三者共用同一套模型与账号池，可随时切换；鉴权用「网关 Key」页里任一启用 Key。"></span>
+            </div>
+            <div class="ep-list">
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">Base URL</span>
+                  <span class="ep-note">填进客户端的「API 地址 / Base URL」</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-base">—</code>
+                  <button class="copy-btn" data-copy-from="api-base" title="复制地址">⧉</button>
+                </div>
+              </div>
+
+              <div class="ep-group">对话协议（按客户端支持的类型选一行）</div>
+
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">OpenAI Chat Completions</span>
+                  <span class="ep-note">多数 OpenAI 兼容客户端的默认协议</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-chat">—</code>
+                  <button class="copy-btn" data-copy-from="api-chat" title="复制地址">⧉</button>
+                </div>
+              </div>
+
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">OpenAI Responses</span>
+                  <span class="ep-note">OpenAI 新协议（Codex、新版 SDK）</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-responses">—</code>
+                  <button class="copy-btn" data-copy-from="api-responses" title="复制地址">⧉</button>
+                </div>
+              </div>
+
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">Anthropic Messages</span>
+                  <span class="ep-note">Claude Code / Anthropic SDK（token 计数：/v1/messages/count_tokens）</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-messages">—</code>
+                  <button class="copy-btn" data-copy-from="api-messages" title="复制地址">⧉</button>
+                </div>
+              </div>
+
+              <div class="ep-group">模型清单</div>
+
+              <div class="ep-row">
+                <div class="ep-head">
+                  <span class="ep-name">模型列表</span>
+                  <span class="ep-note">客户端自动拉取可用模型；不受鉴权限制，配 Key 之前就能拉</span>
+                </div>
+                <div class="ep-line">
+                  <code class="ep-value" id="api-models">—</code>
+                  <button class="copy-btn" data-copy-from="api-models" title="复制地址">⧉</button>
+                </div>
+              </div>
+            </div>
+            <div class="panel-foot">
+              <span>鉴权用「网关 Key」页里任一<b>启用</b>的 Key：请求带 <code>Authorization: Bearer &lt;key&gt;</code> 或 <code>x-api-key: &lt;key&gt;</code>。一把启用的 Key 都没有时不鉴权（网关只监听 127.0.0.1）。</span>
+            </div>
+          </section>
+        </section>
+
         <!-- ─── 日志 ───
              只承载系统事件：网关的模型请求已拆到独立的「请求日志」页
              （两边数据源、筛选维度、分页口径都不同，页内 .seg 切换的形态随拆分取消）。
@@ -611,11 +636,6 @@
                   <option value="">全部分类</option>
                 </select>
                 <input type="search" id="logs-keyword" placeholder="搜索消息关键词…" autocomplete="off">
-                <label class="switch" title="隐藏分类为「脱敏」的命中记录">
-                  <input type="checkbox" id="logs-hide-desensitize" checked>
-                  <span class="track"></span>
-                  <span>不看脱敏</span>
-                </label>
               </div>
 
               <div class="log-list" id="log-list"><div class="log-empty">正在加载日志…</div></div>
@@ -678,7 +698,8 @@
              列形态参考 OmniProxy 的请求日志：时间 / 提供商·账号 / 重试 / 状态 / 模型 /
              用时 / 用量 / 错误。后端 /api/stats/requests 只支持时间区间、状态与
              模型名精确匹配，分页是 offset 真分页，条数没有前端上限。
-             没有详情弹层：本页不存请求 / 响应报文，可看的都在列里。 -->
+             「重试」一列同时承载重试链与敏感词命中两枚标签（各自带悬停面板，
+             敏感词那枚只写一个「敏」字，理由见 requests-panel.js 的 retryCell）。 -->
         <section class="page" data-page="requests">
           <div class="page-head">
             <h2>请求日志</h2>
@@ -933,44 +954,45 @@
                   </div>
                 </section>
 
-                <!-- ── 数据：保存位置 ──
-                     两类数据各自可换保存目录（config.json 的 logDir / requestStatsDir，
-                     经 /api/storage 读写）。更改时由后端把现有数据迁移到新目录，
-                     迁移弹窗期间界面锁定，进度条经 /api/storage/progress 轮询。 -->
+                <!-- ── 数据：存储位置（只读） ──
+                     数据统一在配置目录的 agent2api.db 里，不再支持按类换目录
+                     （改造前那三个「更改…」按钮与迁移弹窗已随单库语义删除，
+                      见 settings-panel.js 那一节的注释）。这里只展示库文件位置、
+                      大小与各表条数；换位置的正路是环境变量 + 重启，页面末尾写着。 -->
                 <section class="panel">
                   <div class="panel-head">
-                    <h2>保存位置</h2>
-                    <span class="tip-q" data-tip="事件日志与请求日志各自可以指定保存目录：数据会迁移到新目录，迁移完成后立即生效，不需要重启程序。空间不足或想集中管理数据时才需要改它；不改就保存在默认的配置目录里。迁移期间请保持程序运行，不要关闭窗口。"></span>
+                    <h2>数据存储</h2>
+                    <span class="tip-q" data-tip="全部数据（账号、事件日志、请求记录、调试报文、设置）统一保存在配置目录下的 agent2api.db 这一个 SQLite 数据库里。备份时只需拷贝这个文件；更换保存位置请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。"></span>
                     <span id="storage-badge" class="badge">检测中…</span>
+                    <div class="head-actions">
+                      <button id="btn-storage-refresh">刷新</button>
+                    </div>
                   </div>
                   <div class="panel-body">
                     <div class="retention-list">
                       <div class="retention-row">
-                        <label for="storage-log-path">事件日志保存位置</label>
+                        <label for="storage-db-path">数据库文件</label>
                         <span class="storage-line">
-                          <span class="storage-path" id="storage-log-path">—</span>
-                          <button id="btn-storage-log">更改…</button>
+                          <span class="storage-path" id="storage-db-path">—</span>
                         </span>
-                        <div class="hint">logs.jsonl 的所在目录（系统事件，最多 500 条）。</div>
+                        <div class="hint">配置目录下的 agent2api.db（账号、日志、请求记录、调试报文与设置都在里面）。</div>
                       </div>
                       <div class="retention-row">
-                        <label for="storage-req-path">请求日志保存位置</label>
+                        <label for="storage-db-size">占用大小</label>
                         <span class="storage-line">
-                          <span class="storage-path" id="storage-req-path">—</span>
-                          <button id="btn-storage-req">更改…</button>
+                          <span class="storage-path" id="storage-db-size">—</span>
                         </span>
-                        <div class="hint">requests.jsonl 与 request-daily.jsonl 的所在目录（逐条请求与按天聚合）。</div>
-                      </div>
-                      <div class="retention-row">
-                        <label for="storage-debug-path">调试报文保存位置</label>
-                        <span class="storage-line">
-                          <span class="storage-path" id="storage-debug-path">—</span>
-                          <button id="btn-storage-debug">更改…</button>
-                        </span>
-                        <div class="hint">debug-traffic.jsonl 的所在目录（调试模式保存的上游原始报文，最多 500 条）。</div>
+                        <div class="hint">库主文件的大小（不含运行期间的 WAL 临时文件，退出时已自动并回）。</div>
                       </div>
                     </div>
-                    <div class="hint retention-note">更改位置时会把现有数据迁移到新目录，迁移期间请保持程序运行；迁移完成后立即生效。</div>
+                    <div class="retention-list storage-counts">
+                      <div class="storage-count"><span class="k">账号</span><span class="v" id="storage-count-accounts">—</span></div>
+                      <div class="storage-count"><span class="k">事件日志</span><span class="v" id="storage-count-logs">—</span></div>
+                      <div class="storage-count"><span class="k">请求记录</span><span class="v" id="storage-count-requests">—</span></div>
+                      <div class="storage-count"><span class="k">报表天数</span><span class="v" id="storage-count-daily">—</span></div>
+                      <div class="storage-count"><span class="k">调试报文</span><span class="v" id="storage-count-debug">—</span></div>
+                    </div>
+                    <div class="hint retention-note">数据统一保存在配置目录下的 agent2api.db；如需更换位置，请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。</div>
                   </div>
                 </section>
               </div>
@@ -1223,36 +1245,20 @@
     </div>
   </div>
 
-  <!-- ─── 更改保存位置 / 迁移弹窗（settings-panel.js 驱动）───
-       两段状态共用一个弹窗：迁移未开始时是确认框（可取消 / 可关闭）；
-       点「开始迁移」后进入迁移态 —— 关闭按钮与取消隐藏、点遮罩与 Esc 不生效、
-       确认键变成禁用的「迁移中…」，进度条经 /api/storage/progress 轮询驱动，
-       迁移结束（接口返回）才恢复可关。 -->
-  <div id="storage-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="storage-modal-title">
-    <div class="modal modal-confirm">
-      <div class="modal-head">
-        <h2 id="storage-modal-title">更改保存位置</h2>
-        <button id="storage-modal-close" title="关闭">✕</button>
-      </div>
-
-      <div class="modal-body">
-        <div id="storage-modal-text">—</div>
-        <div class="progress" id="storage-progress" hidden><div class="bar" style="width:0%"></div></div>
-        <div class="detail" id="storage-modal-state" style="display:none">正在迁移，请不要关闭程序…</div>
-      </div>
-
-      <div class="modal-foot">
-        <div class="spacer"></div>
-        <button id="storage-modal-cancel">取消</button>
-        <button id="storage-modal-ok" class="primary">开始迁移</button>
-      </div>
-    </div>
-  </div>
+  <!-- ─── 数据结构升级（旧 JSON/JSONL → 单个 SQLite 库）───
+       本次更新把存储换成了单个 SQLite 数据库。改造后**没有弹窗**：
+       upgrade-panel.js 在启动时探测一次，有待迁移的旧文件就直接导入
+       （升级没有选项、不能取消，弹窗只是一道多余的坎，且它的「稍后」会让
+       账号一直空着）。
+       旧数据只改名为 *.migrated 备份、**绝不删除**；过程与结果都由 toast 告知
+       （用户没点过任何东西，程序在搬数据时必须让他知道文件还在）。 -->
 
   <!-- ─── 请求详情弹窗（requests-panel.js）───
        展示调试模式保存的**上游原始报文**：请求头（凭据类已脱敏）、请求体、
-       响应头、响应体。报文由 /api/debug/traffic?id= 按需拉取（列表接口不带
-       报文，见后端 debug_api 的模块头）。 -->
+       响应头、响应体。四段用弹窗内的分段选择器切换（`.seg` 那一套），
+       不是平铺 —— 响应体常是几百行 SSE，平铺会把其余三段挤到屏幕外。
+       报文由 /api/debug/traffic?id= 按需拉取（列表接口不带报文，
+       见后端 debug_api 的模块头）；四段内容一次拿回，切换不发请求。 -->
   <div id="req-detail-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="req-detail-title">
     <div class="modal modal-wide">
       <div class="modal-head">
@@ -1372,6 +1378,25 @@
             </div>
           </div>
           <div class="mapping-preview" id="mapping-preview"></div>
+          <!-- 思考等级（照抄 OmniProxy 模型管理的手动绑定形态）：
+               选项 = 「不覆盖」（空值）+ 通用等级表（值由后端的 manage_view
+               下发 `reasoningLevels`，前端不自己抄一份，免得两处漂移）
+               + 末尾一个「自定义等级」入口。选到自定义那一项时下面的输入框
+               才露出来：表外的值也可能有意义（各家上游的档位拼法不同），
+               但平时藏着，免得每次建映射都要判断「这里要不要填」。
+               注意：这个绑定会真的注入转发（跟着它所在的这条映射走），
+               但「哪些情况不注入」有几条明确规则 —— 相邻的问号说明了要点。 -->
+          <div class="mapping-row mapping-row-single" style="margin-top:10px">
+            <div class="mapping-col">
+              <label for="mapping-reasoning">思考等级</label>
+              <div class="reasoning-pick">
+                <select id="mapping-reasoning"></select>
+                <span class="tip-q" data-tip="绑定在「对外名 → 上游模型」这一条映射上的思考等级（列表照抄 OmniProxy 的手动绑定），选「不覆盖」表示不给这条映射指定等级。它会跟着这条映射注入转发，由承载的那家翻译成自己的档位字段（CatPaw 归并成 low/high/max，Qoder 按模型声明的档位归一）。以下几种情况故意不注入：① off / none（关闭思考）—— 本项目没有安全的表达方式；② 表外的自定义等级（各家能力范围不同，无法判断上游收不收）；③ 客户端请求体里已经自己指定了档位（那是更明确的意图，绑定不覆盖）；④ 这家上游不认识档位字段（如 WorkBuddy / 小浣熊 / AutoClaw / Cline）。注入与跳过都会写进详细日志。"></span>
+              </div>
+              <input id="mapping-reasoning-custom" type="text" maxlength="32"
+                     placeholder="自定义等级（例如 custom-high）" autocomplete="off" hidden>
+            </div>
+          </div>
           <p class="detail">
             对外名可自由命名，允许与上游模型 ID 同名（同名时该上游的原生路由优先，映射作兜底）；
             支持字母、数字与 <code>- _ . / :</code>。同一对外名可在多个提供商各添加一条：
@@ -1405,6 +1430,36 @@
             <label for="key-value">Key</label>
             <input id="key-value" type="text" placeholder="留空自动生成；手填至少 8 个字符" autocomplete="off" spellcheck="false">
           </div>
+
+          <!-- ── 可用提供商 / 可用模型（R9，参考 OmniProxy 的 Key 限制）──
+               两个多选都是自研下拉（select.js 增强出来的触发器 + 浮层，与脱敏页
+               「作用提供商」同一控件），选项在打开弹窗时由 keys-panel.js 灌入：
+                 · 可用提供商 = 后端下发的**注册表**摘要（不硬编码 id 清单 ——
+                   项目禁止维护第二份 provider 清单，见 account_store 模块头）
+                 · 可用模型   = 后端下发的 modelsByProvider 按**当前勾选的提供商**
+                   取并集。一家都没勾时它是空的 —— 没有约束范围就没有候选，
+                   空态在浮层里给一句说明（keys-panel.js 的 rebuildModelOptions）。
+                   勾选提供商即时联动重建，不必关掉重开弹窗。
+               `data-placeholder` 是「一项都没勾」时触发器上的文案（写这句的是
+               select.js 的 selectedText）：空选的语义是「不限制」，必须说清 ——
+               留一个空框会让人以为「不选就等于全都不能用」。 -->
+          <div class="field-row" style="margin-top:9px" id="key-restrict-row">
+            <label for="key-allowed-providers">可用提供商</label>
+            <select id="key-allowed-providers" multiple data-placeholder="留空 = 不限制"></select>
+          </div>
+          <div class="field-row" style="margin-top:9px">
+            <label for="key-allowed-models">可用模型</label>
+            <select id="key-allowed-models" multiple data-placeholder="留空 = 不限制"></select>
+          </div>
+          <p class="hint" id="key-restrict-hint">
+            留空表示不限制；同时设置时请求需同时满足两个条件（模型在白名单内且路由到允许的提供商）。
+            「可用模型」的候选跟着上面勾选的提供商走：没勾提供商时它是空的（还没有约束范围），
+            勾了几家就列出这几家能收的全部对外名。
+          </p>
+          <!-- 当前选的摘要（keys-panel.js 的 paintRestrictionState 写它）：
+               多选的触发器上只显示「勾了几项的文案」，勾了哪几家要在这儿摊开 ——
+               用户点完「保存范围」就看不到弹窗了，摘要要在关窗前给他核对一遍。 -->
+          <p class="hint" id="key-restrict-summary"></p>
         </div>
         <div class="detail" id="key-modal-status" style="min-height:18px"></div>
       </div>
@@ -1441,8 +1496,15 @@
        refresh() 是异步的（首个 await 之后才轮到渲染），排在 app.js 之后即可。
        同时它自带加载期的 DOM 绑定（搜索框 input、刷新按钮 click），
        因此必须排在 index.html 里那两个元素之后（本文件底部，天然满足）。 -->
+  <!-- 思考等级组件（chip 上的等级标 / 映射弹窗里的下拉）：必须排在 models-panel.js
+       之前 —— 后者在 IIFE 里就解构 window.wbModelsReasoning（要的是那个对象本身，
+       不是运行期再查一次）。它只依赖 wbApp 的 esc，所以排在 app.js 之后即可。 -->
+  <script src="models-reasoning.js"></script>
   <script src="models-panel.js"></script>
-  <!-- 网关 Key 页（多把 Key 的列表 / 新建 / 启停 / 删除）：同样依赖 wbApp，排在 app.js 之后 -->
+  <!-- 网关 Key 页（多把 Key 的列表 / 新建 / 启停 / 删除 / 可用范围限制）：
+       同样依赖 wbApp，排在 app.js 之后。选项来源里用到 wbProviders.labelOf
+       （可用提供商的展示名）与主状态的 models（可用模型的候选），两者都是
+       **运行期**读取，不依赖加载顺序。 -->
   <script src="keys-panel.js"></script>
   <!-- 网页登录的交互引擎（WorkBuddy 与小浣熊共用）：等待态 / 取消 / 按钮复位 / 成功收尾
        只实现一次，两家各交一份配置。必须在 add-account.js 之前 —— 后者在加载期就要用它
@@ -1490,6 +1552,17 @@
   <script src="confirm-dialog.js"></script>
   <script src="desensitize-panel.js"></script>
   <script src="logs-panel.js"></script>
+  <!-- 请求日志的两块「独立小件」，都必须排在 requests-panel.js 之前：
+       · request-hover    列表里重试 / 敏感词两枚标签的悬停面板。requests-panel 在
+                          加载期就调 wbRequestHover.bind 把委托挂到列表上
+                          （走可选链，未就绪时静默跳过 —— 那样整个悬停功能就没了，
+                          所以这个顺序是硬要求，与 tooltip.js 的自动增强不同）。
+       · request-detail   详情弹窗（上游原始报文 + 分段切换）。它**自己**在加载期
+                          绑弹窗的关闭 / 分段事件，并独占 #req-detail-modal 那组 DOM；
+                          requests-panel 只在点「详情」时调它的 open(id)。
+                          排在前面是为了让「谁负责哪块 DOM」在文件顺序上也看得出来。 -->
+  <script src="request-hover.js"></script>
+  <script src="request-detail.js"></script>
   <script src="requests-panel.js"></script>
   <!-- 定时任务面板：读写两条接口（/api/scheduled-tasks 与 /api/auto-checkin）。
        排在 logs-panel / requests-panel 之后：它保存成功后要把新间隔推给那两个面板
@@ -1516,5 +1589,8 @@
   <!-- update-panel 必须在 settings-panel 之前：后者在设置页首持加载时会调它。 -->
   <script src="update-panel.js"></script>
   <script src="settings-panel.js"></script>
+  <!-- 数据结构升级弹窗：启动时问一次 /api/upgrade，有待迁移数据就弹。
+       排在最后：它的 refreshPanels() 要调各面板的 load()，那些都得先挂好 -->
+  <script src="upgrade-panel.js"></script>
 </body>
 </html>

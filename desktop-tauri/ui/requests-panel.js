@@ -1,5 +1,5 @@
 /* Agent2API · 请求日志面板（网关转发明细 · 筛选 / 分页 / 自动刷新） */
-/* global workbuddyDesktop, wbApp */
+/* global workbuddyDesktop, wbApp, wbRequestHover, wbRequestDetail */
 
 /**
  * 「请求日志」页的自持面板：网关每次转发到上游的请求日志。
@@ -11,6 +11,15 @@
  * 所以走后端 offset/limit 真分页；每页 50 条（后端默认值，这里显式传，
  * 页数才可算），上限 500 条由后端夹紧。后端支持的筛选只有时间区间与
  * 状态（ok/error）—— 模型 / 提供商筛选、关键词搜索不在接口契约里。
+ *
+ * ── 「重试」列为什么是一个入口而不是一个标记（本次改造）─────
+ * 后端明细里有 `attemptDetails`（每一次上游尝试的 provider / 状态码 /
+ * 错误摘要）与 `sensitiveHits`（本次命中的敏感词 × 次数）两个字段，
+ * 这一列因此可以回答「换了谁、哪一次失败在哪」与「命中了什么词」。
+ * 两枚标签各自带悬停面板，面板的机制与内容构造在 `request-hover.js`
+ * （本文件只渲染标签并提供「按 id 反查数据」的回调）—— 拆出去的理由
+ * 与 tooltip.js / select.js 相同：浮层的定位与生命周期是一整块自洽逻辑，
+ * 混在列表渲染里会让两边都难改。
  *
  * ── 自动刷新的间隔从哪来 ────────────────────────────────────
  * 与 logs-panel.js 同一套：由「定时任务」页配置（config.json 的
@@ -180,12 +189,65 @@
     return `<span class="req-status"><span class="badge tag ${ok ? 'ok' : 'bad'}"${title ? ` title="${esc(title)}"` : ''}>${status || '失败'}</span></span>`;
   }
 
-  /** 重试列：attempts 是含首次的尝试次数，只有 >1 才有信息量 */
+  /**
+   * 重试列：上游尝试链（`attempts`）+ 敏感词命中（`sensitiveHits`）。
+   *
+   * ── 这一列现在承载两件事（本次改造）──────────────────────────
+   * 改造前这里只是一个「重试」标记（`attempts > 1` 时出现），敏感词命中在
+   * 「日志」页由 `[Desensitize]` 那类应用日志间接呈现 —— 两处都只说「发生过」，
+   * 不说「发生了什么」。现在两者都收敛到这一列，并各自带一个悬停面板：
+   *   · 橙标签 → 切换路径 + 每次尝试的（提供商 → 成功/失败 · 状态码 · 错误）
+   *   · 紫标签 → 命中的词 × 次数
+   * 形态照 OmniProxy 的 `FailoverTip` / `SensitiveMaskedTag`（同一列里两枚
+   * 标签，各自挂自己的弹层 —— 那边特意**不**把整格包一层 Tooltip，
+   * 否则两枚标签的弹层会互相嵌套、悬停时同时弹出）。
+   *
+   * ── 敏感词标签为什么只写一个「敏」字（本次改造）──────────────
+   * 表头已经收窄成「重试」（见 REQ_HEAD 的说明），这一列只有 52px 宽：
+   * 「敏感词」三个字会把标签撑得比「重试 N」还宽，两枚标签竖排时右边留一大块
+   * 空白、列也容易被挤到换行。命中是**有没有**的问题，不是**几个字**的问题，
+   * 所以缩成一个「敏」字，完整含义交给两个既有出口：`title` 悬停提示与
+   * 点击/聚焦弹出的富文本面板（那里面仍然逐词列出命中明细，一个字都没少）。
+   * `aria-label` 补上完整说法，读屏软件不会只念出一个孤零零的「敏」。
+   *
+   * ── 为什么标签是 button ──────────────────────────────────────
+   * `cursor: help` 只对鼠标有意义；做成 button 之后键盘能 Tab 到、聚焦即弹出
+   * （request-hover.js 的 focusin/focusout），读屏软件也会把它当成可交互元素。
+   * 数据不塞进 `data-*`：一次尝试明细可达 24 条、错误摘要 200 字符，
+   * 50 行就是几百 KB 的属性文本 —— 会拖慢整表重绘。改为按 `data-req-id`
+   * 反查 `entries` 里的那一行（见本文件绑定的 `entryOf`）。
+   *
+   * 该列为空时显示 `-`（两枚标签都没有内容时）。
+   */
   function retryCell(entry) {
     const attempts = Number(entry.attempts) || 1;
-    if (attempts <= 1) return '<span class="req-none">-</span>';
-    return `<span class="req-retry"><span class="badge tag warn" title="共尝试 ${attempts} 次（含首次）">重试</span></span>`;
+    const key = rowKey(entry);
+    const tags = [];
+    if (attempts > 1) {
+      tags.push(`<button type="button" class="badge tag warn req-hover-tag"`
+        + ` data-req-hover="chain" data-req-id="${esc(key)}"`
+        + ` title="查看每次尝试的提供商与结果">重试 ${attempts}</button>`);
+    }
+    // 敏感词命中：判据是「命中表非空」（后端 sensitiveHits 字段）。
+    // 不用 attempts 那类计数 —— 命中是这条请求的属性，与重试次数无关
+    // （一次成功的请求同样可能命中敏感词，那时这一列只有这一枚标签）。
+    if (Array.isArray(entry.sensitiveHits) && entry.sensitiveHits.length) {
+      tags.push(`<button type="button" class="badge tag req-hover-tag sensitive"`
+        + ` data-req-hover="sensitive" data-req-id="${esc(key)}"`
+        + ` title="命中了敏感词，点击查看明细" aria-label="命中了敏感词">敏</button>`);
+    }
+    if (!tags.length) return '<span class="req-none">-</span>';
+    return `<span class="req-retry">${tags.join('')}</span>`;
   }
+
+  /**
+   * 一行请求在 DOM 里的身份键（悬停面板反查数据用）。
+   *
+   * 优先用 `id`（调试模式下与报文同键、天然唯一）；没有 id 的旧行退回 `ts`。
+   * 两者都缺时给空串 —— 那时标签仍会渲染（按钮可聚焦、面板会显示「未采集」
+   * 的兜底文案），只是反查不到数据，比不渲染更不容易让人以为界面坏了。
+   */
+  const rowKey = entry => String(entry?.id || entry?.ts || '');
 
   /**
    * 提供商与账号同格两行（OmniProxy 的「提供商/key」一列对应到这里是
@@ -289,7 +351,12 @@
    * 才能命中「唯一子元素居中」那条规则。
    * 每个格子都带与数据行同名的类（req-model / req-provider / …）：
    * 窄窗口下网格要按「哪一列」重排（见 page-requests.css 的媒体查询），
-   * 有了稳定的类名就不必依赖「它是第几个子元素」这种会随字段增删失效的判据。 */
+   * 有了稳定的类名就不必依赖「它是第几个子元素」这种会随字段增删失效的判据。
+   *
+   * 第三列的表头是「重试」而不是「重试 / 敏感词」：敏感词那枚标签已经缩成
+   * 一个「敏」字（见 retryCell 的说明），表头跟着收窄才配得上这一列 52px 的
+   * 宽度 —— 原来那五个字在这点宽度里只能靠省略号收住，等于没写。
+   * 这一列的两枚标签各自带悬停面板，含义不靠表头解释。 */
   const REQ_HEAD = `<div class="req-head">
       <span class="req-time">时间</span>
       <span class="req-target">提供商 / 账号</span>
@@ -559,86 +626,6 @@
     });
   }
 
-  // ─── 详情弹窗（上游原始报文）─────────────────
-  //
-  // 报文由 `/api/debug/traffic?id=` 按需拉取：列表接口不带报文（一个完整 SSE
-  // 响应可达数百 KB，塞进列表会让每页体积爆掉）。取不到时后端给 404，弹窗里
-  // 如实说明原因（当时没开调试模式 / 已超出保留条数），而不是留一片空白。
-  //
-  // 内容按「请求 → 响应」分块展示，与排障时的阅读顺序一致；头是 JSON 对象
-  // （后端已把凭据类字段换成 [redacted]），体是原始文本（请求体是 JSON 文本，
-  // 响应体是上游 SSE 原文）。
-
-  /** 弹窗开着时按 Esc 关闭（与确认弹窗同一交互） */
-  function onDetailKeydown(event) {
-    if (event.key === 'Escape') closeDetail();
-  }
-
-  function closeDetail() {
-    $('req-detail-modal')?.classList.remove('open');
-    document.removeEventListener('keydown', onDetailKeydown);
-  }
-
-  /** 一个展示块：标题 + 等宽正文（正文是纯文本，用 textContent 写入） */
-  function detailBlock(title, text) {
-    if (!text) return '';
-    return `<section class="req-detail-block"><h3>${esc(title)}</h3>`
-      + `<pre class="req-detail-pre">${esc(text)}</pre></section>`;
-  }
-
-  /** 对象 → 缩进 JSON 文本；失败时给空串（不让展示层抛错） */
-  function jsonText(value) {
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'string') return value;
-    try {
-      return JSON.stringify(value, null, 2);
-    } catch {
-      return '';
-    }
-  }
-
-  function renderDetail(data) {
-    const body = $('req-detail-body');
-    const hint = $('req-detail-hint');
-    if (!body) return;
-    const status = data.status === null || data.status === undefined ? '-' : String(data.status);
-    const lines = [
-      data.url ? `URL: ${data.url}` : '',
-      data.provider ? `提供商: ${data.provider}` : '',
-      `上游状态码: ${status}`,
-    ].filter(Boolean);
-    body.innerHTML =
-      `<div class="req-detail-meta">${lines.map(esc).join('<br>')}</div>`
-      + detailBlock('上游请求头（凭据类已脱敏）', jsonText(data.requestHeaders))
-      + detailBlock('上游请求体', jsonText(data.requestBody))
-      + detailBlock('上游响应头（凭据类已脱敏）', jsonText(data.responseHeaders))
-      + detailBlock('上游响应体', data.responseBody ? String(data.responseBody) : '');
-    if (hint) {
-      hint.textContent = data.truncated
-        ? '报文超过单条上限，请求体 / 响应体已按上限截断'
-        : '内容按原样保存，请求头中的凭据字段已替换为 [redacted]';
-    }
-  }
-
-  async function openDetail(id) {
-    const modal = $('req-detail-modal');
-    const body = $('req-detail-body');
-    const hint = $('req-detail-hint');
-    if (!modal || !body) return;
-    body.textContent = '正在读取…';
-    if (hint) hint.textContent = '—';
-    modal.classList.add('open');
-    document.addEventListener('keydown', onDetailKeydown);
-    try {
-      renderDetail(await api.getDebugTraffic(id));
-    } catch (error) {
-      // 404（没开调试模式 / 超出保留条数）与其它失败在这里收敛成同一块提示：
-      // 后端给的文案已经说清了原因，直接展示它
-      body.innerHTML = `<div class="req-detail-empty">${esc(error.message || '读取失败')}</div>`;
-      if (hint) hint.textContent = '在设置 → 通用里开启「调试模式」后，新发生的请求才会保存报文';
-    }
-  }
-
   // ─── 事件绑定 ──────────────────────────────
 
   // 时间档位的默认值（「全部」）写在 HTML 里，存过的值在这里纠正
@@ -667,16 +654,43 @@
 
   // ─── 详情弹窗（上游原始报文）─────────────────
   //
-  // 事件委托在列表容器上：行是每次重绘重建的，绑在按钮上会随重绘失效。
+  // 实现整体拆到 **request-detail.js**（本次改造）：那一块与列表渲染零耦合
+  // （自己按 id 拉报文、自己管弹窗的开合与分段状态），而本文件在加上
+  // 「重试列弹层」与「详情分段」之后已到 900 行，超过项目「单文件不过 800 行」
+  // 的约定。拆分口径与项目既有先例一致（usage-panel.js 从 accounts-model.js
+  // 拆出、request-hover.js 与本文件的分工）。
+  //
+  // 本文件只留两件事：
+  //   ① 列表里的「详情」按钮 → wbRequestDetail.open(id)（下面那个委托）；
+  //   ② 弹窗自己的关闭/分段事件全在那边绑（它独占 #req-detail-modal 那组 DOM），
+  //      本文件不再碰那些节点。
   $('req-list')?.addEventListener('click', event => {
     const button = event.target.closest('[data-detail]');
     if (!button) return;
-    void openDetail(button.dataset.detail);
+    void window.wbRequestDetail?.open?.(button.dataset.detail);
   });
-  $('req-detail-close')?.addEventListener('click', closeDetail);
-  $('req-detail-cancel')?.addEventListener('click', closeDetail);
-  $('req-detail-modal')?.addEventListener('click', event => {
-    if (event.target === $('req-detail-modal')) closeDetail();
+
+  // ─── 重试列 / 敏感词的悬停面板 ───────────────
+  //
+  // 反查而不是把数据写进属性：标签上只留一个 `data-req-id`（行的身份键），
+  // 面板内容由本函数从**当前这一屏的数据**（`entries`）里找出来现算。
+  // 这样既省掉每行几百 KB 的属性文本（见 retryCell 的说明），也自动跟着
+  // 数据的更新走 —— 列表重绘时 `entries` 已经换成新的一屏，
+  // 面板永远弹的是「屏幕上那一条」，不会弹出上一屏的残留。
+  //
+  // 找不到时的兜底：返回 null（面板则不显示）。理论上不该发生 ——
+  // 标签与数据在同一次 `render` 里生成，`id` 为空的行退回 `ts`，
+  // 而 `ts` 在同一屏里可能重复（同一毫秒的并发请求），所以按 id 优先、
+  // 找不到再用 ts 匹配第一条（重复时弹第一条的明细，比什么都不弹好排障）。
+  window.wbRequestHover?.bind?.({
+    host: $('req-list'),
+    entryOf: tag => {
+      const key = tag?.dataset?.reqId || '';
+      if (!key) return null;
+      return entries.find(item => String(item?.id || '') === key)
+        || entries.find(item => String(item?.ts || '') === key)
+        || null;
+    },
   });
 
   window.wbRequestsPanel = {

@@ -6,26 +6,41 @@
 //!
 //! 三条不变量在这里落地，改代码前务必读 `super::mod` 的头部说明：
 //!   1. **优先级全局唯一**（所有提供商共用一条队列）：写入侧遇到冲突一律 409，
-//!      由用户显式选一个空闲值；冲突判定、号段分配、整队重编号都在全部账号上算
-//!      —— 见 `priority_peers`；
+//!      由用户显式选一个空闲值；冲突判定与号段分配都在全部账号上算
+//!      （改造后各由一次投影列查询完成：`sql::priority_holder` /
+//!      `sql::priorities_except`），整队重编号见 `renumber_consecutively`；
 //!   2. **未知字段全量保留**：记录是 JSON 对象（`StoredAccount`），只改自己要改的键；
-//!   3. **持锁期间不做网络请求**：本文件全是纯文件读写，没有任何 await。
+//!   3. **持锁期间不做网络请求**：本文件全是数据库读写，没有任何 await。
+//!
+//! ── 写入粒度：单条操作只碰一行（本切片的改造）────────────────
+//! 改造前每条路径都是「load 全量 → 改内存里那一份 → save 全量」。现在的分布是：
+//!   - 读：`record_by_id` / `records_for_provider` 按需取（不再全表解析）；
+//!   - 判重与号段：`priority_holder` / `count_except` / `priorities_except`
+//!     直接在投影列上查（不再把 20 条记录的 JSON 全解析出来数一遍）；
+//!   - 写：`sql::put` / `sql::update_in_place` / `sql::delete` 单行落地。
+//!
+//! **两条例外**（都要整队或全局排序，见各自函数的说明）：
+//!   - `promote_to_front`：置顶后其余账号必须整体让位，读全量算一遍新编号；
+//!   - `move_account`：相邻位可能是**另一家**的账号（全局一条队列），
+//!     必须按全局优先级序把它找出来。
+//! 两者的**读**是全量（语义要求），但**写**仍只落真正变了的那一两行
+//! （`move_account` 两次 UPDATE 在一个事务里；`promote_to_front` 经 `save`，
+//! 而 `save` 是按差异写的，编号没变的行一条 UPDATE 都不发）。
 //!
 //! 新增账号的 `provider` 字段一律写默认 provider（`DEFAULT_PROVIDER_ID`）：
 //! 本函数只服务 **workbuddy 那一条添加路径**（其余各家的添加入口在
-//! `raccoon_accounts.rs`，以及后续波次的 catpaw / autoclaw 模块），且
+//! `raccoon_accounts.rs`，以及 catpaw / autoclaw / cline / qoder 模块），且
 //! **不读取 payload 里的 provider** —— 免得前端误传一个未知 provider 就把
 //! 账号写进没人认的组里。分派发生在 `api::accounts::add_account`：
-//! 先按注册表把 payload 的 provider 换算成 kind，再穷举分到各家的入口
-//! （未实现的 catpaw / autoclaw 在那里显式 400，到不了本函数）。
+//! 先按注册表把 payload 的 provider 换算成 kind，再穷举分到各家的入口。
 
 use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::priority::{
-    find_priority_holder, next_free_priority, normalize_priority, renumber_consecutively,
-    DEFAULT_PRIORITY,
+    next_free_priority, normalize_priority, renumber_consecutively, DEFAULT_PRIORITY,
 };
-use crate::server::core::account_store::state::{priority_peers, AccountState, StoredAccount};
+use crate::server::core::account_store::sql;
+use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
     js_string, number_or, object_or_empty, optional_text, pick_token, token_tail_of, truncate_chars,
@@ -79,9 +94,9 @@ impl AccountStore {
         }
 
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
         let id = format!("user-{uid}");
-        let existing = state.accounts.iter().find(|item| item.id() == id).cloned();
+        // 只读这一行（不再读全量）：既有记录是「更新」还是「新建」全靠它分支
+        let existing = self.record_by_id(&_guard, &id);
         // ── 撞 id 保护（Agent2API W3-T4）────────────────────────────
         // 小浣熊账号的 id 也是 `user-<数字>` 形态（`add_raccoon_account` 与
         // 旧数据导入都这么生成），而它的 userId 可能正好与某个 workbuddy 账号的
@@ -108,13 +123,11 @@ impl AccountStore {
             .as_ref()
             .map(StoredAccount::provider)
             .unwrap_or_else(|| DEFAULT_PROVIDER_ID.to_string());
-        let others: Vec<StoredAccount> = state
-            .accounts
-            .iter()
-            .filter(|item| item.id() != id)
-            .cloned()
-            .collect();
-        if existing.is_none() && others.len() >= MAX_ACCOUNTS {
+        // 上限判定：`count_except(&id)` 就是旧实现里的 `others.len()`
+        // （`others` 排除了同 id 的既有记录）—— 投影列上数一行，不必把
+        // 其余 19 条记录的 JSON 读出来。
+        let others_count = self.with_conn(&_guard, |conn| sql::count_except(conn, &id))?;
+        if existing.is_none() && others_count as usize >= MAX_ACCOUNTS {
             return Err(AccountStoreError::bad_request(format!(
                 "最多保存 {MAX_ACCOUNTS} 个账号"
             )));
@@ -142,8 +155,10 @@ impl AccountStore {
                 .as_deref(),
         );
         // 新账号默认排在末尾，避免凭空插队改变现有转发顺序；显式指定则校验唯一。
-        // 号段与冲突看全部账号（全局一条队列，见模块头）
-        let peers = priority_peers(&others);
+        // 号段与冲突看全部账号（全局一条队列，见模块头）——两者都只在投影列
+        // `priority` 上做，不解析任何记录的 JSON：
+        //   号段取 `priorities_except(&id)`（旧实现的 `others` 的优先级），
+        //   冲突判定走 `priority_holder`（一条 SQL 换掉「读全量 + 内存里 find」）。
         let existing_priority = existing.as_ref().map(StoredAccount::priority);
         let priority = match payload_object.get("priority") {
             Some(value) => normalize_priority(
@@ -152,12 +167,15 @@ impl AccountStore {
             ),
             None => match existing_priority {
                 Some(value) => value,
-                None => next_free_priority(
-                    &peers.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
-                ),
+                None => {
+                    let used = self.with_conn(&_guard, |conn| sql::priorities_except(conn, &id))?;
+                    next_free_priority(&used)
+                }
             },
         };
-        if let Some((_, holder_name)) = find_priority_holder(&peers, priority, None) {
+        if let Some(holder_name) = self.with_conn(&_guard, |conn| {
+            sql::priority_holder(conn, priority, &id)
+        })? {
             return Err(AccountStoreError::new(
                 format!(
                     "优先级 {priority} 已被账号「{holder_name}」占用，请换一个\
@@ -311,10 +329,9 @@ impl AccountStore {
         record.insert("updatedAt".to_string(), Value::from(logging::now_ms()));
 
         let saved = StoredAccount::from_map(record);
-        let mut merged = others;
-        merged.push(saved.clone());
-        state.accounts = merged;
-        self.save(&state, &_guard)?;
+        // 单行落地：`put` 是 DELETE + INSERT，于是「更新既有记录时它在列表里
+        // 往后挪」这个旧行为（`retain` + `push`）原样保留（见 `sql::put`）。
+        self.with_conn(&_guard, |conn| sql::put(conn, &saved))?;
         logging::log(
             "[Accounts]",
             &format!(
@@ -349,20 +366,18 @@ impl AccountStore {
             return Err(AccountStoreError::new(reason, 400));
         }
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
-        let provider = state
-            .accounts
-            .iter()
-            .find(|item| item.id() == id)
-            .map(StoredAccount::provider)
+        // provider 要在**删除之前**取好（记录删掉之后回读只能得到 None）
+        let provider = self
+            .record_by_id(&_guard, id)
+            .map(|record| record.provider())
             .unwrap_or_default();
-        let before = state.accounts.len();
-        state.accounts.retain(|item| item.id() != id);
-        if state.accounts.len() == before {
+        // 单行删除，`false` 表示本来就没有这一行 → 404（与旧实现数数组长度的
+        // 判据等价：删之前找不到这个 id）
+        let removed = self.with_conn(&_guard, |conn| sql::delete(conn, id))?;
+        if !removed {
             return Err(AccountStoreError::not_found("账号不存在"));
         }
-        self.save(&state, &_guard)?;
-        // 落盘已完成，账号锁在这里放开：注册表作废是另一把锁的操作，
+        // 落库已完成，账号锁在这里放开：注册表作废是另一把锁的操作，
         // 两者不必（也不该）嵌套（见 `invalidate_catpaw_sessions` 的说明）
         drop(_guard);
         self.invalidate_catpaw_sessions(id, &provider);
@@ -374,6 +389,14 @@ impl AccountStore {
     /// 置顶只调整优先级，不改变启用状态；禁用账号仍不参与转发。
     /// `currentAccountId` 保留「首个启用且有可用凭证的账号」的语义，
     /// 不一定指向本次置顶的账号。
+    ///
+    /// ── 为什么这一条必须读全量、写多行 ──────────────────────────
+    /// 其余单条操作都只碰一两行，这一条不行：优先级唯一的前提下，把目标插到
+    /// 队首后**其余账号必须整体让位**，否则会撞号（`renumber_consecutively`
+    /// 给整队重新连续编号）。所以它按语义要求把全部账号读出来算一遍 ——
+    /// 但**写**仍然只写真正变了的那些行：`save_state` 是按差异写的，
+    /// 编号没变的账号一条 UPDATE 都不会发（例如 [0,1,2] 置顶末位时
+    /// 2→0/0→1/1→2 三行都变，而 [0,5,9] 置顶末位时只有一行变）。
     pub fn promote_to_front(&self, id: &str) -> Result<Value, AccountStoreError> {
         let _guard = self.guard();
         let mut state = self.load(&_guard);
@@ -424,13 +447,12 @@ impl AccountStore {
             .find(|item| item.id() == id)
             .map(StoredAccount::name)
             .unwrap_or_default();
-        // 整份数组按优先级序落盘（与单上游时代的实现一致）
+        // 按优先级序交给保存层：`save_state` 只对 data 真的变了的行发 UPDATE，
+        // 于是「不重写没变的账号」这条收益在这里同样成立。
+        // 物理行序（列表顺序）**不动** —— 界面与选路都自己按优先级排，
+        // 没有消费方观察数组顺序（推演见 `sql.rs` 模块头「顺序」一节）。
         state.accounts = ordered;
-        if let Some(record) = state
-            .accounts
-            .iter_mut()
-            .find(|item| item.id() == id)
-        {
+        if let Some(record) = state.accounts.iter_mut().find(|item| item.id() == id) {
             record.set_updated_at(logging::now_ms());
         }
         self.save(&state, &_guard)?;
@@ -456,6 +478,12 @@ impl AccountStore {
     /// 只处理显式传入的字段（patch 语义），未传字段保持不变。
     /// 返回 `(account, changes)`，changes 为字段变化列表（供日志与前端提示）。
     ///
+    /// ── 返回的 `account` 用的是**改动前**的 updatedAt（易错点）──
+    /// 改造前就是这么做的：`public_account` 在 `set_updated_at` **之前**取值，
+    /// 所以响应里的 `updatedAt` 是旧值（下一次读列表才看到新的）。这里逐字保留
+    /// —— 前端可能拿它做「这一条是不是刚改过」的判断，顺手「修正」会让响应
+    /// 形状与 Node 版分叉。
+    ///
     /// ── 禁用时作废 CatPaw 的会话映射（W5-T-d4）──────────────────
     /// 「禁用」的语义是「不再用它转发」。而注册表里属于它的 conversationId 是
     /// 上游账号上下文里的对象：继续留着，用户重新启用后那一轮的增量续接会
@@ -472,24 +500,26 @@ impl AccountStore {
             .cloned()
             .ok_or_else(|| AccountStoreError::bad_request("请求内容必须是 JSON 对象"))?;
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
-        let index = state
-            .accounts
-            .iter()
-            .position(|item| item.id() == id)
+        // 只读目标那一行：apply_patch 只改这一条，优先级冲突另走一次投影列查询
+        // （旧实现为此要把全部账号读进内存再 find 一遍）
+        let mut record = self
+            .record_by_id(&_guard, id)
             .ok_or_else(|| AccountStoreError::not_found("账号不存在"))?;
-
-        let provider = state.accounts[index].provider();
-        let was_enabled = state.accounts[index].enabled();
-        let changes = Self::apply_patch(&mut state, index, &patch)?;
-        let account = self.public_account(&state.accounts[index]);
+        let provider = record.provider();
+        let was_enabled = record.enabled();
+        let changes = Self::apply_patch(&mut record, &patch, |next| {
+            self.with_conn(&_guard, |conn| sql::priority_holder(conn, next, id))
+        })?;
+        let account = self.public_account(&record);
         if changes.is_empty() {
             return Ok((account, changes));
         }
-        let now_disabled = !state.accounts[index].enabled();
-        let name = state.accounts[index].name();
-        state.accounts[index].set_updated_at(logging::now_ms());
-        self.save(&state, &_guard)?;
+        let now_disabled = !record.enabled();
+        let name = record.name();
+        record.set_updated_at(logging::now_ms());
+        // 原地更新（物理位置不动）：旧实现在下标上改字段，数组顺序本来就不变 ——
+        // 界面上的行序是按优先级排的，不该因为一次「改备注名」而跳动
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))?;
         logging::log(
             "[Accounts]",
             &format!("✏️  账号已更新: {name}（{}）", changes.join("，")),
@@ -502,17 +532,27 @@ impl AccountStore {
         Ok((account, changes))
     }
 
-    /// 把 patch 应用到单条记录（纯内存操作：不落盘、不动 state 之外的东西）。
+    /// 把 patch 应用到**单条记录**（纯内存操作：不落库、不动记录之外的东西）。
     ///
-    /// `updateAccount` 与 `batchUpdate` 共用这里，保证单账号与批量的语义完全一致。
-    /// 非法取值按错误抛出，调用方决定是整体失败还是记入 failed。
+    /// `update_account` 与 `batch_update` 共用这里，保证单账号与批量的语义完全
+    /// 一致。非法取值按错误抛出，调用方决定是整体失败还是记入 failed。
+    ///
+    /// ── 签名里的 `find_holder` 是什么（本切片的改造）────────────
+    /// 优先级冲突判定要「在**全部**账号里找有没有别人占着这个号」，而本函数
+    /// 手里只有一条记录 —— 改造前它拿的是整份 `AccountState`，于是两个调用点
+    /// 都必须先把全部账号读进内存。现在把那次查询做成回调：调用方给出「按候选
+    /// 优先级找占位者名字」的实现（单条走一次 SQL，批量两条也各走一次），
+    /// 冲突判定与 409 文案仍**只在本函数里写一遍**。
+    ///
+    /// 回调只在优先级**确实要变**时才被调用（值没变就不用查），因此「patch 只
+    /// 改备注名」这类常见情况下一次多余查询都不会发。
     ///
     /// `pub(crate)`：批量操作在 `store_batch.rs`（同一 `impl` 的另一个分块），
     /// 私有方法对**兄弟模块**不可见 —— 拆分时把可见性放宽到这里。
     pub(crate) fn apply_patch(
-        state: &mut AccountState,
-        index: usize,
+        record: &mut StoredAccount,
         patch: &Map<String, Value>,
+        find_holder: impl FnOnce(i64) -> Result<Option<String>, AccountStoreError>,
     ) -> Result<Vec<String>, AccountStoreError> {
         let mut changes = Vec::new();
 
@@ -521,26 +561,23 @@ impl AccountStore {
                 Value::String(text) => truncate_chars(text.trim(), 100),
                 _ => String::new(),
             };
-            let current = state.accounts[index].name();
+            let current = record.name();
             if next != current {
                 if next.is_empty() {
                     return Err(AccountStoreError::bad_request("备注名不能为空"));
                 }
-                state.accounts[index].set("name", Value::String(next.clone()));
+                record.set("name", Value::String(next.clone()));
                 changes.push(format!("备注名 → {next}"));
             }
         }
 
         if let Some(value) = patch.get("priority") {
-            let current = state.accounts[index].priority();
+            let current = record.priority();
             let next = normalize_priority(Some(value), current);
             if next != current {
                 // 冲突看全部账号（优先级全局唯一，见模块头）。
                 // 排除自己：改自己的优先级不该被自己的旧值挡住
-                let entries = priority_peers(&state.accounts);
-                if let Some((_, holder_name)) =
-                    find_priority_holder(&entries, next, Some(state.accounts[index].id()))
-                {
+                if let Some(holder_name) = find_holder(next)? {
                     return Err(AccountStoreError::new(
                         format!(
                             "优先级 {next} 已被账号「{holder_name}」占用，请换一个\
@@ -549,16 +586,16 @@ impl AccountStore {
                         409,
                     ));
                 }
-                state.accounts[index].set_priority(next);
+                record.set_priority(next);
                 changes.push(format!("优先级 → {next}"));
             }
         }
 
         if let Some(value) = patch.get("enabled") {
             let next = !matches!(value, Value::Bool(false));
-            let current = state.accounts[index].enabled();
+            let current = record.enabled();
             if next != current {
-                state.accounts[index].set_enabled(next);
+                record.set_enabled(next);
                 changes.push(if next { "已启用".to_string() } else { "已禁用".to_string() });
             }
         }
@@ -569,9 +606,9 @@ impl AccountStore {
                 .unwrap_or(Value::Null);
             // Node 用 JSON.stringify 比较：形状相同（含键顺序）才算未变化。
             // serde_json 的序列化键序由插入序决定，与 JS 的对象字面量序一致。
-            let before = value_or_nullish(state.accounts[index].get("proxy"), Value::Null);
+            let before = value_or_nullish(record.get("proxy"), Value::Null);
             if next != before {
-                state.accounts[index].set_proxy(next.clone());
+                record.set_proxy(next.clone());
                 let label = if next.is_null() {
                     "代理 → 无代理（直连）".to_string()
                 } else {
@@ -599,6 +636,9 @@ impl AccountStore {
     /// 可能属于另一家，交换后两家的相对顺序随之改变 —— 这正是全局队列的语义。
     pub fn move_account(&self, id: &str, direction: &str) -> Result<Value, AccountStoreError> {
         let _guard = self.guard();
+        // 相邻位要靠**全局优先级序**找出来：交换对象可能是另一家账号
+        // （全局一条队列），所以这里必须把全部账号读出来排一次 —— 语义要求，
+        // 与 `promote_to_front` 同理。但**写**只碰交换的那两行。
         let mut state = self.load(&_guard);
         if !state.accounts.iter().any(|item| item.id() == id) {
             return Err(AccountStoreError::not_found("账号不存在"));
@@ -625,23 +665,40 @@ impl AccountStore {
         let target = target as usize;
         let mine = ordered[index].priority();
         let theirs = ordered[target].priority();
-        // 只交换这两个账号的优先级；文件顺序保持原样 —— Node 版同样只改这两个
-        // 对象的字段（state.accounts 的顺序不动），所以 accounts.json 的行序不会
-        // 因为一次「上移/下移」被整体重排（用户手工编辑时不会被搅乱）。
-        let now = logging::now_ms();
         let mine_id = ordered[index].id().to_string();
         let other_id = ordered[target].id().to_string();
-        if let Some(record) = state.accounts.iter_mut().find(|item| item.id() == mine_id) {
-            record.set_priority(theirs);
-            record.set_updated_at(now);
-        }
-        if let Some(record) = state.accounts.iter_mut().find(|item| item.id() == other_id) {
-            record.set_priority(mine);
-            record.set_updated_at(now);
-        }
         let mine_name = ordered[index].name();
         let theirs_name = ordered[target].name();
-        self.save(&state, &_guard)?;
+        // 只交换这两个账号的优先级；物理顺序保持原样 —— Node 版同样只改这两个
+        // 对象的字段（state.accounts 的顺序不动），所以列表的行序不会因为一次
+        // 「上移/下移」被整体重排。
+        //
+        // 两次 UPDATE 放在**一个事务**里：交换是「两行同时改」的原子操作，
+        // 中途失败会留下两条记录优先级相同的中间态（破坏唯一性不变量）。
+        let now = logging::now_ms();
+        let mut mine_record = ordered[index].clone();
+        let mut other_record = ordered[target].clone();
+        mine_record.set_priority(theirs);
+        mine_record.set_updated_at(now);
+        other_record.set_priority(mine);
+        other_record.set_updated_at(now);
+        self.with_conn_mut(&_guard, |conn| {
+            let tx = conn.transaction()?;
+            sql::update_in_place(&tx, &mine_record)?;
+            sql::update_in_place(&tx, &other_record)?;
+            tx.commit()
+        })?;
+        // 快照用同一份内存状态（把那两行的新值写回去），不再多读一次库：
+        // 其余账号这一轮没有被动过，库里的值与手里这份一致。
+        for record in state.accounts.iter_mut() {
+            if record.id() == mine_id {
+                record.set_priority(theirs);
+                record.set_updated_at(now);
+            } else if record.id() == other_id {
+                record.set_priority(mine);
+                record.set_updated_at(now);
+            }
+        }
         logging::log(
             "[Accounts]",
             &format!("↕️  优先级交换: {mine_name}(P{mine}) ⇄ {theirs_name}(P{theirs})"),

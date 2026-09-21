@@ -21,7 +21,21 @@
 (() => {
   const STORE_KEY = 'agent2api-accounts-col-widths';
 
-  /** 默认列宽（px）：与 page-accounts-table.css 的 .cell-* 一一对应 */
+  /**
+   * 默认列宽（px）：与 page-accounts-table.css 的 .cell-* 一一对应。
+   *
+   * 改这里**必须**同时改 CSS 与那份文件头的列宽预算说明 —— 三处是同一组数字。
+   * 漂移的症状：用户双击把手「还原」后列宽跳到另一个值（还原读的是这里的
+   * DEFAULTS，而首屏渲染走的是 CSS）。
+   *
+   * 本次改造调了两列：usage 100 → 84、actions 190 → 250。
+   * 原因是查询余额按钮从余额列挪进了操作列（见 accounts-table.js 的
+   * usageCell / actionsCell）：按钮数多了一颗、最坏组合变成
+   * 「设为首选 + 余额 + 设置 + 已签到 + ⋯」，两处必须一起动 ——
+   * 只改一处会让「已签到」被省略号切掉（那是不可点的状态，
+   * 切掉之后用户看不到「今天没得签了」）。
+   * 250 这个值是量出来的（算式见 page-accounts-table.css 里那条声明）。
+   */
   const DEFAULTS = {
     pick: 26,
     priority: 132,
@@ -31,8 +45,8 @@
     status: 80,
     limits: 148,
     expiry: 80,
-    usage: 100,
-    actions: 190,
+    usage: 84,
+    actions: 250,
   };
 
   /** 拖动的下限：再窄就该点不准里面的控件了 */

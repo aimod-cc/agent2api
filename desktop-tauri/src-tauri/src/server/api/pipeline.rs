@@ -26,6 +26,7 @@ use axum::response::Response;
 use serde_json::Value;
 
 use crate::server::config;
+use crate::server::core::key_scope::{self, KeyScope};
 use crate::server::core::providers::catalog::{
     active_manifests, advertised_manifest_contains, default_model_catalog, default_model_usable,
     model_blocked_everywhere, suggest_advertised,
@@ -33,7 +34,7 @@ use crate::server::core::providers::catalog::{
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
-use crate::server::request_stats::{NewRequestEntry, RequestStats};
+use crate::server::request_stats::{AttemptDetail, NewRequestEntry, RequestStats, SensitiveHit};
 use crate::server::ServerState;
 
 /// 调试落盘的目录名与文件名（Node 版 `join(CONFIG_DIR, 'debug', ...)`）
@@ -81,13 +82,34 @@ pub const STREAM_ABORTED: &str = "响应流未完整下发（客户端中断或�
 /// 与上游 id 同名时，改写会**遮蔽**那个同名的上游模型（它的原生路由收不到
 /// 流量），所以旧版干脆禁止同名。映射语义重做后（同名允许、同名校多提供商
 /// 主备），改写下沉到**发送侧按家进行**（`payload::send_body` →
-/// `catalog::wire_model_for_provider`）：请求名全程保持客户端原值，原生承载
+/// `catalog::wire_target_for_provider`）：请求名全程保持客户端原值，原生承载
 /// 家收到本名、映射家收到各自的 target —— 候选链的展开在
 /// `providers::router::route_for_forward`。
 ///
 /// `payload` 会被就地改写（仅填默认模型）：后续转发与记账都用一致的请求名，
 /// 而客户端原始 body 的去重键在调用方算（见各 handler）。
-pub fn resolve_model(state: &ServerState, payload: &mut Value) -> Result<String, GatewayError> {
+///
+/// ── `scope`：网关 Key 的可用模型白名单（R9）────────────────────
+/// `None` = 不限制（免鉴权模式 / 环境变量 Key / 未知 Key，见 `core::key_scope`）。
+/// 有 scope 时在**这里**判，而不是留到转发层：模型白名单的语义是
+/// 「这个模型对你这把 Key 不存在」，所以拒绝形态与「模型不在目录里」逐字相同
+/// （404 + `model_not_found`，照抄 OmniProxy 的
+/// `if (!keyAllowsModel(...)) return fail(res, \`模型 '${publicModel}' 不可用\`, 404, 'model_not_found')`）——
+/// 连「存在性」都不该向下游暴露：能列出却打不通，是比 404 更难解释的一种。
+///
+/// 两条例外（与下面 ③ 的两条例外同源，各有各的理由）：
+///   - 客户端**没点名**（走默认模型回落）：回落链的候选也要按白名单收窄
+///     （见下方 `allowed` 过滤），否则会给一把只授权了 A 的 Key 注入一个它
+///     没被授权的 B —— 那不是限制，那是「用网关的默认值绕过限制」。
+///     收窄后一个都没有时给一条**可操作的**错误，而不是把无 model 的请求
+///     转给上游（那样由上游挑模型，白名单等于不存在）。
+///   - **一家可用提供商都没有**（没加账号，`active` 为空）：与 ③ 同一条例外 ——
+///     广告视图必然为空，此时报「没有可用账号」比报「模型不存在」有用。
+pub fn resolve_model(
+    state: &ServerState,
+    payload: &mut Value,
+    scope: Option<&KeyScope>,
+) -> Result<String, GatewayError> {
     let requested = model_field_text(payload);
     // 客户端是否**点名**了模型：默认值注入后这个事实就丢了，先记下来
     let client_named = !requested.is_empty();
@@ -97,14 +119,31 @@ pub fn resolve_model(state: &ServerState, payload: &mut Value) -> Result<String,
         // 一家都不认时不注入 model，按「未指定」处理（让上游用它自己的默认）
         let snapshot = config::current();
         let default_model = snapshot.default_model();
+        // 白名单收窄：不限制时 `allowed` 恒真，等价于原逻辑（零行为差异）
+        let allowed = |name: &str| key_scope::allows_model(scope, name);
         let models = default_model_catalog();
-        let fallback = if default_model_usable(default_model) {
+        let fallback = if default_model_usable(default_model) && allowed(default_model) {
             Some(default_model.to_string())
         } else {
             models
                 .iter()
-                .find(|model| model.get("isDefault").map(value_is_truthy).unwrap_or(false))
-                .or_else(|| models.first())
+                .find(|model| {
+                    model.get("isDefault").map(value_is_truthy).unwrap_or(false)
+                        && model
+                            .get("id")
+                            .map(crate::server::core::models::shape_value_text)
+                            .map(|id| allowed(&id))
+                            .unwrap_or(false)
+                })
+                .or_else(|| {
+                    models.iter().find(|model| {
+                        model
+                            .get("id")
+                            .map(crate::server::core::models::shape_value_text)
+                            .map(|id| allowed(&id))
+                            .unwrap_or(false)
+                    })
+                })
                 .and_then(|model| model.get("id"))
                 .filter(|id| !id.is_null())
                 .map(|id| match id {
@@ -116,6 +155,14 @@ pub fn resolve_model(state: &ServerState, payload: &mut Value) -> Result<String,
             if let Some(object) = payload.as_object_mut() {
                 object.insert("model".to_string(), Value::String(fallback));
             }
+        } else if scope.is_some_and(KeyScope::restricts_models) && !models.is_empty() {
+            // 这条 Key 限制了模型、而目录里**没有一个是它被授权的**：
+            // 继续往下走只会让上游拿它自己的默认模型去回答（白名单形同虚设），
+            // 所以在这里就明确拒绝。文案指向该去改什么（管理页那两处）。
+            return Err(GatewayError::bad_request(
+                "这把网关 Key 的可用模型列表里没有任何当前可用的模型：请到「网关 Key」页为它勾选可用模型",
+            )
+            .with_code("model_not_found"));
         }
     }
     let requested_model = model_field_text(payload);
@@ -128,6 +175,15 @@ pub fn resolve_model(state: &ServerState, payload: &mut Value) -> Result<String,
     }
     // ③ 广告视图里没有 → 400（「列表里没有就拒绝」；例外见函数头说明）
     if client_named && !requested_model.is_empty() {
+        // ── 这里的 active 用**未按 Key 收窄**的那一份（刻意）───────────
+        // `/v1/models` 按 Key 的提供商白名单收窄后再广告（见
+        // `catalog::models_response`），这里却用全量：两者的差异正好构成
+        // 「模型存在、但这把 Key 不允许任何承载它的家」这一种情形。
+        // 那种情形**必须由转发层拒**（`provider_loop::forward_with_providers`
+        // 的可用提供商分支），因为只有它手里有候选链、能说清「提供它的家都被
+        // 你这把 Key 挡了」；在这里按全量放行、到转发层给准确文案，
+        // 比在这里用收窄后的视图报一句笼统的「模型不存在」对用户有用得多
+        //（后者会让人去查模型管理页的启停，而真正要改的是 Key 的可用提供商）。
         let active = active_manifests(state.store());
         let has_provider = !active.is_empty();
         if has_provider && !advertised_manifest_contains(&active, &requested_model) {
@@ -141,6 +197,20 @@ pub fn resolve_model(state: &ServerState, payload: &mut Value) -> Result<String,
                 },
             );
             return Err(GatewayError::bad_request(message).with_code("model_not_found"));
+        }
+        // R9 模型白名单：**排在广告视图校验之后**。顺序上先是「这个模型对谁都
+        // 不存在」（目录口径），再是「对你这把 Key 不存在」—— 两者的响应形状
+        // 逐字相同（同一个 code、同一个状态码），所以顺序只影响排查时的先后，
+        // 但把「目录里根本没有」排在前面能让用户先看到更容易理解的那条。
+        //
+        // 与 ③ 的两条例外一致：客户端没点名（走默认模型）与「一家可用提供商都
+        // 没有」都不在这里判（前者已在回落链里按白名单收窄过，后者交给转发层
+        // 给「没有可用账号」那条更准的提示）。
+        if has_provider && !key_scope::allows_model(scope, &requested_model) {
+            return Err(GatewayError::bad_request(format!(
+                "模型 '{requested_model}' 不可用：不在这把网关 Key 的可用模型列表里"
+            ))
+            .with_code("model_not_found"));
         }
     }
     // 记录本次实际用的模型（默认值已填充完毕），供账号页筛选默认选中
@@ -278,6 +348,29 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     // 前端回落显示 model 一行 —— 旧数据没有这两个键，同一口径。
     entry.client_model = context.client_model.clone();
     entry.upstream_model = snapshot.upstream_model;
+    // 两个明细字段（本次改造）：都是「有采集才有值」的旁路数据，采集点在
+    // 转发链路上（`core::upstream::usage` 槽），这里只负责搬运。
+    //   · attemptDetails：每次上游尝试的（provider / 状态码 / 错误摘要），
+    //     请求日志「重试」列的弹层显示它；转发前就失败的请求没有它（空表）。
+    //   · sensitiveHits：本次命中的敏感词与次数，同一列的紫色标签显示它。
+    // 存储层的两个类型与采集侧**各自定义、当前同形**（见 `RequestEntry` 的
+    // 注释），所以这里逐字段转一次 —— 不做 `From` impl 是为了让两处结构能
+    // 各自演化（把「转发期形态」与「落库形态」绑成一个类型，将来改一处
+    // 就得同时改另一处，而它们的变化理由本来不同）。
+    entry.attempt_details = snapshot
+        .attempts_detail
+        .into_iter()
+        .map(|item| AttemptDetail {
+            provider: item.provider,
+            status: item.status,
+            error: item.error,
+        })
+        .collect();
+    entry.sensitive_hits = snapshot
+        .sensitive_hits
+        .into_iter()
+        .map(|hit| SensitiveHit { word: hit.word, count: hit.count })
+        .collect();
     entry.error = error;
     entry.prompt_tokens = snapshot.prompt_tokens;
     entry.completion_tokens = snapshot.completion_tokens;

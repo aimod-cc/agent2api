@@ -47,11 +47,13 @@
 use serde_json::{Map, Value};
 
 use crate::server::core::account_store::priority::next_free_priority;
+use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
 use crate::server::core::account_store::{
-    is_cline_family, CredentialWrite, MAX_ACCOUNTS, MAX_TOKEN_LENGTH,
+    is_cline_family, CredentialWrite, CLINE_FREE_PROVIDER_ID, CLINE_PASS_PROVIDER_ID, MAX_ACCOUNTS,
+    MAX_TOKEN_LENGTH,
 };
 use crate::server::core::providers::cline::credentials;
 use crate::server::logging;
@@ -85,19 +87,16 @@ impl AccountStore {
             return None;
         }
         let guard = self.guard();
-        let state = self.load(&guard);
         if !account_id.is_empty() {
-            return state
-                .accounts
-                .iter()
-                .find(|item| item.id() == account_id && item.provider() == provider)
-                .map(StoredAccount::to_value);
+            // 按 id 直查一行；provider 判定在读到之后做 —— 同一个账号可能两个池
+            // 各有一条记录，所以「id 对上」还不足以确认是**这个池**的那条
+            let record = self.record_by_id(&guard, account_id)?;
+            return (record.provider() == provider).then(|| record.to_value());
         }
-        let mut candidates: Vec<StoredAccount> = state
-            .accounts
-            .iter()
-            .filter(|item| item.provider() == provider && item.enabled())
-            .cloned()
+        let mut candidates: Vec<StoredAccount> = self
+            .records_for_provider(&guard, provider)
+            .into_iter()
+            .filter(StoredAccount::enabled)
             .collect();
         candidates.sort_by_key(StoredAccount::order_key);
         candidates.into_iter().next().map(|item| item.to_value())
@@ -116,19 +115,16 @@ impl AccountStore {
     /// 各可能有一条记录，只给 id 无法区分。
     pub fn cline_any_account_record(&self, account_id: &str) -> Option<Value> {
         let guard = self.guard();
-        let state = self.load(&guard);
         if !account_id.is_empty() {
-            return state
-                .accounts
-                .iter()
-                .find(|item| item.id() == account_id && is_cline_family(&item.provider()))
-                .map(StoredAccount::to_value);
+            let record = self.record_by_id(&guard, account_id)?;
+            return is_cline_family(&record.provider()).then(|| record.to_value());
         }
-        let mut candidates: Vec<StoredAccount> = state
-            .accounts
+        // 空 id = 「两个池里优先级最小的启用账号」：两次按 provider 查询
+        // （各读自己那一组）后合起来排序 —— 比读全量再按家过滤少读别家的记录
+        let mut candidates: Vec<StoredAccount> = [CLINE_FREE_PROVIDER_ID, CLINE_PASS_PROVIDER_ID]
             .iter()
-            .filter(|item| is_cline_family(&item.provider()) && item.enabled())
-            .cloned()
+            .flat_map(|provider| self.records_for_provider(&guard, provider))
+            .filter(StoredAccount::enabled)
             .collect();
         candidates.sort_by_key(StoredAccount::order_key);
         candidates.into_iter().next().map(|item| item.to_value())
@@ -144,13 +140,9 @@ impl AccountStore {
             return None;
         }
         let guard = self.guard();
-        let state = self.load(&guard);
-        state
-            .accounts
-            .iter()
-            .find(|item| item.id() == account_id)
-            .map(StoredAccount::provider)
-            .filter(|provider| is_cline_family(provider))
+        let record = self.record_by_id(&guard, account_id)?;
+        let provider = record.provider();
+        is_cline_family(&provider).then_some(provider)
     }
 
     /// 这条记录是不是**桌面端实时登录态**（凭证在 Cline 客户端自己的文件里）。
@@ -165,13 +157,10 @@ impl AccountStore {
             return false;
         }
         let guard = self.guard();
-        let state = self.load(&guard);
-        state
-            .accounts
-            .iter()
-            .find(|item| item.id() == account_id)
-            .map(|item| item.is_desktop() && is_cline_family(&item.provider()))
-            .unwrap_or(false)
+        let Some(record) = self.record_by_id(&guard, account_id) else {
+            return false;
+        };
+        record.is_desktop() && is_cline_family(&record.provider())
     }
 
     // ─── 写：手动添加 / 登录落账号 ────────────────────────────
@@ -261,9 +250,9 @@ impl AccountStore {
         };
 
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
-        let existing = state.accounts.iter().find(|item| item.id() == id).cloned();
-        if existing.is_none() && state.accounts.len() >= MAX_ACCOUNTS {
+        // 只读这一行（不再读全量）：既有记录决定「更新还是新建」与多处沿用值
+        let existing = self.record_by_id(&_guard, &id);
+        if existing.is_none() && self.with_conn(&_guard, |conn| sql::count_all(conn))? as usize >= MAX_ACCOUNTS {
             return Err(AccountStoreError::new(
                 format!("最多保存 {MAX_ACCOUNTS} 个账号"),
                 400,
@@ -304,13 +293,14 @@ impl AccountStore {
             .as_ref()
             .map(StoredAccount::priority)
             .unwrap_or_else(|| {
-                next_free_priority(
-                    &state
-                        .accounts
-                        .iter()
-                        .map(StoredAccount::priority)
-                        .collect::<Vec<_>>(),
-                )
+                // 号段取全部账号（优先级全局唯一）；改造后只取投影列一列数值。
+                // 这里用 unwrap_or_else 的闭包形态，所以把查询结果先取出来：
+                // 查询失败（库不可用）时回落到默认号段，与旧实现「拿不到账号
+                // 就当没有号段」的兜底一致（`next_free_priority(&[])` = 默认值）。
+                let used = self
+                    .with_conn(&_guard, |conn| sql::priorities_all(conn))
+                    .unwrap_or_default();
+                next_free_priority(&used)
             });
         let mut fields: Map<String, Value> = existing
             .as_ref()
@@ -386,9 +376,9 @@ impl AccountStore {
         }
         let saved = StoredAccount::from_map(fields);
         let is_new = existing.is_none();
-        state.accounts.retain(|item| item.id() != saved.id());
-        state.accounts.push(saved.clone());
-        self.save(&state, &_guard)?;
+        // 单行落地：`put` = DELETE + INSERT（更新既有记录时它落到列表末尾，
+        // 与旧实现 retain + push 的结果一致，见 `sql::put`）
+        self.with_conn(&_guard, |conn| sql::put(conn, &saved))?;
         logging::log(
             "[Accounts]",
             &format!(
@@ -428,8 +418,7 @@ impl AccountStore {
             })?;
         let id = credentials::desktop_account_id(provider);
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
-        let existing = state.accounts.iter().find(|item| item.id() == id).cloned();
+        let existing = self.record_by_id(&_guard, &id);
         if let Some(existing) = existing.as_ref() {
             if existing.provider() != provider {
                 return Err(AccountStoreError::new(
@@ -438,7 +427,7 @@ impl AccountStore {
                 ));
             }
         }
-        if existing.is_none() && state.accounts.len() >= MAX_ACCOUNTS {
+        if existing.is_none() && self.with_conn(&_guard, |conn| sql::count_all(conn))? as usize >= MAX_ACCOUNTS {
             return Err(AccountStoreError::new(
                 format!("最多保存 {MAX_ACCOUNTS} 个账号"),
                 400,
@@ -470,13 +459,14 @@ impl AccountStore {
             .as_ref()
             .map(StoredAccount::priority)
             .unwrap_or_else(|| {
-                next_free_priority(
-                    &state
-                        .accounts
-                        .iter()
-                        .map(StoredAccount::priority)
-                        .collect::<Vec<_>>(),
-                )
+                // 号段取全部账号（优先级全局唯一）；改造后只取投影列一列数值。
+                // `unwrap_or_default` 的兜底：库不可用时当成「没有号段」，
+                // 得到 `next_free_priority(&[])` 的默认号 —— 与旧实现拿不到
+                // 账号时的兜底同形（那条路径本来也不该在此时被调用）。
+                let used = self
+                    .with_conn(&_guard, |conn| sql::priorities_all(conn))
+                    .unwrap_or_default();
+                next_free_priority(&used)
             });
         // 桌面端账号**不落 token**（实时读 providers.json）：只写展示需要的最小
         // 事实 + 一个用于界面显示的有效期（下次读文件会刷新它）
@@ -543,9 +533,9 @@ impl AccountStore {
         fields.remove("refreshToken");
         let saved = StoredAccount::from_map(fields);
         let is_new = existing.is_none();
-        state.accounts.retain(|item| item.id() != id);
-        state.accounts.push(saved.clone());
-        self.save(&state, &_guard)?;
+        // 单行落地：`put` = DELETE + INSERT（更新既有记录时它落到列表末尾，
+        // 与旧实现 retain + push 的结果一致，见 `sql::put`）
+        self.with_conn(&_guard, |conn| sql::put(conn, &saved))?;
         logging::log(
             "[Accounts]",
             &format!(
@@ -577,41 +567,42 @@ impl AccountStore {
         expires_at: Option<f64>,
     ) -> Result<CredentialWrite, String> {
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
-        let Some(index) = state.accounts.iter().position(|item| item.id() == id) else {
+        // 「比较-再写」只涉及这一行：读它、比它、原地更新它
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
             // 账号已被删除：结果无处可写，也不该新建记录
             return Ok(CredentialWrite::Stale);
         };
-        if state.accounts[index].is_desktop() {
+        if record.is_desktop() {
             return Err(
                 "桌面端账号的凭证不落盘（实时读 Cline 的 providers.json），无需回写".to_string(),
             );
         }
         // 「是不是 Cline 账号」按**系**判（两个池都算），不认具体的池 ——
         // 回写只关心「这条记录的凭证格式归不归我管」，池在写入时原样保留
-        if !is_cline_family(&state.accounts[index].provider()) {
+        if !is_cline_family(&record.provider()) {
             return Err(format!("账号 {id} 不是 Cline 账号"));
         }
-        if state.accounts[index].access_token() != expected_access_token
-            || state.accounts[index].refresh_token() != expected_refresh_token
+        if record.access_token() != expected_access_token
+            || record.refresh_token() != expected_refresh_token
         {
             return Ok(CredentialWrite::Stale);
         }
         if !access_token.is_empty() {
-            state.accounts[index].set("accessToken", Value::String(access_token.to_string()));
-            state.accounts[index].set("tokenTail", Value::String(token_tail_of(access_token)));
+            record.set("accessToken", Value::String(access_token.to_string()));
+            record.set("tokenTail", Value::String(token_tail_of(access_token)));
         }
         if !refresh_token.is_empty() {
-            state.accounts[index].set("refreshToken", Value::String(refresh_token.to_string()));
+            record.set("refreshToken", Value::String(refresh_token.to_string()));
         }
         if let Some(value) = expires_at.filter(|value| *value > 0.0) {
-            state.accounts[index].set(
+            record.set(
                 "expiresAt",
                 crate::server::core::account_store::state::json_number(value),
             );
         }
-        state.accounts[index].set_updated_at(logging::now_ms());
-        self.save(&state, &_guard).map_err(|error| error.message)?;
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
+            .map_err(|error| error.message)?;
         Ok(CredentialWrite::Written)
     }
 

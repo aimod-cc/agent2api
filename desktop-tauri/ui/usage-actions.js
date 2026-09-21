@@ -127,10 +127,16 @@
    *
    * ── 为什么单查要走 `?id=` 而不是「取一批后筛一条」────────────
    * 后端批量路径的目标集合是「全部**启用**账号」—— 禁用是「别用它转发」的意思，
-   * 定时那一轮不该为它们发请求。但用户手点某一行账号的「积分」按钮问的是另一个
+   * 定时那一轮不该为它们发请求。但用户手点某一行账号的「余额」按钮问的是另一个
    * 问题：「这个账号现在还剩多少」。按启用状态把它挡掉，结果里就没有这一行，
    * 界面只能兜底成「未返回余额数据」—— 用户分不清是禁用了还是上游挂了。
    * 所以单查带 id 走后端那条**不看启用状态**的分支（见 core::usage_query）。
+   *
+   * **这条口径与「签到」刻意不同**（`checkin.rs` 的单账号路径会拒掉已禁用账号）：
+   * 余额查询是**只读**的（不产生任何上游副作用，也不改本机状态），
+   * 「这个禁用账号还剩多少」是一个合理且无害的问题；而签到会消耗上游每日额度、
+   * 写回 `checkinAt`，那才需要「禁用就不做」。同一条 `enabled` 在两个动作上
+   * 语义相反是有意的，不要为了「统一口径」把其中一处改掉。
    *
    * 批量（`id` 缺省）仍是「全部启用账号」，行为与改造前一致。
    */
@@ -168,17 +174,41 @@
    *
    * 目标集合只含「有余额概念 + 启用」：已禁用账号后端同样会跳过，
    * 界面若把它算进分母，播报的「已更新 N/M」会与真实条数对不上。
+   *
+   * ── 第二次点击 = 收起（本次改造）────────────────────────────
+   * 与单账号那颗「积分」按钮同一套判据：目标是同一批账号时，若它们已经
+   * 全部展开着，这一次点击就是收起（`wbAccountsView.panelsAllOpen`），
+   * 不发请求、不动按钮文案。
+   *
+   * 判据为什么必须问视图侧、不能在这里自己算：面板展开态（`openPanels`）
+   * 住在 accounts-view.js，单账号按钮的「再点一次收起」正是直接读写它。
+   * 若这里另写一份（比如「usageMap 里都有值」），就会与那一份分叉 ——
+   * 最典型的场景是：用户单点某行收起它，累计几次之后总按钮以为「都还开着」，
+   * 于是那一下点击只收起了它自己看到的那一份，而单按钮早就关掉的行不动 ——
+   * 界面上表现为「按了没反应」。所以两个入口读**同一个函数**：
+   * 一致性来自「同一份状态 + 同一个读法」，不是来自两处判据写得一样。
+   *
+   * 收起路径不碰 usageMap：已查到的那一轮结果原样留着（收起只是不看，不是丢弃），
+   * 所以再点一次回来时不需要重新请求就又能看到数字。
    */
   async function queryAllUsage() {
     if (usageBusy) return;
     const targets = accounts().filter(account => supportsUsage(account) && account.enabled !== false);
     if (!targets.length) { toast('暂无可查询余额的账号', 'err'); return; }
+    const ids = targets.map(a => a.id);
+    // 收起分支（与单账号按钮的 `wasOpen` 那条同形）：不置 usageBusy、不改按钮文案、
+    // 一个请求都不发 —— 只翻展开态再重绘一次
+    if (window.wbAccountsView?.panelsAllOpen?.(ids, 'usage')) {
+      window.wbAccountsView?.closePanels?.(ids, 'usage');
+      repaint();
+      return;
+    }
     usageBusy = true;
     const button = document.getElementById('btn-query-usage');
     if (button) { button.disabled = true; button.textContent = '查询中…'; }
     // 先把结果区展开（null = 查询中）再重绘：不展开的话结果回来了却无处可看
     targets.forEach(a => usageMap.set(a.id, null));
-    openUsagePanels(targets.map(a => a.id));
+    openUsagePanels(ids);
     repaint();
     try {
       const rows = (await queryUsageFor(null))?.results || [];
@@ -203,7 +233,7 @@
 
   /**
    * 展开一批账号的「余额」明细行。由视图侧提供实现（面板展开态归它管），
-   * 没提供时静默跳过 —— 结果是缓存里的，用户点一下那行的「积分」照样能看到。
+   * 没提供时静默跳过 —— 结果是缓存里的，用户点一下那行操作列的「余额」照样能看到。
    */
   function openUsagePanels(ids) {
     window.wbAccountsView?.openPanels?.(ids, 'usage');

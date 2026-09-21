@@ -35,7 +35,7 @@
 //!   2. **桌面端账号 id**：原项目用 `desktop-auth`，这里用 `autoclaw-desktop`。
 //!      原因很实际：`desktop-auth` 已被 **CatPaw** 的桌面端账号占用
 //!      （`catpaw::credentials::DESKTOP_ACCOUNT_ID`，同样照抄原项目），而账号
-//!      记录的 id 在整份 accounts.json 里唯一、`remove_account` / `patch_account`
+//!      记录的 id 在整份账号集合里唯一、`remove_account` / `patch_account`
 //!      都按裸 id 查找 —— 两家同名会让「删除/改备注」落到另一家身上。
 //!      凭证层的 `credentials::DESKTOP_ACCOUNT_ID`（`desktop-auth`）是**凭证对象**
 //!      的 id，与账号记录 id 是两回事；`snapshot_for` 认的是记录里的 `desktop`
@@ -56,6 +56,7 @@
 use serde_json::{Map, Value};
 
 use crate::server::core::account_store::priority::next_free_priority;
+use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{pick_token, token_tail_of, truncate_chars};
@@ -93,20 +94,16 @@ impl AccountStore {
     /// `tokenTail`（见 `to_autoclaw_public_account`）。
     pub fn autoclaw_account_record(&self, account_id: &str) -> Option<Value> {
         let _guard = self.guard();
-        let state = self.load(&_guard);
         let autoclaw = autoclaw_id();
         if !account_id.is_empty() {
-            return state
-                .accounts
-                .iter()
-                .find(|item| item.id() == account_id && item.provider() == autoclaw)
-                .map(StoredAccount::to_value);
+            // 按 id 直查一行（不读别家、也不读其余 AutoClaw 账号）
+            let record = self.record_by_id(&_guard, account_id)?;
+            return (record.provider() == autoclaw).then(|| record.to_value());
         }
-        let mut candidates: Vec<StoredAccount> = state
-            .accounts
-            .iter()
-            .filter(|item| item.provider() == autoclaw && item.enabled())
-            .cloned()
+        let mut candidates: Vec<StoredAccount> = self
+            .records_for_provider(&_guard, autoclaw)
+            .into_iter()
+            .filter(StoredAccount::enabled)
             .collect();
         candidates.sort_by_key(StoredAccount::order_key);
         candidates.into_iter().next().map(|item| item.to_value())
@@ -174,9 +171,9 @@ impl AccountStore {
         let device_id = truncate_chars(&parsed.device_id, MAX_IDENTITY_LENGTH);
 
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
         let id = format!("user-{user_id}");
-        let existing = state.accounts.iter().find(|item| item.id() == id).cloned();
+        // 只读这一行（不再读全量）：既有记录决定「更新还是新建」与多处沿用值
+        let existing = self.record_by_id(&_guard, &id);
         if let Some(existing) = existing.as_ref() {
             let existing_provider = existing.provider();
             if existing_provider != autoclaw_id() {
@@ -189,11 +186,15 @@ impl AccountStore {
                 ));
             }
         }
-        if existing.is_none() && state.accounts.len() >= MAX_ACCOUNTS {
-            return Err(AccountStoreError::new(
-                format!("最多保存 {MAX_ACCOUNTS} 个账号"),
-                400,
-            ));
+        if existing.is_none() {
+            // 上限判定查投影列（COUNT），不把记录读出来数
+            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
+            if total as usize >= MAX_ACCOUNTS {
+                return Err(AccountStoreError::new(
+                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
+                    400,
+                ));
+            }
         }
         // 备注名兜底：显式传入 → 既有记录里的备注名 → `账号 {userId}`
         // （原项目的缺省是 `账号 ${userId}`；它没有「用户改过的备注名要保留」
@@ -212,15 +213,13 @@ impl AccountStore {
             .unwrap_or_else(|| format!("账号 {user_id}"));
         let priority = match existing.as_ref() {
             Some(record) => record.priority(),
-            None => next_free_priority(
+            None => {
                 // 号段取**全部**账号：优先级全局唯一（四家共用一条队列），
-                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）
-                &state
-                    .accounts
-                    .iter()
-                    .map(StoredAccount::priority)
-                    .collect::<Vec<_>>(),
-            ),
+                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）。
+                // 改造后直接在投影列上取一列数值，不解析任何记录的 JSON。
+                let used = self.with_conn(&_guard, |conn| sql::priorities_all(conn))?;
+                next_free_priority(&used)
+            }
         };
         let now = logging::now_ms();
         let mut record = Map::new();
@@ -295,9 +294,9 @@ impl AccountStore {
             }
         }
         let saved = StoredAccount::from_map(merged);
-        state.accounts.retain(|item| item.id() != id);
-        state.accounts.push(saved.clone());
-        self.save(&state, &_guard)?;
+        // 单行落地：`put` = DELETE + INSERT，于是「更新既有记录时它在列表里
+        // 往后挪」的旧行为（retain + push）保持不变（见 `sql::put`）
+        self.with_conn(&_guard, |conn| sql::put(conn, &saved))?;
         logging::log(
             "[Accounts]",
             &format!("✅ AutoClaw 账号已保存: {record_name}（{user_id}，优先级 {priority}）"),
@@ -328,9 +327,8 @@ impl AccountStore {
             .unwrap_or("")
             .to_string();
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
         let id = DESKTOP_ACCOUNT_ID.to_string();
-        let existing = state.accounts.iter().find(|item| item.id() == id).cloned();
+        let existing = self.record_by_id(&_guard, &id);
         if let Some(existing) = existing.as_ref() {
             let existing_provider = existing.provider();
             if existing_provider != autoclaw_id() {
@@ -342,11 +340,15 @@ impl AccountStore {
                 ));
             }
         }
-        if existing.is_none() && state.accounts.len() >= MAX_ACCOUNTS {
-            return Err(AccountStoreError::new(
-                format!("最多保存 {MAX_ACCOUNTS} 个账号"),
-                400,
-            ));
+        if existing.is_none() {
+            // 上限判定查投影列（COUNT），不把记录读出来数
+            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
+            if total as usize >= MAX_ACCOUNTS {
+                return Err(AccountStoreError::new(
+                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
+                    400,
+                ));
+            }
         }
         let default_name = if user_id.is_empty() {
             "桌面端登录账号".to_string()
@@ -360,15 +362,13 @@ impl AccountStore {
             .unwrap_or_else(|| default_name.clone());
         let priority = match existing.as_ref() {
             Some(record) => record.priority(),
-            None => next_free_priority(
+            None => {
                 // 号段取**全部**账号：优先级全局唯一（四家共用一条队列），
-                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）
-                &state
-                    .accounts
-                    .iter()
-                    .map(StoredAccount::priority)
-                    .collect::<Vec<_>>(),
-            ),
+                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）。
+                // 改造后直接在投影列上取一列数值，不解析任何记录的 JSON。
+                let used = self.with_conn(&_guard, |conn| sql::priorities_all(conn))?;
+                next_free_priority(&used)
+            }
         };
         let now = logging::now_ms();
         let mut record = Map::new();
@@ -417,9 +417,9 @@ impl AccountStore {
             }
         }
         let saved = StoredAccount::from_map(merged);
-        state.accounts.retain(|item| item.id() != id);
-        state.accounts.push(saved.clone());
-        self.save(&state, &_guard)?;
+        // 单行落地：`put` = DELETE + INSERT，于是「更新既有记录时它在列表里
+        // 往后挪」的旧行为（retain + push）保持不变（见 `sql::put`）
+        self.with_conn(&_guard, |conn| sql::put(conn, &saved))?;
         logging::log(
             "[Accounts]",
             &format!(
@@ -444,8 +444,8 @@ impl AccountStore {
     ///
     /// 同时同步 `userId`（新 token 的 JWT 声明是权威的）与 `deviceId`
     /// （刷新响应不会改设备，但 token 里可能带新的 `device_id` 声明），
-    /// 并在同一次落盘里完成 —— 不再有「先更新 token、再单独加锁补字段」的
-    /// 第二次写盘。桌面端账号仍然拒绝（它的凭证在 auth.json）。
+    /// 并在同一次写入里完成 —— 不再有「先更新 token、再单独加锁补字段」的
+    /// 第二次写入。桌面端账号仍然拒绝（它的凭证在 auth.json）。
     pub fn update_autoclaw_account_tokens_if_current(
         &self,
         id: &str,
@@ -457,37 +457,37 @@ impl AccountStore {
         device_id: &str,
     ) -> Result<CredentialWrite, String> {
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
-        let Some(index) = state.accounts.iter().position(|item| item.id() == id) else {
+        // 「比较-再写」只涉及这一行：读它、比它、原地更新它（与 raccoon 同一改造）
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
             // 账号已被删除（或 id 被换掉）：刷新结果无处可写，也不该新建记录
             return Ok(CredentialWrite::Stale);
         };
-        if state.accounts[index].is_desktop() {
+        if record.is_desktop() {
             return Err(
                 "桌面端账号的凭证不落盘（实时读 auth.json 并解密），无需回写".to_string(),
             );
         }
-        if state.accounts[index].provider() != autoclaw_id() {
+        if record.provider() != autoclaw_id() {
             return Err(format!("账号 {id} 不是 AutoClaw 账号"));
         }
         // 比较：记录里此刻的凭证必须仍是刷新前那份
-        if state.accounts[index].access_token() != expected_access_token
-            || state.accounts[index].refresh_token() != expected_refresh_token
+        if record.access_token() != expected_access_token
+            || record.refresh_token() != expected_refresh_token
         {
             return Ok(CredentialWrite::Stale);
         }
         if !access_token.is_empty() {
-            state.accounts[index].set("accessToken", Value::String(access_token.to_string()));
-            state.accounts[index].set(
+            record.set("accessToken", Value::String(access_token.to_string()));
+            record.set(
                 "tokenTail",
                 Value::String(token_tail_of(access_token)),
             );
         }
         if !refresh_token.is_empty() {
-            state.accounts[index].set("refreshToken", Value::String(refresh_token.to_string()));
+            record.set("refreshToken", Value::String(refresh_token.to_string()));
         }
         if let Some(value) = expires_at.filter(|value| *value > 0.0) {
-            state.accounts[index].set(
+            record.set(
                 "expiresAt",
                 crate::server::core::account_store::state::json_number(value),
             );
@@ -500,20 +500,21 @@ impl AccountStore {
                 _ => String::new(),
             };
             if !user_id.is_empty() {
-                state.accounts[index].set(
+                record.set(
                     "userId",
                     Value::String(truncate_chars(&user_id, MAX_IDENTITY_LENGTH)),
                 );
             }
         }
         if !device_id.trim().is_empty() {
-            state.accounts[index].set(
+            record.set(
                 "deviceId",
                 Value::String(truncate_chars(device_id.trim(), MAX_IDENTITY_LENGTH)),
             );
         }
-        state.accounts[index].set_updated_at(logging::now_ms());
-        self.save(&state, &_guard).map_err(|error| error.message)?;
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
+            .map_err(|error| error.message)?;
         Ok(CredentialWrite::Written)
     }
 

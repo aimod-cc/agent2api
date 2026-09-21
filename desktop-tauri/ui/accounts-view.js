@@ -75,7 +75,18 @@
   const snapshot = () => wbApp.getState()?.accounts;
 
   // ─── 行内面板：展开状态 ─────────────────────
-  // 面板按需展开（用户点过「限流」/「积分」/「签到」或批量操作带出结果之后），收起时 HTML 为空串。
+  // 面板按需展开（用户点过「限流」/「余额」/「签到」或批量操作带出结果之后），收起时 HTML 为空串。
+  //
+  // ── 这一份 Map 是「面板开着没」的**唯一判据来源** ──────────────
+  // 四个入口都只读它，谁都不自己另存一份布尔量：
+  //   · 单账号按钮（本文件绑定的 `data-action="usage"` / `"limits"`）读 `panelOpen`;
+  //   · 批量展开（余额 / 签到的工具条按钮）读 `panelsAllOpen` 决定「这次是查询还是收起」;
+  //   · 渲染（`panelsHtml`）按它决定这一行要不要生成明细行；
+  //   · 账号被删除时 `render` 顺手清理不在列表里的 id。
+  // 这样「单按钮关了一行、总按钮却以为还开着」在结构上不可能发生 —— 不是靠
+  // 两处判据写得一样来维持一致，而是它们本来就是同一个函数读同一份状态。
+  // 反过来说：**以后再加第三个入口，也必须走这里的三个函数**（panelOpen /
+  // setPanelOpen / panelsAllOpen），不要另起一套判据，否则这条保证就断了。
   /** 已展开明细的账号：accountId -> Set<'limits' | 'usage' | 'checkin'> */
   const openPanels = new Map();
 
@@ -93,6 +104,25 @@
   /** 批量展开入口：余额 / 签到的批量动作在 usage-actions.js，展开态归本文件管 */
   function openPanelsFor(ids, kind) {
     for (const id of ids) setPanelOpen(id, kind, true);
+  }
+
+  /** 批量收起入口（`openPanelsFor` 的反操作），同一处实现，理由见上面那条注释 */
+  function closePanelsFor(ids, kind) {
+    for (const id of ids) setPanelOpen(id, kind, false);
+  }
+
+  /**
+   * 一批账号的某块明细是否**全部**已展开。
+   *
+   * 批量按钮「第二次点击 = 收起」的判据。它必须由**本文件**回答而不是让
+   * usage-actions.js 自己遍历一遍：那样就有了第二份判据，而两份判据在
+   * 「空集合算不算全开」「某个 id 不在列表里怎么算」这些边角上必然分叉。
+   *
+   * 空集合返回 false：没有目标时应当走到调用方那句「暂无可查询的账号」提示，
+   * 而不是被当成「都开着」而静默收起（`every` 在空数组上返回 true，是个坑）。
+   */
+  function panelsAllOpen(ids, kind) {
+    return ids.length > 0 && ids.every(id => panelOpen(id, kind));
   }
 
   /** 该账号当前要渲染的行内明细（未展开时为空串） */
@@ -545,7 +575,12 @@
         return;
       }
       if (action === 'usage') {
-        // 点「积分」即展开明细；已展开时再点则收起（当成开关用）
+        // 点「余额」按钮即展开明细；已展开时再点则收起（当成开关用）。
+        // 这颗按钮本次改造从余额列挪进了操作列（见 accounts-table.js 的
+        // actionsCell），但**这里一行都不用改** —— 委托靠 data-action 匹配，
+        // 与它渲染在哪一格无关。批量那颗「查询积分」走的是
+        // usage-actions.js 的 queryAllUsage，两处的展开态判据是同一份
+        // （openPanels，见那边「唯一判据来源」的说明）。
         const wasOpen = panelOpen(id, 'usage');
         setPanelOpen(id, 'usage', !wasOpen);
         if (wasOpen) { render(); return; }
@@ -718,6 +753,11 @@
     renderNavCount,
     refreshCaches,
     openPanels: openPanelsFor,
+    // 批量「开着没」的两个判据与「收起」入口一并导出：余额批量动作的那条链
+    // 在 usage-actions.js，而展开态住在这里 —— 它只通过这些函数问与改，
+    // 不自己遍历一份副本（见文件里「唯一判据来源」那段注释）
+    closePanels: closePanelsFor,
+    panelsAllOpen,
     // 连接数：切页面回来时视图侧主动补一次（轮询只认「当时在账号页」，
     // 切走的这两分钟里数据已经过期了）
     syncConnections,

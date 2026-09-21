@@ -4,10 +4,11 @@
 //! （`x || y`、`x ?? y`、`Number(x)`、`String(x)`、`JSON.stringify` 比较…）。
 //! 这些函数的唯一目标就是**在 Rust 里逐条复刻那些语义**，让行为与 Node 版一致：
 //! 宁可容忍脏数据（类型不对就回落），也不要报错或丢字段 —— 用户手工编辑
-//! accounts.json 是明确支持的用法。
+//! 账号记录（库里的 `data` 列，或导出文件）是明确支持的用法。
 //!
-//! 从 store.rs 拆出（单文件行数约定）。三处使用：store.rs（读写与公开形态）、
-//! store_crud.rs（增删改查）、account_transfer.rs（导入导出归一）。
+//! 从 store.rs 拆出（单文件行数约定）。三处使用：store.rs / store_view.rs
+//! （读写与公开形态）、store_crud.rs（增删改查）、account_transfer.rs
+//! （导入导出归一）。
 
 use serde_json::{Map, Value};
 

@@ -23,7 +23,7 @@
 //! 用 `OnceLock<HashMap<…>>` 反而要处理「注册表还没装好时被调用」的路径，
 //! 而那条路径在 panic=abort 的 release 里只能 panic —— 得不偿失。
 //!
-//! ── 契约之外的九处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
+//! ── 契约之外的十处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
 //!   1. `retry_advice`：识别「可退避重试的错误」并给出间隔与日志文案。
 //!      §4.3 要求「11128 退避逻辑保持在转发层」——**循环**留在编排层，
 //!      但「哪个码要退避、退多久」是 provider 知识（11128 是 workbuddy 的
@@ -90,6 +90,13 @@
 //!      手动路径靠它逐家如实汇报，见 [`refresh_implemented_forced`]。
 //!      默认实现仍是 false：那是给「将来新接入、目录还没拉通」的 provider 留的
 //!      过渡态（与 `supports_chat` 同一性质）。
+//!  10. `reasoning_patch`（思考等级绑定的翻译，R7 的后半段）：「通用 8 档怎么
+//!      翻译成本家上游认识的字段与取值」是**各家的知识**（CatPaw 只认
+//!      low/high/max，多一个值当场 400；Qoder 按模型自己声明的 efforts 归一；
+//!      另外几家原样透传 body、上游不认识这类字段），所以由适配器回答，
+//!      编排层（`upstream::payload`）只负责在正确的时机问一次、按结果改写 body。
+//!      **默认实现是「不接」**（返回 `NotSupported`）—— 理由见那个方法的文档：
+//!      接一家要有一家的证据，没证据就注入等于把未知参数推给上游。
 //!
 //! ── 未注册的 provider 怎么办 ────────────────────────────────
 //! 四家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
@@ -173,6 +180,35 @@ pub struct RetryAdvice {
     pub delay_ms: u64,
     /// 完整日志文案（provider 专属措辞，编排层原样打）
     pub log_message: String,
+}
+
+/// 一次思考等级翻译的结果（`ProviderAdapter::reasoning_patch` 的返回）。
+///
+/// ── 为什么是「要么一个字段、要么一个原因」而不是 `Option<Value>` ──
+/// 注入点（`upstream::payload`）要做两件事：改写 body、**把结果记进详细日志**。
+/// 「不注入」有四五种成因（这家不支持 / 客户端已指定 / 等级不在能力范围内 /
+/// 该等级语义是关闭思考……），对用户来说原因完全不同 —— 用 `Option` 会让
+/// 日志只能写一句「未注入」，那正是「我绑了为什么不生效」最难查的情形。
+/// 把原因做成返回值的一部分，适配器就必须为自己的判断给出一句话。
+#[derive(Clone, Debug)]
+pub enum ReasoningPatch {
+    /// 注入：把 body 顶层的 `field` 设成 `value`（覆盖同名的旧值）。
+    ///
+    /// `Value` 而不是 `String`：当前两家（CatPaw / Qoder）要的都是字符串档位，
+    /// 但上游表达「开思考 + 档位」的形态未必都是字符串（布尔开关、嵌套对象
+    /// 都常见），留成 `Value` 让将来那家不必先改这个枚举的**形状**。
+    Set {
+        /// body 顶层的字段名（各家自己那个 resolver 认识的键，如
+        /// `reasoning_effort`）—— 注入点只负责写，不认识字段的语义。
+        field: &'static str,
+        value: Value,
+    },
+    /// 不注入（body 一个字节都不动，保持本功能之前的行为）。`reason` 进详细日志。
+    Skip {
+        /// 给用户看的一句话原因（「这家不支持思考等级」/「客户端请求体里已指定」
+        /// /「该等级不在本家接受的档位内」……）。
+        reason: &'static str,
+    },
 }
 
 /// 单个提供商的转发适配能力（架构文档 §4.2）。
@@ -259,6 +295,67 @@ pub trait ProviderAdapter: Send + Sync {
         client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError>;
 
+    /// 把「映射上绑的思考等级」翻译成本家上游认识的字段与取值（模块头扩展 10）。
+    ///
+    /// ── 调用时机与调用者 ────────────────────────────────────────
+    /// `upstream::payload::send_body`：某一家 provider 的凭证已就绪、即将发送，
+    /// 在按家改写完模型名之后调一次（**与模型名改写同一步**，因为等级与发送名
+    /// 来自同一条映射，见 `catalog::WireTarget`）。注入点只做三件事：把
+    /// `level` 原样递进来、按返回结果改写 body、把 `reason` 记进详细日志。
+    /// 它不认识任何一家的字段名，也不做任何「档位该叫什么」的判断。
+    ///
+    /// ── `level` 是什么、不是什么（实现必须先读这段）────────────────
+    /// 传进来的是**映射上原样存着的那个字符串**（已过 `normalize`：去空白、
+    /// 非空、不超 32 字符），**没有**预先按通用表过滤过 —— 判断「这个值能不能
+    /// 翻译」是实现的责任，因为各家的能力范围不同（CatPaw 只有三档，Qoder
+    /// 看模型自己声明的 efforts）。
+    ///
+    /// 两条**共用**的判据在 `model_rules` 里，实现应当直接用它们而不是自己抄一份：
+    ///   - `model_rules::reasoning_is_off(level)`：`off` / `none` —— 一律不注入。
+    ///     本项目没有安全的「关闭思考」表达（Qoder 的 `enable_thinking = false`
+    ///     会让 Qwen3.8 系列行为异常，CatPaw 没有这一档），**不要**把它翻译成
+    ///     任何一个「关」的字段，`Skip` 就是正确答案；
+    ///   - `model_rules::reasoning_rank(level)`：通用 6 档的强弱序号
+    ///     （0 = minimal … 5 = max），表外的自定义等级返回 None。
+    ///     CatPaw 拿它 `rank / 2` 折成自己的三档（见那家适配器的实现）；
+    ///     自定义等级一律 `Skip` —— 用户可能填了任何东西，而错值在 CatPaw 是
+    ///     当场 400，在别家是未知参数，都不如不注入。
+    ///
+    /// ── 为什么默认是「不接」而不是「透传一个通用字段」────────────
+    /// 默认实现返回 `Skip`，且**所有没覆写的家都应当保持它**。理由是本项目的
+    /// 一条既有事实：五家里有三家（workbuddy / 小浣熊 / Cline）的
+    /// `build_chat_request` 是 `body.clone()` 原样透传，另外两家的上游协议由
+    /// 各自的 resolver 现算档位 —— **没有任何证据**表明它们认识一个通用档位
+    /// 字段。给上游塞一个它不认识的键不叫「让绑定生效」，只是把未知参数推过去：
+    /// 好一点的情况是被忽略（用户以为生效了，其实没有），坏一点是 400。
+    /// 所以接一家要有一家的证据（上游枚举、实测、上游自己的 resolver 认这个键），
+    /// 并在这里覆写；「看起来应该支持」不是证据。
+    ///
+    /// ── 实现必须自己判的第三条：客户端是不是已经指定了 ──────────────
+    /// 客户端在请求体里显式传了档位（CatPaw 的 `reasoning_effort` /
+    /// `reasoningEffort` / `effort`，Qoder 的 `reasoning_effort` / `reasoning` /
+    /// `thinking`）时，绑定**不覆盖**它 —— 那是用户的明确意图，比映射上的默认值
+    /// 更具体。判据请**直接复用本家那个 resolver**（`catpaw::models::resolve_effort`
+    /// 的取值链、`qoder::protocol::resolve_thinking` 读的那三个键），不要在这里
+    /// 另抄一份键名清单：抄一份的下场是上游将来加一个别名时，绑定会开始覆盖
+    /// 一个「客户端其实已经指定了」的请求，而那种错误没有任何日志会提示。
+    ///
+    /// ── 与 `build_chat_request` 的分工（为什么不做成后者的参数）──────
+    /// 那个方法的入参是「账号 + 客户端原始 body」，而等级来自**映射**、由
+    /// 编排层在按家改写模型名时才解析出来（同一处，见 `catalog::WireTarget`）；
+    /// 把它塞进 `build_chat_request` 会让适配器看到一份与它无关的编排层状态，
+    /// 也会让 `forward_conversation` 那条有状态路径（CatPaw / Qoder 都走它）
+    /// 拿不到这个值 —— 而这两家恰恰是唯一要翻译的两家。
+    ///
+    /// `model` 是**即将发给上游的那个名字**（已按家改写，见 `WireTarget.model`）：
+    /// 需要按模型判断档位的家（Qoder 要拿它去查模型的 `efforts`）用它，
+    /// 不看模型的家忽略它。
+    fn reasoning_patch(&self, _level: &str, _model: &str, _body: &Value) -> ReasoningPatch {
+        ReasoningPatch::Skip {
+            reason: "该提供商不支持思考等级绑定（上游无对应字段）",
+        }
+    }
+
     /// 判定上游错误类型（status + 已解析的错误体）。
     ///
     /// `error_body` 是**已归一化**的错误对象：至少含 `code`（上游业务码，
@@ -267,7 +364,6 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::request::read_upstream_error`），因为「怎么读一个 HTTP 错误体」
     /// 是协议层的事、与哪一家无关。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass;
-
     /// 取可用 access token（含临期主动刷新；刷新结果回写 store）。
     ///
     /// `account_id` 为空串表示「没有指定账号」：用默认登录态

@@ -147,7 +147,6 @@ pub fn run() {
             commands::login_state,
             commands::cancel_login,
             commands::export_logs,
-            commands::pick_directory,
             commands::get_app_settings,
             commands::save_app_settings,
             commands::export_accounts,

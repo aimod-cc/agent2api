@@ -92,7 +92,12 @@
       title: '该账号当前限流中的模型；点徽章看明细',
     },
     { key: 'expiry', label: '有效期' },
-    { key: 'usage', label: '余额 / 积分' },
+    // 「余额 / 积分」改成「余额」（本次改造）：这一列现在只放**读数**，
+    // 那颗查询按钮已移到操作列（见 usageCell 与 actionsCell）——
+    // 一个只显示余额数字的列叫「余额 / 积分」会让人以为这里还能点。
+    // 而「余额」这个词也容得下各家的不同叫法（WorkBuddy 是积分、
+    // 小浣熊是积分、AutoClaw 是余额），不必在表头枚举。
+    { key: 'usage', label: '余额' },
     { key: 'actions', label: '操作' },
   ];
 
@@ -134,30 +139,69 @@
     + ` data-pick="${esc(account.id)}"${picked ? ' checked' : ''} title="勾选后可批量操作"></td>`;
 
   /**
-   * 优先级：全局序号 + 可直接编辑的数字输入框 + ↑/↓。
+   * 优先级：全局序号 + 「↓ 数字 ↑」合并控件。
    *
-   * 序号（#N）回答「第几位」，输入框里的数字回答「队列值」—— 两者是同一个事实的
+   * 序号（#N）回答「第几位」，控件里的数字回答「队列值」—— 两者是同一个事实的
    * 两种读法：序号便于扫读（「我的账号在第 3 位」），数值便于精确定位与手工对齐。
-   * 为什么是「一直可编辑」而不是「双击才变输入框」：这一列的主用途就是改顺序，
-   * 双击先要用户发现「这里能双击」；而 ↑/↓ 已经覆盖了最常用的「挪一位」，
+   * 为什么数字一直可编辑而不是「双击才变输入框」：这一列的主用途就是改顺序，
+   * 双击先要用户发现「这里能双击」；而两枚箭头已经覆盖了最常用的「挪一位」，
    * 剩下的「改成一个具体数字」交给一个本身就长得像输入框的控件最直接。
    * 保存时机是**失焦 / 回车**（回车即触发一次失焦），不是在 input 事件里 ——
    * 每敲一位就发一次请求会让「改成 250」变成三次 PATCH，中间还会撞上冲突。
+   *
+   * ── 为什么把「数字框 + 两枚箭头」合成一个控件（本次改造）──────
+   * 改造前是三块并排的独立控件：一个 44px 的数字框 + 一组「↑ ↓」（间距 3px）。
+   * 三块拼在一起时，箭头组与输入框之间没有任何视觉关联，看着像
+   * 「一个输入框 + 两个无关按钮」；而它们实际上是**同一个东西**——
+   * 都是「改这个值」的入口，只是一个给增量、一个给绝对值。
+   * 合成一个控件（共享外框与圆角，内部用分隔线断开）之后，那层关系在
+   * 视觉上直接成立。
+   *
+   * ── 方向与语义的对应（**极易搞反，改动时先读这里**）──────────
+   * 优先级是**数值越小越先用**（全局队列一条，见 accounts-view.js 的模块头），
+   * 所以：
+   *   · 上箭头（↑）= 与队列里的**上一个**账号交换 = 排得更靠前 = **优先级数值变小**
+   *   · 下箭头（↓）= 与队列里的**下一个**账号交换 = 排得更靠后 = **优先级数值变大**
+   * 这两个方向来自后端 `move_account(id, "up" | "down")` 的语义：
+   * `down` 找 `index + 1`（后一个），`up` 找 `index - 1`（前一个），见
+   * `core::account_store::store_crud::move_account`。
+   * **视觉顺序也是这个含义**：控件里上箭头在**上方/右侧靠↑**、下箭头在下方，
+   * 与「值往哪个方向走」一致 —— 写成 `↓ 数字 ↑` 而不是 `↑ 数字 ↓`，
+   * 是因为竖排方向上「上」在心理模型里对应「往前排」。
+   *
+   * 按钮的 `data-action` 保持 `move-up` / `move-down` 不变：事件处理在
+   * accounts-view.js，改名会让那边的分支静默失效（它按字符串匹配）。
    */
   function priorityCell(account, ctx) {
     const value = ctx.draft ?? priorityOf(account);
     const title = '全局唯一：所有提供商的账号都不能重号，数值越小越先用';
     const seat = ctx.seat || { position: 1, total: 1 };
     // 拼串时不留多余缩进空白：td 是块级上下文，模板里的换行与缩进会原样进入
-    // 文本节点，把输入框与按钮挤开。所有片段都紧凑地贴在标签上。
+    // 文本节点，把控件挤开。所有片段都紧凑地贴在标签上。
+    //
+    // 控件内部的顺序：↓ / 数字框 / ↑。
+    //   · 下箭头在左、上箭头在右，中间夹着数字框 —— 与「左降右升」的
+    //     横排直觉一致（左低右高），也让两枚按钮贴着输入框的两侧，
+    //     视觉上是一组而不是三块。
+    //
+    // ── 箭头为什么是 SVG 而不是 ↓ / ↑ 字符（本次修复）──────────────
+    // 那两个字是字体字形，墨迹在行盒里天生偏下（Segoe UI 下 ascent=7 /
+    // descent=0，整个字形贴在基线之上），而同一行的数字是 ascent=8 ——
+    // 两者都靠 flex 把行盒居中，于是箭头视觉重心比几何中心低约 0.5px，
+    // 用户实测能看到「有点靠下」。SVG 的箭头在 24 画布内上下对称
+    // （顶点 5 / 底点 19），盒居中即墨迹居中，与字体无关。
+    // 图标本体与理由写在 icons.js 的 arrowDown / arrowUp。
+    const arrow = (name, size) => window.wbIcons?.icon?.(name, size) || '';
     return `<td class="cell-priority"><div class="prio">`
       + `<span class="seat" title="全局队列第 ${seat.position} 位，共 ${seat.total} 位">#${seat.position}</span>`
+      + `<span class="prio-stepper">`
+      + `<button class="prio-arrow" data-action="move-down" data-id="${esc(account.id)}"`
+      + ` title="与队列里的下一个账号交换优先级（可能是另一家的账号）"${seat.position >= seat.total ? ' disabled' : ''}>${arrow('arrowDown', 14)}</button>`
       + `<input class="prio-input" type="number" data-prio="${esc(account.id)}"`
       + ` min="${PRIORITY_MIN}" max="${PRIORITY_MAX}" step="1" value="${esc(String(value))}"`
       + ` aria-label="优先级" title="${esc(title)}">`
-      + `<span class="order-btns">`
-      + `<button data-action="move-up" data-id="${esc(account.id)}" title="与队列里的上一个账号交换优先级（可能是另一家的账号）"${seat.position <= 1 ? ' disabled' : ''}>↑</button>`
-      + `<button data-action="move-down" data-id="${esc(account.id)}" title="与队列里的下一个账号交换优先级（可能是另一家的账号）"${seat.position >= seat.total ? ' disabled' : ''}>↓</button>`
+      + `<button class="prio-arrow" data-action="move-up" data-id="${esc(account.id)}"`
+      + ` title="与队列里的上一个账号交换优先级（可能是另一家的账号）"${seat.position <= 1 ? ' disabled' : ''}>${arrow('arrowUp', 14)}</button>`
       + `</span></div></td>`;
   }
 
@@ -380,26 +424,51 @@
   }
 
   /**
-   * 余额 / 积分：「积分」按钮（查一次）+ 结果摘要。
+   * 余额：只放**摘要读数**（不可点），查询按钮已移到操作列。
    *
-   * 按钮点一下查询并展开明细，再点一下收起。摘要只做展示（不可点）——
-   * 同一格放两个能点的东西，用户会分不清哪个是查询、哪个是展开；
-   * 展开/收起始终由左边那颗按钮负责。
+   * ── 为什么按钮挪走（本次改造）────────────────────────────────
+   * 原先这一列是「一颗「积分」按钮 + 一行摘要」。按钮在余额列里的问题是
+   * **它的位置与它的作用不符**：它发起的是一个网络动作（查上游余额），
+   * 而这一列是读数区（有效期、状态、限流都是读数）。用户扫这一列是想看
+   * 「还剩多少」，结果每行第一个东西是一颗要点的按钮。
+   * 挪到操作列之后，这一列纯粹是读数，与相邻几列的语义一致。
+   *
+   * 摘要仍然只做展示（不可点）：展开/收起由操作列那颗按钮负责，
+   * 同一格放两个能点的东西会让人分不清哪个是查询、哪个是展开。
    */
   function usageCell(account, ctx) {
     if (!supportsUsage(account)) {
       return '<td class="cell-usage"><span class="muted" title="该提供商没有余额查询">—</span></td>';
     }
     const summary = usageSummary(ctx.usageEntry);
-    const open = ctx.usageOpen === true;
     return `<td class="cell-usage">`
-      + `<button class="usage-btn${open ? ' open' : ''}" data-action="usage" data-id="${esc(account.id)}"`
-      + ` title="${esc(open ? '收起余额明细' : '查询该账号剩余积分')}">积分</button>`
       + `<span class="usage-sum ${summary.kind}" title="${esc(summary.title)}">${esc(summary.text)}</span></td>`;
   }
 
   /**
-   * 操作：设为首选 / 设置 / 签到 / ⋯。置顶只看全局位置，不按可用性过滤。
+   * 操作：设为首选 / 设置 / 查余额（或收起）/ 签到 / ⋯。置顶只看全局位置，
+   * 不按可用性过滤。
+   *
+   * ── 查询余额按钮（本次改造从余额列挪来）──────────────────────
+   * 文案**恒定**是「余额」，展开态表达在 `title` 与 `.open` 类上 ——
+   * 这不是随手取的，而是**列宽预算的要求**（见下）。
+   * 它原先在余额列里就是同一套做法（标签恒为「积分」，只有 title 变化）。
+   *
+   * 为什么不改成「余额 / 收起余额」两态文案（看起来更直白）：操作列是这张表里
+   * 最挤的一格（五颗按钮并排），而最坏组合是「设为首选 + 余额 + 设置 + 已签到 + ⋯」
+   * ——「收起余额」比「余额」宽出两个字（约 23px），那 23px 只能从账号列挤。
+   * 而这一列里已经有一颗**真的**用两态文案的按钮（签到 / 已签到），那是有理由的：
+   * 「已签到」是**不可点**的状态（带 disabled），用户必须一眼看出「今天没得签了」，
+   * 藏进 title 就失去意义。余额按钮则两态都可点、且展开态本身有更强的信号
+   * （下面那行明细面板整条展开了，控件高亮着）—— 不缺这一句文案。
+   *
+   * 行为与它原先在余额列里**逐字一致**（`data-action="usage"` 的处理在
+   * accounts-view.js，那里对已展开的行走「只收起、不发请求」的分支），
+   * 所以下游一行没改 —— 改变的只有它渲染在哪一列。
+   *
+   * `supportsUsage` 不适用的家不渲染这颗按钮（与余额列显示破折号同一判据，
+   * 两处必须同源：列里写着「该提供商没有余额查询」而操作列却给一颗能点的
+   * 按钮，用户会以为按钮坏了）。
    *
    * ── 签到按钮的两种形态 ─────────────────────────────────────
    * 今天已经签过（`checkinAt` 落在本地今天，含自动签到与手动签到两条路径）时
@@ -409,10 +478,21 @@
    *
    * `disabled` 是真的禁用属性（而不是只加个灰样式）：这才同时挡住点击与键盘
    * 操作，也让读屏软件念出「不可用」—— 与「设为首选」在队首时的处理一致。
+   *
+   * ── 禁用账号不渲染签到按钮 ─────────────────────────────────
+   * `!enabled` 时整颗按钮不出现。这一条与后端 `checkin.rs` 单账号路径的
+   * `enabled` 检查**成对存在**（后端那处返回 400「账号已被禁用」）：
+   * 界面上不给入口 + 后端拒绝执行，两道都要有 —— 前端可能是旧版本，
+   * 后端可能是被别人直接调的，任何一道单独存在都不足以保证「禁用就不签」。
    */
   function actionsCell(account, ctx) {
     const enabled = isEnabled(account);
     const settings = `<button data-action="settings" data-id="${esc(account.id)}" title="备注名 / 启用 / 代理">设置</button>`;
+    const open = ctx.usageOpen === true;
+    const usage = supportsUsage(account)
+      ? `<button class="usage-btn${open ? ' open' : ''}" data-action="usage" data-id="${esc(account.id)}"`
+        + ` title="${esc(open ? '收起余额明细' : '查询该账号剩余余额')}">余额</button>`
+      : '';
     const checkedIn = checkedInToday(account);
     const checkin = !enabled || !supportsCheckin(account)
       ? ''
@@ -423,7 +503,7 @@
     const atFront = ctx.seat?.position === 1;
     const promote = `<button data-action="switch" data-id="${esc(account.id)}"`
       + ` title="${atFront ? '已在全局队列第一位' : '仅将优先级调整到全局第一位，不改变启用状态'}"${atFront ? ' disabled' : ''}>设为首选</button>`;
-    return `<td class="cell-actions"><div class="acct-actions">${promote}${settings}${checkin}`
+    return `<td class="cell-actions"><div class="acct-actions">${promote}${usage}${settings}${checkin}`
       + `<button data-action="more" data-id="${esc(account.id)}" title="更多操作">⋯</button></div></td>`;
   }
 

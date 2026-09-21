@@ -142,7 +142,7 @@ impl Pool {
     /// 上游 id 的**通道前缀**（`cline-free/` / `cline-pass/`）。
     ///
     /// 这个前缀必须原样发上游（是计费通道选择器），也是「某条映射属于哪个池」
-    /// 的判据（见 `catalog::wire_model_for_provider`）。
+    /// 的判据（见 `catalog::wire_target_for_provider`）。
     pub fn target_prefix(self) -> &'static str {
         match self {
             Self::Free => FREE_PREFIX,

@@ -12,7 +12,7 @@
 //!
 //! 全局实例：日志库在启动时初始化一次，之后所有模块共用（Node 版同样是
 //! 一个模块级 logStore 常量）。用 `OnceLock` 而不是 `Mutex<Option<...>>`，
-//! 读路径无锁；写入的串行化由 LogStore 内部的 Mutex 负责。
+//! 读路径无锁；写入的串行化由 LogStore 内部的锁负责。
 
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 
+use crate::server::db::Db;
 use crate::server::logs_store::{LogEntry, LogStore, NewEntry};
 
 /// 标签 → 日志分类，与桌面端筛选下拉一致（照抄 Node 版 TAG_CATEGORY）。
@@ -58,18 +59,27 @@ static VERBOSE: OnceLock<bool> = OnceLock::new();
 
 /// 初始化日志库。重复调用只生效一次（OnceLock 语义），返回是否本次装入成功。
 ///
-/// 在 `server::start()` 里最先调用 —— 之后其它模块再写日志就能入库。
+/// 在 `ServerState::bootstrap` 里调用 —— 数据库就绪之后、其余模块之前，
+/// 之后其它模块再写日志就能入库。
+///
+/// ── 参数为什么从 `directory` 改成 `Db` ─────────────────────
+/// 日志数据现在在统一库的 `logs` 表里（本切片从 `logs.jsonl` 迁过来），
+/// 不再有「日志自己的目录」。与 T2 的 `AccountStore::with_db(db)` 同一形态：
+/// 路径由 `Db` 唯一持有，日志库只是它的一个使用者。
+/// 接 `Option<Db>` 是因为 `ServerState::bootstrap` 手里就是 `Option<Db>`
+/// （库打不开时仍要能启动）：`None` 时日志库照常装起来，但写入静默丢弃、
+/// 读取返回空 —— 降级细节见 `LogStore` 各方法的说明。
 ///
 /// 保留天数走**回调**（每次裁剪时动态取 `config::retention_settings()`）：
 /// 于是设置页改完天数，下一次写日志 / 显式 prune 就生效，不需要重启进程
 /// （与 `RequestStats` 的 `get_retention` 同一模式）。
 /// 读的是配置的**内存快照**而不是每次读盘 —— 写日志是相对频繁的路径。
-pub fn init_store(directory: &std::path::Path, verbose: bool) -> bool {
+pub fn init_store(db: Option<Db>, verbose: bool) -> bool {
     let _ = VERBOSE.set(verbose);
     if STORE.get().is_some() {
         return false;
     }
-    let _ = STORE.set(LogStore::new(directory, || {
+    let _ = STORE.set(LogStore::with_db(db, || {
         crate::server::config::retention_settings().log_days
     }));
     true

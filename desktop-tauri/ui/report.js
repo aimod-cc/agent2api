@@ -227,14 +227,27 @@
 
   // ─── 板块二：Top 提供商 / Top 账号排行 ──────
   //
-  // 两张卡片（并排）共用同一套渲染：都是「一行一个主体 + 占比条 + 请求数 + 百分比」，
+  // 两张卡片（并排）共用同一套渲染：都是「一行一个主体 + 用量条 + Token 用量」，
   // 差别只在数据来源、名字怎么取、以及「其它」那一行怎么称呼。抽成一个函数传配置，
   // 而不是写两份 —— 两份的列宽、tooltip 格式、排序口径迟早会漂，而这类漂移
   // 不会报错，只会让两张并排的卡片看起来像两套设计。
+  //
+  // ── 为什么这一维只看 Token（本次改造）────────────────────────
+  // 原先是「按请求数排序 + 显示请求数 + 显示占比 + tooltip 里带成功率」，四列
+  // 读数挤在两张并排的窄卡里，读者要先分清「哪一列是次数、哪一列是百分比」。
+  // 而这一块存在的意义是回答「**用量**花在谁身上」—— 用量就是 Token，
+  // 请求数是过程量（一条 3 次重试的失败请求也会 +3 次请求数，却一个 Token 都不消耗）。
+  // 所以排序依据、条宽基准、格内读数、小标题、tooltip 全部统一到 Token 这一条口径上，
+  // **成功率也一并去掉**：它不是用量，留在这里会让「纯用量排行」重新变成混合读数。
+  // 成功率与请求数没有消失 —— 概览那张卡片里有精确值，请求日志里能逐条核对。
+  //
+  // 后端 `build_providers` / `build_accounts` 仍然照旧输出 requests / success /
+  // failures / totalTokens：那张聚合被报表的其它地方消费（概览对账、模型维度），
+  // 这里改的只是**前端怎么读它**。
 
   /**
    * 数据来自 summary.providers / summary.accounts
-   * （`[{id,label,requests,success,totalTokens}]`，按请求数降序）。
+   * （`[{id,label,requests,success,totalTokens}]`，后端按请求数降序）。
    *
    * 整块的可见性由 paintRank 决定：**契约里没有这个字段就整块隐藏**
    * （旧后端 / 该维度还没接上），与「字段在但为空数组」不同 —— 后者是「这段时间
@@ -271,7 +284,7 @@
   };
 
   /**
-   * 一组排行行 → HTML。
+   * 一组排行行 → HTML（只讲 Token 用量，见上「为什么这一维只看 Token」）。
    *
    * 两条 `RANK_CARDS` 的 label 语义不同（provider 的由后端注册表现算，
    * 账号的是聚合时留下的名字快照），但都已经是可直接显示的字符串，
@@ -283,49 +296,52 @@
         id: String(item?.id ?? '').trim(),
         // label 缺省用 id 兜底；两者都空的那一组是后端的「未知」
         label: String(item?.label ?? '').trim(),
-        requests: Number(item?.requests) || 0,
-        success: Number(item?.success) || 0,
+        // 后端字段名是 totalTokens（account 维度同形）；tokens 是兼容旧版本/别处形态
+        // 的兜底读法，保留它不增加分支成本
         tokens: Number(item?.totalTokens ?? item?.tokens) || 0,
       }))
-      .filter(item => item.requests > 0 || item.tokens > 0);
+      // 全零的组不参与：它们只可能来自手改过的数据，画出来是一条永远为 0 的行。
+      // 判据只看 tokens（不再是 requests）—— 与排序口径同一条，才不会出现
+      // 「因为请求数 >0 被保留、却按 0 Token 排在最后」的怪行
+      .filter(item => item.tokens > 0);
 
     if (!rows.length) return placeholder(config.emptyText);
 
-    const total = rows.reduce((sum, item) => sum + item.requests, 0);
-    // 总量为 0（只有 token 没有请求，理论上不该出现）时不给百分比：0/0 没有意义
+    const total = rows.reduce((sum, item) => sum + item.tokens, 0);
+    // 总量为 0 时不给百分比：0/0 没有意义。理论上走不到（上面的 filter 已把全零组
+    // 滤掉），但 rows 非空不代表 total 非空 —— total 是 Number 归一后的求和，
+    // 保留这条兜底与概览里的口径一致
     const share = count => (total ? (count / total) * 100 : 0);
 
-    // 按请求数排序后截断，溢出的合并成「其它」一行 —— 合并后的条仍然按真实
-    // 总量画，所以所有条加起来始终是 100%，不会因为截断而看起来缺一截
-    const sorted = [...rows].sort((left, right) => right.requests - left.requests);
+    // 按 Token 用量降序排序后截断，溢出的合并成「其它」一行 —— 合并后的条仍然
+    // 按真实总量画，所以所有条加起来始终是 100%，不会因为截断而看起来缺一截
+    const sorted = [...rows].sort((left, right) => right.tokens - left.tokens);
     const head = sorted.slice(0, RANK_TOP);
     const rest = sorted.slice(RANK_TOP);
     if (rest.length) {
       head.push({
         id: '',
         label: config.restLabel(rest.length),
-        requests: rest.reduce((sum, item) => sum + item.requests, 0),
-        success: rest.reduce((sum, item) => sum + item.success, 0),
+        // 合并行的 tokens 累加：排序基准换成 tokens 之后它自然就对了
         tokens: rest.reduce((sum, item) => sum + item.tokens, 0),
       });
     }
 
     return head.map(item => {
-      const percent = share(item.requests);
-      // 成功率只在有请求时给（0/0 没有意义），与概览里的口径一致
-      const rate = item.requests ? `${((item.success / item.requests) * 100).toFixed(1)}%` : '—';
+      const percent = share(item.tokens);
+      const text = formatTokens(item.tokens);
       const name = item.label || item.id || '未知';
       // 「名字（id）」这一形态有两处用途：整行的气泡说明，以及名字列的原生 title
       // （名字列可能被省略号截断，原生 title 是最直接的补救）。两者同源，
       // 名字列的显示与身份标识不会各说各话。
       const full = config.tipName({ ...item, label: name });
-      // 条宽用百分比：容器宽度变化时条跟着伸缩，不必像 SVG 那样量宽度重绘
-      const tip = `${full}：${formatInt(item.requests)} 次请求 · 占 ${percent.toFixed(1)}%`
-        + ` · 成功率 ${rate} · ${formatTokens(item.tokens)} tokens`;
+      // 条宽用百分比：容器宽度变化时条跟着伸缩，不必像 SVG 那样量宽度重绘。
+      // 气泡只讲用量：读数 + 占比，与格里看到的两列同源（不给成功率，见板块头）
+      const tip = `${full}：${text} tokens · 占 ${percent.toFixed(1)}%`;
       return `<div class="rank-row" data-tip="${esc(tip)}">
           <span class="name" title="${esc(full)}">${esc(name)}</span>
           <span class="track"><span class="bar" style="width:${percent.toFixed(1)}%"></span></span>
-          <span class="num">${formatInt(item.requests)}</span>
+          <span class="num" title="${esc(`${text} tokens`)}">${esc(text)}</span>
           <span class="pct">${percent.toFixed(1)}%</span>
         </div>`;
     }).join('');
@@ -336,6 +352,10 @@
    *
    * 字段缺失（`undefined`）→ 整块隐藏：这是「这份后端还没有这一维」，
    * 不是「这一维没数据」。面板与页头的小标题一起藏，避免页面上留一个空卡片。
+   *
+   * 小标题读数是 **Token 总量**（不再是「N 次请求」）：它与行内读数同一口径，
+   * 于是「5 行之和小标题」这条对账关系在界面上随时看得出来 —— 请求数总量写在
+   * 概览卡片里，两处各管一个量纲，不会互相打架。
    */
   function paintRank(key, list) {
     const config = RANK_CARDS[key];
@@ -346,8 +366,9 @@
     panel.hidden = !has;
     if (!has) return;
     paint(config.listId, rankHtml(list, config));
-    paint(config.labelId, esc(`${formatInt(
-      list.reduce((sum, item) => sum + (Number(item?.requests) || 0), 0))} 次请求`));
+    // 小标题按同一维度求和：后端字段是 totalTokens，兼容读法见 rankHtml
+    paint(config.labelId, esc(`${formatTokens(
+      list.reduce((sum, item) => sum + (Number(item?.totalTokens ?? item?.tokens) || 0), 0))} tokens`));
   }
 
   // ─── 板块三：热力图 ────────────────────────

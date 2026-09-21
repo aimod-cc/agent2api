@@ -1,10 +1,13 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "2.3.0"
+version = "2.4.0"
 description = "Agent2API 桌面端 — 多提供商本地网关与会话管理"
 authors = ["aimod-cc"]
 edition = "2021"
-rust-version = "1.77"
+# MSRV 由 rusqlite 0.40 → libsqlite3-sys 0.38 决定（它的声明值是 1.88）。
+# 本机工具链是 1.95，能编；但声明值必须与实际要求一致 —— 声明 1.77 却
+# 要求 1.88，会让「照着 rust-version 装旧工具链」的构建直接失败。
+rust-version = "1.88"
 # 许可：LICENSE 正文是逐字的标准 MIT 条款，但文件末尾附有「使用声明」，
 # 其第 3 条禁止商业用途 / 二次分发牟利，属于 MIT 之外的附加限制；
 # 根 README「许可」一节也写明两者共同构成完整的授权与使用约定。
@@ -99,6 +102,40 @@ md-5 = "0.10"
 # 正确性已与 Node 的 crypto 对拍（Rust 加密 → Node 私钥解密往返成功，
 # 且 AES-CBC / MD5 / 请求体编码的密文与 Node 逐字节一致）。
 num-bigint = "0.4"
+# 本地存储：数据从「一堆 JSON / JSONL 文件」收敛到单文件 SQLite
+# （`{config_dir}/agent2api.db`，见 server/db/）。之所以现在引入：
+# 现在的形态是「每个 store 各自持一份全量内存快照 + 整文件重写」，
+# 日志/统计/账号三份数据的裁剪、迁移、崩溃恢复各写各的，口径迟早会分叉；
+# 交给 SQLite 之后这些都由事务与索引保证，库是唯一真相。
+#
+# ── 为什么选 rusqlite 而不是 sqlx / sea-orm ───────────────────
+# 本项目全程**同步**访问存储（各 store 内部一把 Mutex，调用点不在 async
+# fn 里）。sqlx 的那套「异步驱动 + 编译期查询校验」需要 async 上下文与
+# 离线元数据，为它把整个存储层改成 async 得不偿失；sea-orm 之类再往上是
+# ORM 与迁移 DSL，而我们的表就 6 张、迁移是几十行确定性代码。rusqlite 是
+# libsqlite3-sys 的薄封装，同步 API 与现有 store 的形状天然对齐。
+#
+# ── 为什么开 bundled ────────────────────────────────────────
+# `bundled` 把 SQLite 的 C 源码（sqlite3.c amalgamation）在**编译期**静态
+# 链接进二进制，于是：
+#   1. 运行时不依赖系统 sqlite3 —— Windows 不自带、macOS 那份版本随系统变，
+#      靠系统库会让「同一份代码在两个平台行为不同」（SQLite 版本差会直接影响
+#      UPSERT / RETURNING / STRICT 表这些语法可用性）；
+#   2. 打包没有额外负担 —— 不用往安装包里塞一个 DLL/dylib，也不用做
+#      codesign / 依赖扫描那一套；
+#   3. 版本可复现 —— 升 rusqlite 就升 SQLite，历史行为不随用户机器漂移。
+# 代价是首次编译要几分钟（cc 编一遍 amalgamation），且需要 C 编译器：
+# 本机 MSVC 工具链已确认可用（ring 已经成功编过），不是新增前置条件。
+#
+# ── 为什么不做连接池（r2d2 / deadpool / 多连接）─────────────
+# 本项目是**单进程单文件**：整个应用只有一个 SQLite 库，写入本来就被 SQLite
+# 串行化（同一时刻只允许一个写事务）。开池子只能并发**读**，而我们的读
+# 也集中在少数几个 API 上、量级远没到需要并发的程度；换来的是每条连接一份
+# 页缓存、WAL 下多写者互相 SQLITE_BUSY、以及「哪个连接看到哪个快照」这类
+# 只在多连接下才存在的 bug。**单连接 + 一把 Mutex** 语义最接近现在的
+# 「内存快照 + 单锁」，迁移期间两边行为好对照。
+# （WAL 下读不阻塞写、写不阻塞读；单个连接照样受益于 WAL，见 server/db/mod.rs。）
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # 查端口监听者与结束进程树改用纯 Win32 API（iphlpapi 的 GetExtendedTcpTable、
 # Toolhelp 进程快照 + OpenProcess/TerminateProcess）。原先靠 spawn taskkill /

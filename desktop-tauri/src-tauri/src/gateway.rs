@@ -161,26 +161,29 @@ fn default_config_dir() -> PathBuf {
     PathBuf::from(home).join(".agent2api")
 }
 
-/// 读取本地 API Key。仅读文件、不出本机；未配置时返回 None。
+/// 读取本地 API Key。仅在本机内存里取；未配置时返回 None。
 /// 先取 `apiKeys` 里第一把启用的 Key，没有该列表再退回旧的单 Key 字段 `apiKey`。
+///
+/// ── 为什么不再读文件（本切片改掉的一处真实开销）──────────────
+/// 改造前这里是 `fs::read_to_string(config.json)` —— 而本函数在**每一个**管理
+/// API 请求上都会被调用（`request_builder` 里加 `X-API-Key` 头），于是每次
+/// 点界面都是一次「打开文件 + 读全文 + 解析 JSON」。配置进了统一库之后，
+/// 再照原样读库会更糟：那要开连接、抢那把全局连接锁（与转发记账、日志写入
+/// 互斥），把管理 API 的每次请求都排到数据库串行队列里。
+/// 改为走**进程内配置快照**（`RuntimeConfig::active_api_keys`，解析实现是
+/// `core::api_keys::active_keys_from`）：与鉴权中间件、`keys_api` 读的是
+/// **同一份**值（`config::current()` 的克隆），因此「刚保存的新 Key 下一个
+/// 请求就生效」这条性质不变，且壳侧不再依赖 `config.json` 文件存在。
+///
+/// ── 未初始化时的行为 ────────────────────────────────────────
+/// `config::current()` 在快照未装入时按「空配置 + 环境变量」临时构造一份
+/// （见它的说明），所以启动极早期（`config::init` 之前）调用本函数不会 panic，
+/// 只是可能拿不到 Key —— 而那段窗口里还没有管理 API 请求要发。
 fn read_api_key() -> Option<String> {
-    let text = std::fs::read_to_string(config_dir().join("config.json")).ok()?;
-    let json: Value = serde_json::from_str(&text).ok()?;
-    if let Some(list) = json.get("apiKeys").and_then(Value::as_array) {
-        return list
-            .iter()
-            .filter(|item| !matches!(item.get("enabled"), Some(Value::Bool(false))))
-            .filter_map(|item| item.get("key").and_then(Value::as_str))
-            .map(str::trim)
-            .find(|key| !key.is_empty())
-            .map(str::to_string);
-    }
-    let key = json.get("apiKey")?.as_str()?.trim().to_string();
-    if key.is_empty() {
-        None
-    } else {
-        Some(key)
-    }
+    crate::server::config::current()
+        .active_api_keys()
+        .into_iter()
+        .next()
 }
 
 fn client() -> Result<reqwest::Client, String> {

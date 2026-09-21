@@ -35,6 +35,7 @@
 use serde_json::{Map, Value};
 
 use crate::server::core::account_store::priority::next_free_priority;
+use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::live_desktop_credentials;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
@@ -66,20 +67,17 @@ impl AccountStore {
     /// 需要 accessToken —— 公开形态按设计只有 `tokenTail`。
     pub fn raccoon_account_record(&self, account_id: &str) -> Option<Value> {
         let _guard = self.guard();
-        let state = self.load(&_guard);
         let raccoon = raccoon_id();
         if !account_id.is_empty() {
-            return state
-                .accounts
-                .iter()
-                .find(|item| item.id() == account_id && item.provider() == raccoon)
-                .map(StoredAccount::to_value);
+            // 按 id 直查一行（不读别家、也不读其余小浣熊账号）
+            let record = self.record_by_id(&_guard, account_id)?;
+            return (record.provider() == raccoon).then(|| record.to_value());
         }
-        let mut candidates: Vec<StoredAccount> = state
-            .accounts
-            .iter()
-            .filter(|item| item.provider() == raccoon && item.enabled())
-            .cloned()
+        // 空 id = 取本家队首：只读这一家，排序交给内存（账号最多 20 条）
+        let mut candidates: Vec<StoredAccount> = self
+            .records_for_provider(&_guard, raccoon)
+            .into_iter()
+            .filter(StoredAccount::enabled)
             .collect();
         candidates.sort_by_key(StoredAccount::order_key);
         candidates.into_iter().next().map(|item| item.to_value())
@@ -153,9 +151,9 @@ impl AccountStore {
         let display = jwt::display_name(&claims);
 
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
         let id = format!("user-{user_id}");
-        let existing = state.accounts.iter().find(|item| item.id() == id).cloned();
+        // 只读这一行（不再读全量）：既有记录决定「更新还是新建」与两处沿用值
+        let existing = self.record_by_id(&_guard, &id);
         // ── 撞 id 保护（与 `add_account` 同一考虑，方向相反）─────────
         // 小浣熊的 `user-<userId>` 与 workbuddy 的 `user-<uid>` 形态相同但 id 空间
         // 独立，一个数字 uid 可能两家都用。撞上**别的 provider** 的记录时报错，
@@ -172,11 +170,15 @@ impl AccountStore {
                 ));
             }
         }
-        if existing.is_none() && state.accounts.len() >= MAX_ACCOUNTS {
-            return Err(AccountStoreError::new(
-                format!("最多保存 {MAX_ACCOUNTS} 个账号"),
-                400,
-            ));
+        if existing.is_none() {
+            // 上限判定查投影列（COUNT），不把记录读出来数
+            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
+            if total as usize >= MAX_ACCOUNTS {
+                return Err(AccountStoreError::new(
+                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
+                    400,
+                ));
+            }
         }
         let explicit_name = name
             .map(str::trim)
@@ -210,15 +212,13 @@ impl AccountStore {
         };
         let priority = match existing.as_ref() {
             Some(record) => record.priority(),
-            None => next_free_priority(
+            None => {
                 // 号段取**全部**账号：优先级全局唯一（四家共用一条队列），
-                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）
-                &state
-                    .accounts
-                    .iter()
-                    .map(StoredAccount::priority)
-                    .collect::<Vec<_>>(),
-            ),
+                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）。
+                // 改造后直接在投影列上取一列数值，不解析任何记录的 JSON。
+                let used = self.with_conn(&_guard, |conn| sql::priorities_all(conn))?;
+                next_free_priority(&used)
+            }
         };
         let now = logging::now_ms();
         let mut record = Map::new();
@@ -288,9 +288,9 @@ impl AccountStore {
             }
         }
         let saved = StoredAccount::from_map(merged);
-        state.accounts.retain(|item| item.id() != id);
-        state.accounts.push(saved.clone());
-        self.save(&state, &_guard)?;
+        // 单行落地：`put` = DELETE + INSERT，于是「更新既有记录时它在列表里
+        // 往后挪」的旧行为（retain + push）保持不变（见 `sql::put`）
+        self.with_conn(&_guard, |conn| sql::put(conn, &saved))?;
         logging::log(
             "[Accounts]",
             &format!(
@@ -318,14 +318,16 @@ impl AccountStore {
             .unwrap_or("")
             .to_string();
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
         let id = credentials::DESKTOP_ACCOUNT_ID.to_string();
-        let existing = state.accounts.iter().find(|item| item.id() == id).cloned();
-        if existing.is_none() && state.accounts.len() >= MAX_ACCOUNTS {
-            return Err(AccountStoreError::new(
-                format!("最多保存 {MAX_ACCOUNTS} 个账号"),
-                400,
-            ));
+        let existing = self.record_by_id(&_guard, &id);
+        if existing.is_none() {
+            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
+            if total as usize >= MAX_ACCOUNTS {
+                return Err(AccountStoreError::new(
+                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
+                    400,
+                ));
+            }
         }
         let default_name = if user_id.is_empty() {
             "桌面端登录账号".to_string()
@@ -339,15 +341,13 @@ impl AccountStore {
             .unwrap_or_else(|| default_name.clone());
         let priority = match existing.as_ref() {
             Some(record) => record.priority(),
-            None => next_free_priority(
+            None => {
                 // 号段取**全部**账号：优先级全局唯一（四家共用一条队列），
-                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）
-                &state
-                    .accounts
-                    .iter()
-                    .map(StoredAccount::priority)
-                    .collect::<Vec<_>>(),
-            ),
+                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）。
+                // 改造后直接在投影列上取一列数值，不解析任何记录的 JSON。
+                let used = self.with_conn(&_guard, |conn| sql::priorities_all(conn))?;
+                next_free_priority(&used)
+            }
         };
         let now = logging::now_ms();
         let mut record = Map::new();
@@ -395,9 +395,9 @@ impl AccountStore {
             }
         }
         let saved = StoredAccount::from_map(merged);
-        state.accounts.retain(|item| item.id() != id);
-        state.accounts.push(saved.clone());
-        self.save(&state, &_guard)?;
+        // 单行落地：`put` = DELETE + INSERT，于是「更新既有记录时它在列表里
+        // 往后挪」的旧行为（retain + push）保持不变（见 `sql::put`）
+        self.with_conn(&_guard, |conn| sql::put(conn, &saved))?;
         logging::log(
             "[Accounts]",
             &format!(
@@ -423,8 +423,8 @@ impl AccountStore {
     ///
     /// 同时拒绝桌面端账号（它的凭证在 auth.json，回写账号记录毫无意义，
     /// 还会把一个本该「实时读盘」的账号变成一份过期副本），并同步小浣熊侧的
-    /// `userId`（新 token 的 JWT 声明是权威的）——都在同一次落盘里完成，
-    /// 不再有「先更新 token、再单独加锁补 userId」的第二次写盘。
+    /// `userId`（新 token 的 JWT 声明是权威的）——都在同一次写入里完成，
+    /// 不再有「先更新 token、再单独加锁补 userId」的第二次写入。
     pub fn update_raccoon_account_tokens_if_current(
         &self,
         id: &str,
@@ -435,34 +435,36 @@ impl AccountStore {
         expires_at: Option<f64>,
     ) -> Result<CredentialWrite, String> {
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
-        let Some(index) = state.accounts.iter().position(|item| item.id() == id) else {
+        // 「比较-再写」只涉及这一行：读它、比它、原地更新它。
+        // 改造前这里要把全部账号读进内存、改一条、再把全部写回去 ——
+        // 而刷新是**每个请求都可能触发**的路径。
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
             // 账号已被删除（或 id 被换掉）：刷新结果无处可写，也不该新建记录
             return Ok(CredentialWrite::Stale);
         };
-        if state.accounts[index].is_desktop() {
+        if record.is_desktop() {
             return Err("桌面端账号的凭证不落盘（实时读 auth.json），无需回写".to_string());
         }
-        if state.accounts[index].provider() != raccoon_id() {
+        if record.provider() != raccoon_id() {
             return Err(format!("账号 {id} 不是小浣熊账号"));
         }
         // 比较：记录里此刻的凭证必须仍是刷新前那份（换号 / 重导入 / 另一轮刷新
         // 先落地都会在这里被拦住）
-        if state.accounts[index].access_token() != expected_access_token
-            || state.accounts[index].refresh_token() != expected_refresh_token
+        if record.access_token() != expected_access_token
+            || record.refresh_token() != expected_refresh_token
         {
             return Ok(CredentialWrite::Stale);
         }
         // 同一把锁内写入（比较与写入之间不可能被别的写者插入）
         if !access_token.is_empty() {
-            state.accounts[index].set("accessToken", Value::String(access_token.to_string()));
-            state.accounts[index].set("tokenTail", Value::String(token_tail_of(access_token)));
+            record.set("accessToken", Value::String(access_token.to_string()));
+            record.set("tokenTail", Value::String(token_tail_of(access_token)));
         }
         if !refresh_token.is_empty() {
-            state.accounts[index].set("refreshToken", Value::String(refresh_token.to_string()));
+            record.set("refreshToken", Value::String(refresh_token.to_string()));
         }
         if let Some(value) = expires_at.filter(|value| *value > 0.0) {
-            state.accounts[index].set(
+            record.set(
                 "expiresAt",
                 crate::server::core::account_store::state::json_number(value),
             );
@@ -470,11 +472,12 @@ impl AccountStore {
         if let Some(claims) = jwt::decode_jwt_claims(access_token) {
             let user_id = jwt::extract_user_id(&claims);
             if !user_id.is_empty() {
-                state.accounts[index].set("userId", Value::String(user_id));
+                record.set("userId", Value::String(user_id));
             }
         }
-        state.accounts[index].set_updated_at(logging::now_ms());
-        self.save(&state, &_guard).map_err(|error| error.message)?;
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
+            .map_err(|error| error.message)?;
         Ok(CredentialWrite::Written)
     }
 

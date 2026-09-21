@@ -46,6 +46,14 @@
 //! ── 旁路记账（usage）────────────────────────────────────────
 //! 每一轮账号尝试都 `telemetry.note_attempt(...)`，并带上 provider id ——
 //! 报表按「实际承载这次请求的家」记账，而不是按客户端请求的模型名猜。
+//!
+//! 同一处还要配一次 `note_attempt_started(provider_id)`，并在本轮定局时
+//! `finish_last_attempt(status, error)` —— 那一对写的是**尝试明细链**
+//! （请求日志「重试」列的弹层要显示「A → B → C」），与 `note_attempt` 的
+//! 「最后一次为准」不同，它是追加式历史。两个出口（成功 `break response`、
+//! 失败 `Err(failure)`）各记一次，所以明细条数恒等于 `attempts`。
+//! **改这里的任何一条出口路径时都要一并检查那两处**：漏一处就会让明细
+//! 比 attempts 少一条（前端会显示一条「无状态码、无错误」的悬空项）。
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -193,6 +201,12 @@ pub(super) async fn forward_with_providers(
         }
         return Err(GatewayError::new("没有可用的提供商，无法转发"));
     }
+    // ── Key 的可用提供商白名单（R9，参考 OmniProxy 的 `filterRoutesForKey`）──
+    // 位置照抄 OmniProxy：**在候选链与选路之间**过滤 —— 候选链仍然是「哪些家
+    // 能提供这个模型」（能力事实），白名单只把其中不被允许的那几家剔除。
+    // 过滤与「全被排除时的错误」都在 `filter_by_key_scope` 里（它要能提前返回
+    // 错误，所以返回 Result）。
+    let candidates = filter_by_key_scope(candidates, ctx.key_scope, &model)?;
     let provider_ids: Vec<&str> = candidates.iter().map(|kind| kind_id(*kind)).collect();
     // 映射扩池的提示：链比本名承载家长，说明追加了映射的提供商（选路顺序仍是
     // 原生优先）。用户看到请求落到映射家时，这里与发送侧的改写日志对得上。
@@ -208,6 +222,55 @@ pub(super) async fn forward_with_providers(
         ),
     );
     attempt_queue(service, &ctx, &provider_ids, slot, connections).await
+}
+
+/// 按网关 Key 的**可用提供商**白名单过滤候选链（R9，照抄 OmniProxy 的
+/// `filterRoutesForKey` 在「候选链与选路之间」的位置）。
+///
+/// 不把这个过滤塞进 `route_for_forward`：那个函数的返回值还背着别的语义
+///（「未知模型」与「全被禁用」的区分，见它的模块头），而白名单是**逐请求**的
+/// 东西，混进去会让「路由结果」变成与请求相关的量。
+///
+/// ── 白名单把候选全部排除时给一条**可读错误**（本需求明确要求的一条）──
+/// 照抄 OmniProxy「空候选必有明确 404」的做法（它那里也是
+/// `fail(res, ..., 404, 'model_not_found')`），但文案要点出真正的原因：
+/// 不是模型不存在，而是这把 Key 不允许提供它的那些家 —— 后者会让人去查
+/// 「模型管理」页的启停，而真正要改的是 Key 的可用提供商。
+///
+/// 与同文件其它错误路径一样：**绝不静默失败、绝不 panic**
+///（release 是 panic=abort，落到那个分支会带走整个桌面应用）。
+fn filter_by_key_scope(
+    candidates: Vec<ProviderKind>,
+    scope: Option<&crate::server::core::key_scope::KeyScope>,
+    model: &str,
+) -> Result<Vec<ProviderKind>, GatewayError> {
+    let Some(scope) = scope.filter(|scope| scope.restricts_providers()) else {
+        // 没有 scope / 这个维度不限制 —— 原样放行（绝大多数请求走这条）
+        return Ok(candidates);
+    };
+    let kept: Vec<ProviderKind> = candidates
+        .iter()
+        .copied()
+        .filter(|kind| scope.allows_provider(kind_id(*kind)))
+        .collect();
+    if !kept.is_empty() {
+        return Ok(kept);
+    }
+    logging::log(
+        "[Security]",
+        &format!(
+            "🚫 请求被网关 Key 的可用提供商拒绝: 模型 {model}（{}）",
+            scope.describe()
+        ),
+    );
+    Err(GatewayError::with_status(
+        404,
+        format!(
+            "模型 '{model}' 不可用：提供它的提供商都不在这把网关 Key 的可用提供商列表里（{}）",
+            scope.describe()
+        ),
+    )
+    .with_code("model_not_found"))
 }
 
 /// 账号循环：每一轮从候选池里按全局优先级选一个账号，用它所属家的适配器发一次。
@@ -244,7 +307,7 @@ async fn attempt_queue(
     // 各家的发送体：某一家即将发送前按作用范围决定一次，换到**同一家同池**的
     // 另一个账号时复用（不重复处理、不重复统计）。键带账号的池（Cline 的账号
     // 记录有 `free`/`pass`）：发送名跟着实际承载的账号所在池走
-    // （`wire_model_for_provider`），跨池账号的发送名不同，各算一份。
+    // （`wire_target_for_provider`），跨池账号的发送名不同，各算一份。
     // 勾选的家用处理副本，未勾选的用原始 body。
     let mut send_cache: HashMap<(&'static str, String), Cow<'_, Value>> = HashMap::new();
 
@@ -384,6 +447,13 @@ async fn attempt_queue(
             ),
             provider_id,
         );
+        // 尝试明细的「起头」：本轮的承载者定了，结果稍后由下面两个出口补上
+        // （成功出口 / 失败出口）。与 note_attempt 必须成对且在它之后 ——
+        // 明细的条数因此恒等于 attempts，前端「共 N 次尝试」与链长对得上。
+        // 放在这里而不是 send_with_retry 里：函数内那层退避重试（同账号重发）
+        // **不算一次新尝试**（口径见 TelemetrySnapshot::attempts 的说明），
+        // 若在循环里起头就会多出几条「同名同账号」的重复项。
+        ctx.telemetry.note_attempt_started(provider_id);
 
         // ── 内容处理：凭证已就绪、这一家**即将发送**，此刻才决定发送体 ────
         // 位置在选路/凭证之后：没有可用账号（上面的 503/401 提前返回）的请求
@@ -409,9 +479,36 @@ async fn attempt_queue(
         let started_at = logging::now_ms();
         let mut refreshed = false;
         let response = loop {
-            let plan = adapter.build_chat_request(&session, body, ctx.client_headers)?;
-            let payload = serde_json::to_string(&plan.body)
-                .map_err(|error| GatewayError::new(format!("请求体序列化失败: {error}")))?;
+            // 构造请求计划**可能失败**（适配器自己的校验，例如小浣熊账号缺
+            // accessToken → 401）。这里显式处理而不是用 `?` 直接抛出：
+            // 上面的 `note_attempt_started` 已经为这一轮起了头，直接返回会让
+            // 那条明细永远停在「无状态码、无错误」的悬空态（前端的重试面板
+            // 会把它渲染成「无结果记录」）—— 明明有一个明确的失败原因。
+            // 所以先给明细定稿，再把错误抛出：明细条数与 attempts 的一一对应
+            // 在此也成立（那是本字段的全部前提，见模块头）。
+            let plan = match adapter.build_chat_request(&session, body, ctx.client_headers) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    ctx.telemetry.finish_last_attempt(
+                        Some(i64::from(error.status_code)),
+                        Some(&error.message),
+                    );
+                    return Err(error);
+                }
+            };
+            // 序列化失败只可能是内部数据坏了（适配器给出的 body 里含不可序列化的
+            // 值），按 500 收敛。同样要先给明细定稿（理由同上一条）。
+            let payload = match serde_json::to_string(&plan.body) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    let gateway = GatewayError::new(format!("请求体序列化失败: {error}"));
+                    ctx.telemetry.finish_last_attempt(
+                        Some(i64::from(gateway.status_code)),
+                        Some(&gateway.message),
+                    );
+                    return Err(gateway);
+                }
+            };
             logging::verbose(
                 "[Upstream]",
                 &format!(
@@ -452,12 +549,30 @@ async fn attempt_queue(
                 capture.reset_request(&transport.url, provider_id, &transport.headers, &plan.body);
             }
             match send_with_retry(adapter, &transport, &mut budget, capture.as_deref()).await {
-                Ok(response) => break response,
+                Ok(response) => {
+                    // 成功出口：这一轮的结果是「成功 + 状态码」，明细在这里定稿。
+                    // 失败出口在下面（`Err(failure)` 那一支的开头）—— 两个出口
+                    // 各记一次，一次起头对应恰好一次定稿。
+                    //
+                    // 状态码取**上游返回的那个**（不是下发给客户端的）：明细要
+                    // 回答「上游怎么回的」，而客户端的 200 在流式响应头阶段就
+                    // 发出去了，之后还可能断流失败 —— 那属于另一列（状态）的
+                    // 口径，见 `RequestEntry::is_success` 的说明。
+                    ctx.telemetry
+                        .finish_last_attempt(Some(i64::from(response.status().as_u16())), None);
+                    break response;
+                }
                 Err(failure) => {
                     // ── 动作 2：token 失效 → 刷新后同一账号重试一次 ──────
                     // 只在「首次失败 + 是 token 失效 + 还没刷新过」时走。
                     // 刷新失败、或重试再失败（此时 `refreshed` 已为 true）
                     // 都落到下面同一套分类处理，不会空转。
+                    //
+                    // 注意这一段在**明细记账之前**：401 刷新重试属于同一轮
+                    // （同一个账号、同一条明细），换的是凭证不是账号，所以它
+                    // 不该产生新明细、也不该在这一刻把这一轮定成失败 ——
+                    // 重试若成功，这一轮的结局就是成功（`break response` 那条
+                    // 出口会记上）。这也与 `attempts` 的口径一致：那一轮只 +1。
                     if matches!(failure.class, UpstreamErrorClass::TokenExpired { .. })
                         && !refreshed
                     {
@@ -487,6 +602,17 @@ async fn attempt_queue(
                             }
                         }
                     }
+                    // ── 这一轮的结局已定（不会再重发同一个账号）→ 记明细 ────
+                    // 位置在动作 1 / 动作 3 之前：那两段会 `continue 'accounts`
+                    // （开下一轮、追加新明细）或 `return Err`（整体收尾），
+                    // 两条路之后都读不到这一轮的 `failure` 了。
+                    // 一次 `note_attempt_started` 对应恰好一次这里（成功则由
+                    // 下面 `break response` 那条出口记），所以明细条数恒等于
+                    // attempts，不存在重复覆盖。
+                    ctx.telemetry.finish_last_attempt(
+                        Some(i64::from(failure.error.status_code)),
+                        Some(&failure.error.message),
+                    );
                     // ── 动作 1：限额 → 标记冷却 + 换下一个账号 ──────────
                     if let (
                         UpstreamErrorClass::QuotaLimited {
@@ -783,6 +909,11 @@ async fn attempt_stateful(
         ),
         provider_id,
     );
+    // 尝试明细的起头：与 note_attempt 配对（同上一条注释的说明）。
+    // 本路径的定稿在下面 match 的两个分支里 —— 有状态 provider 没有账号轮换，
+    // 所以一轮就是一条明细，链路至多一项（`provider_loop` 的 `'accounts` 循环
+    // 仍可能在外层顺延到下一个账号，那会走本函数第二次调用）。
+    ctx.telemetry.note_attempt_started(provider_id);
     let started_at = logging::now_ms();
     logging::verbose(
         "[Upstream]",
@@ -818,11 +949,20 @@ async fn attempt_stateful(
                 "[Upstream]",
                 &format!("会话式转发完成（{}ms）", logging::now_ms() - started_at),
             );
+            // 明细定稿：这条路径的成功标志是「outcome 拿到了」（会话式转发的
+            // 状态码由协议层自定，取不到上游 HTTP 码），所以 status 给 None、
+            // 不带错误 —— 前端把它渲染成「成功」（无状态码）。
+            ctx.telemetry.finish_last_attempt(None, None);
             Ok(attach_slot(outcome, slot, connections))
         }
         // 一律透传（Fatal 语义，核对结论见函数头）：不换账号、不冷却、不重试
         Err(error) => {
             logging::log("[Upstream]", &format!("❌ {}", error.message));
+            // 明细定稿：状态码取网关错误的（有状态路径的错误由适配器定档，
+            // 502/500/上游码都可能），错误摘要用同一条文案 —— 与列表里
+            // 「错误」列显示的是同一个根因。
+            ctx.telemetry
+                .finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
             Err(error)
         }
     }

@@ -13,10 +13,14 @@
      .card-head / .pick / .who / .who-name / .who-meta / .card-state / .card-note
      .card-foot / .rank / .card-actions / .order-btns / .row-panels
    这些骨架规则继续保留，理由有两条：
-     1. `.order-btns`、`.more-menu`、`.row-panel` 的形制仍被表格直接复用或
-        在 page-accounts-table.css 里按同等形制重写了一份，逐条甄别「哪条还活着」
+     1. `.more-menu`、`.row-panel` 的形制仍被表格直接复用或在
+        page-accounts-table.css 里按同等形制重写了一份，逐条甄别「哪条还活着」
         的成本（以及删错一条就得回滚的风险）高于留着它们的成本；
      2. 恢复卡片视图时不必重写一遍。
+   **注意 `.order-btns` 是个例外**：表格那边原先按它的形制重写了一份，
+   本次改造把优先级控件改成「↓ 数字 ↑」的合并控件（.prio-stepper），
+   表格不再使用这个类名。它现在只为「第 2 条理由」（将来恢复卡片视图）留着，
+   全站已无引用 —— 恢复卡片视图时若沿用新控件，这几条可以一并删掉。
    （设置页「账号列表两侧留白」开关已随功能移除，其 :root[data-content] 两档
    规则也已删除，.acct-grid 只保留下面的基础口径。）
    ───────────────────────────────────────────── */

@@ -6,23 +6,36 @@
 //! diff 里必然出现 `rename` 那一行，不会因为「顺手调整 rename 策略」而
 //! 静默改掉线上格式。
 //!
+//! ── `RequestEntry` 的序列化用途变了，但键名契约没变 ──────────
+//! 改造前它整体序列化成 JSONL 的一行落盘；现在明细进 `requests` 表的**列**
+//! （每字段一列，见 `db/schema.rs`），序列化只剩两个用途：
+//!   - `report::entry_json` 把它转成 `/api/stats/requests` 的响应行
+//!     （前端读的就是这套键名，所以 `rename` 一个都不能少）；
+//!   - 迁移项解析**旧文件**（`parse_requests_jsonl`）反序列化回来。
+//! 换句话说：它现在是「API 契约 + 旧格式解析器」，不再是落盘格式。
+//!
 //! ── 为什么读入侧全字段带 `default` ───────────────────────────
-//! 文件是长期存在的（明细 30 天、聚合一年），中间可能跨好几个版本。
-//! 缺少新字段的旧行必须还能读进来（缺的按 0 / 空算），否则升级一次
-//! 就会把用户已有的曲线整段丢掉。
+//! 两个地方要靠它容错，都还在生效：
+//!   - **旧文件解析**（迁移项）：明细 30 天、聚合一年，中间可能跨好几个版本，
+//!     缺少新字段的旧行必须还能读进来（缺的按 0 / 空算），否则升级一次
+//!     就会把用户已有的曲线整段丢掉；
+//!   - **聚合的三个 JSON 列**（`model_tokens` / `provider_stats` /
+//!     `account_stats`）：整体读写，条目结构也可能随版本增加列，
+//!     `default` 让「多一个键」不至于让整列解析失败。
 
 use serde::{Deserialize, Serialize};
 
-/// 明细在内存/文件里保留的最大条数（环形保留，超出丢最旧的）。
+/// 明细保留的最大条数（超出丢最旧的）。
 ///
 /// 与按时间的保留期是双保险：保留期管「多久」，上限管「多少」——
-/// 短时间内的突发流量不该按天数比例吃光内存。
+/// 短时间内的突发流量不该按天数比例吃光磁盘。
+///
+/// 改造前它是「内存数组的环形保留」（在 `insert_sorted` 里 drain）；现在由
+/// `sql::trim_requests_capacity` 用一条 `DELETE` 守住，**按 ts 保留最新的 N 条**
+/// —— 与旧实现「从升序数组头部 drain 掉溢出部分」等价（头部就是 ts 最小的那些）。
 pub const MAX_ENTRIES: usize = 20_000;
 
-/// 满额后攒够这么多条追加才整文件重写一次（对应 logs_store 的 COMPACT_STEP）
-pub const COMPACT_STEP: usize = 100;
-
-/// 聚合行在内存里保留的最大天数（兜底：手改文件塞进十万行时不至于撑爆内存）
+/// 聚合行保留的最大天数（兜底：手改库塞进十万行时不至于把报表撑爆）
 pub const MAX_DAILY_DAYS: usize = 4000;
 
 /// 查询分页的默认条数与上限。
@@ -120,8 +133,8 @@ pub struct RequestEntry {
     /// （旧数据全部来自单上游时代也不许补 workbuddy：那是猜，不是事实）。
     ///
     /// ── 为什么没有 `rename` 而只加 `default` ────────────────────
-    /// 落盘的键名就是 `provider`，与字段名相同（本文件的 `rename` 都出现在
-    /// 两者不一致的字段上）。`default` 保证缺键的旧行照常读入；空值**照写**
+    /// 序列化出来的键名就是 `provider`，与字段名相同（本文件的 `rename` 都出现在
+    /// 两者不一致的字段上）。`default` 保证缺键的旧行照常读入；空值**照给**
     /// （与 `accountId` / `accountName` 同一形态：键恒在、空串表示没有），
     /// 于是「有没有这个键」不再是前端要判的第三种情况。
     #[serde(default)]
@@ -142,6 +155,80 @@ pub struct RequestEntry {
     /// 这里记上游真正收到、也真正认识的名字。
     #[serde(rename = "upstreamModel", default)]
     pub upstream_model: String,
+    /// **每一次上游尝试的明细**（`[{provider, status, error}]`，按发生顺序）。
+    ///
+    /// ── 与 `attempts` 的关系（这是本字段存在的全部理由）────────────
+    /// `attempts` 只回答「试了几次」，`provider` 只回答「最后是谁扛的」——
+    /// 中间那几轮换了谁、为什么换，在改造前**没有任何落点**，所以请求日志的
+    /// 「重试」列只能显示一个没有信息量的「重试」标记。本字段就是那段历史。
+    ///
+    /// 条数上限：采集侧保证 `attempt_details.len() <= attempts`，而 `attempts`
+    /// 的上界是 `MAX_ROUTE_ATTEMPTS + 1`（32+1）。采集侧另有
+    /// `MAX_ATTEMPT_DETAILS`（24）的体积闸 —— 截断时明细会比 `attempts` 短，
+    /// 前端据此显示「只保留前 N 条」（见 requests-panel）。
+    ///
+    /// ── 为什么存 JSON 文本列而不是拆表 ──────────────────────────
+    /// 它是「一条明细的附属历史」，**整体读写**（写入时整份给、读取时整份取），
+    /// 没有任何按单次尝试查询的需求。拆一张 `request_attempts` 表要引入
+    /// 外键、级联删除与分页 join，而收益只是「能 SQL 查某一次尝试」——
+    /// 那是排障场景，`sqlite3` 里对 JSON 列用 `json_each` 一样能查。
+    /// 与 `request_daily` 的三个 `*Stats` JSON 列同一取舍（见 schema.rs）。
+    ///
+    /// ── 旧行怎么办 ──────────────────────────────────────────────
+    /// `default` 读成空表：旧行没有这个键，空表是「不知道明细」，与「一次都没试」
+    /// 不是一回事，但展示层对两者的处理相同（重试链为空时该列只在有敏感词命中
+    /// 时才有内容）。与 `provider` 的空串同一约定：**不给旧数据猜值**。
+    #[serde(rename = "attemptDetails", default)]
+    pub attempt_details: Vec<AttemptDetail>,
+    /// **本次请求命中的敏感词**（`[{word, count}]`，按次数降序；空表 = 没命中）。
+    ///
+    /// 结构与 `core::upstream::usage::SensitiveHit` **逐字段相同**（`word` /
+    /// `count`）：那是它的产生处，这里只是落库的镜像。两处刻意不做类型别名、
+    /// 各自独立定义 —— `request_stats` 是存储层，不该为了省一次转换就依赖
+    /// `core::upstream` 的运行时类型（那样这个存储契约会被一个与存储无关的
+    /// 模块绑住，将来转发层重构会牵动库格式）。
+    ///
+    /// 展示位置：请求日志「重试」列里的紫色标签（悬停看命中词），与 OmniProxy
+    /// 的 `SensitiveMaskedTag` 同形。命中**不再**在「日志」页展示 —— 改造前那
+    /// 边靠 `[Desensitize] 已脱敏命中…` 那行应用日志间接呈现（见 logs-panel
+    /// 的模块头），现在逐条请求有了直接落点，日志页那层间接展示整体移除；
+    /// 应用日志那一行本身**仍然保留**，它是排障时的实时记录，与请求日志的
+    /// 用途不同（一个回答「刚才发生了什么」，一个回答「这条请求命中了什么」）。
+    #[serde(rename = "sensitiveHits", default)]
+    pub sensitive_hits: Vec<SensitiveHit>,
+}
+
+/// 一个被命中的敏感词及其次数（存储契约）。
+///
+/// 与 `core::upstream::usage::SensitiveHit` 同形但各自独立定义，理由见
+/// `RequestEntry::sensitive_hits`。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SensitiveHit {
+    /// 命中的词
+    #[serde(default)]
+    pub word: String,
+    /// 本次请求里命中的次数
+    #[serde(default)]
+    pub count: i64,
+}
+
+/// 单次上游尝试的明细（存储契约）。
+///
+/// 与 `core::upstream::usage::AttemptDetail` 同形但各自独立定义，理由同上。
+/// `provider` 空串表示「这一轮没记下承载者」—— 采集侧保证它非空
+/// （`note_attempt_started` 的入参就是 provider_id），所以空串只可能来自
+/// 手工改过的库，展示层照常给占位文案。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttemptDetail {
+    /// 这一轮实际发送的 provider id
+    #[serde(default)]
+    pub provider: String,
+    /// 这一轮的 HTTP 状态码（None = 未定论或传输层失败，见采集侧的说明）
+    #[serde(default)]
+    pub status: Option<i64>,
+    /// 这一轮的失败摘要（成功时为 None）
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// `attempts` 的 serde 默认值（载入缺该字段的旧行时按 1 次算）
@@ -168,13 +255,16 @@ impl RequestEntry {
     /// 按**当前**口径归一后的副本：失败请求的 token 一律清零。
     ///
     /// ── 为什么需要它 ────────────────────────────────────────────
-    /// 正常路径用不到 —— 明细落盘前已经过 `NewRequestEntry::normalize`。
-    /// 但**载入进来的历史明细可能来自更早的版本**：1.x 的 `normalize` 只做
+    /// 正常路径用不到 —— 明细进库前已经过 `NewRequestEntry::normalize`。
+    /// 但**从旧文件导入的历史明细可能来自更早的版本**：1.x 的 `normalize` 只做
     /// 数值夹取，没有「失败清零」这一段，那时失败的请求也照记 token
     /// （旧文件里确有这类行：`status: 200` + 流未完整下发的摘要 + 六位数 token）。
     /// 回填聚合要拿这些旧行重算，必须先把它们过一遍今天的口径，
     /// 否则报表会把「失败也算用量」这个旧规则带进 token 曲线 ——
     /// 而当前契约是「失败的请求不产生用量」。
+    ///
+    /// 唯一调用点：`backfill::rebuild_legacy_days`（由**迁移项**在导入旧数据时
+    /// 调用）。运行期不再有调用点 —— 库里的行都出自今天的 `normalize`。
     ///
     /// 幂等：已归一的条目再走一遍结果不变（失败的那几个字段恒为 0）。
     pub(super) fn normalized_for_aggregate(&self) -> Self {
@@ -215,15 +305,20 @@ pub struct NewRequestEntry {
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
     /// 实际承载本次请求的 provider id（Agent2API 改造 W2b-T3 新增填入，
-    /// W4 接上落盘：见 `normalize` 末尾的透传）。
+    /// W4 接上持久化：见 `normalize` 末尾的透传）。
     ///
     /// `None` = 一次都没发出去就失败了（请求体非法 / 模型不存在 / 无可用账号），
-    /// 落盘时归一成空串，聚合层归入「未知」组。
+    /// 入库时归一成空串，聚合层归入「未知」组。
     pub provider: Option<String>,
     /// 下游请求的模型名（客户端原值；空串 = 未点名 / 未记录）
     pub client_model: String,
     /// 实际发给上游的模型名（空串 = 一次都没发出去 / 未记录）
     pub upstream_model: String,
+    /// 每一次上游尝试的明细（见 `RequestEntry::attempt_details`）。
+    /// 空表 = 一次都没发出去（转发前就失败）或采集侧没记上。
+    pub attempt_details: Vec<AttemptDetail>,
+    /// 本次请求命中的敏感词（见 `RequestEntry::sensitive_hits`）。空表 = 没命中。
+    pub sensitive_hits: Vec<SensitiveHit>,
 }
 
 impl NewRequestEntry {
@@ -248,10 +343,15 @@ impl NewRequestEntry {
             client_model: String::new(),
             upstream_model: String::new(),
             id: String::new(),
+            // 两条都是「有采集才有值」：转发前就失败的请求走 `record_early_failure`，
+            // 那里构造的 telemetry 是空的，于是两个空表如实表达「没发生过尝试 /
+            // 没命中过词」—— 而不是留一个需要读侧再判一次的 None
+            attempt_details: Vec::new(),
+            sensitive_hits: Vec::new(),
         }
     }
 
-    /// 归一化成可落盘的条目。
+    /// 归一化成可入库的条目。
     ///
     /// 时间补全与数值夹取都集中在这里，于是 `record` 只处理「已合法」的数据。
     ///
@@ -267,10 +367,10 @@ impl NewRequestEntry {
         let failed = !(200..300).contains(&self.status)
             || self.error.as_deref().is_some_and(|text| !text.is_empty());
         let token = |value: i64| if failed { 0 } else { value.max(0) };
-        // provider 从入参透传到落盘条目（W2b 留的丢弃点在此接上）。
+        // provider 从入参透传到记账条目（W2b 留的丢弃点在此接上）。
         // `None`（转发链没走到选路就失败）与空串（上游返回了空 id）都归一成
         // **空串**：两者在报表语义上都是「未知承载者」，多一种表示只会让
-        // 聚合与前端各写一遍「None 也算空」。trim 一下，避免手改文件或异常
+        // 聚合与前端各写一遍「None 也算空」。trim 一下，避免旧文件或异常
         // 写入带进来的空白造出一个看不见的独立分组。
         let provider = self
             .provider
@@ -300,6 +400,33 @@ impl NewRequestEntry {
             // 「看起来不同的名字」）；空串语义 = 没有点名 / 没有发出去
             client_model: self.client_model.trim().to_string(),
             upstream_model: self.upstream_model.trim().to_string(),
+            // ── 两个明细字段的归一（本次改造）───────────────────────
+            // 都做「清掉空项 + 夹到合理形状」，让读侧（SQL false 编码、前端渲染）
+            // 拿到的永远是可直接消费的表：
+            //   · provider 空串的明细项**保留**（它表达「这一轮没记下是谁」，
+            //     与前缀字段 `provider` 的空串语义一致，读侧本来就要处理）；
+            //   · error 空串收敛成 None（与 `error` 字段同一口径：空串不是错误）；
+            //   · 敏感词的 count 夹到 ≥0（负数只可能来自手改的库，展示层不该
+            //     为它写分支）；word 空的项**丢弃**（一个没有词的命中项没有
+            //     任何信息量，留着只会渲染出一行「× 3」）。
+            attempt_details: self
+                .attempt_details
+                .into_iter()
+                .map(|item| AttemptDetail {
+                    provider: item.provider.trim().to_string(),
+                    status: item.status,
+                    error: item.error.filter(|text| !text.is_empty()),
+                })
+                .collect(),
+            sensitive_hits: self
+                .sensitive_hits
+                .into_iter()
+                .map(|hit| SensitiveHit {
+                    word: hit.word.trim().to_string(),
+                    count: hit.count.max(0),
+                })
+                .filter(|hit| !hit.word.is_empty())
+                .collect(),
         }
     }
 }
@@ -327,8 +454,10 @@ pub struct DailyEntry {
     /// `"all"` / `"month"` 这类跨年区间只能靠聚合行算模型占比；
     /// 没有它，全年 tokens 冠军会在明细到期后突然变形。
     /// 前端只读自己认识的键，多一个 `modelTokens` 不影响既有契约。
-    /// 单天无模型明细时整键省略（`skip_serializing_if`），
-    /// 让文件在只有零散请求时也保持紧凑。
+    /// 单天无模型明细时整键省略（`skip_serializing_if`）——
+    /// 这条在**旧文件解析**时仍生效（迁移读的就是旧格式），入库时那三个列由
+    /// `sql::encode_accum` 统一写成 JSON 文本（空表则是 `[]`，
+    /// 与 DDL 的默认值同形）。
     #[serde(rename = "modelTokens", default, skip_serializing_if = "Vec::is_empty")]
     pub model_tokens: Vec<ModelAccum>,
     /// 当天的按 provider 累计（**契约之外的补充字段**，W4 新增）。
@@ -381,7 +510,7 @@ pub struct ModelAccum {
 /// 单个 provider 在某天的累计（聚合行的组成部分，W4 新增）。
 ///
 /// 只存「成功数」而**不存失败数**：失败数 = `requests - successful`，
-/// 存两份会出现「对手改过的文件，两列对不上账」这种无法判定的状态，
+/// 存两份会出现「对手改过的库，两列对不上账」这种无法判定的状态，
 /// 而报表要输出的 `failures` 由一次减法得出，没有信息损失。
 ///
 /// `provider` 为空串表示当天有「未知承载者」的请求（旧版本写出的明细、
@@ -407,7 +536,7 @@ pub struct ProviderAccum {
 /// ── 为什么同时存 id 与 name ──────────────────────────────────
 /// `accountId` 是身份、`accountName` 是**当时的展示名快照**：账号可以在账号页
 /// 改名，名字变了不该把它拆成两行，所以身份只认 id（见 `push_account_accum`
-/// 的匹配规则）；但名字也要留在文件里 —— 账号被删除后（明细与聚合的寿命
+/// 的匹配规则）；但名字也要一起留下 —— 账号被删除后（明细与聚合的寿命
 /// 都长于账号记录）报表仍要显示一个可读的名字，而不是一串 id。
 ///
 /// 两个字段都为空表示「不知道是谁承载的」：走默认登录态转发（未配置账号列表）

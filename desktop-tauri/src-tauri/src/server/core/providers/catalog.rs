@@ -68,6 +68,7 @@
 use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::key_scope::{self, KeyScope};
 use crate::server::core::model_rules;
 use crate::server::core::models::{list_item, list_response_from, model_id, suggest_from, ModelCatalog};
 use crate::server::core::providers::adapter::adapter_for;
@@ -589,7 +590,70 @@ fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Option<String> {
         .map(model_id)
 }
 
-/// 发给某个 provider 时应使用的**该家认识的**模型名。
+/// 一次「按家改写发送名」的结果：**该家要收到的模型名**，以及跟着它走的思考等级。
+///
+/// ── 为什么两个属性绑在一个返回值里（不要拆成两次解析）─────────
+/// 「发什么名字」与「绑了什么等级」是**同一条映射**上的两个属性（见
+/// `model_rules::reasoning` 的模块头）。若调用方分两次解析（先问名字、再问等级），
+/// 两处各自的候选选择规则迟早会分叉 —— 而分叉的表现就是本项目最忌讳的那类
+/// 静默错误：「请求落到了 B 家，却把 A 家那条映射的等级注入了」。
+/// 一次解析、两个属性同源，跨家串味在结构上就不可能发生。
+///
+/// `reasoning` 为 `None` = 这次发送没有可注入的等级（本名直发、没有映射、
+/// 或那条映射没绑等级），调用方据此跳过整段注入逻辑。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WireTarget {
+    /// 该家认识的那个模型名（零改写时就是请求名原值）
+    pub model: String,
+    /// 决定了这个发送名的那条映射上绑的思考等级（`None` = 无）
+    pub reasoning: Option<String>,
+}
+
+/// 请求名在该家**自己的映射条目**里命中的那一条（`provider` 明确等于本家）。
+///
+/// 抽成独立函数是为了让「原生直发」与「映射改写」两个分支用**同一个**选择规则
+/// （见 `wire_target_for_provider` 的 ②）：原生分支只借用它的等级、映射分支连
+/// 名字一起用。两处若各写一遍，同家多条映射时就会一个分支选第一条、另一个分支
+/// 选前缀命中的那条。
+///
+/// `same_target_only` 为真时只保留 `target` 与 `name` 相同（忽略大小写）的条目
+/// —— 原生直发分支用它挑「名字不变的那条按家映射」，理由见
+/// `wire_target_for_provider` 的「思考等级跟着哪一条走」。
+///
+/// 入参是**已经查好的**同名映射条目（调用方只需查一次 `mappings_of`，见
+/// `wire_target_for_provider`）—— 转发热路径上不做重复的线性扫描。
+///
+/// 选择规则（与函数头 ② 一致）：同家多条命中时优先选 target 落在本家通道前缀
+/// 里的那条，其余家最多一条按家条目，这一步等于没开销。
+fn pick_own_mapping<'a>(
+    mappings: &[&'a model_rules::Mapping],
+    provider_id: &str,
+    name: &str,
+    same_target_only: bool,
+) -> Option<&'a model_rules::Mapping> {
+    let own: Vec<&model_rules::Mapping> = mappings
+        .iter()
+        .copied()
+        .filter(|m| {
+            m.provider
+                .as_deref()
+                .map_or(false, |p| p.eq_ignore_ascii_case(provider_id))
+        })
+        .filter(|m| !same_target_only || m.target.eq_ignore_ascii_case(name))
+        .collect();
+    // 本家的**通道前缀**（`cline-free/` / `cline-pass/`）：只有 Cline 系有这个概念，
+    // 前缀本身定义在 `cline::models::Pool`（那是「池 → 前缀」的唯一事实来源，
+    // 转发侧与种子侧都用它）—— 这里按 provider id 反查，不另写一份字面量。
+    let channel_prefix = super::cline::models::Pool::from_provider_id(provider_id)
+        .map(super::cline::models::Pool::target_prefix);
+    own.iter()
+        .copied()
+        .find(|m| channel_prefix.is_some_and(|prefix| m.target.starts_with(prefix)))
+        .or_else(|| own.first().copied())
+}
+
+/// 发给某个 provider 时应使用的**该家认识的**模型名，以及跟着这条映射走的
+/// 思考等级（见 [`WireTarget`]）。
 ///
 /// ── 为什么需要这个改写 ─────────────────────────────────────
 /// 候选链经映射扩池后，链上各家的目录里认的名字未必相同：WorkBuddy 认
@@ -613,6 +677,26 @@ fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Option<String> {
 ///      **② 恒先于 ③**，与数组顺序无关（全局条目是兼容形态，不挡新条目）；
 ///   ④ 都不命中 → 原样返回（防御：正常选路下不会发生，链就是这么算的）。
 ///
+/// ── 思考等级跟着哪一条走（本函数里唯一容易做错的地方）─────────
+/// `reasoning` 取自**决定了发送名的那条映射**：
+///   - ② / ③ 命中 → 取那条的 `reasoning`（名字与等级同源，不可能串到别家）；
+///   - ① 原生直发 → 名字不是任何映射给的，此时**只认「名字不变的那条按家映射」**
+///     （`target` 与即将发出的名字相同，见下面的判据）。这一步存在的理由：
+///     本项目的界面只能把等级绑在映射上，所以「给 catpaw 的 kimi-k3 绑 high」
+///     在界面上表现为建一条 `kimi-k3 → kimi-k3（catpaw）` 的映射 —— 那条映射
+///     对**选路**是冗余的（原生直发本来就落到这家），但它是用户表达「这个名字
+///     在这家要用这个等级」的**唯一入口**，不认它等于让这条绑定永远无效。
+///
+///   为什么只认「名字不变」的那条（而不是该家为这个请求名建的任意一条）：
+///   一条 `foo → bar（catpaw）` 的映射在 `foo` 被 catpaw 原生承载时**并没有
+///   生效**（原生路由优先，发出去的是 `foo` 不是 `bar`）。它的等级是为「发到
+///   catpaw 的 bar」写的，把它用到一次发的是 `foo` 的请求上，就是让一个没生效的
+///   映射去影响另一个模型 —— 与「等级必须跟着那条映射走」自相矛盾。
+///   判据因此是「这条映射的 target 就是即将发出的名字」：名字一致时，无论走原生
+///   还是走映射，用户看到的上游模型都是同一个，等级跟着它不会错。
+///   旧版全局条目（provider 缺失）**不参与**这一支：它在别家也显示，拿它的等级
+///   去注入一个没被它改写过名字的原生请求，属于超出用户表达范围的推断。
+///
 /// 与改写前旧实现的差别：改写不再发生在请求入口（payload 的 model 保持
 /// 客户端原值），只发生在**发出去的字节**上 —— 记账 / 限额键 / 日志里的模型
 /// 始终是客户端请求的名字，报表不会因为映射而「换姓」。
@@ -621,16 +705,19 @@ fn entry_id_in_manifest(manifest: &[Value], requested: &str) -> Option<String> {
 /// `pool` 字段挑一条」，现在这个判断由 target 前缀给出（见 ②）。留着它是因为
 /// 调用方（`upstream::payload`）手上本来就有账号对象，而「这条映射该按谁的
 /// 身份挑」将来可能再需要账号信息；去掉参数只会让那条链多一处改动。
-pub fn wire_model_for_provider(
+pub fn wire_target_for_provider(
     model: &str,
     provider_id: &str,
     account: Option<&Value>,
-) -> String {
+) -> WireTarget {
     let _ = account;
     let requested = model.trim();
     if requested.is_empty() {
-        return model.to_string();
+        return WireTarget { model: model.to_string(), reasoning: None };
     }
+    let rules = model_rules::current();
+    // 同名映射条目查一次、两个分支共用（原生分支只借等级、映射分支连名字一起用）
+    let mappings = rules.mappings_of(requested);
     // ① 该家原生承载：发送名取该家清单里那条目的 id（id 命中 = 原值，
     //   展示名命中 = 还原真名）。「哪家承载」与「发什么名字」用的是**同一份
     //   清单、同一套匹配口径**（`providers_for_model` 与本函数都先 id 后 name），
@@ -639,48 +726,38 @@ pub fn wire_model_for_provider(
         .iter()
         .any(|kind| kind_id(*kind) == provider_id)
     {
-        return kind_from_id(provider_id)
+        let name = kind_from_id(provider_id)
             .and_then(|kind| entry_id_in_manifest(&manifest_for(kind), requested))
             .unwrap_or_else(|| requested.to_string());
+        // 等级只认「名字不变的那条按家映射」（理由见函数头「思考等级跟着哪一条走」）
+        let reasoning = pick_own_mapping(&mappings, provider_id, &name, true)
+            .and_then(|mapping| mapping.reasoning.clone());
+        return WireTarget { model: name, reasoning };
     }
-    let rules = model_rules::current();
-    let mappings = rules.mappings_of(requested);
     // ② 先于 ③ 是**两遍扫描**而不是单循环按数组顺序：具体条目必须优先于
     // 旧版全局条目 —— 后者是升级兼容形态，存量用户盘上留着的旧条目（如
     // Cline 短名指向 pass 池的那条）在数组里排在前面，单循环会让它永远
     // 挡住新种出来的按家条目，短名改写就切不过来了。
-    //
-    // ② 内部同家多条命中时选 target 落在本家前缀里的那条（见函数头 ②）。
-    let own: Vec<_> = mappings
-        .iter()
-        .filter(|m| {
-            m.provider
-                .as_deref()
-                .map_or(false, |p| p.eq_ignore_ascii_case(provider_id))
-        })
-        .collect();
-    // 本家的**通道前缀**（`cline-free/` / `cline-pass/`）：只有 Cline 系有这个概念，
-    // 前缀本身定义在 `cline::models::Pool`（那是「池 → 前缀」的唯一事实来源，
-    // 转发侧与种子侧都用它）—— 这里按 provider id 反查，不另写一份字面量。
-    let channel_prefix = super::cline::models::Pool::from_provider_id(provider_id)
-        .map(super::cline::models::Pool::target_prefix);
-    let picked = own
-        .iter()
-        .copied()
-        .find(|m| channel_prefix.is_some_and(|prefix| m.target.starts_with(prefix)))
-        .or_else(|| own.first().copied());
-    if let Some(mapping) = picked {
-        return mapping.target.clone();
+    if let Some(mapping) = pick_own_mapping(&mappings, provider_id, requested, false) {
+        return WireTarget {
+            model: mapping.target.clone(),
+            reasoning: mapping.reasoning.clone(),
+        };
     }
+    // ③ 旧版全局条目（provider 缺失）且该家承载 target
     for mapping in mappings.iter().filter(|m| m.provider.is_none()) {
         if providers_for_model(&mapping.target)
             .iter()
             .any(|kind| kind_id(*kind) == provider_id)
         {
-            return mapping.target.clone();
+            return WireTarget {
+                model: mapping.target.clone(),
+                reasoning: mapping.reasoning.clone(),
+            };
         }
     }
-    requested.to_string()
+    // ④ 防御：正常选路下不会走到（链就是这么算的）
+    WireTarget { model: requested.to_string(), reasoning: None }
 }
 
 /// 聚合结果的来源元信息 `(meta.source, meta.lastRefreshedAt)`。
@@ -722,8 +799,32 @@ fn aggregate_source(active: &[(ProviderKind, Vec<Value>)]) -> (&'static str, i64
 ///   - OpenAI 响应结构不变（`data` 数组，`id` 为上游原始模型名）。
 ///
 /// 合并与来源元信息分别走 `merged_items` / `aggregate_source`（见它们的说明）。
-pub fn models_response(store: &AccountStore) -> Value {
-    let active = active_manifests(store);
+///
+/// ── `scope`：网关 Key 的可用模型 / 可用提供商白名单（R9）────────
+/// `None` = 不限制（免鉴权模式 / 环境变量 Key / 未知 Key，见 `key_scope` 模块头）。
+/// 有 scope 时**在列表生成处过滤**，而不是留给前端 —— 这是服务端语义：
+/// 「让对方拉列表只看到被授权的部分」（照抄 OmniProxy 在 `GET /v1/models` 里的
+/// `allowedModelNames` 过滤）。在**这里**过滤而不是在 `api::chat::list_models`
+/// 之后对 JSON 二次裁剪，是因为这一层才认识「条目的对外名」与「承载它的家」。
+///
+/// ── 提供商过滤为什么在**合并之前**（顺序上唯一的坑）──────────────
+/// `merged_items_available` 是「可用的先认领」：同名模型由注册表顺序靠前的
+/// 那家认领，后面那家的同名条目被丢掉。若先把合并做完再按 provider 过滤，
+/// 会出现「A 家认领了 X、但 Key 只允许 B 家 → 过滤掉 A 的条目 → X 从列表里
+/// 消失」，而转发侧按承载家过滤后**留的正是 B**（它确实能提供 X）。
+/// 于是「列表里看不到、却能调通」—— 恰好是本项目最忌讳的那种不一致
+///（见 `advertised_manifest_contains` 的「列表里没有就拒绝」）。
+/// 因此先把**不允许的家整个从 active 里剔除**，再交给合并：认领只发生在
+/// 允许的家之间，列表与路由两侧的白名单口径逐字同源。
+///
+/// 模型白名单则按**对外名**判，且上游 id 与每个映射别名**各自判定**
+///（它们是不同的对外名，授权其中一个不该顺带授权另一个 —— 用户在白名单里
+/// 勾的是名字）。两个白名单同时给定时是**交集**（与 OmniProxy 的注释一致）。
+pub fn models_response(store: &AccountStore, scope: Option<&KeyScope>) -> Value {
+    let active: Vec<(ProviderKind, Vec<Value>)> = active_manifests(store)
+        .into_iter()
+        .filter(|(kind, _)| key_scope::allows_provider(scope, kind_id(*kind)))
+        .collect();
     let (source, last_refreshed_at) = aggregate_source(&active);
     let rules = model_rules::current();
     // 禁用 / 隐藏的模型不广告；映射名作为独立条目追加（复制目标条目、换 id），
@@ -735,15 +836,24 @@ pub fn models_response(store: &AccountStore) -> Value {
     // 同一对外名跨提供商去重（同名多条映射只广告一条）
     for (_, item) in merged_items_available(&active, &rules) {
         let id = model_id(&item);
+        let mut pending: Vec<Value> = Vec::new();
         for alias in rules.aliases_of_any(&id) {
             let mut copy = item.clone();
             if let Some(object) = copy.as_object_mut() {
                 object.insert("id".to_string(), Value::String(alias.to_string()));
                 object.insert("is_default".to_string(), Value::Bool(false));
             }
-            aliases.push(copy);
+            pending.push(copy);
         }
-        data.push(item);
+        if key_scope::allows_model(scope, &id) {
+            data.push(item);
+        }
+        for copy in pending {
+            let name = model_id(&copy);
+            if key_scope::allows_model(scope, &name) {
+                aliases.push(copy);
+            }
+        }
     }
     data.extend(aliases);
     list_response_from(data, source, last_refreshed_at)
@@ -804,6 +914,13 @@ pub fn advertised_model_ids(active: &[(ProviderKind, Vec<Value>)]) -> Vec<String
 /// 一行 = 一次「这条上游模型以哪些对外名暴露」，映射的主备关系（同一对外名
 /// 在多行出现）在表格上一眼可见。顶层 `mappings` 是全量映射表（含 provider），
 /// 前端添加映射弹窗的提供商下拉用注册表，不需要它，但留着便于排查。
+///
+/// 顶层还带 `reasoningLevels`（思考等级的可选值，见 `model_rules::REASONING_LEVELS`）
+/// —— 那是「照抄 OmniProxy 的手动思考等级绑定」的候选表，界面按它铺下拉项。
+/// 每条映射的 `reasoning` 字段是它的绑定值（`null` = 不覆盖）。
+/// **绑定已接入转发**：等级与「这一家收哪个模型名」在同一次解析里取出
+/// （`wire_target_for_provider`），由承载那家的适配器翻译成本家上游认识的字段
+/// —— 各家的翻译规则与「哪些情况故意不注入」见 `model_rules::reasoning` 的模块头。
 pub fn manage_view(store: &AccountStore) -> Value {
     let rules = model_rules::current();
     let models: Vec<Value> = manage_entries(store, &rules)
@@ -863,7 +980,7 @@ pub fn manage_view(store: &AccountStore) -> Value {
             });
             // `carried`：这个名字**路由层认不认**（不分账号、不看池收窄）——
             // 带 provider 的条目只看那一家，旧版全局条目看所有家（与
-            // `wire_model_for_provider` 的候选口径一致）。
+            // `wire_target_for_provider` 的候选口径一致）。
             //
             // 与 `dangling` 配对使用，把「表里看不见」的两种情形分开：
             //   dangling=true,  carried=true  → 配置有效，只是这家现在不广告它
@@ -886,12 +1003,25 @@ pub fn manage_view(store: &AccountStore) -> Value {
                 "alias": m.alias,
                 "target": m.target,
                 "provider": m.provider,
+                // 思考等级绑定（None = 不覆盖）。放在**顶层这份全量映射表**里
+                // 而不是给每行的 `aliases` 再加一个平行数组：行上的 chip 已经
+                // 带着 (alias, target, provider) 三元组，前端拿它对这里查一次
+                // 就能拿到等级 —— 两个数组一旦因为过滤口径不同而对不上，
+                // 界面上会出现「chip 在、等级丢了」这种无从解释的空档。
+                "reasoning": m.reasoning,
                 "dangling": dangling,
                 "carried": carried,
             })
         })
         .collect();
-    json!({ "models": models, "mappings": mappings })
+    json!({
+        "models": models,
+        "mappings": mappings,
+        // 思考等级的可选值（照抄 OmniProxy 的 GENERIC_REASONING_LEVELS）。
+        // 由后端下发而不是前端自己抄一份：这张表将来若要调整（或改成按家给
+        // 候选），只有一处要改；前端只管把数组铺成下拉项。
+        "reasoningLevels": model_rules::REASONING_LEVELS,
+    })
 }
 
 /// `GET /api/session` 的 `models` 字段：聚合清单的**数组**形态，每条带 provider 归属。
@@ -920,6 +1050,71 @@ pub fn session_models(store: &AccountStore) -> Vec<Value> {
         .into_iter()
         .map(|(_, item)| item)
         .collect()
+}
+
+/// 每家的**对外名清单**（条目 id + 映射别名，去重、忽略大小写）：
+/// `{"workbuddy": ["..."], "raccoon": [...]}`，只含**当前可用**的家
+/// （有登录态且清单非空，判据同 `active_manifests`）。
+///
+/// ── 为什么要单独一个函数（不能拿 `session_models` 过滤）──────────
+/// `session_models` / `/v1/models` 是**跨家去重**后的聚合视图：同名模型只留
+/// 最先认领的那一家（见 `merged_items_available`）。网关 Key 页要让用户勾
+/// 「这把 Key 能用哪几家的哪些模型」，若拿那份去重视图按 `provider` 字段过滤，
+/// **被别家认领的同名模型会凭空消失** —— 例如 `glm-5.3-flash` 同时由 WorkBuddy
+/// 与 AutoClaw 提供、条目上记的是 WorkBuddy，用户勾了 AutoClaw 却看不到它，
+/// 而 AutoClaw 确实收这个模型（`route_for_forward` 认得）。
+/// 所以本函数按**家**遍历原始清单（不去重），这正是「哪家能收哪些名字」的真值。
+///
+/// ── 为什么包含映射别名 ──────────────────────────────────────
+/// 别名是用户自己起的对外名，客户端就是用它发请求的（见 `model_rules` 的映射
+/// 语义），所以它必须可勾 —— 与 `/v1/models` 把别名当独立条目广告同一口径。
+/// 判定用 `aliases_of_any`（跨家全量）而不是 `aliases_of`（按行归属）：后者要求
+/// 映射条目带 provider 字段，而**旧版映射条目是不带的**（见 `model_rules`
+/// 的兼容说明），用按行归属去判会让旧条目的别名在任何一家下都勾不到。
+///
+/// ── 为什么交出去的是「每家的清单」而不是「一次请求的并集」──────
+/// 界面要随用户勾选**即时**联动模型候选（勾一家多一批、取消一家少一批）。
+/// 给整张表，前端本地取并集，勾选时零往返；给并集接口则每勾一下就发一次请求，
+/// 还可能出现「响应回来时用户已经改了勾选」的竞态。
+///
+/// 某家不在表里 = 这家现在没有可用登录态或清单为空 → 界面按空清单处理
+/// （用户勾了它也勾不到任何模型，这是事实而不是缺陷）。
+pub fn models_by_provider(store: &AccountStore) -> Value {
+    let rules = model_rules::current();
+    let mut map = Map::new();
+    for (kind, manifest) in active_manifests(store) {
+        let provider_id = kind_id(kind);
+        let mut names: Vec<String> = Vec::new();
+        for item in manifest {
+            let id = model_id(&item);
+            if id.is_empty() || rules.is_blocked(provider_id, &id) {
+                continue;
+            }
+            push_unique(&mut names, &id);
+            for alias in rules.aliases_of_any(&id) {
+                push_unique(&mut names, alias);
+            }
+        }
+        names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        map.insert(
+            provider_id.to_string(),
+            Value::Array(names.into_iter().map(Value::String).collect()),
+        );
+    }
+    Value::Object(map)
+}
+
+/// 往清单里放一个名字（忽略大小写去重）。同一个名字可能同时是某家的条目 id
+/// 与另一家的别名，只该出现一次。
+fn push_unique(out: &mut Vec<String>, name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    if out.iter().any(|known| known.eq_ignore_ascii_case(name)) {
+        return;
+    }
+    out.push(name.to_string());
 }
 
 /// 管理页条目：**不去重**的每家清单（`manage_view` 的数据源）。

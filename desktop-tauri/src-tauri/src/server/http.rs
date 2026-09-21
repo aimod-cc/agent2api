@@ -141,11 +141,17 @@ pub fn router(state: ServerState) -> Router {
         )
         .route("/api/debug/traffic", get(api::debug_api::get_traffic))
         // ── 数据保存位置（设置页「保存位置」）──
-        // 与 /api/retention 同级敏感：能读数据概况、能搬数据，挂 protected。
-        // relocate 是**同步**迁移（阻塞到搬完才返回），期间前端轮询 progress 画进度。
+        // 只读概况（库在哪、多大、各表多少条）。挂 protected 与 /api/retention
+        // 同级：它能读到「这台机器上有多少账号与请求记录」这类存储规模信息。
+        // 改造前的两条写路由（relocate / progress）随「三类数据各自一个目录」
+        // 的语义一起删除，理由见 `api::storage_api` 的模块头。
         .route("/api/storage", get(api::storage_api::get_storage))
-        .route("/api/storage/relocate", post(api::storage_api::relocate))
-        .route("/api/storage/progress", get(api::storage_api::progress))
+        // ── 数据结构升级（旧 JSON/JSONL → 统一 SQLite 库）──
+        // 启动时**不自动迁移**，由用户在弹窗里点「升级」触发（需求：必须让用户
+        // 知道数据换了存储形态、旧数据保留）。挂 protected：run 会写库里的
+        // 全部业务表（账号、日志、统计、配置），与 /api/config 同级敏感。
+        .route("/api/upgrade", get(api::upgrade_api::get_upgrade))
+        .route("/api/upgrade/run", post(api::upgrade_api::run_upgrade))
         // ── 账号管理（对照 workbuddy-account-routes.mjs）──
         // 用 any(...) 注册两条入口（无尾段 + 通配尾段），方法/路径的判定交给
         // api::accounts::dispatch —— 这是为了复刻 Node 版 tryHandle 的判定顺序
@@ -362,15 +368,44 @@ fn attach_cors(headers: &mut axum::http::HeaderMap) {
 ///
 /// 只需要「当前生效的配置」这一份全局状态，所以用 `from_fn`（无 state）即可：
 /// 后续切片的路由挂进来时不用重复传状态。
-async fn require_api_key(request: Request, next: Next) -> Response {
-    // 每次都读内存快照（不是读文件），所以「刚保存的新 key」下一个请求就生效
+///
+/// ── R9：命中的那把 Key 要带到 handler（可用提供商 / 可用模型）──────
+/// 校验通过后把**那条记录**（`api_keys::entry_for_key`）包成
+/// [`key_scope::KeyScope`] 放进请求扩展 —— 后面 handler 才知道该套用哪套白名单。
+/// 选请求扩展而不是「改 body / 加请求头」的理由见 `key_scope` 的模块头
+/// （body 要去重、头要透传给上游，都不能动）。
+///
+/// 三处「没有命中的 Key」的情形都不放这个扩展，于是消费点统一按**不限制**处理：
+///   - 免鉴权模式（一把启用的 Key 都没有）：下面第一个分支直接放行。
+///     **这是既有语义，不要因为「没命中 Key」改成拒绝** —— 改造前未配置
+///     API Key 时网关对 /v1/* 是完全开放的（只监听 127.0.0.1）。
+///   - 环境变量 Key（`WORKBUDDY_PROXY_API_KEY`）：`entry_for_key` 对它返回
+///     None（没有列表记录可挂白名单）→ 不限制。
+///   - Key 在两次快照之间被删/停用：同样取不到记录 → 不限制（宁可放行，
+///     不可因为管理页上改了一下就把正在跑的客户端全挡掉）。
+///
+/// 注意 `/v1/models` 在 public 组、**不经过本中间件** —— 它有自己的一条限制
+/// 生效点（见 `api::chat::list_models`），用的是同一份 `KeyScope` 语义
+/// （但那里是「有记录就按记录过滤，没有就不过滤」，因为它免鉴权也能用）。
+async fn require_api_key(mut request: Request, next: Next) -> Response {
+    // 每次都读内存快照（不是读文件），所以「刚保存的新 key」下一个请求就生效。
+    // 快照取一次、整个判定过程复用（`current()` 会克隆整份配置，鉴权是每个请求
+    // 都要走的热路径 —— 多取几次就是为同一件事重复克隆）
     let snapshot = crate::server::config::current();
     let keys = snapshot.active_api_keys();
     if keys.is_empty() {
         return next.run(request).await;
     }
 
-    if keys.iter().any(|expected| request_matches_key(&request, expected)) {
+    let matched = keys
+        .iter()
+        .find(|expected| request_matches_key(&request, expected))
+        .cloned();
+    if let Some(matched) = matched {
+        // 命中的那把 Key 的限制随请求带到 handler（见函数头）
+        if let Some(scope) = scope_for_key(&snapshot.raw(), &matched) {
+            crate::server::core::key_scope::attach(&mut request, scope);
+        }
         return next.run(request).await;
     }
 
@@ -378,6 +413,57 @@ async fn require_api_key(request: Request, next: Next) -> Response {
     let method = request.method().as_str().to_string();
     logging::log("[Security]", &format!("❌ 拒绝未授权的请求: {method} {path}"));
     errors::unauthorized_response()
+}
+
+/// 在**给定快照**里找命中的 Key 并构造它的限制（R9）。
+///
+/// 抽成普通函数是为了另一条调用路径：**`GET /v1/models` 挂在免鉴权组**
+/// （Node 版这条就是不查 API Key 的只读探针，客户端常在配 Key 之前先拉列表），
+/// 所以它不经过 `require_api_key`。但它的「只返回被授权的模型」这条限制又必须
+/// 认 Key —— 于是那个 handler 自己取一份快照、调本函数，与中间件共用**同一套
+/// 匹配口径**（`headers_match_key` + `entry_for_key_from`），不会出现
+/// 「中间件认这把 Key、列表接口不认」这种自相矛盾。
+///
+/// 返回值 `None` = 没有命中的记录（免鉴权模式 / 环境变量 Key / 未知 Key）——
+/// 调用方一律按**不限制**处理，理由见 `core::key_scope` 的模块头。
+pub fn key_scope_from_headers(
+    headers: &axum::http::HeaderMap,
+) -> Option<crate::server::core::key_scope::KeyScope> {
+    let snapshot = crate::server::config::current();
+    let keys = snapshot.active_api_keys();
+    if keys.is_empty() {
+        return None;
+    }
+    let matched = keys.iter().find(|expected| headers_match_key(headers, expected))?;
+    scope_for_key(&snapshot.raw(), matched)
+}
+
+/// 命中的明文 Key → 它的 `KeyScope`（在给定快照里查记录；查不到 = 不限制）
+fn scope_for_key(
+    raw: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<crate::server::core::key_scope::KeyScope> {
+    crate::server::core::api_keys::entry_for_key_from(raw, key)
+        .map(|entry| crate::server::core::key_scope::KeyScope::from_entry(&entry))
+}
+
+/// `request_matches_key` 的头比较部分，抽出来给只有 `HeaderMap` 的调用方用
+/// （`GET /v1/models` 的 handler）。实现与 `request_matches_key` 逐字一致 ——
+/// 后者委托给它，保证两处不可能漂移。
+fn headers_match_key(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if strip_bearer_prefix(value) == expected {
+            return true;
+        }
+    }
+
+    if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        if value == expected {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// 比对请求头里的凭证，逐字复刻 Node 版 checkApiKey：
@@ -392,22 +478,13 @@ async fn require_api_key(request: Request, next: Next) -> Response {
 /// 这是「顺手修复」的诱惑点，但契约以 Node 版为准，保持一致。
 /// `x-api-key` 则要求严格相等（不做 trim）。大小写方面：HTTP 头名不区分大小写
 /// （由 HeaderMap 处理），值区分大小写。
+///
+/// 实现委托给 [`headers_match_key`]：`/v1/models` 的 handler 只有 `HeaderMap`
+/// 而没有完整请求（它不在中间件链上），两处必须是**同一套**匹配口径 ——
+/// 各写一份就会漂移成「中间件认这把 Key、列表接口不认」，而那种分叉在界面上
+/// 完全看不出来（都是 200，只是列表少几个模型）。
 fn request_matches_key(request: &Request, expected: &str) -> bool {
-    let headers = request.headers();
-
-    if let Some(value) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-        if strip_bearer_prefix(value) == expected {
-            return true;
-        }
-    }
-
-    if let Some(value) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        if value == expected {
-            return true;
-        }
-    }
-
-    false
+    headers_match_key(request.headers(), expected)
 }
 
 /// 去掉 `Bearer ` 前缀（大小写不敏感，`\s+` 至少一个空白）。

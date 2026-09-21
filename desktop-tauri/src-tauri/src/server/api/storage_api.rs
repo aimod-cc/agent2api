@@ -1,231 +1,107 @@
-//! 数据保存位置（设置页「保存位置」）。
+//! 数据存储概况（设置页「保存位置」）。
 //!
 //! ```text
-//! GET  /api/storage            两类数据的当前目录、文件与大小
-//! POST /api/storage/relocate   迁移到新目录（同步执行；迁移期间可轮询进度）
-//! GET  /api/storage/progress   最近一次迁移的进度（无迁移时 active:false）
+//! GET /api/storage   统一库的位置、大小与各表条数
 //! ```
 //!
-//! ── 与 /api/retention 的关系 ─────────────────────────────────
-//! 保留期管「存多久」，这里管「存哪里」。两者都是动用户数据的低频管理接口，
-//! 同挂 `protected`；写动作落在 `config::set_storage_dir`（config.json）与
-//! 两个存储各自的 `relocate`（真正的搬家）。
+//! ── 本切片起是**单库语义**（改造前是「三类数据各自一个目录」）────────
+//! 改造前这里有两条写路由（`POST /api/storage/relocate` 搬家 +
+//! `GET /api/storage/progress` 进度轮询），三类数据各自可换保存目录。
+//! 数据全部进统一库 `{config_dir}/agent2api.db` 之后那套语义在数据模型上
+//! 已经不成立：「把日志单独搬到另一个文件」只会造出第二份真相（库里的还在），
+//! 下一个请求写日志时两份立刻分叉（论证见各 store 里被删掉的 `relocate`）。
+//! 因此两条写路由连同三个 store 的 `relocate` 一起删除，本模块只剩**只读概况**。
 //!
-//! ── 迁移的执行模型 ──────────────────────────────────────────
-//! POST 是**同步**的：handler 把搬迁扔进 `spawn_blocking`，等它跑完才返回 ——
-//! 前端在等待期间轮询 `/progress` 画进度条，POST 返回即迁移结束。
-//! 迁移本体持存储的 `inner` 锁（见 `LogStore::relocate` / `RequestStats::relocate`），
-//! 期间的转发记账 / 写日志会排队等迁移完成。
+//! ── 想换位置怎么办（界面上要告诉用户的那句话）───────────────
+//! 库的位置由配置目录决定，而配置目录由环境变量 `AGENT2API_PROXY_HOME`
+//! 覆盖（旧名 `WORKBUDDY_PROXY_HOME` 仍可读，见 `gateway::config_dir`）。
+//! 设置页因此只展示、不给「更改」按钮，并把这句话原样写给用户 ——
+//! 一个点了必然报错的按钮比没有按钮更糟（这正是本切片要收掉的死路径）。
 //!
-//! 成功后才写 config.json（目录键），且新目录等于配置目录时把键清掉 ——
-//! 「搬回默认位置」不该在配置里固化一份绝对路径。
+//! ── 形状为什么是 `database: {...}` 而不是平铺 ────────────────
+//! 改造前返回 `{logs: {...}, requests: {...}, debug: {...}}`，前端拿
+//! `storage[target]` 逐项渲染。现在三类数据**没有各自的目录与文件**，能给的
+//! 只有「同一个库 + 各表条数」——平铺成三个同形对象会诱导读者以为它们仍然
+//! 各自独立（前端当年就是被这个形状带着把 `bytes + dailyBytes` 相加，
+//! 而那两个字段指向同一个文件，字节数被算了两遍）。
+//! 合成一个 `database` 对象之后，「只有一个文件、里面有若干张表」这件事
+//! 在响应形状上直接可见。
+//!
+//! 保留 `configDir` 字段：前端用它拼「库在配置目录下」这句提示，
+//! 也是排障时第一眼要看的位置。
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::Path;
 
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::Response;
 use serde_json::{json, Value};
 
-use crate::server::config::{self, KEY_DEBUG_DIR, KEY_LOG_DIR, KEY_REQUEST_STATS_DIR};
-use crate::server::errors;
-use crate::server::http::{ok_json, parse_body};
-use crate::server::logging;
+use crate::server::config;
+use crate::server::http::ok_json;
 use crate::server::ServerState;
-
-/// 进行中的迁移进度（进程内唯一一份）。`None` = 当前没有迁移在跑。
-///
-/// 用 `std::sync::Mutex` 而不是 tokio 的锁：进度回调来自**阻塞线程**
-/// （spawn_blocking 里的搬迁本体），临界区只有一次赋值，异步锁没有意义。
-static RELOCATE: Mutex<Option<RelocateLive>> = Mutex::new(None);
-
-/// 一条进行中的迁移：目标是哪类数据、当前完成百分比
-struct RelocateLive {
-    target: &'static str,
-    percent: u32,
-}
-
-fn set_progress(target: &'static str, percent: u32) {
-    if let Ok(mut guard) = RELOCATE.lock() {
-        *guard = Some(RelocateLive {
-            target,
-            percent: percent.min(100),
-        });
-    }
-}
-
-fn clear_progress() {
-    if let Ok(mut guard) = RELOCATE.lock() {
-        *guard = None;
-    }
-}
 
 /// 文件大小；不存在（还没写过盘）按 0 算
 fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-/// GET /api/storage —— 两类数据的当前目录与文件概况（设置页渲染用）。
+/// GET /api/storage —— 统一库的位置、大小与各表条数（设置页渲染用）。
 ///
-/// `custom` 表示目录是不是用户自定义的（≠ 配置目录）；`bytes` 供界面
-/// 显示「迁移多大」；`count` 是条数（日志 500 条上限 / 明细 2 万条上限）。
+/// `bytes` 是**库主文件**的大小。WAL 里的页不算在内（`RequestStats::flush`
+/// 在停机时把 WAL 并回主库，正是为了让「占用多大」只有一个文件是真相）——
+/// 所以运行期间这个数字可能略小于实际占用，属预期。
+///
+/// 条数一律取各 store 现有的计数入口，没有硬凑：
+///   - `accounts` / `logs` / `requests` / `dailyDays` / `debug` 分别来自
+///     `AccountStore` 的账号快照、`LogStore::stats()`、`RequestStats::stats()`
+///     与 `debug_traffic::count()`；
+///   - 库不可用时各计数回落 0（与各 store 自己的降级值一致），
+///     `file` 给空串 —— 让界面显示「不可用」，而不是一个看着正常的 0 条。
 pub async fn get_storage(State(state): State<ServerState>) -> Response {
-    let base = config::config_dir();
-    let dirs = config::storage_dirs();
+    let config_dir = config::config_dir();
+    // 库路径的事实来源是 `Db::file()`（打开失败时用约定路径兜底：排障时
+    // 「该去哪找库」这个答案与库有没有打开无关，与 `AccountStore::file()`
+    // 的处置一致）。
+    let db_file = match state.db() {
+        Some(db) => db.file().to_path_buf(),
+        None => config_dir.join(crate::server::db::FILE_NAME),
+    };
+    let available = state.db().is_some();
 
-    let log = match logging::store_ref() {
-        Some(store) => {
-            let file = store.file();
-            json!({
-                "dir": dirs.log_dir.to_string_lossy(),
-                "custom": dirs.log_dir != base,
-                "file": file.to_string_lossy(),
-                "bytes": file_size(&file),
-                "count": store.stats().total,
-            })
-        }
-        None => Value::Null,
-    };
-    let requests = {
-        let requests = state.request_stats();
-        let request_file = requests.request_file();
-        let daily_file = requests.daily_file();
-        let stats = requests.stats();
-        json!({
-            "dir": dirs.request_stats_dir.to_string_lossy(),
-            "custom": dirs.request_stats_dir != base,
-            "file": request_file.to_string_lossy(),
-            "bytes": file_size(&request_file),
-            "dailyFile": daily_file.to_string_lossy(),
-            "dailyBytes": file_size(&daily_file),
-            "count": stats.get("total").and_then(Value::as_u64).unwrap_or(0),
-        })
-    };
-    // 调试模式的原始报文（只有开着调试模式写过盘时才有内容）
-    let debug = {
-        let file = crate::server::core::debug_traffic::file();
-        json!({
-            "dir": dirs.debug_dir.to_string_lossy(),
-            "custom": dirs.debug_dir != base,
-            "file": file.as_ref().map(|path| path.to_string_lossy().to_string()).unwrap_or_default(),
-            "bytes": file.as_deref().map(file_size).unwrap_or(0),
-            "count": crate::server::core::debug_traffic::count(),
-        })
-    };
+    // 账号数：走账号快照（`list_accounts` 会取锁并读全表）。库不可用时它返回
+    // 空列表，正好是「0 个账号」这个诚实的结果。
+    let accounts = state
+        .store()
+        .list_accounts()
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+
+    // 事件日志条数：`LogStore::stats()` 的 `total`（库不可用时它给 0）
+    let logs = crate::server::logging::store_ref()
+        .map(|store| store.stats().total)
+        .unwrap_or(0);
+
+    // 请求明细与聚合天数：`RequestStats::stats()` 一次给全（它自己会取锁读库）
+    let stats = state.request_stats().stats();
+    let requests = stats.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let daily_days = stats.get("dailyDays").and_then(Value::as_u64).unwrap_or(0);
+
     ok_json(json!({
-        "configDir": base.to_string_lossy(),
-        // 键与 relocate 的 target 取值（logs / requests / debug）保持同名：
-        // 前端拿同一个 target 既读概况又发迁移请求，两处名字必须一致
-        "logs": log,
-        "requests": requests,
-        "debug": debug,
+        "configDir": config_dir.to_string_lossy(),
+        "database": {
+            "file": db_file.to_string_lossy(),
+            "bytes": if available { file_size(&db_file) } else { 0 },
+            // 条数只在库可用时才可信（不可用时各 store 都回落 0，与「真的没有
+            // 数据」在数字上无法区分）—— 这个布尔让界面能说「不可用」而不是
+            // 显示一排看着正常的 0
+            "available": available,
+            "accounts": accounts,
+            "logs": logs,
+            "requests": requests,
+            "dailyDays": daily_days,
+            "debug": crate::server::core::debug_traffic::count(),
+        },
     }))
-}
-
-/// POST /api/storage/relocate —— body `{ target: "logs"|"requests", dir: "..." }`
-///
-/// 同步执行迁移（阻塞到搬迁结束才返回），成功后写 config.json 的目录键。
-/// 迁移期间前端轮询 `/api/storage/progress` 画进度条；返回错误（400/500）
-/// 时旧数据原封不动（搬迁失败不切目录，见 `relocate` 的失败语义）。
-pub async fn relocate(State(state): State<ServerState>, body: Bytes) -> Response {
-    let payload = match parse_body(&body) {
-        Ok(value) => value,
-        Err(error) => return errors::management_error(400, error.message),
-    };
-    let target = match payload.get("target").and_then(Value::as_str).unwrap_or("") {
-        "logs" => "logs",
-        "requests" => "requests",
-        "debug" => "debug",
-        other => {
-            return errors::management_error(
-                400,
-                format!("target 取值非法: {other}（合法值 logs、requests、debug）"),
-            );
-        }
-    };
-    let dir_text = payload
-        .get("dir")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if dir_text.is_empty() {
-        return errors::management_error(400, "dir 不能为空");
-    }
-    let dir = PathBuf::from(&dir_text);
-    if !dir.is_absolute() {
-        return errors::management_error(400, "dir 必须是绝对路径（由目录选择框给出）");
-    }
-
-    // 搬迁放进阻塞线程池：持存储锁 + 文件 IO 不该占住 async worker
-    set_progress(target, 0);
-    let target_for_progress = target;
-    let result = tokio::task::spawn_blocking(move || {
-        let progress = |written: u64, total: u64| {
-            let percent = if total == 0 {
-                100
-            } else {
-                ((written * 100) / total).min(100) as u32
-            };
-            set_progress(target_for_progress, percent);
-        };
-        match target {
-            "logs" => match logging::store_ref() {
-                Some(store) => store.relocate(&dir, progress),
-                None => Err("日志模块未启用".to_string()),
-            },
-            "debug" => {
-                // 报文是小文件（上限 500 条），一次性搬完即可，不逐字节报进度
-                progress(1, 1);
-                crate::server::core::debug_traffic::relocate(&dir)
-            }
-            _ => state.request_stats().relocate(&dir, progress),
-        }
-    })
-    .await
-    .map_err(|error| format!("迁移任务执行失败: {error}"));
-    clear_progress();
-
-    match result {
-        Ok(Ok(())) => {
-            // 成功才写配置：搬回默认配置目录时清掉键（不固化绝对路径）。
-            // dir 已随闭包搬进 spawn_blocking，这里按 dir_text 重取一份
-            let base = config::config_dir();
-            let key = match target {
-                "logs" => KEY_LOG_DIR,
-                "debug" => KEY_DEBUG_DIR,
-                _ => KEY_REQUEST_STATS_DIR,
-            };
-            let moved_dir = PathBuf::from(&dir_text);
-            if !config::set_storage_dir(key, (moved_dir != base).then_some(dir_text.as_str())) {
-                logging::console_line(
-                    "[Config]",
-                    "⚠️ 保存位置写入 config.json 失败，本次运行内仍生效",
-                );
-            }
-            let label = match target {
-                "logs" => "事件日志",
-                "debug" => "调试报文",
-                _ => "请求日志",
-            };
-            logging::log("[Config]", &format!("✅ {label}已迁移到 {dir_text}"));
-            ok_json(json!({ "target": target, "dir": dir_text }))
-        }
-        // 搬迁本体失败（建目录 / 写文件失败、目录相同）：旧数据原封不动
-        Ok(Err(message)) => errors::management_error(500, message),
-        Err(message) => errors::management_error(500, message),
-    }
-}
-
-/// GET /api/storage/progress —— 迁移进度。无迁移进行时 `{ active: false }`。
-pub async fn progress() -> Response {
-    let payload = {
-        let guard = RELOCATE.lock().ok();
-        match guard.as_deref().and_then(|live| live.as_ref()) {
-            Some(live) => json!({ "active": true, "target": live.target, "percent": live.percent }),
-            None => json!({ "active": false }),
-        }
-    };
-    ok_json(payload)
 }

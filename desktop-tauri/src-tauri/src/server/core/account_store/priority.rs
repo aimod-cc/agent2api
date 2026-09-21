@@ -61,26 +61,13 @@ pub fn by_priority_order(a: (i64, i64), b: (i64, i64)) -> std::cmp::Ordering {
         .then(a_added.cmp(&b_added))
 }
 
-/// 找占用某优先级且不是 `exclude_id` 的账号。
-/// 返回其 `(id, name)` —— 报错文案里要带占位者的名字。
-///
-/// `entries` 是全部账号的三元组 `(id, name, priority)`（唯一性是全局的，见模块头）。
-pub fn find_priority_holder(
-    entries: &[(String, String, i64)],
-    priority: i64,
-    exclude_id: Option<&str>,
-) -> Option<(String, String)> {
-    entries
-        .iter()
-        .find(|(id, _, value)| {
-            Some(id.as_str()) != exclude_id && normalize_priority_value(*value) == priority
-        })
-        .map(|(id, name, _)| (id.clone(), name.clone()))
-}
-
 /// 下一个可用优先级：排在现有账号之后（新增账号不抢占已有转发顺序）。
 ///
-/// `used` 是全部账号已占用的号段。
+/// `used` 是全部账号已占用的号段。这里收的是**裸数值**而不是记录列表：
+/// 号段计算是纯数值运算，改造后调用方直接在投影列 `priority` 上查一次
+/// （`sql::priorities_except`）就能填进来，不必为了数 20 个数把全部记录的 JSON
+/// 解析一遍。
+///
 /// 号段用满时从默认值起找第一个空位；再找不到就回落默认值
 /// （与 Node 版完全相同的兜底路径）。
 pub fn next_free_priority(used: &[i64]) -> i64 {

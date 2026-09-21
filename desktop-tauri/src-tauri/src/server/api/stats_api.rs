@@ -283,7 +283,7 @@ pub async fn put_retention(State(state): State<ServerState>, body: Bytes) -> Res
         // ── 立即清理（两种数据各自的时机不同，这里一次触发）──
         // 请求统计：prune() 内部**动态取**保留期回调，所以取到的就是刚写入的值
         state.request_stats().prune();
-        // 事件日志：LogStore 的保留天数同样走回调（见 `LogStore::new` 的注释），
+        // 事件日志：LogStore 的保留天数同样走回调（见 `LogStore::with_db` 的注释），
         // prune 返回裁掉的条数，打一行控制台便于确认「改小天数确实删了东西」
         if let Some(store) = logging::store_ref() {
             let removed = store.prune();

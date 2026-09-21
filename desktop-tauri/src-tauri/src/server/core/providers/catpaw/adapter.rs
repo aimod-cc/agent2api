@@ -63,12 +63,22 @@ use crate::server::errors::GatewayError;
 // trait 与注册表工具都在上一层，写全路径比堆两层 super 更好读。
 use super::conversation::{run_conversation, CatPawCredentials, ConversationRequest};
 use super::registry::AccountIdentity;
-use super::{catalog, conversation, credentials};
+use super::{catalog, conversation, credentials, models};
 use crate::server::core::providers::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
 use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::logging;
+
+/// 映射上绑的思考等级注入到请求体的哪个键。
+///
+/// 用 `reasoning_effort` 而不是 `effort`：`resolve_effort` 的取值链是
+/// `reasoning_effort ?? reasoningEffort ?? effort`，三者都能到同一个上游字段
+/// （`declarativeParams.effort`），但 `reasoning_effort` 是**最标准、也是客户端
+/// 最常传的那个**（OpenAI 的 Chat 扩展字段）—— 取它能让「客户端已指定时我们
+/// 跳过」与「注入」两条路在 body 上看起来是同一件事，排障时不必再想「这次是
+/// 从哪个键读进去的」。
+const REASONING_FIELD: &str = "reasoning_effort";
 
 /// CatPaw 适配器（无状态单例：会话状态在 `conversation::registry()` 的进程级
 /// 句柄里，凭证在账号存储 / auth.json / 环境变量里，本结构不持有任何字段）。
@@ -141,6 +151,55 @@ impl ProviderAdapter for CatPawAdapter {
             .unwrap_or("上游错误")
             .to_string();
         UpstreamErrorClass::Fatal { status, message, upstream_code: None }
+    }
+
+    /// 思考等级绑定 → `reasoning_effort`（本家是**唯一需要归并档位**的一家）。
+    ///
+    /// ── 为什么本家要覆写 ────────────────────────────────────────
+    /// 本家的上游枚举只有 low / high / max 三个（`resolve_effort` 对别的值
+    /// **当场 400**），而网关的通用候选表是 6 档。不归并就会把 `medium` /
+    /// `xhigh` 这类完全合法的绑定打成 400 —— 那是把「绑定不生效」升级成
+    /// 「请求失败」，方向反了。归并规则（两两合流）与理由写在
+    /// `models::effort_for_level`。
+    ///
+    /// ── 客户端已指定时为什么不覆盖 ──────────────────────────────
+    /// 判据是 `resolve_effort(body)` 读出了东西（它认 `reasoning_effort` /
+    /// `reasoningEffort` / `effort` 三个键，与转发时用的是**同一个函数**，
+    /// 所以不存在「这里说没指定、那边读出来一个值」）。用户在某一次请求里显式
+    /// 传了档位，那是比映射上的默认值更具体的意图；绑定是「没指定时的默认」。
+    /// 这与 OmniProxy 的 `reasoning_override`（覆盖语义）有意不同：那个项目里
+    /// 客户端档位只用于能力判断与日志，本项目这条链路从改造前起就是「客户端
+    /// 字段直达上游」，改成覆盖会静默换掉用户显式传的值。
+    ///
+    /// **`Err` 也算「指定过」**（这一条容易写反）：客户端传了 `medium` 这类本家
+    /// 不认的值时，`resolve_effort` 报错，随后 `prepare::prepare` 会给出那条
+    /// 400。若此时注入绑定的档位，就把用户传错的参数**悄悄换掉**了 —— 请求
+    /// 变成成功，而他永远不知道自己传的值是无效的（也再没有别的地方会提示）。
+    /// 所以「读得出值」与「读出来是错的」都归「客户端已指定」，绑定一律让位，
+    /// 校验与报错交给原有那条路径。
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> ReasoningPatch {
+        let declared = match models::resolve_effort(body) {
+            // 读出一个档位 = 客户端指定过
+            Ok(Some(_)) => true,
+            // 三个键都不在（或都是 null）= 没指定
+            Ok(None) => false,
+            // 指定了、但值非法 —— 见上方说明，同样让位
+            Err(_) => true,
+        };
+        if declared {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考档位，绑定不覆盖",
+            };
+        }
+        match models::effort_for_level(level) {
+            Some(effort) => ReasoningPatch::Set {
+                field: REASONING_FIELD,
+                value: Value::String(effort.to_string()),
+            },
+            None => ReasoningPatch::Skip {
+                reason: "该等级不在本家接受的档位内（仅 low / high / max，通用 6 档已归并）",
+            },
+        }
     }
 
     /// 取可用凭证（`X-Passport-Token` + `uid`），**含存在性校验**。

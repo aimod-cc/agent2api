@@ -176,12 +176,21 @@ const BRIDGE_JS: &str = r#"
     // —— **带刷新后的聚合清单**，界面就地重绘、不必再拉一次 /api/session
     // （理由见后端 `api::models` 的模块头）。不传 body：这条无入参
     refreshModels: () => call('POST', '/api/models/refresh', {}),
-    // 模型管理（启停 / 删除隐藏 / 映射）：写接口都返回最新 {models, mappings}
+    // 模型管理（启停 / 删除隐藏 / 映射）：写接口都返回最新 {models, mappings, reasoningLevels}
     // 映射照抄 OmniProxy 语义：对外名自由命名（允许与上游 id 同名），同一对外名
     // 可在不同提供商各建一条（主备）；provider 为空 = 旧版全局语义
+    //
+    // 第 4 个参数是**思考等级绑定**（照抄 OmniProxy 的手动绑定列表，见
+    // 模型管理页的下拉）：省略 = 不动已有等级（旧调用点的行为），
+    // '' / null = 清成「不覆盖」，其它字符串 = 设成该等级。
+    // 后端按「请求体里有没有这个键」区分这三态，所以这里展开成条件键 ——
+    // 直接塞 `reasoning: reasoning || ''` 会把「不改」也变成「清空」，
+    // 那是一次静默的数据丢失。
     getModelManage: () => call('GET', '/api/models/manage'),
     setModelState: payload => call('POST', '/api/models/state', payload),
-    addModelMapping: (alias, target, provider) => call('POST', '/api/models/mappings', { alias, target, provider }),
+    addModelMapping: (alias, target, provider, reasoning) => call('POST', '/api/models/mappings', {
+      alias, target, provider, ...(reasoning === undefined ? {} : { reasoning }),
+    }),
     removeModelMapping: (alias, target, provider) => call('POST', '/api/models/mappings/remove', { alias, target, provider }),
 
     // ── 网关 API Key（多把）──
@@ -336,13 +345,17 @@ const BRIDGE_JS: &str = r#"
     // 且对 PUT 无 body 时会补一个空对象，所以这里直接透传即可。
     saveRetention: patch => call('PUT', '/api/retention', patch),
 
-    // ── 数据保存位置（设置页「保存位置」）──
+    // ── 数据存储概况（设置页「保存位置」）──
+    // 只读：数据统一在配置目录的 agent2api.db 里，不再支持换目录
+    // （改造前的 relocateStorage / storageProgress 两条写命令已随单库语义删除，
+    //  见 server/api/storage_api.rs 的模块头）。
     getStorage: () => call('GET', '/api/storage'),
-    // 迁移是同步的：resolve 即迁移结束（迁移期间用 storageProgress 轮询进度画条）
-    relocateStorage: payload => call('POST', '/api/storage/relocate', payload),
-    storageProgress: () => call('GET', '/api/storage/progress'),
-    // 弹系统目录选择框，返回 { path } 或 { canceled: true }
-    pickDirectory: title => invoke('pick_directory', { title: title ?? null }),
+
+    // ── 数据结构升级（旧 JSON/JSONL → 统一 SQLite 库）──
+    // 启动时只探测、不自动迁移；界面拿到 pending 后弹窗，用户点「升级」才导入。
+    // 旧数据不会被删除（只改名为 *.migrated），详见 server/api/upgrade_api.rs。
+    getUpgrade: () => call('GET', '/api/upgrade'),
+    runUpgrade: () => call('POST', '/api/upgrade/run', {}),
 
     // ── 请求重试（设置页「通用 → 请求重试」）──
     // 转发层退避的次数 / 间隔，存后端 config.json（/api/retry）。
@@ -351,8 +364,8 @@ const BRIDGE_JS: &str = r#"
     saveRetry: patch => call('PUT', '/api/retry', patch),
 
     // ── 调试模式（设置页「通用 → 调试模式」）──
-    // 开关存后端 config.json（debugMode）：开启后转发层把上游原始报文
-    // （凭据类头已脱敏）落到 debug-traffic.jsonl，请求日志页的「详情」列据此展示。
+    // 开关存配置（debugMode）：开启后转发层把上游原始报文（凭据类头已脱敏）
+    // 落到统一库的 debug_traffic 表，请求日志页的「详情」列据此展示。
     getDebug: () => call('GET', '/api/debug'),
     saveDebug: enabled => call('PUT', '/api/debug', { debugMode: enabled }),
     // 按 id 取一条请求的原始报文（列表接口不返回报文，见后端 debug_api 的模块头）。

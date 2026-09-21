@@ -15,10 +15,11 @@
 //! 逐位置按交替顺序试词，命中即消费该词长度，完全复刻 ①②③
 //! （推导见 `canonicalize` 与 `find_at` 的注释）。零依赖、零 panic 风险。
 //!
-//! ── 键顺序与「有意偏离」────────────────────────────────────
-//!   - 词表文件手工按 Node 的字段顺序序列化（JSON.stringify(x,null,2)+"\n"），
-//!     做到两边写出的字节完全一致（serde_json 的 Map 会按字母排序，不能用）。
-//!   - 唯一有意偏离：**词条以星面字符开头**时（emoji 等代理对），Node 的
+//! ── 与 Node 版的两处有意偏离 ────────────────────────────────
+//! （「词表文件的字段顺序与缩进字节对齐 Node」那条要求**已随本次改造消失**：
+//! 词表从 `desensitize.json` 进了 `kv` 表，那份状态没有第二个读写方了，
+//! 本文件里与它配套的手工序列化函数一并删除；完整论证见 `mod.rs` 模块头。）
+//!   - **词条以星面字符开头**时（emoji 等代理对），Node 的
 //!     `term[0]` 取到的是高代理（半个字符），`zeroWidthSplit` 就把 ZWSP 插在
 //!     代理对中间，产出一个含孤立代理的非法 UTF-16 串；JSON 化后它是
 //!     `"\ud83d​\ude00…"`，任何严格解析器都读不回来。Rust 的 String 必须是
@@ -33,9 +34,6 @@ use serde_json::Value;
 
 /// 零宽空格：插在词内部打断关键词匹配，不影响阅读
 pub const ZWSP: char = '\u{200b}';
-
-/// 词表文件名（与 accounts.json 同级）
-pub const FILE_NAME: &str = "desensitize.json";
 
 /// 默认处理这两种角色：system 是客户端合规模板的集中地，user 是用户真实输入
 pub const DEFAULT_ROLES: &[&str] = &["system", "user"];
@@ -95,10 +93,11 @@ pub const DEFAULT_TERMS_VERSION: u32 = 3;
 
 /// 默认词表补词迁移表：版本号 → 该版本新增的默认词条。
 ///
-/// 老用户的词表持久化在 desensitize.json，默认词表更新后不会自动生效，
-/// 因此按版本做一次性合并：文件里记录已合并到哪个版本（defaultsVersion），
-/// 启动加载时把缺失的新词条按忽略大小写补进去，合并完落盘并更新版本标记。
-/// 用「只补登记词条」而不是「与 DEFAULT_TERMS 求并集」，是为了保护用户的删除权。
+/// 老用户的词表（原先是 `desensitize.json`，现在是库里那份状态）记着「已合并到
+/// 哪个版本」（`defaultsVersion`），默认词表更新后不会自动生效，因此按版本做
+/// 一次性合并：启动读状态时把缺失的新词条按忽略大小写补进去，合并完落库并更新
+/// 版本标记。用「只补登记词条」而不是「与 DEFAULT_TERMS 求并集」，是为了保护
+/// 用户的删除权。
 pub const DEFAULT_TERM_MIGRATIONS: &[(u32, &[&str])] = &[
     (2, &["Main branch (you will usually use this for PRs)"]),
     (3, &["You are Claude Code", "Anthropic's official CLI for Claude"]),

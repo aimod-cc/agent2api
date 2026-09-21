@@ -279,9 +279,43 @@
   word-break: break-all;
 }
 
-.req-detail-block { margin-top: 14px; }
+/* ─── 详情弹窗的分段选择器（请求头 / 请求体 / 响应头 / 响应体）───
+   .seg / .seg-item 的形制来自 components.css（请求日志页的时间档位、
+   账号页的筛选分段用的是同一套），这里只补三处本场景特有的：
 
-.req-detail-block h3 {
+   ① 分段条与下面的面板之间要有间距（.seg 自身没有下外边距，
+      在页头里靠父容器的 gap 分隔，这里是弹窗内的独立一行）；
+   ② 空段的标记：一枚小圆点（.seg-dot），并从 .seg-item.zero 的
+      半透明里继承「这一段没内容」的观感；
+   ③ 面板的显示切换靠 .is-active（一次渲染四块，切换只改 class ——
+      这样切换时当前段的滚动位置不会丢，见 switchDetailSeg 的说明）。 */
+
+.req-detail-segs { margin: 12px 0 10px; }
+
+/* 空段标记：4px 圆点，比文字淡一档。放在标签文字后面（gap 由 .seg-item 的
+   既有 gap: 5px 给出），不影响标签的点击区域 —— 它自己 pointer-events: none，
+   点在圆点上与点在文字上一样会命中按钮。 */
+.seg-item .seg-dot {
+  flex: 0 0 auto;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .5;
+  pointer-events: none;
+}
+
+/* 空段「仍可点」是这个控件的一条要求（见 request-hover 之外的说明：
+   点进去会看到一句空态文案，比「点不动」更能解释为什么没有内容）。
+   .seg-item.zero 的既有声明是 opacity: .45，这里不再压 —— 标签本身
+   已经是「有内容/没内容」的完整表达，再压会让它看起来像 disabled。 */
+.seg-item.zero:not(.active) { opacity: .6; }
+
+.req-detail-pane { display: none; }
+
+.req-detail-pane.is-active { display: block; }
+
+.req-detail-pane h3 {
   margin-bottom: 6px;
   color: var(--text-3);
   font-size: 11.5px;
@@ -310,4 +344,145 @@
   color: var(--text-3);
   font-size: 12.5px;
   text-align: center;
+}
+
+/* ─── 重试列的标签与悬停面板（request-hover.js）───────────────
+   这一列现在承载两件事：重试链（橙标签）与敏感词命中（紫标签），
+   悬停弹出富文本面板。形态照 OmniProxy 的 FailoverTip / SensitiveMaskedTag，
+   配色换算到本项目自己的变量（那边用 antd 的 Tag 色板）。
+   面板本体是 fixed 定位挂在 body 上 —— 与 .tip-bubble 同因同法
+   （.panel 是 overflow:hidden，absolute 会被卡片裁掉）。 */
+
+/* 标签排布：一列里可能有两枚（重试 + 敏感词），竖着排比并排好读 ——
+   这一列只有 52px 宽，并排会立刻换行，反而不如显式竖排整齐。 */
+.req-row .req-retry {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+/* 标签自身：沿用 .badge / .tag 的既有形制（尺寸与状态列那两枚一致），
+   只补一个「可以悬停看详情」的指针语义与交互反馈 ——
+   它是一颗真按钮（见 requests-panel.js 的 retryCell），所以要清掉按钮的
+   默认底色与内边距，让它看起来仍是徽章而不是一颗小按钮。 */
+.req-hover-tag {
+  padding: 0 6px;
+  border: 0;
+  cursor: help;
+}
+
+.req-hover-tag:focus-visible { box-shadow: var(--ring); }
+
+/* 敏感词命中：紫色（OmniProxy 的 Tag color="purple"）。
+   tokens.css 没有紫色语义变量，这里就地取一个色相的固定值而不是新加一个
+   token —— 全站只有这一处需要紫色，进 tokens.css 会让人以为它是通用语义色。
+   浅深两套各写一份：同一组紫在浅底与深底上需要的明度不同。 */
+.req-hover-tag.sensitive {
+  background: oklch(0.55 0.18 305 / 14%);
+  border: 1px solid oklch(0.55 0.18 305 / 32%);
+  color: oklch(0.45 0.18 305);
+}
+
+@media (prefers-color-scheme: dark) {
+  .req-hover-tag.sensitive {
+    background: oklch(0.7 0.16 305 / 16%);
+    border-color: oklch(0.7 0.16 305 / 34%);
+    color: oklch(0.82 0.12 305);
+  }
+}
+
+/* 面板：深色底 + 浅字（与 .tip-bubble 同一档观感，但内容多、要能滚动）。
+   用 --surface 系而不是主色底：面板里有红/绿/灰三种状态的文字色，
+   压在 --primary 上会看不出差别。 */
+.req-hover {
+  position: fixed;
+  z-index: 35;              /* 与下拉浮层、.tip-bubble 同档：在弹窗遮罩（30）之上 */
+  display: none;
+  max-height: min(360px, 60vh);
+  padding: 10px 12px;
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--surface) 96%, black);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-x: hidden;
+  overflow-y: auto;
+  box-shadow: var(--shadow-3);
+  pointer-events: none;
+  /* 注意：不能整体写 overflow-wrap: anywhere —— 那会把中文长句拆得七零八落。
+     长英文 / URL 的换行只给 .rh-bad 那一类（见下）。 */
+  word-break: normal;
+}
+
+.req-hover.open { display: block; }
+
+/* 深色主题下深色面板与背景的分离度不够，改用带边框的抬升表面色 */
+@media (prefers-color-scheme: dark) {
+  .req-hover {
+    border: 1px solid var(--border-strong);
+    background: var(--surface-3);
+  }
+}
+
+/* 切换路径行：面板顶部一条，与下面的尝试列表用分隔线隔开（OmniProxy 同法） */
+.rh-chain {
+  padding-bottom: 6px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  word-break: break-word;
+}
+
+.rh-chain-k { color: var(--text-3); font-weight: 600; }
+.rh-chain-v { color: var(--text); font-weight: 600; }
+
+/* 面板小标题（敏感词面板用） */
+.rh-title {
+  margin-bottom: 4px;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+
+.rh-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 4px;
+  min-width: 0;
+  word-break: break-word;
+}
+
+/* 尝试序号 / 箭头 / 说明是次要标记：淡一档 */
+.rh-no,
+.rh-arrow,
+.rh-dim { color: var(--text-3); }
+
+.rh-who { color: var(--text); font-weight: 600; }
+
+/* 失败那一行可能带 200 字符的错误摘要：允许在任意位置断行，
+   否则一条没有空格的英文报错会把面板顶宽（OmniProxy 的 overflowWrap: anywhere 同法） */
+.rh-bad {
+  flex: 1 1 0%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--danger);
+  font-weight: 500;
+}
+
+.rh-ok { color: var(--ok); font-weight: 500; }
+
+/* 敏感词列表：词与次数分列，次数贴右竖着能比大小 */
+.rh-hit {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.rh-hit-w { color: var(--text); word-break: break-word; }
+.rh-hit-c {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }

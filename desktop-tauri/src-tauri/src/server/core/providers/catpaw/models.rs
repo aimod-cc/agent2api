@@ -301,10 +301,43 @@ pub fn resolve_effort(body: &Value) -> Result<Option<String>, CatPawError> {
         return Ok(None);
     };
     let value = value_text(raw).trim().to_ascii_lowercase();
-    if !matches!(value.as_str(), "low" | "high" | "max") {
+    // 校验用 [`EFFORTS`]（而不是在这里再列一遍三个字面量）：上游枚举与
+    // 「映射绑定怎么归并到这几个值」必须同源，否则加一档时只改一处，
+    // 另一处会把新档位当成非法值 400 掉
+    if !EFFORTS.iter().any(|known| *known == value) {
         return Err(CatPawError::bad_request("reasoning_effort 仅支持 low / high / max"));
     }
     Ok(Some(value))
+}
+
+/// 本家接受的三个档位（**由弱到强**）。`resolve_effort` 的硬校验与
+/// [`effort_for_level`] 的归并都以这一份为准 —— 上游枚举改了这里改一处。
+pub const EFFORTS: &[&str] = &["low", "high", "max"];
+
+/// 网关映射上绑的**通用思考等级** → 本家的档位（`None` = 不注入）。
+///
+/// ── 为什么必须归并（不能原样发）─────────────────────────────
+/// `resolve_effort` 对三个枚举之外的值**当场 400**，而网关的通用表是 6 档
+/// （`minimal` / `low` / `medium` / `high` / `xhigh` / `max`）—— 原样注入等于
+/// 让 `medium` / `xhigh` 这种合法绑定把一条本来能用的请求打成 400。
+/// 归并规则是**两两合流**（`rank / 2`，由弱到强保持单调）：
+/// ```text
+///   minimal | low   → low
+///   medium  | high  → high
+///   xhigh   | max   → max
+/// ```
+/// 「就近取一档」而不是「只放行恰好命中的那一档」：上游只有三档，用户的意图
+/// 是「更强 / 更弱」，把 `medium` 拒掉等于让一半的候选值形同虚设。
+///
+/// ── 表外的自定义等级为什么返回 None ────────────────────────
+/// 界面允许填表外值（照抄 OmniProxy 的自定义入口），但本家对未知值的反应是
+/// **400**，而这条请求在本功能之前是能用的。所以自定义值一律不注入
+/// （照旧保存、照旧显示），宁可这条绑定不生效，不可把请求弄坏。
+pub fn effort_for_level(level: &str) -> Option<&'static str> {
+    let rank = crate::server::core::model_rules::reasoning_rank(level)?;
+    // rank ∈ 0..=5（通用表 6 档）→ 0..=2（本家 3 档）。
+    // `min` 只为「将来通用表加档」时不越界，正常路径取不到。
+    EFFORTS.get((rank / 2).min(EFFORTS.len() - 1)).copied()
 }
 
 /// 上下文档位别名（原实现 `CONTEXT_WINDOW_ALIASES`）

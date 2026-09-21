@@ -430,7 +430,7 @@ fn upstream_message(error_body: &Value) -> String {
 /// 现在两家各记各的 seeded，先刷到的池拿到「去前缀」那条；两家的短名都由
 /// `model_rules::EXTRA_ALIASES` 点名补挂，因此**无论哪家先刷，短名都能路由到
 /// 两个池**（各有一条映射进候选链，发送名跟着实际承载的 provider 走，见
-/// `catalog::wire_model_for_provider` 的 ②）。短名最终落在谁家只影响
+/// `catalog::wire_target_for_provider` 的 ②）。短名最终落在谁家只影响
 /// 「候选链里哪个在前」，而那由账号优先级与候选链的既有规则决定，不再是
 /// 一个藏在种子里、随刷新顺序漂移的隐规则。
 pub(crate) fn seed_defaults(pool: Pool) -> Option<String> {

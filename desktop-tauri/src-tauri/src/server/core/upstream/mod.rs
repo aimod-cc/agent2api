@@ -174,6 +174,23 @@ pub struct ForwardRequest {
     /// 那时数据必须落在**调用方仍持有**的句柄里才拿得到。调用方（记账点）
     /// 拿同一个 `Arc` 的另一份克隆，就能在流收尾时读到最终值。
     pub telemetry: Arc<usage::RequestTelemetry>,
+    /// 本次请求命中的网关 Key 所带来的**可用提供商**限制（R9）。
+    ///
+    /// `None` = 不限制（免鉴权模式 / 环境变量 Key / 未知 Key，见
+    /// `core::key_scope` 的模块头）。为什么**放在入参里**而不是让转发层自己去
+    /// 请求头里再解析一次：转发层不该认识「网关 Key」这个概念（它只认识上游与
+    /// 账号），而且 handler 手里已经有 `KeyScope`（中间件放进请求扩展的那份），
+    /// 再解析一次就是两处实现同一件事。传值（`Option<KeyScope>`）而不是引用：
+    /// 它要活过整个转发过程，而 handler 的栈帧可能在流式路径上先返回。
+    ///
+    /// **只有提供商白名单进这里**：模型白名单是**入口校验**（handler 在解析
+    /// 模型名时就判、以 404 拒绝），不该等到了转发层才按家过滤 —— 那条路
+    /// 会把请求打到上游再失败，而正确的语义是「这个模型对你这把 Key 不存在」。
+    ///
+    /// 写成完整路径 `crate::server::core::key_scope::KeyScope` 而不是 `super::`：
+    /// 本文件在 `server::core::upstream` 下，`super::key_scope` 指的是
+    /// `server::core::upstream::key_scope`（不存在）—— 这里跨了一层模块。
+    pub allowed_providers: Option<crate::server::core::key_scope::KeyScope>,
 }
 
 /// 转发结果：要么是可直接下发的流，要么是聚合好的 JSON
@@ -255,12 +272,20 @@ impl UpstreamService {
         // 用同一份范围（请求进行中改设置不会让语义漂移），且这里的 body 始终是
         // 客户端原始请求体 —— 处理只发生在「某一家即将发送之前」，见 payload.rs。
         let desensitize_scope = crate::server::core::desensitize::global().provider_scope();
+        // Key 的提供商白名单随请求带进转发上下文：它要活过整条转发链
+        //（含流式 —— 但流本身不需要它，只在选路与重试时读）。
+        // 这里把 request 的字段**移出来**再借给 context：`request` 的其它部分
+        // （body / headers）同样以借用形式进了 context，直接 `&request.allowed_providers`
+        // 会因为「同时持有 request 的可变借用（上面改过 body）」而借不过 ——
+        // 移出后所有权清晰，也不必再多一次克隆。
+        let key_scope = request.allowed_providers;
         let context = payload::ProviderContext {
             body: &upstream_body,
             stream: request.stream,
             client_headers: &request.client_headers,
             telemetry: &request.telemetry,
             desensitize_scope: &desensitize_scope,
+            key_scope: key_scope.as_ref(),
         };
         provider_loop::forward_with_providers(self, context, &mut slot, &mut connections).await
     }

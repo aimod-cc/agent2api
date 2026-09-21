@@ -62,7 +62,7 @@ use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::GatewayError;
@@ -73,6 +73,13 @@ use self::stream::SseEvent;
 
 pub struct QoderAdapter;
 pub static QODER_ADAPTER: QoderAdapter = QoderAdapter;
+
+/// 映射上绑的思考等级注入到请求体的哪个键。
+///
+/// `protocol::resolve_thinking` 认 `reasoning_effort` / `reasoning` / `thinking`
+/// 三个键，选 `reasoning_effort` 的理由与 CatPaw 那边同：它是最标准、客户端最
+/// 常传的那个，注入与「客户端已指定」在 body 上同形。
+const REASONING_FIELD: &str = "reasoning_effort";
 
 /// 一个上游响应 id（客户端按它关联同一次回答；形态照抄 OpenAI）
 fn response_id() -> String {
@@ -280,6 +287,55 @@ impl ProviderAdapter for QoderAdapter {
     /// 而不是被注入一个别家语义的模型名（架构文档 §4.4 末句的「不注入」分支）。
     fn supports_default_model(&self) -> bool {
         false
+    }
+
+    /// 思考等级绑定 → `reasoning_effort`（值**原样**交给本家的归一逻辑）。
+    ///
+    /// ── 为什么本家不做档位映射（与 CatPaw 的差别，别照抄那边）──────
+    /// 「这一家收哪些档位」在 Qoder 是**模型级**知识：上游目录每个模型条目自己
+    /// 声明 `thinking_config.enabled.efforts`（Qwen3.8 系列是 low / medium /
+    /// xhigh），`protocol::resolve_thinking` 已经按它归一与回退（`minimal` →
+    /// `low`、`high` / `max` → `xhigh`、模型不支持的档位退回该模型默认档）。
+    /// 在这里再折一层等于把同一件事做两遍，而且**必然做错**：适配器这一层只看
+    /// 得到 `_model` 这个名字，拿不到那个模型声明的档位表，只能瞎猜一个映射 ——
+    /// 猜出来的映射与 `resolve_thinking` 里那份一旦不一致，同一档位会按不同
+    /// 结果发出去（取决于哪一层先动手）。
+    ///
+    /// 所以这里只做两件事：判「客户端是不是已经指定了」、判「这个值值不值得
+    /// 交给上游的归一逻辑」。第二件的判据是通用表的正向 6 档
+    /// （`model_rules::reasoning_rank`）：
+    ///   - 表内值 → 注入。归并与回退交给 `resolve_thinking`（它有模型上下文，
+    ///     做得到）；
+    ///   - 表外的自定义值 → 不注入。本家对未知档位**不报错**（回退到模型默认
+    ///     档），所以注入它不会弄坏请求 —— 但也**不会生效**：上游收到的仍然是
+    ///     模型默认档，而日志里会出现一行「已注入」。那正是「绑了没生效还查不出」
+    ///     的典型来源，不如明确跳过并说清原因。
+    ///   - `off` / `none` 在注入点就被拦下了（理由见 `model_rules::reasoning`：
+    ///     本家关思考会让 Qwen3.8 系列行为异常），这里收不到。
+    ///
+    /// ── 客户端已指定时不覆盖 ────────────────────────────────────
+    /// 判据走 `protocol::client_specified_reasoning` —— 它与
+    /// `resolve_thinking` 的取值链**同一个函数**（只是把「值是 null」归到
+    /// 「没指定」，理由写在那个函数的文档里），不存在「这里说没指定、
+    /// 那边读出来一个值」。
+    ///
+    /// `_model` 不用（档位是模型级知识，但那份知识在 `models::resolve` 的结果
+    /// 里，不在这条只有名字的路径上 —— 见上）。
+    fn reasoning_patch(&self, level: &str, _model: &str, body: &Value) -> ReasoningPatch {
+        if protocol::client_specified_reasoning(body) {
+            return ReasoningPatch::Skip {
+                reason: "客户端请求体里已指定思考档位，绑定不覆盖",
+            };
+        }
+        if crate::server::core::model_rules::reasoning_rank(level).is_none() {
+            return ReasoningPatch::Skip {
+                reason: "该等级不在通用候选表内，本家无法判断上游收不收（档位由各模型自己声明）",
+            };
+        }
+        ReasoningPatch::Set {
+            field: REASONING_FIELD,
+            value: Value::String(level.trim().to_string()),
+        }
     }
 
     /// SSE 帧的 model 名回写由本适配器**自己做**（在 `forward_conversation` 里

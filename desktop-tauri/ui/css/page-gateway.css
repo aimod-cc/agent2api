@@ -1,5 +1,11 @@
 /* ─────────────────────────────────────────────
-   网关 Key 页：接口条；模型管理页：模型表格 + 映射弹窗；两页共用同一套表格样式
+   文档页：接口条；模型管理页：模型表格 + 映射弹窗；网关 Key 页：Key 表格
+
+   三个页面的样式同住一个文件，是因为它们共用同一套表格与面板骨架
+   （.models-table 是模型管理与网关 Key 共用，见下方注释）。
+   **接口条（.ep-*）R8 起住在「文档」页**：它原来在「网关 Key」页，
+   整块搬走后这些规则一字未改 —— 它们没有按 [data-page] 收窄（CSS 本来就是
+   全局加载的），所以换页面不需要动样式。这里只更正文件头的描述。
    ───────────────────────────────────────────── */
 
 /* ─── 接口条：纵向列表，一行一条端点 ───
@@ -196,6 +202,44 @@
   line-height: 1;
 }
 .alias .x:hover:not(:disabled) { opacity: 1; background: color-mix(in srgb, var(--text) 10%, transparent); color: inherit; border-color: transparent; }
+
+/* 思考等级标：贴在映射名药丸里的第二枚小按钮（`alias · high`）。
+   为什么是「药丸里的一枚按钮」而不是再加一枚独立的药丸：等级是**这条映射的属性**，
+   和对外名是同一件事的两个字段，放进同一枚药丸才读得出从属关系；
+   独立药丸会让一屏里出现两倍数量的 chip，哪个是名字哪个是等级要靠猜。
+   未绑定时（孤儿映射那组用）走虚线，与「已绑定」一眼分开。 */
+.alias .alias-level {
+  height: 16px;
+  padding: 0 5px;
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  background: color-mix(in srgb, var(--primary-fg) 12%, transparent);
+  box-shadow: none;
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: .02em;
+}
+.alias .alias-level:hover:not(:disabled) {
+  border-color: var(--primary-bd);
+  background: var(--surface);
+  color: var(--primary-fg);
+}
+.alias .alias-level.unset {
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  color: var(--text-3);
+  font-weight: 600;
+}
+.alias .alias-level.unset:hover:not(:disabled) { border-style: solid; color: var(--primary-fg); }
+
+/* 弹窗里的思考等级控件行：下拉 + 问号并排（问号的说明很长，放在下拉右边
+   与设置页各面板标题的问号是同一个组件，见 css/tooltip.css）。 */
+.reasoning-pick { display: flex; align-items: center; gap: 7px; }
+.reasoning-pick select { flex: 1 1 auto; min-width: 0; }
+
 .alias-add {
   height: 22px;
   padding: 0 8px;
@@ -242,6 +286,23 @@ button.danger-text:hover:not(:disabled) { background: var(--danger-soft); color:
 /* 网关 Key 页：key 单元格 */
 .keycell { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .keycell .kv { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 12px; }
+
+/* 新建 / 编辑 Key 弹窗里的两个多选（可用提供商 / 可用模型）。
+   与脱敏页的 .provider-pick select 同一取舍：原生 select 留在壳里当宽高锚，
+   给它一个「够放下两个中文名」的下限、上界收在 260px —— 勾多了由触发器里的
+   文案自己省略号收住，这一行保持等高。`.field-row` 是 flex 行，不设 flex:1
+   就会按内容宽度塌成很窄的一条。 */
+#key-allowed-providers, #key-allowed-models {
+  flex: 1 1 auto;
+  min-width: 180px;
+  max-width: 260px;
+}
+/* 弹窗里这两行之间的间距已经由行内 style 给了，这里只补「标签与控件不同基线」
+   带来的视觉偏移（.field-row 是 align-items:center，多选外壳比 input 略高） */
+#key-modal .field-row > label { align-self: center; }
+/* 摘要行：与上面的说明同款小字，首行前留一点空隙（它是「当前选择」而不是
+   「使用说明」，视觉上要分得开） */
+#key-restrict-summary { margin-top: 2px; }
 
 /* ─────────────────────────────────────────────
    脱敏页

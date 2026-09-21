@@ -29,12 +29,13 @@
 //! 将来要接回余额功能时有原始凭证可用。
 //!
 //! ── 硬约束 ────────────────────────────────────────────────
-//! 本文件全是文件读写，**没有任何网络请求**；绝不 unwrap/expect
+//! 本文件只做「读旧文件 + 写数据库」，**没有任何网络请求**；绝不 unwrap/expect
 //! （release 是 panic=abort）。
 
 use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::priority::next_free_priority;
+use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::AccountStore;
 use crate::server::core::account_store::store_util::{strip_bearer_prefix, token_tail_of, truncate_chars};
@@ -75,8 +76,23 @@ impl AccountStore {
         let catpaw = catpaw_id();
         {
             let _guard = self.guard();
-            let state = self.load(&_guard);
-            let has_catpaw = state.accounts.iter().any(|item| item.provider() == catpaw);
+            // 本家账号数为 0（投影列 COUNT）—— 触发条件之一，只问「有没有」。
+            // 改造前这里要读全量再 any() 一遍，等于为了一个布尔值解析 20 条记录。
+            // 查询失败（库不可用）按「有账号」处理并跳过：本函数是启动期的
+            // **一次性**导入，库不可用时顺势去写只会再失败一次并刷屏；
+            // 账号功能整体已不可用这件事由别处的 ❌ 日志说明。
+            let has_catpaw = match self
+                .with_conn(&_guard, |conn| sql::count_by_provider(conn, catpaw))
+            {
+                Ok(count) => count > 0,
+                Err(error) => {
+                    logging::log(
+                        "[Accounts]",
+                        &format!("⚠️  读取CatPaw账号数失败，跳过旧数据导入: {error}"),
+                    );
+                    true
+                }
+            };
             let flagged = crate::server::config::current()
                 .raw()
                 .get(IMPORT_FLAG_KEY)
@@ -168,9 +184,22 @@ impl AccountStore {
             .unwrap_or_default();
         let catpaw = catpaw_id();
         let _guard = self.guard();
-        let mut state = self.load(&_guard);
+        // 导入前把「已占用的 id」与「已占用的优先级」各取一次（各一列，
+        // 不解析记录），循环里在内存中增量维护 —— 同批新加的账号也必须参与
+        // 去重与号段判定，否则同一批里的重复 id / 重号会落库。
+        // 改造前这两件事都靠「读全量 state 再遍历」实现。
+        let mut taken_ids: std::collections::HashSet<String> = self
+            .with_conn(&_guard, |conn| sql::all_ids(conn))
+            .map_err(|error| error.message)?
+            .into_iter()
+            .collect();
+        let mut used_priorities: Vec<i64> = self
+            .with_conn(&_guard, |conn| sql::priorities_all(conn))
+            .map_err(|error| error.message)?;
         let mut added = 0usize;
         let mut skipped = 0usize;
+        // 本批要写入的记录：循环里只组装，最后一次性进事务（见循环后的说明）
+        let mut fresh: Vec<StoredAccount> = Vec::new();
         for item in items {
             let Some(object) = item.as_object() else {
                 skipped += 1;
@@ -197,7 +226,7 @@ impl AccountStore {
                 );
                 continue;
             }
-            if state.accounts.iter().any(|item| item.id() == id) {
+            if taken_ids.contains(&id) {
                 skipped += 1;
                 logging::log(
                     "[Accounts]",
@@ -205,7 +234,8 @@ impl AccountStore {
                 );
                 continue;
             }
-            if state.accounts.len() >= MAX_ACCOUNTS {
+            // 账号总数上限：已存在的 + 本批已收下的
+            if taken_ids.len() >= MAX_ACCOUNTS {
                 skipped += 1;
                 logging::log(
                     "[Accounts]",
@@ -234,15 +264,10 @@ impl AccountStore {
                 .filter(|value| !value.is_empty())
                 .map(|value| truncate_chars(value, 100))
                 .unwrap_or_else(|| format!("账号 {id}"));
-            let priority = next_free_priority(
-                // 号段取**全部**账号：优先级全局唯一（四家共用一条队列），
-                // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）
-                &state
-                    .accounts
-                    .iter()
-                    .map(StoredAccount::priority)
-                    .collect::<Vec<_>>(),
-            );
+            // 号段取**全部**账号：优先级全局唯一（四家共用一条队列），
+            // 只看本家会让新账号撞上别家已在用的号（见 priority.rs 模块头）。
+            // `used_priorities` 随本批的每次分配增量更新，所以同批内不会重号。
+            let priority = next_free_priority(&used_priorities);
             let now = logging::now_ms();
             let mut record = Map::new();
             record.insert("id".to_string(), Value::String(id.clone()));
@@ -289,12 +314,25 @@ impl AccountStore {
                     .filter(|value| value.as_i64().map(|item| item != 0).unwrap_or(false))
                     .unwrap_or_else(|| Value::from(now)),
             );
-            state.accounts.push(StoredAccount::from_map(record));
+            taken_ids.insert(id.clone());
+            used_priorities.push(priority);
+            fresh.push(StoredAccount::from_map(record));
             added += 1;
         }
-        if added > 0 {
-            self.save(&state, &_guard)
-                .map_err(|error| format!("导入落盘失败: {}", error.message))?;
+        if !fresh.is_empty() {
+            // 整批一个事务：要么全部导入、要么一条都不导入。中断留下「部分导入」
+            // 会让「本家账号列表为空」这个触发条件永远不再成立（下一次启动看到
+            // 有账号就跳过导入），于是剩下的旧账号再也没机会进来。
+            // 逐条 `put` 而不是整份状态差异写：本批全是新增，而库里别的记录
+            // 这一轮没有被碰过 —— 重写它们纯属多余（改造前正是整份重写）。
+            self.with_conn_mut(&_guard, |conn| {
+                let tx = conn.transaction()?;
+                for record in &fresh {
+                    sql::put(&tx, record)?;
+                }
+                tx.commit()
+            })
+            .map_err(|error| format!("导入落盘失败: {}", error.message))?;
         }
         Ok((added, skipped))
     }

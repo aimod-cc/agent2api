@@ -10,31 +10,44 @@
    状态列就被推走）；而账号列是唯一内容长度不可控的（昵称 / uid / 邮箱），
    只有它该参与伸缩。
 
-   预算（默认窗口 1060px）：侧栏 216 + 内容区左右留白 40 + 面板边框 2 +
-   滚动条常驻槽 11 ≈ 269，列表可用宽度约 791px。七个固定列合计 642px
-   （26 + 92 + 106 + 76 + 72 + 84 + 186），账号列因此拿到约 149px ——
-   昵称（5 个汉字 65px）与 uid（`uid 1234567890` 约 110px）都放得下，
-   更长的串按下面的 ellipsis 收口、完整值在 title 里。
+   预算：九个固定列合计 988px
+   （26 + 132 + 132 + 56 + 80 + 148 + 80 + 84 + 250，逐列见下方声明）。
+   默认窗口 1060px 时列表可用宽度约 791px，也就是说**默认窗口下这张表横向滚动**，
+   账号列拿到的是它的最小值而不是「剩余宽度」。这是有意的：
+   表格**不压缩列宽**（见下），宁可横滚也不把「设为首选」折成两行、
+   把优先级控件挤到点不准。拉宽窗口或拖窄某几列之后，账号列才开始吃剩余空间。
 
-   固定列里最贵的是操作列 186px：那是「设为首选 / 设置 / 签到 / ⋯」四颗按钮
-   并排的最坏情况（4 字 58 + 2 字 36 + 2 字 36 + ⋯ 26 + 间距 12 = 168，
-   加单元格左右内边距 16）。它排在最后一列、右侧没有别的列要抢位，
-   宽度可以放心给 —— 省下来的都归账号列。
-   次贵的是优先级列 106px（输入框 44 + 间距 3 + ↑/↓ 两枚 42 = 89），
-   这是把「改成具体数值」与「挪一位」两种操作都留在行上的代价。
-   两处「宁可竖着放也不要横着挤」的取舍：
+   固定列里最贵的是操作列 250px：那是「设为首选 / 余额 / 设置 / 已签到 / ⋯」
+   五颗按钮并排的最坏情况（按 11.5px 字号逐颗量出来的，算式见那条声明）。
+   它排在最后一列、右侧没有别的列要抢位，宽度可以放心给 —— 省下来的都归账号列。
+   **本次改造把它从 190 加到 250、余额列从 100 收到 84**：查询余额那颗按钮
+   从余额列挪进了操作列（余额列只剩一行摘要读数），按钮数量与文案长度都变了，
+   两列的一增一减必须同时调 —— 只改一处会让操作列里的「已签到」被省略号切掉
+   （那是**不可点**的状态，被切掉之后用户看不到「今天没得签了」这条信息）。
+   注意最坏组合不是罕见情况：同一家的账号**同时**满足「非队首 + 有余额概念 +
+   今天已签到」是常态，所以这个值要按最坏情况留足。 */
+
+   次贵的是优先级列 132px：序号 22 + 间距 3 + 合并控件 84 = 109，
+   余量留给「改成五位数」这类极端值。这是把「改成具体数值」与「挪一位」
+   两种操作都留在行上的代价。
+
+   三处「宁可竖着放也不要横着挤」的取舍：
      · 状态列：开关一行、健康徽章一行。并排放不下（开关 36 + 徽章 ≥45 >
        内容盒 60），而两行的高度与相邻的账号列（名字 + 明细行）相当，
        整行不会有一列明显空着。
      · 提供商列：展示名与版本徽章同样竖排 —— 「WorkBuddy」（66px）
        后面再跟一枚「国内版」必然超宽，而这一列是整张表里唯一区分
        「换了一家」的线索，被省略号砍成「Work…」就失去意义了。
-     · 余额列：按钮一行、结果摘要一行。摘要「可用 4300 积分」这类文案长度不可控，
-       横排只能给它几十像素、几乎必然被砍成「可用 4…」，竖着放反而读得全。
+     · 余额列：只剩一行摘要（查询按钮已挪走），但摘要「可用 4300 积分」
+       这类文案长度不可控，84px 下仍按省略号收口、完整值在 title 里 ——
+       这一列现在没有任何可点控件，它的全部职责就是「一眼看出还剩多少」。
 
-   最小窗口 820px 时（侧栏已收到 68px）可用宽度约 699px，按 760px 的最小宽度横向
-   滚动约 61px —— 表格**不压缩列宽**，压缩会把「设为首选」折成两行、
-   把优先级输入框挤到点不准，而横滚只是滑一下，信息一个不少。 */
+   最小窗口 820px 时（侧栏已收到 68px）可用宽度约 699px，按下面 900px 的
+   最小宽度横向滚动约 200px。 */
+/* 注意：下面这份「预算说明」在历史上曾与 CSS 的实际数值漂移过（注释里写 92/106，
+   CSS 里是 132/132）。改动任何一列的默认宽度时**同时**改三处：
+   这里的说明、下面的 .cell-* 声明、以及 accounts-columns.js 的 DEFAULTS ——
+   三处不一致时用户拖动一次列宽就会把差异暴露成「表格跳一下」。 */
 
 .acct-table {
   width: 100%;
@@ -105,8 +118,16 @@
 .cell-status { width: 80px; }
 .cell-limits { width: 148px; }
 .cell-expiry { width: 80px; }
-.cell-usage { width: 100px; }
-.cell-actions { width: 190px; }
+/* 余额列只剩一行摘要（查询按钮已挪到操作列，见 accounts-table.js 的 usageCell） */
+.cell-usage { width: 84px; }
+/* 操作列：五颗按钮的最坏情况（设为首选 / 余额 / 设置 / 已签到 / ⋯），
+   本次改造从 190 加到 250 —— 理由见文件头的列宽预算。
+   这个值是**量出来的**，不是估的：按 11.5px 字号、每颗按钮左右各 8px 内边距、
+   按钮间距 4px、单元格左右各 8px 内边距算，
+   「设为首选(62+16) + 余额(23+16) + 设置(23+16) + 已签到(46+16) + ⋯(12+16)
+   + 4×4 间距 + 16 单元格内边距 ≈ 250」。改按钮文案或增删按钮时**重算一遍**
+   （改小会让「已签到」被省略号切掉，改大则白占账号列的宽度）。 */
+.cell-actions { width: 250px; }
 /* .cell-account 不写宽度：table-layout: fixed 下它会自动吃掉剩下的全部。
    用户拖过的列由 accounts-columns.js 生成的 colgroup inline style 覆盖这里的默认值。 */
 
@@ -240,11 +261,11 @@
 .acct-note.warn { color: var(--warn); }
 .acct-note.bad { color: var(--danger); }
 
-/* ─── 优先级列（全局队列：序号 + 可直接编辑）─── */
+/* ─── 优先级列（全局队列：序号 + 「↓ 数字 ↑」合并控件）─── */
 
 .prio { display: flex; align-items: center; gap: 3px; }
 
-/* 全局序号：#N 是队列位置（与后端选路同构），数值输入框是队列值。
+/* 全局序号：#N 是队列位置（与后端选路同构），控件里的数字是队列值。
    两个都要 —— 序号便于扫读「我的账号在第几位」，数值便于精确定位与跨行对齐。 */
 .prio .seat {
   flex: 0 0 auto;
@@ -255,53 +276,144 @@
   text-align: right;
 }
 
-/* 输入框 44 + 间距 3 + ↑/↓ 两枚 42 + 序号 22 ≈ 111，落在 132px 的列里（内容盒 116）。
-   44 这个宽度是按最长的值反推的：0–9999 四位数字在 11.5px 等宽字体下约 31px，
-   加左右各 4px 内边距与 2px 描边正好 41，取 44 留一点余量。 */
-.prio-input {
-  width: 44px;
+/* ── 合并控件：下箭头 / 数字 / 上箭头共享一个外框 ──
+   改造前是三块独立控件（数字框 + 一组 order-btns，中间留 3px 缝），
+   看上去像「一个输入框 + 两个无关按钮」；而它们其实是同一个动作的
+   两种输入方式（增量 / 绝对值），所以合成一个整体。
+
+   宽度预算：两枚箭头各 20 + 输入框 42 = 82，加上外框描边 2 = 84，
+   再加上序号 22 与间距 3 ≈ 109，落在 132px 的列里（内容盒 116）还有余量。
+   输入框从 44 收到 42：合并后两侧的箭头各让出 1px 给描边，
+   而 0–9999 四位数字在 11.5px 等宽字体下约 31px，42 仍有充足余量。
+
+   ── 圆角与描边怎么分 ──
+   外框统一给圆角与描边（.prio-stepper 自己带 border + overflow: hidden），
+   内部三块各自**不带**边框与圆角，只用一条内部分隔线断开（相邻处 border-left）。
+   这样做的理由与 .seg / .seg-item 那一对完全相同（见 components.css）：
+   若让每一块各自带圆角与描边，三个圆角会在接缝处叠成一道毛边，而且
+   边框会变成 2 条相邻的线（1+1px），比一条分隔线显粗。
+   overflow: hidden 是必需的：输入框在聚焦态不换边框（见下），
+   但内部元素的方角要靠它被外框裁掉。 */
+.prio-stepper {
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
   height: 24px;
-  padding: 0 4px;
+  overflow: hidden;
   border: 1px solid var(--control-border);
   border-radius: var(--r-sm);
   background: var(--control-bg);
+  transition: border-color .15s ease;
+}
+
+/* 整组悬停 / 聚焦：边框高亮提到外框上（而不是各块自己变），
+   于是「这是一个控件」的观感在交互态也成立 */
+.prio-stepper:hover { border-color: var(--control-border-hover); }
+.prio-stepper:focus-within { border-color: var(--primary); }
+
+/* 两枚箭头：无边框、贴满可用高度，颜色比正文淡一档（次要动作）。
+   它们是 `button` 的默认样式被清掉后的形态，尺寸靠 flex 撑满。
+
+   ── 为什么必须显式写 height（本次修复）──────────────────────
+   改造前这里只声明了 `width: 20px`、**没写 height**，于是全局
+   `button { height: 30px }`（components.css）直接生效 —— 它与特异性无关，
+   纯粹是这里没人声明过高度。
+   后果：按钮实际高 30px，而外框 `.prio-stepper` 只有 24px，
+   `overflow: hidden` 把它裁到 24px。按钮自己的垂直中心落在 15px（30/2），
+   而外框中心是 12px（24/2）—— 箭头整体**向下偏 3px**、底部还被裁掉一截。
+   补上 `height: 100%` 之后，两枚箭头与中间的输入框（也写着 height:100%）
+   共用同一套高度基准，三者对齐。
+
+   `flex: 0 0 auto` 同理：箭头是固定 20px 的两枚按钮，不该参与伸缩
+   （与输入框那条一致）。
+
+   选择器带 `.prio-stepper` 前缀是让这几条覆盖不依赖「本文件排在
+   components.css 之后」这个隐含前提 —— 与下面 `.prio-input` 同一手法。 */
+.prio-stepper .prio-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-2);
+  font-size: 10.5px;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+.prio-arrow:hover:not(:disabled) { background: var(--nav-hover); color: var(--text); }
+.prio-arrow:disabled { opacity: .3; cursor: not-allowed; }
+
+/* 箭头图标本体（icons.js 的 arrowDown / arrowUp，内联 SVG）。
+   `display: block` 是必需的：SVG 默认是行内元素，会落在**基线上**、
+   下方留出 descender 的空隙（约 2–3px），于是图标看着偏上、按钮的
+   点击热区也跟着歪。改成块级之后它就是一个纯几何盒子，
+   由 .prio-arrow 的 flex 居中精确对位。
+   这一步与「不用字符箭头」是同一个目的的两半：先把会飘的字形换掉，
+   再把新元素放平 —— 少任何一半都还会偏。 */
+.prio-arrow svg { display: block; }
+
+/* 输入框：占中间一格，自己不带描边与圆角（那些归外框）。
+   高度用 100% 而不是 24px —— 外框有 1px 描边，写死 24 会顶出去。
+   两条分隔线：输入框自带左边一条（断在「下箭头 | 数字」之间），
+   右边那条由 `+` 相邻选择器给上箭头（见下）—— 输入框自身不加右边框，
+   它聚焦时不换任何边框，两条线不会跟着交互态变，视觉上更稳。
+
+   ── 选择器为什么要写成 `.prio-stepper .prio-input`（不是 `.prio-input`）──
+   components.css 的全局表单规则是 `input[type="number"]`（特异性 0,1,1），
+   比单个类（0,1,0）**高**，所以下面这些声明必须靠**再加一个类**压过去，
+   否则全局那条会赢、数字周围会多出一个圆角描边框，与外框叠成两层：
+     · `border-radius: var(--r-md)` —— 数字被裹成一个胶囊（本次修的就是它）；
+     · `border: 1px solid` —— 多出一圈框；
+     · `height: 30px` —— 比外框的 24px 还高，撑破合并控件；
+     · `padding: 0 10px` —— 数字被挤偏；
+     · `flex: 1 1 auto` —— 输入框会吃掉箭头的位置。
+   与 page-settings.css 的 `.retention-input input[type="number"]` 同一手法
+   （那里也是嵌在自定义外壳里的数字框，注释写着同样的理由）。 */
+.prio-stepper .prio-input {
+  width: 42px;
+  height: 100%;
+  padding: 0 4px;
+  border: 0;
+  border-left: 1px solid var(--control-border);
+  border-radius: 0;
+  background: transparent;
   color: var(--text);
   font-family: var(--font-mono);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   text-align: center;
-  /* 数字框的上下箭头在 24px 高里会把数字挤成半截，去掉；改值用键盘或 ↑/↓ 按钮 */
+  /* 数字框的上下箭头在 24px 高里会把数字挤成半截，去掉；
+     改值用键盘或两侧的箭头按钮（后者是本控件的主要改值方式） */
   appearance: textfield;
   -moz-appearance: textfield;
+  /* flex 归零：箭头是固定 20px 的两枚按钮，输入框不许参与伸缩
+     （全局 `input[type=number]{flex:1 1 auto}` 会把它们挤没） */
+  flex: 0 0 auto;
 }
 
-.prio-input::-webkit-outer-spin-button,
-.prio-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.prio-stepper .prio-input::-webkit-outer-spin-button,
+.prio-stepper .prio-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 
-.prio-input:hover { border-color: var(--control-border-hover); }
-.prio-input:focus { border-color: var(--primary); background: var(--control-bg); }
-.prio-input:disabled { opacity: .5; }
+/* 聚焦时整组高亮（见 .prio-stepper:focus-within），输入框自身不加描边与光晕。
+   box-shadow 也要清：全局 `input:focus` 会画一圈 --ring，
+   在 24px 高的合并控件里会糊成一团。 */
+.prio-stepper .prio-input:focus { outline: none; box-shadow: none; }
 
-/* ↑/↓ 拼成一组（与卡片时代的 .order-btns 同一形制，只是尺寸收小到表格行的尺度）。
-   这两枚按钮必须留着：它们是最直观的「换顺序」方式，尤其面对「把第 7 位挪到第 3 位」
-   时，改优先级要同时改另一行的号（同家唯一），点两下 ↑ 则不必知道任何一个号码。 */
-.order-btns { display: inline-flex; flex: 0 0 auto; }
+/* 悬停同理：全局 `input:hover` 会把边框改成高亮色，而这里的边框是 0，
+   改的是「看不见的边框」—— 它会让输入框那一格与外框的描边色不一致，
+   所以显式压掉，让整组的悬停高亮只由 .prio-stepper:hover 一处负责。 */
+.prio-stepper .prio-input:hover:not(:disabled) { border-color: transparent; }
 
-.order-btns button {
-  width: 21px;
-  height: 24px;
-  padding: 0;
-  border-radius: 0;
-  color: var(--text-2);
-  font-size: 10.5px;
-  line-height: 1;
-}
+.prio-stepper .prio-input:disabled { opacity: .5; }
 
-.order-btns button:first-child { border-radius: var(--r-sm) 0 0 var(--r-sm); }
-.order-btns button:last-child { border-radius: 0 var(--r-sm) var(--r-sm) 0; }
-.order-btns button + button { margin-left: -1px; }
-.order-btns button:hover:not(:disabled) { position: relative; z-index: 1; }
-.order-btns button:disabled { opacity: .3; }
+/* 上箭头的左侧分隔线（把「数字 | 上箭头」断开，与输入框那条呼应） */
+.prio-input + .prio-arrow { border-left: 1px solid var(--control-border); }
 
 /* ─── 连接数列 ───
    只在有连接时显示一个绿色数字（与 OmniProxy 上游管理页的「连接」列同款观感），
@@ -381,36 +493,31 @@
 .cell-expiry { color: var(--text-2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
 .cell-expiry .muted { color: var(--text-3); }
 
-/* ─── 余额 / 积分列 ───
-   「积分」按钮在上（这一列唯一可点的控件）、结果摘要在下。
-   摘要不横排的原因见文件头的列宽预算：84px 的列宽横排放不下
-   「可用 4300 积分」这类长度不可控的文案，竖着放（整列宽度都归它）才读得全。
+/* ─── 余额列 ───
+   只放**摘要读数**（不可点）—— 查询按钮已移到操作列（本次改造），
+   所以这里不再有「这一列唯一可点的控件」那层结构。
+   摘要独占整列宽度，因此不必横排（见文件头的列宽预算：横排放不下
+   「可用 4300 积分」这类长度不可控的文案）。
 
    注意：这一格**不能**写成 display: flex。给 <td> 改 display 会让它不再是
    table-cell，浏览器只能把它包进匿名单元格里 —— table-layout: fixed 的列宽
    与 vertical-align 都会跟着失效（不同内核表现还不完全一致）。
-   按钮与摘要是行内元素，靠 .usage-sum 的 display: block 自然换到第二行。 */
+   摘要靠自己的 display: block 占满这一格。 */
 .cell-usage { white-space: nowrap; }
 
-.usage-btn {
-  height: 24px;
-  padding: 0 8px;
-  border-radius: var(--r-sm);
-  font-size: 11.5px;
-}
-
-.usage-btn:hover:not(:disabled) {
-  border-color: var(--primary-bd);
-  background: var(--primary-soft);
-  color: var(--primary-fg);
-}
-
+/* 查询余额按钮（现在住在操作列里）：尺寸与悬停强调全部由下面的
+   `.acct-actions button` 一组规则统一给出（那一列里的按钮本来就是同一档），
+   所以这里只留它独有的**「已展开」态** —— 与展开的面板呼应，
+   一眼看出再点一下是收起。
+   改造前这几条声明在余额列里，那时它必须自带尺寸；挪到操作列后
+   再写一遍就是重复定义，会把 .acct-actions 那组规则覆盖得各说各话。 */
 .usage-btn.open { border-color: var(--primary-bd); background: var(--primary-soft); color: var(--primary-fg); }
 
-/* 结果摘要：单行省略，完整文案在 title 里（余额数字长度不可控） */
+/* 结果摘要：单行省略，完整文案在 title 里（余额数字长度不可控）。
+   余额列现在只有它一个元素，不再需要 margin-top 让位给按钮 ——
+   留 0 让文字在行内垂直居中，与相邻几列（有效期、状态）的读数对齐。 */
 .usage-sum {
   display: block;
-  margin-top: 3px;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
   overflow: hidden;

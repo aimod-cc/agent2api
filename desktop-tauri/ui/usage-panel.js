@@ -148,7 +148,10 @@
    */
   function usagePanelHtml(account, entry) {
     if (entry === undefined) {
-      return `<div class="row-panel">余额尚未查询，请点击该卡片上的「积分」按钮。${panelClose('usage')}</div>`;
+      // 按钮改名与换列（本次改造）：原先叫「积分」、住在余额列里，
+      // 现在叫「余额」（已展开时是「收起余额」）、住在操作列。
+      // 这句提示必须跟着改 —— 指着一个不存在的按钮名会让用户找不到入口。
+      return `<div class="row-panel">余额尚未查询，请点击该行操作列的「余额」按钮。${panelClose('usage')}</div>`;
     }
     if (entry === null) {
       return `<div class="row-panel"><span class="badge warn">正在查询…</span>${panelClose('usage')}</div>`;

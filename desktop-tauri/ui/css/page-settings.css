@@ -288,10 +288,10 @@
 
 .retention-input .unit { color: var(--text-3); font-size: 12px; }
 
-/* ─── 保存位置 ───
-   复用 .retention-row 的两列版式；第二列是「路径 + 更改按钮」：路径是主体，
-   可能很长（用户自定义目录），允许在任意字符处折行 —— 目录路径没有天然的
-   断点，靠 word-break 拆，否则长路径会把行撑出横向滚动 */
+/* ─── 数据存储（只读展示）───
+   复用 .retention-row 的两列版式；第二列是路径：路径是主体，可能很长，
+   允许在任意字符处折行 —— 目录路径没有天然的断点，靠 word-break 拆，
+   否则长路径会把行撑出横向滚动 */
 .storage-line {
   display: inline-flex;
   align-items: center;
@@ -305,6 +305,35 @@
   color: var(--text-2);
   word-break: break-all;
   line-height: 1.45;
+}
+
+/* 各表条数：一排小方块，键在上值在下。
+   用网格而不是列表 —— 五个数字并排一眼能看完，比五行「标签：值」省一半高度。
+   列宽用 auto-fit + minmax 而不是固定五列：窄窗口下自动折成两三行，
+   不必写媒体查询（设置页已经是两栏布局，再套一层断点容易互相打架）。
+   外层同时挂了 .retention-list（有边框与内边距），所以这里的小方块只用
+   最轻的分隔 —— 再描一圈同色的边会变成「框中框」。 */
+.storage-counts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+  gap: 8px;
+}
+
+.storage-count {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+}
+
+.storage-count .k { color: var(--text-3); font-size: 11.5px; }
+.storage-count .v {
+  color: var(--text);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
 }
 
 /* 说明另起一行、占满整行（从标签左边缘开始，不必再缩进）。
@@ -400,9 +429,11 @@
   .route-row { grid-template-columns: max-content 1fr; }
 }
 
-/* ─── 保留期改小确认弹窗 ───
+/* ─── 确认弹窗 ───
    复用 .modal 外壳（components.css），只覆盖宽度：
-   确认框只有一句话加两个按钮，620px 太宽、文字会散开，收窄到 440px 更聚拢。
-   危险动作的样式不由这里负责 —— 确认键用既有的 button.danger。 */
+   这类框只有一段话加两个按钮，620px 太宽、文字会散开，收窄到 440px 更聚拢。
+   危险动作的样式不由这里负责 —— 确认键用既有的 button.danger。
+   升级结果原先也用它（弹窗展示逐项清单），改成自动升级 + toast 之后
+   不再需要 —— 这里只剩全站的危险操作确认框（confirm-dialog.js）。 */
 .modal-confirm { width: min(440px, 100%); }
 

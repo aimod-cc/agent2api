@@ -9,8 +9,22 @@
  * 通过 window.wbLogsPanel 暴露 load 给 app.js（切到日志页时立即刷新）。
  *
  * ── 数据口径 ────────────────────────────────────────────────
- * 系统事件（GET /api/logs）：内存里最多 500 条，一次拉满后端上限即可，
- * 翻页与「不看脱敏」都在前端算 —— 交互即时，也不会和轮询抢状态。
+ * 系统事件（GET /api/logs）：最多 500 条（后端 `logs_store::MAX_ENTRIES`），
+ * 一次拉满后端上限即可，翻页纯在前端算 —— 交互即时，也不会和轮询抢状态。
+ *
+ * ── 「不看脱敏」为什么整体移除（本次改造）────────────────────
+ * 那个开关是「在日志页过滤掉 `category === 'desensitize'` 的条目」的一层
+ * 前端过滤，配上徽标里的「已隐藏 N 条」读数。它存在的前提是**敏感词命中
+ * 只能在日志页看到**（靠脱敏模块打的 `[Desensitize] 已脱敏命中 N 处：…`
+ * 应用日志）。命中明细现在跟着每条请求进了请求日志（`sensitiveHits` 字段 →
+ * 「重试」列里那枚「敏」标签 → 悬停看命中词），日志页那层间接展示失去了
+ * 唯一的用途，整套移除：HTML 里的开关、`HIDE_KEY` 持久化、`localFilter`、
+ * 徽标的「已隐藏」读数、以及本文件里所有 `hideOn` 分支。
+ *
+ * **脱敏分类本身仍然保留**：`[Desensitize]` 那行应用日志照旧落库、分类字典里
+ * 也照旧有「脱敏」一项，用户想专门看它仍然可以在分类下拉里筛出来。
+ * 移除的只是「默认隐藏它」这个开关 —— 那本来就是一个为了绕开噪音的
+ * 权宜之计，而噪音的来源（每条命中都打一行）现在有了更合适的去处。
  *
  * ── 自动刷新的间隔从哪来 ────────────────────────────────────
  * 不在本文件写死：由「定时任务」页（tasks-panel.js）配置，落在 config.json 的
@@ -62,12 +76,8 @@
   const PAGE_SIZE = 50;
   /** 系统事件单次拉取上限（后端上限）：一次拿全，总页数才对得上真实结果 */
   const FETCH_LIMIT = 500;
-  /** 「不看脱敏」的持久化键：读不到 / 存储不可用时都按默认「隐藏」处理。
-   *  前缀沿用项目既有的 workbuddy-desktop-*（主题、日志已读标记用的是同一套） */
-  const HIDE_KEY = 'workbuddy-desktop-logs-hide-desensitize';
   /** 事件日志时间范围的持久化键（请求日志页的档位在 requests-panel.js，两键独立） */
   const EVENT_RANGE_KEY = 'workbuddy-desktop-logs-range';
-  const CAT_DESENSITIZE = 'desensitize';
 
   /** 合法的时间档位与后端 /api/stats/summary 的白名单同字面量（报表页也是这一组）。
    *  默认「全部」而不是报表页的 7 天：日志页原先没有任何时间条件，
@@ -80,27 +90,9 @@
   let current = null;      // 最近一次事件日志查询结果
   let stats = null;        // 最近一次统计（导航徽标用）
   let timer = null;
-  let page = 1;            // 事件日志当前页码（1 起，指向过滤后的结果）
-  let filtered = [];       // 事件日志最近一次结果经「不看脱敏」过滤后的条目
+  let page = 1;            // 事件日志当前页码（1 起）
 
-  // ─── 开关与档位状态 ──────────────────────────
-
-  /** 只有明确存过 '0' 才算关闭；其余情况（无值 / 读取抛错）都是默认开启 */
-  function readHide() {
-    try {
-      return localStorage.getItem(HIDE_KEY) !== '0';
-    } catch {
-      return true;
-    }
-  }
-
-  function persistHide(enabled) {
-    try {
-      localStorage.setItem(HIDE_KEY, enabled ? '1' : '0');
-    } catch {
-      // 存储不可用时只影响下次打开，不影响本次会话内的表现
-    }
-  }
+  // ─── 档位状态 ────────────────────────────────
 
   /** 只有明确存过合法档位才采纳；无值 / 读取抛错 / 值被改坏一律回落「全部」 */
   function readRange(key) {
@@ -116,12 +108,11 @@
     try {
       localStorage.setItem(key, value);
     } catch {
-      // 同 persistHide：存储不可用不该影响本次会话
+      // 存储不可用只影响下次打开，不影响本次会话内的表现
     }
   }
 
-  /** 开关与档位的当前值以内存为准：localStorage 只负责跨次启动恢复 */
-  let hideOn = readHide();
+  /** 档位的当前值以内存为准：localStorage 只负责跨次启动恢复 */
   let eventRange = readRange(EVENT_RANGE_KEY);
 
   // ─── 时间档位 → start 参数 ────────────────────
@@ -184,35 +175,16 @@
   }
 
   /**
-   * 「不看脱敏」这层只能在前端叠加：级别 / 分类 / 关键词 / 时间区间都由后端过滤，
-   * 后端不认识这个开关，也不该为它加参数。过滤放在分页之前，总页数才是对的。
-   */
-  function localFilter(entries) {
-    if (!hideOn) return { rows: entries, hidden: 0 };
-    const rows = [];
-    let hidden = 0;
-    for (const entry of entries) {
-      if (entry.category === CAT_DESENSITIZE) hidden += 1;
-      else rows.push(entry);
-    }
-    return { rows, hidden };
-  }
-
-  /**
-   * 徽标：正常情况下沿用「N 条 / M / N 条」，
-   * 一旦藏过日志就把隐藏条数一并写出，否则用户会以为日志丢了。
+   * 徽标：`N 条`（无筛选时）或 `M / N 条`（筛过时）。
    *
-   * 分母有讲究：带隐藏时改成「命中条数」，写总数会让人以为丢了 400 条，
-   * 而括号里只解释了其中几条 —— 「97 / 100 条（已隐藏 3 条脱敏）」才是自洽的读数。
-   * 「要不要分母」仍按原口径（是否筛过）决定，无筛选时给出「498 条（已隐藏 2 条脱敏）」。
+   * 改造前这里还有一层「已隐藏 K 条脱敏」的读数 —— 随「不看脱敏」开关一起移除
+   * （见模块头的说明）。现在这两个数字就是后端给的原值，不再有「可见条数」
+   * 与「匹配条数」的差别，括号里那层解释也就不需要了。
    */
-  function renderBadge(badge, { total, matched, hidden }) {
+  function renderBadge(badge, { total, matched }) {
     if (!badge) return;
-    const visible = Math.max(0, matched - hidden);
-    const denom = hidden ? matched : total;
-    const base = matched === total ? `${visible} 条` : `${visible} / ${denom} 条`;
     badge.className = 'badge';
-    badge.textContent = hidden ? `${base}（已隐藏 ${hidden} 条脱敏）` : base;
+    badge.textContent = matched === total ? `${total} 条` : `${matched} / ${total} 条`;
   }
 
   function renderPager(pageCount) {
@@ -224,10 +196,12 @@
     if (next) next.disabled = page >= pageCount;
   }
 
-  /** 空态文案沿用原口径，只把「全被开关藏起来」单独说明，免得看着像筛选出错 */
-  function emptyText(total, matched, hidden) {
+  /** 空态文案（改造前还有一条「全被开关藏起来」的说明，随开关移除） */
+  function emptyText(total, matched) {
     if (!total) return '暂无日志';
-    if (matched && hidden >= matched) return `已按「不看脱敏」隐藏 ${hidden} 条日志，取消勾选即可查看`;
+    // matched 有值却一条都没渲染出来，只可能是页码越界（清空 / 筛选变严后
+    // 停在旧页）；render 会把页码夹回有效范围，所以这里只需给出通用文案
+    void matched;
     return '没有符合筛选条件的日志';
   }
 
@@ -257,28 +231,25 @@
     const total = Number(current?.total) || 0;
     const matched = Number(current?.matched) || 0;
 
-    const { rows, hidden } = localFilter(entries);
-    filtered = rows;
-
-    // 总页数按过滤后的条数算；日志被清空或筛选变严后页码会越界，回落到最后一页
-    const pageCount = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
+    // 总页数按条目数算；日志被清空或筛选变严后页码会越界，回落到最后一页
+    const pageCount = Math.max(1, Math.ceil(entries.length / PAGE_SIZE));
     page = Math.min(Math.max(1, page), pageCount);
 
-    renderBadge($('logs-badge'), { total, matched, hidden });
+    renderBadge($('logs-badge'), { total, matched });
     if (current?.file) $('logs-file').textContent = current.file;
     renderPager(pageCount);
 
     const start = (page - 1) * PAGE_SIZE;
-    const pageRows = rows.slice(start, start + PAGE_SIZE);
+    const pageRows = entries.slice(start, start + PAGE_SIZE);
     if (!pageRows.length) {
-      list.innerHTML = `<div class="log-empty">${esc(emptyText(total, matched, hidden))}</div>`;
+      list.innerHTML = `<div class="log-empty">${esc(emptyText(total, matched))}</div>`;
       return;
     }
 
     list.innerHTML = pageRows.map(rowHtml).join('');
   }
 
-  /** 分类下拉选项由后端返回的字典填充（只填一次；含「脱敏」，关掉开关后可专门看它） */
+  /** 分类下拉选项由后端返回的字典填充（只填一次；含「脱敏」，可专门筛出这一类看） */
   function fillCategories(categories) {
     const select = $('logs-category');
     if (!select || !categories || select.dataset.filled === '1') return;
@@ -424,9 +395,15 @@
 
   // ─── 操作 ──────────────────────────────────
 
-  /** 翻页只重绘：整窗口的数据已经在 filtered 里，不必再打一次接口 */
+  /**
+   * 翻页只重绘：整窗口的数据已经在 `current.entries` 里，不必再打一次接口。
+   *
+   * 条数直接取 `current.entries`（改造前取的是「经前端过滤后」的那份 `filtered`；
+   * 那层过滤随「不看脱敏」开关一起移除了，见模块头）。
+   */
   function gotoPage(target) {
-    const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+    const entries = Array.isArray(current?.entries) ? current.entries : [];
+    const pageCount = Math.max(1, Math.ceil(entries.length / PAGE_SIZE));
     const next = Math.min(Math.max(1, target), pageCount);
     if (next === page) return;
     page = next;
@@ -515,11 +492,7 @@
 
   // ─── 事件绑定 ──────────────────────────────
 
-  // 开关默认勾选写在 HTML 里，只有存过「关闭」才在首屏改掉（避免先亮后灭的闪动）
-  const hideBox = $('logs-hide-desensitize');
-  if (hideBox) hideBox.checked = hideOn;
-
-  // 时间档位的默认值（「全部」）也写在 HTML 里，存过的值在这里纠正
+  // 时间档位的默认值（「全部」）写在 HTML 里，存过的值在这里纠正
   $('logs-range')?.querySelectorAll('.seg-item[data-range]').forEach(item => {
     item.classList.toggle('active', item.dataset.range === eventRange);
   });
@@ -549,14 +522,6 @@
   $('logs-keyword').addEventListener('input', () => {
     clearTimeout(keywordTimer);
     keywordTimer = setTimeout(() => load({ resetPage: true }), 300);
-  });
-  hideBox?.addEventListener('change', event => {
-    hideOn = event.target.checked;
-    persistHide(hideOn);
-    page = 1;
-    render();   // 纯前端过滤，改完重绘即可
-    setListScroll('log-list');
-    toast(hideOn ? '已隐藏脱敏日志' : '已显示全部日志');
   });
   /**
    * 从别的页面跳转过来并把分类筛选预设好（定时任务页「查看签到日志」按钮用）。

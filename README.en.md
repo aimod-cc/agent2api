@@ -30,6 +30,7 @@ OpenAI client / any SDK
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Data Storage](#data-storage)
 - [Gateway API](#gateway-api)
 - [Project Layout](#project-layout)
 - [Development & Build](#development--build)
@@ -44,7 +45,7 @@ Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\
 
 > When upgrading from the 1.x "install for current user" layout (`%LOCALAPPDATA%\<product name>`), the new version cleans up that old installation on first launch: it first confirms the directory really holds this product's main executable, then removes the directory, the Start Menu / desktop shortcuts, the uninstall registry entry and any dead run-at-login registration; if the old directory is still in use (cannot be deleted) or is not this product, it is skipped. This cleanup runs in release builds only — running `tauri dev` during development will not touch the official build installed on your machine. The data directory is unaffected (migration copies).
 
-1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If the 1.x data directory `~/.workbuddy-proxy` is detected, it is **copied wholesale** to `~/.agent2api` (the old directory is kept, so you can roll back), and the old account data from all providers is imported automatically (the old gateway account file plus each vendor's desktop login state; WorkBuddy accounts come along with the directory copy).
+1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If the 1.x data directory `~/.workbuddy-proxy` is detected, it is **copied wholesale** to `~/.agent2api` (the old directory is kept, so you can roll back). Account and history import is described in [Data Storage](#data-storage) above: if JSON / JSONL data files from an older version are found, a dialog appears at startup and waits for you to press "Upgrade" — after that, the old account data from all providers (the old gateway account file plus each vendor's desktop login state) is imported as well.
 2. Click "Login / Add account" on the Report or Accounts page and **pick a provider in the dialog** (WorkBuddy / Raccoon / CatPaw / AutoClaw / Qoder), then finish that vendor's login or fill in its credentials. WorkBuddy only supports web login (embedded window or system browser); Raccoon supports web login, pasting a token, and "import desktop login state from this machine"; CatPaw supports web login, pasting credentials, and "import desktop login state from this machine"; AutoClaw supports SMS code login, pasting credentials, and "import desktop login state from this machine"; Qoder supports web login (both the Global and China sites) and a personal access token (PAT) — web login and the Global / China sites are one and the same device-authorization flow, so whichever site you pick is the site you sign in to. Importing desktop login state reuses the desktop client's own login-state file directly: no token is stored in the account record, and the gateway follows as soon as the client signs in again (Qoder has no such option).
 3. Set your OpenAI client's `base_url` to `http://127.0.0.1:3065/v1` and put anything in `api_key` (for example `sk-local`; the server does not check it while authentication is disabled).
 
@@ -77,6 +78,18 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+---
+
+## Data Storage
+
+Everything lives in **a single SQLite database**: `~/.agent2api/agent2api.db` (the config directory can be overridden with the `AGENT2API_PROXY_HOME` environment variable). Inside, data is split by purpose — `accounts`, `logs` (system events), `requests` / `request_daily` (per-request records and daily aggregates), `debug_traffic` (raw upstream payloads captured in debug mode), and `kv` (gateway config plus assorted small state). Settings → General → Data Storage shows the database path, its size, and the row count of each table.
+
+The database runs in WAL mode, so while the app is running you will also see `agent2api.db-wal` and `agent2api.db-shm` next to it. Include them when backing up (or quit the app first — it checkpoints the WAL back into the main file on exit).
+
+> **Upgrading from an older version**: earlier versions scattered data across 8 JSON / JSONL files (`accounts.json`, `config.json`, `logs.jsonl`, `requests.jsonl`, `request-daily.jsonl`, `debug-traffic.jsonl`, `desensitize.json`, `desktop-settings.json`). On first launch the new version **detects** them and shows a dialog explaining that storage has moved to SQLite; the import only starts after you press "Upgrade" in that dialog. Choosing "Later" skips the import for this run (accounts and history stay unavailable, and the dialog appears again on the next launch).
+>
+> After a successful import the old files are **renamed** to `name.migrated` (for example `accounts.json.migrated`) and kept in place as backups — they are **never deleted**. You can open them at any time to roll back or cross-check your data; rename one back and restart to be prompted to upgrade again.
 
 ---
 
@@ -219,4 +232,6 @@ This project is provided "as is"; the author makes no promise about its availabi
 
 ## License
 
-This project is released under the [MIT License](./LICENSE); you may use, modify and distribute it freely as long as the copyright notice is retained. The LICENSE file carries the usage notice above at its end, and the two together form the complete terms of licensing and use.
+This project is released under the [MIT License](./LICENSE); you may use, modify and distribute it freely as long as the copyright notice is retained.
+
+One caveat: the LICENSE file carries a **Usage Notice** after the MIT text, whose clause 3 **adds restrictions on top of** MIT (no commercial use, no reselling redistributions, no bulk account operation). This project is therefore **not** pure MIT — **the MIT terms and the Usage Notice together form the complete license**, and where the two reach different conclusions on the same act, the stricter one governs. That is also why `Cargo.toml` points `license-file` at the LICENSE file instead of declaring the SPDX identifier `"MIT"`.

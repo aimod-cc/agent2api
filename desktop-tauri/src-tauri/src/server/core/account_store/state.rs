@@ -1,4 +1,8 @@
-//! 账号文件的磁盘形态与记录访问器。
+//! 账号记录的 JSON 形态与容错访问器。
+//!
+//! 持久化形态已从 `accounts.json` 换到 SQLite 的 `accounts` 表（见 `sql.rs`），
+//! 但**记录本身的形状一字未变**：它仍是「原样持有的 JSON 对象 + 一组容错
+//! 访问器」，`data` 列存的就是本文件的 `to_value()`。
 //!
 //! ── 为什么记录用 `serde_json::Map` 而不是 struct ──
 //! Node 版把每条账号记录当普通对象读写（`record.anything`），字段集随版本演进，
@@ -16,12 +20,12 @@ use serde_json::{Map, Value};
 use crate::server::core::account_store::priority::normalize_priority_value;
 use crate::server::core::providers::DEFAULT_PROVIDER_ID;
 
-/// 整个 accounts.json 的内存形态。
+/// 一整份账号集合的内存形态（迁移期与「需要整份数据」的路径用）。
 ///
 /// 顶层只认识 `accounts` 与 `priorityScope`；其余顶层字段（旧版本的
-/// currentAccountId 之类）刻意不解析 —— 读盘时丢弃、下次保存即自然消失。
+/// currentAccountId 之类）刻意不解析 —— 从旧文件迁移时丢弃，之后不再存在。
 ///
-/// `priority_scope` 是优先级号段的作用域标记：`"global"` 表示账号文件已经按
+/// `priority_scope` 是优先级号段的作用域标记：`"global"` 表示账号数据已经按
 /// 「全局一条队列」编号过。旧版本按 provider 各排各的队（文件里没有这个标记），
 /// 启动迁移据此判断要不要做一次跨家的重新编号（见 `store_admin::migrate_startup`）。
 #[derive(Clone, Debug, Default)]
@@ -117,7 +121,7 @@ impl StoredAccount {
     /// 记录里**显式**写了 provider 字段吗（惰性迁移据此判断要不要补写）。
     ///
     /// 与 `provider()` 的区别：后者对缺失字段做默认值兜底，本函数只看字段本身，
-    /// 所以「字段缺失」与「字段值就是 workbuddy」能区分开 —— 迁移只在缺失时才写盘。
+    /// 所以「字段缺失」与「字段值就是 workbuddy」能区分开 —— 迁移只在缺失时才写库。
     pub fn provider_explicit(&self) -> Option<&str> {
         match self.fields.get("provider") {
             Some(Value::String(text)) if !text.trim().is_empty() => Some(text.trim()),
@@ -335,23 +339,19 @@ impl StoredAccount {
 
 // ─── 优先级判定的数据源（全局一条队列）────────────────────
 
-/// 全部账号的三元组 `(id, name, priority)` —— 优先级冲突判定与号段分配的
-/// **唯一数据源**（正是 `find_priority_holder` / `next_free_priority` 要的形态）。
-///
-/// 优先级是全局唯一的（见 `priority.rs` 模块头），所以这里不按 provider 过滤；
-/// 写入侧（新增 / 改优先级）统一从这里取，避免某处漏掉变成局部判定。
-pub fn priority_peers(accounts: &[StoredAccount]) -> Vec<(String, String, i64)> {
-    accounts
-        .iter()
-        .map(|record| (record.id().to_string(), record.name(), record.priority()))
-        .collect()
-}
+// 改造前这里有一个 `priority_peers(&[StoredAccount]) -> Vec<(id, name, priority)>`
+// 的水位函数，供写入侧在内存里做「号段分配 + 冲突判定」。账号数据搬到 SQLite
+// 之后这两件事各由一次投影列查询完成（`sql::priorities_except` 拿号段、
+// `sql::priority_holder` 拿占位者名字），不再需要把全部记录先搬进内存 ——
+// 于是它随改造一起删掉了（留一个无人调用的函数只会变成死代码）。
+// 「优先级全局唯一」这条不变量的判据没变，只是执行者从 Rust 内存换成了 SQL。
 
 /// 把数值转成 JSON：**整数形式的数写成整数**。
 ///
 /// 为什么必须这样：`serde_json::Value::from(1e12_f64)` 会输出 `1000000000000.0`，
 /// 而 Node 的 `JSON.stringify(1730000000000)` 输出 `1730000000000`。
-/// 时间戳一律是整数毫秒，写成浮点会让 accounts.json 的 diff 全是噪音，
+/// 时间戳一律是整数毫秒，写成浮点会让账号记录里出现 `1730000000000.0` 这种
+/// 无意义的形态（旧 accounts.json 的 diff 也会满是噪音），
 /// 也可能让「按文本比对配置」的用法出现意外差异。
 pub fn json_number(value: f64) -> Value {
     if !value.is_finite() {

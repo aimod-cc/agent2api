@@ -129,6 +129,124 @@ pub struct TelemetrySnapshot {
     pub first_response_at: Option<i64>,
     /// 中断 / 异常原因（成功为 None）
     pub error: Option<String>,
+    /// **本次请求命中的敏感词**（词 + 次数；空表 = 一个都没命中）。
+    ///
+    /// ── 数据从哪来 ──────────────────────────────────────────────
+    /// `core::desensitize` 的 `process_body` 早就算出了 `term_counts`
+    /// （按次数降序的每词命中数），但那份结果此前只喂给两个消费者：
+    /// 进程级的聚合统计（设置页「脱敏」那一块显示的累计值）与一行
+    /// `[Desensitize] 已脱敏命中 N 处：词×次数` 日志。**逐条请求**的命中
+    /// 明细当场就丢了，于是请求日志那边只能说「这次命中了敏感词」，
+    /// 说不出命中了什么。
+    ///
+    /// 采集点在 `payload::send_body`（某一家即将发送、拿到 `ProcessOutcome`
+    /// 的那一刻），由 [`Self::note_sensitive_hits`] 合并进来。
+    ///
+    /// ── 为什么是并集累加（与 attempts 的覆盖式相对）───────────────
+    /// 见 `payload::send_body` 的说明：跨家降级时每个在范围内的家各处理一次，
+    /// 合并计数才是「这次请求命中了什么」的正确读数。
+    pub sensitive_hits: Vec<SensitiveHit>,
+    /// **每一次上游尝试的明细**（按发生顺序，与账号轮换链一一对应）。
+    ///
+    /// ── 为什么需要它（Agent2API 请求日志改造）───────────────────
+    /// 原先只有 `attempts`（次数）与 `provider`（最终承载者）两个读数，
+    /// 于是请求日志里那一列只能显示一个「重试」标记 —— 用户看到「重试过」，
+    /// 但看不到**换了谁、哪一次失败在哪、最后是谁扛下来的**。而这些信息在
+    /// 转发链路里每一轮都是现成的（provider id、HTTP 状态码、错误摘要），
+    /// 只是此前没有落点。
+    ///
+    /// ── 口径（与 `attempts` / `provider` 刻意不同）──────────────
+    /// `attempts` 与 `provider` 都是「最后一次为准」的**覆盖式**读数；
+    /// 本字段相反，是**追加式**的历史。两者不冲突：覆盖式回答「最终算谁头上」
+    /// （报表聚合要的就是这个），追加式回答「这一路是怎么走过来的」。
+    ///
+    /// ── 为什么记「已发送」而不是「选路选到了」───────────────────
+    /// 采集点在 `note_attempt` 旁边（该函数在**凭证已就绪、即将发送之前**
+    /// 被调用），所以与 `attempts` 同源同频。选路过程中被跳过的账号
+    /// （禁用 / 限额冷却 / 不支持该模型）**不进这条链** —— 它们没有产生任何
+    /// 上游往返，混进来会让「切换路径」显示一串从没被请求过的名字。
+    ///
+    /// 条数上限见 [`MAX_ATTEMPT_DETAILS`]：这是一条请求内的内存小数组，
+    /// 落库时序列化成 JSON 文本，必须有上界。
+    pub attempts_detail: Vec<AttemptDetail>,
+}
+
+/// 一个被命中的敏感词及其次数（`TelemetrySnapshot::sensitive_hits` 的元素）。
+///
+/// 字段名与前端 `sensitiveHits` 契约里的键一致（`word` / `count`），
+/// 与 OmniProxy 的 `SensitiveTermHit` 同形 —— 那边的 `sensitive_masked_terms`
+/// 也是一份 `[{word, count}]`。同形不是巧合：两边的信息结构本来就一样
+/// （命中词 × 次数），照抄形态省掉一层没意义的转换。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SensitiveHit {
+    /// 命中的词（词表里的原样字符串，未做大小写归一 —— 用户填的是什么就显示什么）
+    pub word: String,
+    /// 本次请求里命中的次数
+    pub count: i64,
+}
+
+/// 单次上游尝试的明细（`TelemetrySnapshot::attempts_detail` 的元素）。
+///
+/// 字段刻意取窄：前端弹层要显示的就这三样（谁 → 成没成 → 为什么）。
+/// 不记时间戳与耗时：那是「每次尝试各花了多久」的另一个问题，转发链路上
+/// 没有现成的分段计时，为它加钩子要动 `send_with_retry` 的每一层 ——
+/// 收益不抵改动面（总耗时与首响已经在明细里给出）。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AttemptDetail {
+    /// 这一轮实际发送的 provider id
+    pub provider: String,
+    /// 这一轮的 HTTP 状态码。
+    ///
+    /// `None` = 还在飞（请求尚未收尾，例如正在流式下发）或传输层失败
+    /// （DNS / 连接 / 代理，压根没拿到响应头）。两者的区别由 `error` 表达：
+    /// 有摘要 = 已定性为失败，没有摘要且 None = 这一轮还没定论。
+    #[serde(default)]
+    pub status: Option<i64>,
+    /// 这一轮的失败摘要（成功或还在飞时为 None）。
+    ///
+    /// 成功的那一轮**也留在链里**（带 status、不带 error）—— 「切换路径」要
+    /// 显示完整的一串（A → B → C），最后那个成功的 C 正是读者要找的答案。
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `attempts_detail` 的长度上限。
+///
+/// 选路循环本身有 `MAX_ROUTE_ATTEMPTS`（32）兜底，但那只在**账号轮换**这条
+/// 路径上生效；同账号内的退避重试（`send_with_retry` 的循环）不计入 attempts，
+/// 也不会往这里追加。所以 32 已经是理论上界，这里再取一个更小的值作为
+/// **落库体积**的上限：每条明细最多几行文本，24 条 × 几条 ≈ 几 KB，
+/// 对一条请求日志来说是合理的。
+///
+/// 为什么是「保头」而不是「保尾」：链的开头是「第一次打给谁、为什么失败」，
+/// 那正是排障最需要的（尾部几轮往往是同一个错误的重复）。
+/// 截断不在数据里补标记项 —— 前端手上本来就有 `attempts`（总数），
+/// 判 `attempts_detail.length < attempts` 即可显示「只保留前 N 条」，
+/// 比在 JSON 里塞一条结构不同的伪明细更干净（那种伪项会让所有读侧都要先判类型）。
+pub const MAX_ATTEMPT_DETAILS: usize = 24;
+
+/// 单条尝试明细里错误摘要的字符上限。
+///
+/// 取值与请求日志那列的 `ERROR_SUMMARY_CHARS`（`api::pipeline`）**有意相同**：
+/// 同一个失败在两个地方（列表的「错误」列、重试弹层里的某一次尝试）显示成长度
+/// 不同的两段文案，会让读者以为它们说的是两件事。两处是独立常量而不是共享一个
+/// —— 本模块在 `core` 下，不能反向依赖 `api`（见 `core/mod.rs` 的约定），
+/// 修改其中一处时**必须**同步另一处，这条注释就是那个提醒。
+pub const MAX_ATTEMPT_ERROR_CHARS: usize = 200;
+
+/// 按字符截断（超出部分用 `…` 收尾）。
+///
+/// 不引 `request_stats::truncate_chars`：同名的实现住在 `api::pipeline` 与
+/// `account_store::store_util` 里，本模块在 `core::upstream`，跨模块取一个
+/// 五行的私有工具只会让依赖方向变乱（core 不认识 api）。按**字符**而不是字节：
+/// 中文摘要按字节截会切出半个字。
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push('…');
+    out
 }
 
 /// usage 上报槽：转发链路往里写，记账点在收尾时读。
@@ -220,12 +338,71 @@ impl RequestTelemetry {
     /// attempts 是累计值 —— 它要回答的是「这条请求换了几个账号才发出」。
     ///
     /// `provider` 同样是**最后一次**（多提供商轮询后真正承载请求的那家）。
-    pub fn note_attempt(&self, account_id: Option<&str>, account_name: &str, provider: &str) {        let mut guard = self.lock();
+    pub fn note_attempt(&self, account_id: Option<&str>, account_name: &str, provider: &str) {
+        let mut guard = self.lock();
         guard.attempts += 1;
         guard.account_id = account_id.unwrap_or("").to_string();
         guard.account_name = account_name.to_string();
         if !provider.is_empty() {
             guard.provider = Some(provider.to_string());
+        }
+    }
+
+    /// 追加一条**尝试明细**（这一轮发给了谁；结果稍后由
+    /// [`Self::finish_last_attempt`] 补）。
+    ///
+    /// ── 为什么分两步写（先起头、后补结果）────────────────────────
+    /// 一次尝试的「谁」在发送**之前**就确定了（那时才决定发送体、才有 provider），
+    /// 而「成没成」要等上游响应头到手才知道。如果只在结果处记一条，那么
+    /// **传输层失败**（`send_chat_request` 报错、压根没有响应）这条路径就永远
+    /// 记不上 —— 而那恰恰是最需要看到的一类失败（DNS / 代理 / 连接被拒）。
+    /// 分两步之后，任何一条走完的路径都至少留下「谁 + 结果」，不存在漏记。
+    ///
+    /// 与 [`Self::note_attempt`] 配对调用（同一次发送前），所以两者条数一致；
+    /// 调用顺序必须是 `note_attempt` → `note_attempt_started`。
+    ///
+    /// 超过 [`MAX_ATTEMPT_DETAILS`] 时**丢弃**新条目（保头，理由见那个常量的说明）。
+    /// 调用方不要靠本方法表达「截断了」——那是 `snapshot()` 的职责。
+    pub fn note_attempt_started(&self, provider: &str) {
+        let mut guard = self.lock();
+        if guard.attempts_detail.len() >= MAX_ATTEMPT_DETAILS {
+            return;
+        }
+        guard.attempts_detail.push(AttemptDetail {
+            provider: provider.to_string(),
+            status: None,
+            error: None,
+        });
+    }
+
+    /// 给**最后一条**尝试明细补上结果（成功也要调，此时 `status` 有值、
+    /// `error` 传空）。
+    ///
+    /// 为什么只认最后一条：一次尝试的发送链是严格串行的（`send_with_retry`
+    /// 内部循环 + 401 刷新重试都在同一轮里），响应回来时「最后起头的那条」
+    /// 必然是它 —— 中间不会有别的尝试插进来。这条性质由 `provider_loop`
+    /// 的 `'accounts` 循环保证（每轮只调一次起头，轮换才进入下一轮）。
+    ///
+    /// `status` 为 None 时（传输层失败）**不覆盖**已有的 None，`error` 照写：
+    /// 于是那一条明细显示成「A → 失败（无状态码）：连接被拒绝」，
+    /// 而不是显示一个凭空捏造的状态码。
+    ///
+    /// 错误摘要与请求日志的 `error` 用同一个截断上限（[`MAX_ATTEMPT_ERROR_CHARS`]），
+    /// 截断在**这里**做而不是靠调用方：入口只有这一个，把上限钉在写入侧才能保证
+    /// 「无论谁调用都不会写进一条超长的明细」。
+    pub fn finish_last_attempt(&self, status: Option<i64>, error: Option<&str>) {
+        let mut guard = self.lock();
+        let Some(last) = guard.attempts_detail.last_mut() else {
+            return;
+        };
+        if status.is_some() {
+            last.status = status;
+        }
+        // 空串摘要按「没有错误」处理（与 RequestEntry.error 的归一同一口径）：
+        // 上游返回空 body 时 read_upstream_error 会给出空 message，
+        // 那不该渲染成「失败：」后面跟着一片空白
+        if let Some(text) = error.filter(|text| !text.is_empty()) {
+            last.error = Some(truncate_chars(text, MAX_ATTEMPT_ERROR_CHARS));
         }
     }
 
@@ -279,6 +456,41 @@ impl RequestTelemetry {
         let mut guard = self.lock();
         if guard.error.is_none() {
             guard.error = Some(message.to_string());
+        }
+    }
+
+    /// 记一批敏感词命中（**并集累加**，见 `TelemetrySnapshot::sensitive_hits`）。
+    ///
+    /// 入参是脱敏模块的 `term_counts` 原样形态（`&[(String, usize)]`）——
+    /// 不在这里重新排序或过滤：那份表已经是「按次数降序」的（`engine::Counter`
+    /// 的口径），重排一遍只会引入第二套顺序定义。前端要展示的顺序就是它。
+    ///
+    /// 同一个词再次出现（跨家降级时另一家的词表也命中）时**合并计数**而不是
+    /// 追加第二条：一份 `[{word, count}]` 里同一个词出现两次，没有任何读侧
+    /// 会把它当成两件事，只会让「命中 3 次」这种读数变成「两条各 2 次」。
+    ///
+    /// 词数上界：词表本身有 `MAX_TERMS`（见 `desensitize::engine`），
+    /// 但那是**整个词表**的上限，一条请求理论上可以把它们全命中一遍。
+    /// 这里不设额外的截断闸 —— 命中表落库是 JSON 文本，而词表上限本身
+    /// 已经是合理量级（前端展示时按次数降序截断，见 requests-panel 的弹层）。
+    pub fn note_sensitive_hits(&self, term_counts: &[(String, usize)]) {
+        if term_counts.is_empty() {
+            return;
+        }
+        let mut guard = self.lock();
+        for (term, count) in term_counts {
+            let count = *count as i64;
+            match guard
+                .sensitive_hits
+                .iter_mut()
+                .find(|hit| hit.word == *term)
+            {
+                Some(hit) => hit.count += count,
+                None => guard.sensitive_hits.push(SensitiveHit {
+                    word: term.clone(),
+                    count,
+                }),
+            }
         }
     }
 

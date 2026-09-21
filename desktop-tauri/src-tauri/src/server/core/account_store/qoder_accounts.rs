@@ -9,6 +9,7 @@ use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::logging;
 
 use super::priority::next_free_priority;
+use super::sql;
 use super::state::StoredAccount;
 use super::store::{AccountStore, AccountStoreError};
 use super::store_util::{token_tail_of, truncate_chars};
@@ -19,15 +20,16 @@ const PROVIDER: &str = kind_id(ProviderKind::Qoder);
 impl AccountStore {
     pub fn qoder_account_record(&self, account_id: &str) -> Option<Value> {
         let guard = self.guard();
-        let state = self.load(&guard);
-        state.accounts.iter()
-            .filter(|record| record.provider() == PROVIDER)
-            .filter(|record| {
-                if account_id.is_empty() { record.enabled() && record.has_token() }
-                else { record.id() == account_id }
-            })
+        if !account_id.is_empty() {
+            // 按 id 直查一行后确认归属（同 id 只会有一条，provider 判定是保险）
+            let record = self.record_by_id(&guard, account_id)?;
+            return (record.provider() == PROVIDER).then(|| record.to_value());
+        }
+        self.records_for_provider(&guard, PROVIDER)
+            .into_iter()
+            .filter(|record| record.enabled() && record.has_token())
             .min_by_key(|record| record.order_key())
-            .map(StoredAccount::to_value)
+            .map(|record| record.to_value())
     }
 
     pub fn add_qoder_account(
@@ -40,18 +42,26 @@ impl AccountStore {
         credentials.complete_identity()
             .map_err(|error| AccountStoreError::new(error.message, error.status_code))?;
         let guard = self.guard();
-        let mut state = self.load(&guard);
-        let existing = state.accounts.iter().find(|record| {
-            record.provider() == PROVIDER && record.user_id() == credentials.user_id
-                && Region::from_payload(&record.to_value()).ok() == Some(credentials.region)
-        }).cloned();
-        if existing.is_none() && state.accounts.len() >= MAX_ACCOUNTS {
+        // 身份匹配要「地区 + userId」两段信息，而地区存在记录 JSON 里（不是投影列），
+        // 所以这里读**本家那一组**（而不是全量）逐条比 —— Qoder 账号通常只有
+        // 一两条，按 provider 收窄已经把别家的记录挡在外面了。
+        let existing = self
+            .records_for_provider(&guard, PROVIDER)
+            .into_iter()
+            .find(|record| {
+                record.user_id() == credentials.user_id
+                    && Region::from_payload(&record.to_value()).ok() == Some(credentials.region)
+            });
+        if existing.is_none()
+            && self.with_conn(&guard, |conn| sql::count_all(conn))? as usize >= MAX_ACCOUNTS
+        {
             return Err(AccountStoreError::bad_request(format!("最多保存 {MAX_ACCOUNTS} 个账号")));
         }
         let id = existing.as_ref().map(|record| record.id().to_string()).unwrap_or_else(|| {
             format!("qoder-{}-{:x}", credentials.region.id(), Sha256::digest(credentials.user_id.as_bytes()))
         });
-        if existing.is_none() && state.accounts.iter().any(|record| record.id() == id) {
+        // 新建时确认这个 id 没被任何人（含别家）占用 —— 主键查询，只读一行
+        if existing.is_none() && self.record_by_id(&guard, &id).is_some() {
             return Err(AccountStoreError::new("Qoder 账号 ID 已被其它账号占用，请先核对账号记录", 409));
         }
         let record_name = name.map(str::trim).filter(|value| !value.is_empty()).map(str::to_string)
@@ -76,9 +86,18 @@ impl AccountStore {
                 fields.insert(key, value);
             }
         }
-        let priority = existing.as_ref().map(StoredAccount::priority).unwrap_or_else(|| {
-            next_free_priority(&state.accounts.iter().map(StoredAccount::priority).collect::<Vec<_>>())
-        });
+        let priority = match existing.as_ref() {
+            Some(record) => record.priority(),
+            None => {
+                // 号段取全部账号（优先级全局唯一）；只取投影列一列数值。
+                // `unwrap_or_default` 兜底到 `next_free_priority(&[])` 的默认号，
+                // 与旧实现在空账号列表上的行为一致。
+                let used = self
+                    .with_conn(&guard, |conn| sql::priorities_all(conn))
+                    .unwrap_or_default();
+                next_free_priority(&used)
+            }
+        };
         fields.insert("id".to_string(), Value::String(id.clone()));
         fields.insert("provider".to_string(), Value::String(PROVIDER.to_string()));
         fields.insert("name".to_string(), Value::String(truncate_chars(&record_name, 100)));
@@ -94,12 +113,11 @@ impl AccountStore {
             fields.remove(key);
         }
         let record = StoredAccount::from_map(fields);
-        if let Some(index) = state.accounts.iter().position(|item| item.id() == id) {
-            state.accounts[index] = record.clone();
-        } else {
-            state.accounts.push(record.clone());
-        }
-        self.save(&state, &guard)?;
+        // 单行落地：`put` = DELETE + INSERT。旧实现在「命中既有记录」时是
+        // `state.accounts[index] = record`（**保持原位**），而 `put` 会把它挪到
+        // 列表末尾 —— 这一处差异不会被任何消费方观察到：列表顺序无消费方
+        // （界面与选路都按优先级排，见 `sql.rs` 模块头「顺序」一节）。
+        self.with_conn(&guard, |conn| sql::put(conn, &record))?;
         logging::log("[Accounts]", &format!("✅ Qoder {}账号已保存（优先级 {priority}）", credentials.region.label()));
         Ok(self.public_account(&record))
     }
@@ -111,8 +129,10 @@ impl AccountStore {
     ) -> Result<CredentialWrite, AccountStoreError> {
         let id = expected.get("id").and_then(Value::as_str).unwrap_or("");
         let guard = self.guard();
-        let mut state = self.load(&guard);
-        let Some(record) = state.accounts.iter_mut().find(|record| record.id() == id && record.provider() == PROVIDER) else {
+        let Some(mut record) = self
+            .record_by_id(&guard, id)
+            .filter(|record| record.provider() == PROVIDER)
+        else {
             return Ok(CredentialWrite::Stale);
         };
         for key in ["accessToken", "refreshToken", "mode", "userId", "machineId", "addedAt"] {
@@ -137,7 +157,7 @@ impl AccountStore {
         }
         record.set("tokenTail", Value::String(token_tail_of(&credentials.access_token)));
         record.set_updated_at(logging::now_ms());
-        self.save(&state, &guard)?;
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
         Ok(CredentialWrite::Written)
     }
 

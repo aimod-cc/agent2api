@@ -5,7 +5,8 @@
 //! "modelRules": {
 //!   "disabled": [{ "provider": "catpaw", "id": "kimi-k3" }],
 //!   "hidden":   [{ "provider": "raccoon", "id": "sn-glm-5-3" }],
-//!   "mappings": [{ "alias": "gpt-4o", "target": "deepseek-v4-pro", "provider": "raccoon" }],
+//!   "mappings": [{ "alias": "gpt-4o", "target": "deepseek-v4-pro", "provider": "raccoon",
+//!                  "reasoning": "high" }],
 //!   "seeded":   ["workbuddy:hy3"]
 //! }
 //! ```
@@ -21,7 +22,7 @@
 //!   **同一 alias 可以有多条映射**（不同提供商各一条）——下游用同一个名字请求，
 //!   路由在「原生承载家 + 各映射提供商」之间按账号全局优先级主备切换。
 //!   候选链的展开与发送名的按家改写见 `providers::router` 与
-//!   `catalog::wire_model_for_provider`。
+//!   `catalog::wire_target_for_provider`。
 //!
 //! ── 映射条目的 provider 字段 ────────────────────────────────
 //! 新条目都带 `provider`（target 所属的家，UI 从该家的模型行上创建）。
@@ -48,6 +49,15 @@
 //!   （重新启用、删除映射）不会被下一次清单刷新悄悄改回去。
 //!
 //! 所有比对忽略大小写（与 `catalog::providers_for_model` 同口径）。
+//!
+//! ── 思考等级绑定（`mappings[].reasoning`）─────────────────────
+//! 每条映射可以额外带一个思考等级（None / 空 = 不覆盖）。**这段机制、各家的
+//! 翻译规则、以及「哪些情况故意不注入」都在 `reasoning.rs`** —— 那里有候选表、
+//! 归一规则，以及「等级怎么进到转发链路」的完整说明（动手改这个字段前务必先读
+//! 那一段）。这里只留结论：字段挂在映射条目上（与本模块的映射同生共死），
+//! `ModelRules::from_raw` / `Mapping::to_value` 负责它的读写容错；
+//! **转发侧**在 `upstream::payload::send_body` 按家改写模型名的那一步一并解析、
+//! 交给该家适配器翻译（见 `providers::catalog::wire_target_for_provider`）。
 
 use serde_json::{json, Map, Value};
 
@@ -64,16 +74,36 @@ mod cline;
 
 pub use cline::{migrate_cline_split, seed_cline_defaults};
 
+/// 思考等级组件（候选表 + 归一规则 + 设计取舍说明）。
+///
+/// 与 `cline` 同一模式：拆出去的理由见那个文件的模块头（长期机制与
+/// 「这一段为什么这么做」的大段说明不该与规则机制本身挤在一个文件里，
+/// 以及单文件体量约定）。`pub use` 让调用方仍写
+/// `model_rules::REASONING_LEVELS` / `model_rules::normalize_reasoning`
+/// 这类路径，不必知道它住在子模块里。
+mod reasoning;
+
+pub use reasoning::{
+    effort_rank as reasoning_rank, is_thinking_off as reasoning_is_off,
+    normalize as normalize_reasoning, REASONING_LEVELS,
+};
+
 /// 一条映射：把上游模型（`provider` × `target`）以对外名 `alias` 暴露给下游。
 ///
 /// `provider` 指明 target 所属的家（新条目总是带；旧版条目为 `None`，
 /// 语义是「所有承载 target 的家」，读取兼容见模块头）。同一 `alias` 允许
 /// 多条（不同提供商各一条），路由时一起进入候选链主备切换。
+///
+/// `reasoning` 是这条映射上的**思考等级绑定**（`None` = 不覆盖）。
+/// 转发侧在按家改写模型名的同一步解析它（`catalog::wire_target_for_provider`），
+/// 交给该家适配器翻译成本家上游认识的档位字段 —— 各家的规则与「故意不注入」
+/// 的几种情形见 `reasoning.rs` 的模块头。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mapping {
     pub alias: String,
     pub target: String,
     pub provider: Option<String>,
+    pub reasoning: Option<String>,
 }
 
 /// 一条启停规则的键：`(provider, id)`。
@@ -103,6 +133,23 @@ impl RuleEntry {
     fn matches(&self, provider: &str, id: &str) -> bool {
         self.id.eq_ignore_ascii_case(id)
             && self.provider.as_deref().map_or(true, |p| p.eq_ignore_ascii_case(provider))
+    }
+}
+
+impl Mapping {
+    /// 落盘的 JSON 形态。
+    ///
+    /// `reasoning` 为 `None` 时**仍然写出 `null`**，与 `provider` 的写法同一
+    /// 口径（`json!` 对 `Option::None` 给 `null`）：形状稳定比省几个字节重要，
+    /// 且读取侧的容错本来就认 `null`（`as_str` 拿到 None）。反过来**不**在
+    /// `None` 时省略这个键 —— 那样配置里同一个字段时有时无，排查时更难读。
+    fn to_value(&self) -> Value {
+        json!({
+            "alias": self.alias,
+            "target": self.target,
+            "provider": self.provider,
+            "reasoning": self.reasoning,
+        })
     }
 }
 
@@ -174,10 +221,19 @@ impl ModelRules {
                             .and_then(Value::as_str)
                             .map(str::trim)
                             .filter(|provider| !provider.is_empty());
+                        // 思考等级：**缺失 / 非字符串 / 空串一律 None（不覆盖）**。
+                        // 旧数据（升级前写下的映射）没有这个键，这条容错就是
+                        // 「升级不能让已有映射变样」的实现方式：读出来与写回去
+                        // 都不带 `reasoning` 的条目，行为与升级前逐字相同。
+                        let reasoning = item
+                            .get("reasoning")
+                            .and_then(Value::as_str)
+                            .and_then(normalize_reasoning);
                         Some(Mapping {
                             alias: alias.to_string(),
                             target: target.to_string(),
                             provider: provider.map(str::to_string),
+                            reasoning,
                         })
                     })
                     .collect()
@@ -207,7 +263,7 @@ impl ModelRules {
         json!({
             "disabled": self.disabled.iter().map(RuleEntry::to_value).collect::<Vec<_>>(),
             "hidden": self.hidden.iter().map(RuleEntry::to_value).collect::<Vec<_>>(),
-            "mappings": self.mappings.iter().map(|m| json!({"alias": m.alias, "target": m.target, "provider": m.provider})).collect::<Vec<_>>(),
+            "mappings": self.mappings.iter().map(Mapping::to_value).collect::<Vec<_>>(),
             "seeded": self.seeded,
         })
     }
@@ -389,21 +445,50 @@ pub fn alias_valid(alias: &str) -> bool {
 /// 完全相同的条目（alias + target + provider 全同）幂等跳过；「alias 与上游 id
 /// 同名」「同一 alias 多条」都不再是错误 —— 前者正是同名主备的用法，后者就是
 /// 多提供商兜底本身。
-pub fn add_mapping(alias: &str, target: &str, provider: Option<&str>) -> ModelRules {
+///
+/// ── 已存在的条目也要能改思考等级（`reasoning`）───────────────
+/// 幂等判定的键仍是三元组（不带 `reasoning`）：同一 (alias, target, provider)
+/// 上的思考等级是**可编辑的属性**，不是身份的一部分。所以三元组命中时要把
+/// 传入的 `reasoning` 写上去（而不是整条跳过）—— 否则管理页上对已有映射改等级
+/// 会静默无效，看起来像「保存成功了、刷新又变回去」。
+///
+/// 代价要说清：这也意味着 `add_mapping` 传了 `reasoning = None` 时会**清掉**
+/// 那条已有的绑定。调用方（`api::model_manage::add_mapping`）因此只在请求体里
+/// **带有** `reasoning` 键时才传 `Some(...)`/`Some(None)`，完全不带该键时走
+/// 「不动等级」的语义 —— 见那个 handler 的取值。
+pub fn add_mapping(
+    alias: &str,
+    target: &str,
+    provider: Option<&str>,
+    reasoning: Option<Option<&str>>,
+) -> ModelRules {
     let mut rules = current();
-    let exists = rules.mappings.iter().any(|m| {
+    let mut touched = false;
+    if let Some(existing) = rules.mappings.iter_mut().find(|m| {
         m.alias.eq_ignore_ascii_case(alias)
             && m.target.eq_ignore_ascii_case(target)
             && m.provider.as_deref().map_or(provider.is_none(), |p| {
                 provider.map_or(false, |given| p.eq_ignore_ascii_case(given))
             })
-    });
-    if !exists {
+    }) {
+        if let Some(next) = reasoning {
+            // `Some(None)` = 显式清空；`Some(Some(x))` = 设成 x
+            let next = next.and_then(normalize_reasoning);
+            if existing.reasoning != next {
+                existing.reasoning = next;
+                touched = true;
+            }
+        }
+    } else {
         rules.mappings.push(Mapping {
             alias: alias.to_string(),
             target: target.to_string(),
             provider: provider.map(str::to_string),
+            reasoning: reasoning.flatten().and_then(normalize_reasoning),
         });
+        touched = true;
+    }
+    if touched {
         save(&rules);
     }
     rules
@@ -474,6 +559,7 @@ pub fn remove_mapping(
                         alias: alias.to_string(),
                         target: target.to_string(),
                         provider: Some(other.to_string()),
+                        reasoning: None,
                     });
                 }
             }
@@ -515,7 +601,7 @@ fn is_opaque_raccoon_id(id: &str) -> bool {
 ///     先刷到的那家拿到那条短名，另一家只记 seeded 不建映射。这里**两家都
 ///     点名**，于是短名默认就有两条映射、各指一个池，不依赖清单刷新顺序：
 ///     路由时两条一起进候选链，发送名跟着实际承载的 provider 走
-///     （见 `catalog::wire_model_for_provider` 的 ②）。缺了任何一条，
+///     （见 `catalog::wire_target_for_provider` 的 ②）。缺了任何一条，
 ///     「短名默认能路由到那个池」这件事就会随刷新顺序时断时续。
 const EXTRA_ALIASES: &[(&str, &str, &str)] = &[
     ("raccoon", "sn-deepseek-v4-1-flash", "deepseek-v4.1-flash"),
@@ -581,6 +667,8 @@ fn seed_extra_aliases(
             alias: alias.to_string(),
             target: id.to_string(),
             provider: Some(provider.to_string()),
+            // 种子建的映射不绑思考等级（那是用户手动绑定的东西）
+            reasoning: None,
         });
         added.push(format!("{alias} → {id}"));
     }
@@ -642,6 +730,7 @@ pub fn seed_raccoon_defaults(ids: &[String]) -> Option<String> {
                 alias: alias.to_string(),
                 target: id.to_string(),
                 provider: Some("raccoon".to_string()),
+                reasoning: None,
             });
             mappings_added.push(format!("{alias} → {id}"));
         }

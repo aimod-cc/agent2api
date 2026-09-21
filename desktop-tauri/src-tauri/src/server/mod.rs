@@ -18,11 +18,27 @@
 //! ```text
 //! server/
 //!   mod.rs          模块总装：ServerState 构造、start()/停机信号
+//!   account_bootstrap.rs 账号侧的启动期一次性迁移（auth.json 旧登录态 /
+//!                   优先级整队 / 三家旧项目数据导入）。**两处调用**：
+//!                   启动时（仅当没有待迁移旧文件）与用户点完「升级」之后 ——
+//!                   为什么不能无条件跑，见那个文件的模块头（有一段不可逆的
+//!                   破坏路径：抢在数据迁移之前占住 `accounts` 表）
 //!   http.rs         axum Router 组装、CORS、API Key 检查、404 兜底
-//!   logging.rs      双通道日志（控制台 + logs.jsonl）
+//!   logging.rs      双通道日志（控制台 + 数据库的 logs 表）
 //!   config.rs       config.json 读写（全量保留未知字段）
-//!   logs_store.rs   logs.jsonl 存储（append/查询/统计/清空）
+//!   logs_store/     事件日志存储（append/查询/统计/清空）：
+//!     mod.rs        句柄与公开 API（幂等写入、降级、导出）
+//!     sql.rs        行级 SQL 访问层 + 筛选条件编译
 //!   errors.rs       网关错误类型 + OpenAI 风格错误 payload
+//!   db/             本地存储的**唯一真相**（单文件 SQLite `{config_dir}/agent2api.db`）：
+//!     mod.rs        连接与句柄（`Db::open` / `with` / `with_mut` / `file`）
+//!     schema.rs     全部建表 DDL 与 `PRAGMA user_version` 逐版本升级
+//!     migrate/      旧文件 → 库的一次性迁移（框架 + 每个迁移项一个文件）
+//!                   八项已全部接入（配置 / 桌面设置 / 账号 / 日志 /
+//!                   请求明细 / 请求聚合 / 调试报文 / 脱敏词表）；
+//!                   **启动时只探测、不执行** —— 由用户在升级弹窗里点「升级」
+//!                   触发 `POST /api/upgrade/run`（见 api/upgrade_api.rs）。
+//!                   迁移成功后旧文件改名为 `*.migrated` 备份，**绝不删除**
 //!   api/
 //!     mod.rs        路由模块登记
 //!     health.rs     GET /health
@@ -41,9 +57,14 @@
 //!     scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务：开关 / 间隔 / 立即执行）
 //!     update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
 //!     endpoints.rs  GET /api/endpoints（接口清单）
+//!     storage_api.rs GET /api/storage（统一库的位置、大小与各表条数，只读）
+//!     upgrade_api.rs GET /api/upgrade、POST /api/upgrade/run（旧数据 → SQLite 库）
 //!   core/
 //!     endpoints.rs 端点/版本/UA/上下文（唯一事实来源）
-//!     account_store/  账号存储（优先级、迁移、CRUD、限额标记）
+//!     account_store/  账号存储（优先级、迁移、CRUD、限额标记）。
+//!                 持久化已从 `{config_dir}/accounts.json` 换到
+//!                 `agent2api.db` 的 `accounts` 表；`sql.rs` 是行级访问层，
+//!                 `store_view.rs` 是公开形态与快照
 //!     account_transfer.rs  账号导入导出
 //!     auth.rs      会话读取、getStatus、鉴权头、token 刷新
 //!     auth_http.rs 上游请求发送与解包（管理接口）+ 鉴权错误类型
@@ -66,6 +87,7 @@
 //!     desensitize/ 内容脱敏：
 //!       mod.rs       词表读写 / 默认词表迁移 / 命中统计（句柄）
 //!       engine.rs    纯函数：词表编译、文本改写、content/messages/body 遍历
+//!       sql.rs       `kv` 表 `desensitize` 键的行级读写
 //!     upstream/    对话转发：
 //!       mod.rs       转发主链路（选路循环 / 429 轮换 / 去重排队 / SSE 流）
 //!       request.rs   请求构造（头集合、URL、system 注入、错误解析）
@@ -80,8 +102,9 @@
 //!     管理 API 已全部就位（切片 1-6），切片 7 只剩打包收尾。
 //!   - 账号与鉴权：`ServerState::store()` / `auth()` / `login()` 三个克隆句柄。
 //!   - 模型目录与转发：`ServerState::models()` / `upstream()`。
-//!   - 脱敏：`ServerState::desensitize()`（路由用）；对话链路里是
-//!     `api::chat::desensitize_body`，它取 `core::desensitize::global()`。
+//!   - 脱敏：`ServerState::desensitize()`（路由用）；对话链路里是转发层的
+//!     `process_body_for_provider`，它取 `core::desensitize::global()`。
+//!     词表与开关现在落在统一库的 `kv` 表（`desensitize` 键）。
 //!   - 定时签到：`ServerState::auto_checkin()`；停机清理走
 //!     `core::auto_checkin::stop_global()`（backend::shutdown 里调用）。
 //!   - 间隔型定时任务：`core::scheduled_tasks`（注册表 + 调度循环，循环在
@@ -92,7 +115,7 @@
 //!   - 请求统计：写入侧是 `api::chat` 的记账点 → `RequestStats::record`；
 //!     读取侧是 `api::stats_api` 的三条路由（报表 / 明细查询 / 清空），
 //!     句柄取 `ServerState::request_stats()`；退出时在 `start()` 的 serve 任务
-//!     收尾处 `flush()`。
+//!     收尾处 `flush()`（把 WAL 并回主库，见那边的说明）。
 //!   - 数据保留期：`config::retention_settings()`（内存快照，热路径用）与
 //!     `config::set_retention()`（写盘）；三个消费点都走**回调动态取值**
 //!     （`RequestStats` / `LogStore` / `PUT /api/retention` 的立即清理），
@@ -111,9 +134,11 @@
 //! 并写明保留理由，便于后续定位。
 
 pub mod api;
+mod account_bootstrap;
 pub mod config;
 pub mod config_migration;
 pub mod core;
+pub mod db;
 pub mod errors;
 pub mod http;
 pub mod logging;
@@ -122,6 +147,7 @@ pub mod request_stats;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
@@ -136,6 +162,7 @@ use crate::server::core::login::LoginService;
 use crate::server::core::models::ModelCatalog;
 use crate::server::core::update::UpdateManager;
 use crate::server::core::upstream::UpstreamService;
+use crate::server::db::Db;
 use crate::server::request_stats::{RequestStats, Retention};
 
 /// 服务器共享状态。handler 通过 `axum::extract::State` 拿到它的克隆。
@@ -168,28 +195,61 @@ pub struct ServerState {
     auto_checkin: AutoCheckin,
     /// 软件更新句柄（GitHub Release 检测 / 安装包下载；内部 Mutex）
     update: UpdateManager,
-    /// 请求统计存储句柄（明细 + 按天聚合）。
+    /// 请求统计存储句柄（明细 + 按天聚合，现在同居统一库的两张表）。
     ///
     /// 外面包一层 `Arc` 而不是像其它 store 那样自带内部 `Arc<Inner>`：
-    /// 存储本体的公开接口（`RequestStats::new`）已经定型，本切片不再改它，
+    /// 存储本体的公开接口（`RequestStats::with_db`）已经定型，
     /// 而 `ServerState` 是 `Clone` 的（handler 靠克隆拿状态），
     /// 所以共享语义由这层 `Arc` 提供 —— 与 `AccountStore` 的 `Arc<Inner>`
     /// 是同一个效果，只是包的位置在外侧。
+    /// 需要 `Arc`（而不是像 `LogStore` 那样靠 `OnceLock` 全局取）还有一个
+    /// 具体原因：流式请求要把这个句柄**移进响应流**（记账发生在流跑完时），
+    /// 所以 handler 必须能拿到一份所有权克隆（见 `request_stats()`）。
     request_stats: Arc<RequestStats>,
+    /// SQLite 数据库句柄。`None` = 打开失败（启动时已记日志）。
+    /// 为什么允许为 None 而不是直接让启动失败：release 构建是 panic=abort，
+    /// 数据库问题不该让整个应用闪退；网关降级启动至少能给出可读错误。
+    db: Option<Db>,
+    /// 启动时发现「还有旧 JSON/JSONL 文件没搬进库」。
+    ///
+    /// ── 为什么是 `Arc<AtomicBool>` 而不是裸 `bool` ──────────────
+    /// `ServerState` 是 `Clone` 的（handler 靠克隆拿状态），裸字段改了不会让
+    /// 别的 handler 看见。而它**必须**能被改：`POST /api/upgrade/run` 跑完迁移
+    /// 之后要把它落回 false，否则界面每次刷新都还会读到「有待迁移数据」，
+    /// 用户会以为升级没生效。用一个原子布尔而不是 `Mutex<bool>`：这里只有
+    /// 「读一个值 / 写一个值」两种操作，没有需要一起保护的第二个字段。
+    ///
+    /// ── 为什么在启动时算一次并记住，而不是每次请求现算 ──────────
+    /// 它是**界面开弹窗的判据**（`GET /api/upgrade`），而每次请求都去挨个
+    /// `is_file()` 一遍没有意义：迁移只可能由 `POST /api/upgrade/run` 改变，
+    /// 那条路由跑完会自己刷新这个字段。代价是**用户手工把旧文件拷回配置目录
+    /// 不会被感知**（要下次启动才发现）—— 这是可接受的：手工放回文件的人
+    /// 本来就知道自己在做什么。
+    upgrade_pending: Arc<AtomicBool>,
 }
 
 impl ServerState {
     /// 构造服务状态，并完成启动期的准备工作。
     ///
     /// 顺序很重要（对照 server.mjs 336-353 行）：
-    ///   1. 读配置 —— 保留期（日志天数）要在装日志库之前就位；
-    ///   2. 装日志库 —— 后面所有模块的日志才能入库；
-    ///   3. 账号库载入 + 旧版 auth.json 迁移（仅账号列表为空时）+ 优先级去重迁移。
+    ///   1. 开数据库 —— 配置、日志库与所有 store 的最终落点；
+    ///   2. 读配置 —— 保留期（日志天数）要在装日志库之前就位，而配置现在
+    ///      就存在库里，所以它必须排在①之后；
+    ///   3. 探测旧文件（**不迁移**）—— 八项各自判自己的旧文件在不在，
+    ///      结果存进 `upgrade_pending`，等用户在界面点「升级」才真正导入
+    ///      （`POST /api/upgrade/run`，见 `api::upgrade_api` 的模块头）；
+    ///   4. 装日志库 —— 后面所有模块的日志才能入库；
+    ///   5. 账号库载入 + 旧版 auth.json 迁移（仅账号列表为空时）+ 优先级去重迁移。
+    /// ①② 的顺序是本任务刚从「先读配置、再开库」调过来的：配置的真相来源进了
+    /// 库，读它需要 `Db` 句柄。调过来带来的新问题（迁移还没跑时配置从哪来）由
+    /// `config::read_raw` 的回落读旧文件解决 —— 那段注释是本顺序的关键，
+    /// 改动①②之前**必须**先读它。
     ///
-    /// ①/② 的顺序是本切片刚从「先装日志库」调过来的：日志库载入历史时就会按
+    /// ②/④ 的顺序是上一个切片刚从「先装日志库」调过来的：日志库载入历史时就会按
     /// 保留天数裁一次，而保留天数来自配置 —— 若配置还没读进来，那次裁剪会退回
     /// 默认 30 天，把用户设了更长保留期的旧日志当场裁掉并落盘（**不可逆的数据丢失**）。
-    /// 两个函数都不写日志，交换它们不会让任何一行启动日志丢失。
+    /// ①→② 的调整**没有**破坏这条：配置依然在 `logging::init_store` 之前就位
+    /// （只是它的来源从文件换成了库 + 文件回落）。
     ///
     /// ── 一次性目录迁移（`~/.workbuddy-proxy` → `~/.agent2api`）不在这里 ──
     /// 它必须早于**任何**会写配置目录的动作，而 `bootstrap` 已经是「桌面设置
@@ -202,9 +262,10 @@ impl ServerState {
     /// 这里保留一道**防御性校验**（`config_migration::pending_reason`）：若旧目录
     /// 仍在、新目录仍不存在，说明本该执行的迁移没有执行（例如后续有人挪动了
     /// 调用点）。此时直接返回错误、不做任何初始化 —— 继续下去的第一件事
-    /// （`config::init` → 读盘；`logging::init_store` → 建目录）就会把新目录
-    /// 建出来，让迁移永远失去重试机会。失败以 `Err` 往上传（`ensure_ready`
-    /// 原样透给 UI 的 `backend:error`），不 panic、也不静默降级。
+    /// （`Db::open` → 建库目录；`config::init` → 建配置目录；`logging::init_store`
+    /// → 建目录）就会把新目录建出来，让迁移永远失去重试机会。失败以 `Err`
+    /// 往上传（`ensure_ready` 原样透给 UI 的 `backend:error`），不 panic、
+    /// 也不静默降级。
     pub fn bootstrap(port: u16) -> Result<Self, String> {
         if let Some(reason) = config_migration::pending_reason() {
             return Err(reason);
@@ -214,19 +275,104 @@ impl ServerState {
         // （旧名 WORKBUDDY_VERBOSE 仍可读，新名优先），
         // 决定 debug 级别日志要不要入库（默认只有 info 以上入库，避免刷屏）
         let verbose = env_flag(&["AGENT2API_VERBOSE", "WORKBUDDY_VERBOSE"]);
-        let snapshot = config::init();
-        // 两类数据的保存目录：config.json 里写了绝对路径（用户在设置页改过位置）
-        // 就用它，否则（缺省 / 写坏）都落配置目录。必须用**解析后**的目录构造
-        // 两个存储 —— 它们的目录由此定死，运行期搬家靠 relocate（storage_api）。
-        let dirs = config::storage_dirs();
-        logging::init_store(&dirs.log_dir, verbose);
+        // ── 数据库 ──────────────────────────────────────────────
+        // 位置是刻意的：在 `config::init()` **之前**、`logging::init_store(...)`
+        // **之前**。
+        //   - 为什么必须在日志库之前：日志库写进数据库，数据库必须先就绪；
+        //     顺序反了，日志库就没有可用的库可写 —— 而那时它已经按「库可用」
+        //     的前提装好了，只能整轮重来。
+        //   - 为什么必须在 `config::init()` 之前（**本切片刚调过来**）：
+        //     配置的真相来源从 `config.json` 变成了统一库的 `kv` 表，读它需要
+        //     `Db` 句柄。调过来之后下面那次 `config::init(db.clone())` 才能
+        //     从库里读；而「迁移还没跑时读不到配置」这个新问题由
+        //     `config::read_raw` 的**回落读旧文件**解决（完整论证与它为什么
+        //     安全见那里的注释，以及 `config::init` 的签名说明）。
+        //     这一步不能反：反了就是「先读配置、再开库」，配置只好去读旧文件
+        //     —— 那正是本切片要消灭的形态，且迁移之后旧文件已被改名，
+        //     第二次启动起配置就全空了。
+        // 打开失败**不阻断启动**（`db = None`），理由见 ServerState.db 的字段注释。
+        let db_path = config_dir.join(db::FILE_NAME);
+        let db = match db::Db::open(&db_path) {
+            Ok(db) => Some(db),
+            Err(error) => {
+                logging::console_line("[Storage]", &format!("❌ 数据库打开失败: {error}"));
+                None
+            }
+        };
+        // 配置快照：**在库就绪之后、迁移之前**装入（理由见上面那段注释）。
+        // 搬回来之后它的降级链是「库 → 旧文件 → 默认值」（`config::read_raw`），
+        // 于是库里还没配置时（迁移尚未跑、或全新安装）读到的是与改造前一致的
+        // 结果 —— 老用户升级后第一次启动拿到的就是他真正的旧配置，
+        // 下面日志裁剪天数与旧文件候选目录才不会用错值。
+        let snapshot = config::init(db.clone());
+        // ── 旧文件一次性迁移：**本切片起不再自动跑** ────────────────
+        // 它现在由用户在升级弹窗里点「升级」触发（`POST /api/upgrade/run`）。
+        // 为什么改成手动：需求是「弹窗告诉用户换了 SQLite，点升级才开始导」——
+        // 自动跑会让弹窗永远来不及出现（第一次启动就搬完了，用户不会知道发生过
+        // 什么），而用户对「我的数据去哪了」的知情权是这个改动的主要目的。
+        //
+        // ── 不跑迁移会不会让本次运行读到错的配置 ────────────────────
+        // 不会，两条回落路径都已核实：
+        //   - `config::init` 走 `config::read_raw`：迁移标记键不在时它会
+        //     **回落读旧 `config.json`**（`read_raw` 的时序论证），所以快照里
+        //     已经是用户真正的旧配置，`storage_dirs()` / `retention_settings()`
+        //     拿到的值都对；
+        //   - 壳侧 `settings::load()`（端口 / 关闭到托盘）同样是「库 → 旧文件 →
+        //     默认值」三级回落（见 `settings` 模块头）。
+        // 换句话说：迁移前与迁移后，读到的配置是同一份 —— 这正是当初把回落读
+        // 设计出来的目的，也是「手动触发」能成立的前提。
+        //
+        // 日志此时还进不了日志库（它尚未初始化），走控制台。
+        // 注意这里**不写**「待迁移」日志的详情：弹窗会列清单，控制台只留一句
+        // 可排障的线索（哪几个文件还在），避免与弹窗的文案各说一套。
+        let upgrade_pending = match db.as_ref() {
+            Some(_) => {
+                let pending = db::migrate::pending_items(&config_dir);
+                if !pending.is_empty() {
+                    logging::console_line(
+                        "[Storage]",
+                        &format!(
+                            "⏳ 检测到待迁移的旧数据（{}），等待用户在界面点「升级」后导入",
+                            pending.join("、")
+                        ),
+                    );
+                }
+                !pending.is_empty()
+            }
+            // 库不可用：没有可导入的目标，不该提示用户去点升级（点了必然失败）。
+            // 那条 ❌ 已经在 `Db::open` 那一步打过，这里不重复。
+            None => false,
+        };
+        // 日志库：把**同一个 `Db`** 传进去 —— 与账号存储同一形态（见下面
+        // AccountStore 的说明）。`db` 是 `Option<Db>`：打不开时日志库照常装起来，
+        // 但写入静默丢弃、读取返回空（日志丢一条不影响任何业务，降级值见
+        // `LogStore` 各方法的说明）。
+        logging::init_store(db.clone(), verbose);
         // 调试模式的原始报文存储：无论开关是否打开都初始化 —— 开关是**逐请求**
         // 判定的（改完设置下一个请求就生效），存储没就绪会让开启后的第一批
-        // 请求无处可落
-        core::debug_traffic::init(dirs.debug_dir.clone());
+        // 请求无处可落。
+        // 本切片起报文进统一库的 `debug_traffic` 表（旧 `debug-traffic.jsonl`
+        // 由 `migrate::import_debug` 一次性搬入），所以传的是**同一个 `Db`** ——
+        // `Option<Db>`：打不开时报文写入静默丢弃（丢一份调试报文不影响任何业务）。
+        core::debug_traffic::init(db.clone());
+        // 注意这里**不再有 `config::storage_dirs()`**：三类数据的保存目录
+        // （`logDir` / `requestStatsDir` / `debugDir`）已经全部失去消费方 ——
+        // 数据都在统一库的配置目录里，各 store 的构造只接 `Db`。
+        // 那三个键与 `storage_dirs()` 仍然保留，但**只服务迁移项**：它们要去
+        // 用户当年自定义过的目录里找旧文件（见 `db::migrate` 的
+        // `logs` / `requests` / `debug` 三项）。设置页也不再展示它们（T8 收尾
+        // 把那一节改成了单库只读概况），所以本文件里出现它们反而是不该发生的
+        // —— 那意味着有人把「旧文件在哪」的知识复制到了第二个地方。
 
-        // 账号库 + 鉴权 + 登录 + 计费（四者共享同一个 store 句柄）
-        let store = AccountStore::with_config_dir();
+        // 账号库 + 鉴权 + 登录 + 计费（四者共享同一个 store 句柄）。
+        // 账号数据现在落在上面那个库里（`accounts` 表），所以把**同一个 `Db`**
+        // 传进去 —— 不再是「记住配置目录，自己要读写时现拼路径」。注意 `db` 是
+        // `Option<Db>`：打开失败时 store 仍然装得起来，但每个账号操作都会以
+        // 500「账号数据库不可用」拒绝（选择与理由见 `store.rs` 的 `Inner::db`）。
+        // 这里**不做**「库不可用就整机不启动」的判断：转发的账号是核心，但网关
+        // 的其余部分（日志、模型目录、健康检查、配置页）不依赖账号，让它们继续
+        // 可用比整体拒绝启动更有用 —— 用户能在界面上看到那条 ❌ 日志并处理磁盘问题。
+        let store = AccountStore::with_db(db.clone());
         let context = core::endpoints::default_context();
         let auth = AuthService::new(store.clone(), context);
         let login = LoginService::new(auth.clone(), store.clone());
@@ -238,10 +384,14 @@ impl ServerState {
         // **同一实例**（共享同一把 RwLock），刷新对两边同时可见。
         let models = core::models::global_catalog();
         let upstream = UpstreamService::new(store.clone(), auth.clone());
-        // 内容脱敏：默认开启，词表与开关持久化在 {config_dir}/desensitize.json
-        // （对照 server.mjs 398 行）。WORKBUDDY_DESENSITIZE=1/0 只覆盖**本次运行**，
-        // 不写回文件（persist:false）—— 避免启动脚本顺带改掉用户在前端的设置
-        let desensitize = core::desensitize::init(&config_dir);
+        // 内容脱敏：默认开启，词表与开关现在落在统一库的 `kv` 表
+        // （`desensitize` 键；旧 `{config_dir}/desensitize.json` 由
+        // `migrate::import_desensitize` 一次性搬入）。所以传的是**同一个 `Db`**
+        // —— `Option<Db>`：打不开时脱敏器照常用默认词表与默认开关工作，
+        // 只是改配置落不了库（内存里仍生效）。
+        // WORKBUDDY_DESENSITIZE=1/0 只覆盖**本次运行**，不落库（persist:false）
+        // —— 避免启动脚本顺带改掉用户在前端的设置
+        let desensitize = core::desensitize::init(db.clone());
         match std::env::var("WORKBUDDY_DESENSITIZE").as_deref() {
             Ok("0") => {
                 desensitize.set_enabled(false, false);
@@ -249,7 +399,7 @@ impl ServerState {
             Ok("1") => {
                 desensitize.set_enabled(true, false);
             }
-            // 未设置（或其它值）→ 沿用文件里的开关
+            // 未设置（或其它值）→ 沿用库里的开关
             _ => {}
         }
 
@@ -265,19 +415,19 @@ impl ServerState {
         // 更新管理器：下载目录 `{config_dir}/updates`，与壳侧 update::download_dir() 同源
         let update = core::update::init_global(UpdateManager::new(config_dir.clone()));
 
-        // 请求统计：数据目录默认与 LogStore **同源**（都是 config_dir）—— 明细
-        // `requests.jsonl` 与聚合 `request-daily.jsonl` 落在配置目录里，与
-        // logs.jsonl 并排；用户在设置页改过「请求日志保存位置」时用的是自定义目录
-        // （`config::storage_dirs()` 已按配置解析好）。两个目录互不约束。
+        // 请求统计：本切片起数据进统一库的 `requests` / `request_daily` 两张表
+        // （旧 `requests.jsonl` / `request-daily.jsonl` 由 `migrate::import_requests`
+        // / `migrate::import_daily` 一次性搬入），所以不再有「统计自己的目录」——
+        // 路径由 `Db` 唯一持有，与 `LogStore` 同一形态。
+        // `requestStatsDir` 这个键仍被迁移项读（去自定义目录里找那两个旧文件，
+        // 见 `db::migrate::requests`），本文件不再碰它。
         //
         // 保留期走**回调**，每次裁剪时动态读配置：明细天数来自
         // `requestRetentionDays`、聚合天数来自 `dailyRetentionDays`
         // （`config::retention_settings()` 读的是 config::init() 装好的内存快照，
         // 而 `PUT /api/retention` 会同步刷新它）——
-        // 于是设置页改完天数，下一次记账 / prune 立即生效，**不需要重启进程**，
-        // 也不必改这里的构造方式。这也正是 RequestStats::new 把保留期做成
-        // 回调而不是构造参数的原因（见那边的注释）。
-        let request_stats = Arc::new(RequestStats::new(dirs.request_stats_dir, || {
+        // 于是设置页改完天数，下一次记账 / prune 立即生效，**不需要重启进程**。
+        let request_stats = Arc::new(RequestStats::with_db(db.clone(), || {
             let settings = config::retention_settings();
             Retention {
                 request_days: settings.request_days,
@@ -285,54 +435,17 @@ impl ServerState {
             }
         }));
 
-        // 旧版单账号 auth.json 迁移（仅当账号列表为空时导入一次）
-        let legacy = read_legacy_session();
-        if let Some(legacy) = legacy {
-            if let Some(account) = store.import_legacy_session(&legacy) {
-                let name = account
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("旧登录态");
-                logging::log("[Accounts]", &format!("✅ 旧版登录态已迁移为账号: {name}"));
-            }
+        // ── 账号侧的启动期一次性迁移：**有待迁移数据时整块跳过** ──────
+        // 那一组迁移（auth.json 旧登录态、`migrate_startup` 的整队与拆池、
+        // 三家旧项目数据导入）的判据全是「库里那份账号列表空不空」，而
+        // **旧数据还没导入时 `accounts` 表是空的** —— 跑它们会有一条不可逆的
+        // 破坏路径（抢先占住表，把 `import_accounts` 的幂等闸门永久关上）。
+        // 完整论证、以及「为什么升级后必须补调一次」都在
+        // `account_bootstrap` 的模块头里 —— 那一段是本次改动最容易读错的地方，
+        // 值得一个能被直接找到的位置，所以整组搬到了那个文件。
+        if !upgrade_pending {
+            account_bootstrap::run(&store);
         }
-        // 启动期数据迁移（一次读、一次写，见 store_admin::migrate_startup）：
-        //   ① 历史账号补 `provider: "workbuddy"`（Agent2API 惰性迁移，§3.2）
-        //   ② 优先级去重 —— 逐 provider 分组重编号，相对顺序保持不变
-        //      （所以升级后实际转发顺序不变）
-        //   ③ Cline 拆池改名（`provider: "cline"` + `pool` → cline-free / cline-pass）
-        store.migrate_startup();
-        // 模型规则的同一轮迁移（`modelRules` 里的 disabled / hidden / mappings /
-        // seeded 都按 provider id 记账，`"cline"` 这个 id 一没就全部匹配不上）。
-        // 与账号迁移分开读一次 config.json：两者在不同的文件（config / accounts），
-        // 而且**必须各自幂等**（只有一个存在迁移内容时不该拖着另一个一起写盘）。
-        // 放这里而不是更早：它要读 modelRules，而那时 config 已经 init 完毕。
-        if let Some(summary) = core::model_rules::migrate_cline_split() {
-            logging::log("[Models]", &summary);
-        }
-        // 小浣熊旧数据一次性导入（架构文档 §3.3，W3-T4）：
-        //   `~/.raccoon-proxy/accounts.json`（旧网关多账号）+
-        //   `~/.box-agent/config/auth.json`（桌面端实时登录态）→ raccoon 账号。
-        // 触发条件是「raccoon 账号列表为空 **且** config 里没有 raccoonImported」，
-        // 幂等且失败不阻断启动（两个来源各自缺失就跳过，见该方法的说明）。
-        // 放在 migrate_startup 之后：迁移已把历史账号归好组，导入的新账号
-        // 不会影响这一轮的去重判定（导入本身按 provider 内号段追加）。
-        store.import_legacy_raccoon_data();
-        // CatPaw 旧数据一次性导入（架构文档 §9，W5-T-d4）：
-        //   `~/.meituan-catpaw/catpaw-proxy-accounts.json`（原项目多账号）+
-        //   `~/.meituan-catpaw/auth.json`（桌面端实时登录态）→ catpaw 账号。
-        // 触发条件是「catpaw 账号列表为空 **且** config 里没有 catpawImported」，
-        // 与上面那条同构（标记键、幂等性、失败不阻断启动都一致）。
-        store.import_legacy_catpaw_data();
-        // AutoClaw 旧数据一次性导入（架构文档 §10.2 末条，W4b-T-c2）：
-        //   `~/.autoclaw-proxy/accounts.json`（原项目多账号）+
-        //   `%APPDATA%/AutoClaw/auth.json`（桌面端实时登录态；备来源
-        //   `~/.openclaw-autoclaw/openclaw.json`）→ autoclaw 账号。
-        // 触发条件是「autoclaw 账号列表为空 **且** config 里没有 autoclawImported」，
-        // 与上面两条同构（标记键、幂等性、失败不阻断启动都一致）。
-        // 三条导入**追加式共存**：各看自己那一家的账号列表与自己那个标记键，
-        // 互不影响，先后顺序不改变任何结果（后一条只增不改前面的账号）。
-        store.import_legacy_autoclaw_data();
 
         let state = Self {
             port,
@@ -347,6 +460,8 @@ impl ServerState {
             auto_checkin,
             update,
             request_stats,
+            db,
+            upgrade_pending: Arc::new(AtomicBool::new(upgrade_pending)),
         };
         logging::log("[Server]", "Agent2API 多提供商本地网关（Rust 进程内服务）启动中…");
         logging::log("[Config]", &format!("API 端口: {}", port));
@@ -390,6 +505,23 @@ impl ServerState {
             ),
         );
         logging::log("[Config]", &format!("配置目录: {}", state.config_dir.display()));
+        // 数据库状态一行（排障第一手信息：库在哪、有没有就绪）。
+        // 放在「配置目录」之后：坏库时的第一句话就是「库在哪、能不能打开」，
+        // 而 `Db::file()` 是唯一知道自己路径的对象（不让别处再拼一次
+        // `config_dir.join(FILE_NAME)` —— 那是把路径知识复制到第二个地方）。
+        // 打开失败的情形在 `Db::open` 那一步已经打过 ❌ 日志，这里不重复报错，
+        // 只把「本次运行数据库不可用」这个后果说清楚（各 store 会降级回落）。
+        match state.db() {
+            Some(db) => {
+                logging::log("[Storage]", &format!("数据库: {}", db.file().display()));
+            }
+            None => {
+                logging::log(
+                    "[Storage]",
+                    "⚠️  数据库不可用：依赖数据库的功能本次运行将降级（详见上方报错）",
+                );
+            }
+        }
         let current = state.store.current_account_id();
         logging::log(
             "[Accounts]",
@@ -544,6 +676,44 @@ impl ServerState {
     pub fn request_stats(&self) -> Arc<RequestStats> {
         self.request_stats.clone()
     }
+
+    /// SQLite 数据库句柄（本地存储的唯一真相）。
+    ///
+    /// 返回 `Option<&Db>`：`None` = 打开失败（启动时已记一行可读日志）。
+    /// 后续各 store 的接线点必须显式处理这一分支 —— 数据库不可用时应当
+    /// 降级回落（例如日志明细先不入库），而不是 panic。理由与字段注释同：
+    /// release 是 panic=abort，数据库问题不该让整个应用闪退。
+    pub fn db(&self) -> Option<&Db> {
+        self.db.as_ref()
+    }
+
+    /// 还有没有待迁移的旧文件（升级弹窗的判据；见字段说明）。
+    pub fn upgrade_pending(&self) -> bool {
+        self.upgrade_pending.load(Ordering::Relaxed)
+    }
+
+    /// 重算「待迁移」并写回（`POST /api/upgrade/run` 跑完之后调）。
+    ///
+    /// 为什么重算而不是直接写 false：迁移**可能只成功了一部分**（某一项解析
+    /// 失败、写库失败，旧文件留在原处），那时还有文件在、也确实还能再点一次
+    /// 升级（迁移项各自幂等）。重算让界面如实反映这一点，用户不必猜
+    /// 「刚才那次到底全成了没有」。
+    ///
+    /// 库不可用时按「没有待迁移」处理：没有可导入的目标，提示用户去点升级
+    /// 只会得到一次必然失败的尝试（与 `bootstrap` 里的判据一致）。
+    pub fn refresh_upgrade_pending(&self) -> bool {
+        let pending = self.db.is_some() && db::migrate::has_pending(&self.config_dir);
+        self.upgrade_pending.store(pending, Ordering::Relaxed);
+        pending
+    }
+
+    /// 待迁移项的可读名清单（升级弹窗列清单用）。
+    pub fn upgrade_items(&self) -> Vec<&'static str> {
+        if self.db.is_none() {
+            return Vec::new();
+        }
+        db::migrate::pending_items(&self.config_dir)
+    }
 }
 
 /// 读布尔型环境变量开关：**按候选名依次取第一个被设置的**（前一个是新名）。
@@ -560,20 +730,6 @@ fn env_flag(names: &[&str]) -> bool {
     false
 }
 
-/// 读旧版单账号 auth.json（缺失/损坏都当没有，对应 Node 版 `loadStoredSession`）
-fn read_legacy_session() -> Option<serde_json::Value> {
-    let path = core::endpoints::legacy_auth_file();
-    let text = std::fs::read_to_string(path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let token = value
-        .get("auth")
-        .and_then(|auth| auth.get("accessToken"))
-        .and_then(serde_json::Value::as_str)?;
-    if token.is_empty() {
-        return None;
-    }
-    Some(value)
-}
 
 /// 启动进程内服务器：同步 bind（失败立刻返回可读错误）+ 异步 serve。
 ///
@@ -634,11 +790,12 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
             Ok(()) => logging::log("[Server]", "服务已停止"),
             Err(error) => logging::log("[Server]", &format!("❌ 服务异常退出: {error}")),
         }
-        // 统计补写：放在 serve 返回**之后**（graceful shutdown 已等在途请求
-        // 跑完），此时不会再有新的记账进来，这一次 flush 的结果就是终态。
-        // 为什么必须显式调用：聚合行是延迟落盘的（变更满 50 次或距上次落盘
-        // 超 60 秒才重写整个文件），不补这一次，用户刚看到的请求在下次启动后
-        // 会少一截（明细走追加写，不受影响）。
+        // 统计收尾：放在 serve 返回**之后**（graceful shutdown 已等在途请求
+        // 跑完），此时不会再有新的记账进来。
+        // 注意它**不再是**「补写未落盘的内容」—— 每次记账都立即提交事务，
+        // 没有延迟落盘的状态了（旧实现的一套延迟机制随 T4 消失）；
+        // 它现在的职责是把 WAL 并回主库、清掉 `-wal` / `-shm` 残留，
+        // 让用户备份时只面对一个文件（见 `RequestStats::flush` 的说明）。
         request_stats.flush();
     });
 

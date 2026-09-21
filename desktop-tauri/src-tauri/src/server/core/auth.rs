@@ -108,7 +108,13 @@ impl AuthService {
         &self.context
     }
 
-    /// 账号列表文件（Node 版 `auth.authFile` —— store 模式下就是 accounts.json）。
+    /// 账号数据所在的**文件**（Node 版 `auth.authFile` 的对等字段）。
+    ///
+    /// 取值来自 `AccountStore::file_string()`，改造后是 **SQLite 库文件**
+    /// （`{config_dir}/agent2api.db`）—— 账号记录在它的 `accounts` 表里，
+    /// 不再是早期那个 `accounts.json`。面板上的「凭证文件」一栏显示的就是它，
+    /// 用户据此知道该备份什么（WAL 模式下还有 `-wal` / `-shm` 两个附属文件）；
+    /// 库没打开时会回落到那个库的**约定路径**，而不是空串。
     ///
     /// Windows 下把分隔符统一成 `\`：Node 的 `path.join` 在 Windows 上就是这么输出的，
     /// 而这个路径会直接显示给用户（面板上的「凭证文件」）并给壳侧打开目录用，

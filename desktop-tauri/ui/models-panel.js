@@ -2,10 +2,10 @@
 /* global workbuddyDesktop, wbApp */
 
 /**
- * 数据来自 `GET /api/models/manage`（`{models, mappings}`，含禁用 / 隐藏的条目，
- * 每条带 enabled / hidden / aliases）。本模块自持这份数据：写接口都会返回最新的
- * 同形数据，就地替换后重绘，不经过 app.js 的 state（那是 /api/session 的快照，
- * 轮询会整份覆盖）。
+ * 数据来自 `GET /api/models/manage`（`{models, mappings, reasoningLevels}`，含禁用 /
+ * 隐藏的条目，每条带 enabled / hidden / aliases）。本模块自持这份数据：写接口都会
+ * 返回最新的同形数据，就地替换后重绘，不经过 app.js 的 state（那是 /api/session
+ * 的快照，轮询会整份覆盖）。
  *
  * 表格按提供商分组（顺序 = 后端数组顺序 = 路由优先级），每组默认只展开前
  * `GROUP_LIMIT` 行，其余折叠成一行「展开其余 N 个」；有搜索词或非「全部」筛选时
@@ -16,6 +16,17 @@
  * 同一对外名可以在多个提供商各建一条（每行的映射 chips 只属于自己那行），
  * 下游用同一个名字请求时，网关在「原生承载家 + 各映射提供商」之间按账号
  * 全局优先级主备切换，发送时按承载家自动换成它认识的真名。
+ *
+ * ── 思考等级（照抄 OmniProxy 的手动绑定，R7）─────────────────
+ * 每条映射可以带一个「思考等级」，值取自**后端下发的** `reasoningLevels`
+ * （= `model_rules::REASONING_LEVELS`，与 OmniProxy 的
+ * `GENERIC_REASONING_LEVELS` 同一张表；前端不自己抄一份，免得两处漂移），
+ * 或表外的自定义值。等级显示在映射 chip 上（`alias → target · high`）。
+ * **绑定会真的注入转发**：等级跟着它所在的这条映射走，由承载的那家适配器
+ * 翻译成本家上游认识的档位字段（CatPaw 把通用 6 档归并成 low/high/max，Qoder
+ * 按模型自己声明的档位归一）。**故意不注入**的几种情形（关闭思考 off/none、
+ * 表外自定义值、客户端已显式指定、这家上游不认识档位字段）与理由写在
+ * `core::model_rules::reasoning` 的模块头里，界面上有问号如实标注。
  *
  * 跨文件引用一律走 `wbApp`（esc / toast 是 app.js 里的全局单份实现）。
  */
@@ -33,6 +44,11 @@
     + '使用固定模型清单的提供商（上游没有目录接口）刷新不会改变它们。'
     + '拉到远程清单后，「来源」列会从「内置」变为「远程」';
   const GROUP_LIMIT = 8;
+  /** 思考等级组件（chip 上的等级标 / 弹窗里的下拉）。住在 models-reasoning.js：
+      那一块内部自洽（候选表 / 索引 / 那个下拉的读写），拆出去让本文件回到
+      表格与映射本身。缺了它（脚本没加载）时下面几个调用点都退化成「不显示
+      等级标」—— 看得到的是「少了个功能」，而不是整套面板报错。 */
+  const reasoning = window.wbModelsReasoning;
 
   /** 当前数据（null = 还没拉到） */
   let data = null;
@@ -50,6 +66,34 @@
 
   function models() { return Array.isArray(data?.models) ? data.models : []; }
   function mappings() { return Array.isArray(data?.mappings) ? data.mappings : []; }
+
+  /**
+   * 「三元组 → 思考等级」查询闭包（由 `models-reasoning.js` 建）。
+   *
+   * 必须**每次渲染前重建一次**（见 `rebuildReasoningIndex`）：数据换了索引就得
+   * 跟着换，否则用户改完等级、列表重绘，chip 上还是旧的那个字。
+   * 初值给一个恒返回空串的闭包 —— 在第一次 render 之前调用它（理论上不会，
+   * 但弹窗是独立入口）也不会炸，只是显示成「未绑定」。
+   */
+  let reasoningOf = () => '';
+
+  function rebuildReasoningIndex() {
+    reasoningOf = reasoning?.buildIndex(mappings()) || (() => '');
+  }
+
+  /** chip 上那枚等级标（转调 `models-reasoning.js`）。
+      缺失该脚本时给空串 —— 少一枚可以点击的标，chip 名字与删除按钮照常，
+      不整块报错（与 `reasoningOf` 的兜底同一取舍）。 */
+  function badgeHtml(alias, target, provider, busy) {
+    if (!reasoning) return '';
+    return reasoning.badge({
+      alias,
+      target,
+      provider,
+      level: reasoningOf(alias, target, provider),
+      busy,
+    });
+  }
 
   /** 提供商下拉选项（id + 展示名；按数据里出现的顺序去重） */
   function providerOptions() {
@@ -144,12 +188,18 @@
   }
 
   /** 映射 chips（照抄 OmniProxy）：每条 chip 属于自己所在的那一行（提供商 ×
-      上游模型），删除时带三元组精确定位 —— 同一对外名在多行出现是主备关系 */
+      上游模型），删除时带三元组精确定位 —— 同一对外名在多行出现是主备关系。
+      绑了思考等级的 chip 在名字后面挂一枚可点的小标（`· high`），点它打开映射
+      弹窗改等级：那是这条映射上唯一的**可编辑属性**（alias / target / provider
+      是它的身份，改了就变成另一条映射），所以入口就挂在它旁边。
+      未绑定时那枚标显示「＋等级」（见 `badgeHtml`）—— 入口要一直看得见。 */
   function aliasChips(m) {
-    const chips = (m.aliases || []).map(alias =>
-      `<span class="alias${m.enabled ? '' : ' off'}"><span class="t">${esc(alias)}</span>`
-      + `<button type="button" class="x" data-act="unmap" data-alias="${esc(alias)}" data-target="${esc(m.id)}" data-provider="${esc(m.provider || '')}" title="删除映射 ${esc(alias)}">×</button></span>`).join('');
-    const add = m.hidden ? '' : `<button type="button" class="alias-add" data-act="map" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}">＋ 映射</button>`;
+    const provider = m.provider || '';
+    const chips = (m.aliases || []).map(alias => `<span class="alias${m.enabled ? '' : ' off'}">`
+      + `<span class="t">${esc(alias)}</span>`
+      + badgeHtml(alias, m.id, provider, false)
+      + `<button type="button" class="x" data-act="unmap" data-alias="${esc(alias)}" data-target="${esc(m.id)}" data-provider="${esc(provider)}" title="删除映射 ${esc(alias)}">×</button></span>`).join('');
+    const add = m.hidden ? '' : `<button type="button" class="alias-add" data-act="map" data-id="${esc(m.id)}" data-provider="${esc(provider)}">＋ 映射</button>`;
     return `<div class="aliases">${chips}${add}</div>`;
   }
 
@@ -211,6 +261,8 @@
   function render() {
     const body = $('models');
     if (!body) return;
+    // 重建思考等级索引（每次渲染一次，见 rebuildReasoningIndex 的说明）
+    rebuildReasoningIndex();
     renderProviderSeg();
     const all = models();
     const keyword = searchTerm();
@@ -313,9 +365,15 @@
         : '任意提供商';
       const key = `${mapping.alias}:${mapping.target}:${mapping.provider || ''}`;
       const busy = pending.has(key);
-      const del = `data-act="unmap" data-alias="${esc(mapping.alias)}"`
+      const triple = `data-alias="${esc(mapping.alias)}"`
         + ` data-target="${esc(mapping.target)}" data-provider="${esc(mapping.provider || '')}"`;
+      const del = `data-act="unmap" ${triple}`;
+      // 孤儿映射同样能改思考等级：那条绑定跟着映射走，映射在哪儿可编辑、
+      // 它的等级就在哪儿可编辑（否则挂不到行的映射反而成了改不了死角的配置）。
+      // `data-act` 必须是各自的（不能复用 del 那串）：事件委托按 data-act 分派，
+      // 一个按钮挂两个动作会让「点等级」变成「删映射」。
       const chips = `<span class="alias orphan"><span class="t">${esc(mapping.alias)}</span>`
+        + badgeHtml(mapping.alias, mapping.target, mapping.provider, busy)
         + `<button type="button" class="x" ${del} title="删除映射 ${esc(mapping.alias)}"${busy ? ' disabled' : ''}>×</button></span>`;
       // 两档的差异全在右半边那句小字上（表格里没有「状态」列可用，也不该为它加一列）
       //
@@ -407,6 +465,11 @@
       return;
     }
     if (act === 'map') openMapping({ target: id, provider });
+    // 点 chip 上的等级标：只改这条映射的思考等级（alias 也在上下文里，弹窗据此
+    // 进入锁定形态）。不用先弹确认框 —— 它只写一个字段，保存前还能取消。
+    if (act === 'reasoning' && alias && target) {
+      openMapping({ alias, target, provider });
+    }
   }
 
   function onTableChange(event) {
@@ -425,7 +488,9 @@
   // ─── 映射弹窗（照抄 OmniProxy 的模型映射）────────────────
 
   let mappingSaving = false;
-  /** 行内打开时锁定的上下文（提供商 + 上游模型不可改，只填对外名）；顶部按钮打开时为 null */
+  /** 行内打开时锁定的上下文；顶部按钮打开时为 null。三种入口：
+   *  `{target, provider}`（行内「＋映射」）、`{alias, target, provider}`（点 chip
+   *  上的等级标，只改等级）、以及不带上下文（顶部「添加映射」）。 */
   let mappingContext = null;
 
   /** 当前选中的上游模型（下拉值） */
@@ -433,17 +498,61 @@
     return ($('mapping-upstream')?.value || '').trim();
   }
 
-  /** 把「该家的模型清单」灌进上游下拉（打开时、切换提供商时都走它） */
-  function fillUpstreamSelect(providerId, keep) {
+  /**
+   * 把「该家的模型清单」灌进上游下拉（打开时、切换提供商时都走它）。
+   *
+   * `keep` 不在候选里时**仍把它补进去**（而不是像早先那样退回首项），
+   * 但**只在锁定态**（行内入口 / 改等级形态）这么做：
+   * 孤儿映射的 target 恰恰常常不在该家清单里（那正是它挂不上行的原因），
+   * 而它照样有自己的思考等级要改。丢掉 keep 会让弹窗里显示「这一家的第一个
+   * 模型」，用户在「设置思考等级」形态下点保存，三元组就从 (alias, target)
+   * 变成 (alias, 另一个模型) —— 命中的是另一条规则（或新建一条），
+   * 等级存到了错的地方，而界面上看不出任何异常。
+   *
+   * 解锁态（顶部「添加映射」自选提供商）不补：那里用户刚换了一家，
+   * 上一家的 target 对新家毫无意义，退回首项才是他要的。
+   */
+  function fillUpstreamSelect(providerId, keep, locked = false) {
     const select = $('mapping-upstream');
     if (!select) return;
     const options = upstreamOptions(providerId);
+    const wanted = (keep || '').trim();
+    const has = id => options.some(item => item.id.toLowerCase() === id.toLowerCase());
+    if (locked && wanted && !has(wanted)) {
+      options.unshift({
+        id: wanted,
+        label: `${wanted}（不在该家当前清单里）`,
+        off: true,
+      });
+    }
     select.innerHTML = options.map(item =>
       `<option value="${esc(item.id)}">${esc(item.label)}${item.off ? '（已禁用）' : ''}</option>`).join('');
     // 记住用户已经选过的那个：切换提供商再切回来时不该被重置
-    const wanted = keep && options.some(item => item.id === keep) ? keep : options[0]?.id || '';
-    select.value = wanted;
+    if (wanted && has(wanted)) {
+      // 用候选里的原始拼写（大小写可能与 keep 不同）：value 必须与 option 的
+      // value 逐字相同才会被选中
+      select.value = options.find(item => item.id.toLowerCase() === wanted.toLowerCase())?.id || wanted;
+    } else {
+      select.value = options[0]?.id || '';
+    }
     window.wbSelect?.sync?.(select);
+  }
+
+  /** 弹窗里那个思考等级下拉的两个元素（readonly，不缓存 DOM 引用之外的任何状态） */
+  const reasoningSelect = () => $('mapping-reasoning');
+  const reasoningCustom = () => $('mapping-reasoning-custom');
+
+  function fillReasoningSelect(keep) {
+    reasoning?.fillSelect(reasoningSelect(), reasoningCustom(), reasoning.levels(data), keep);
+  }
+
+  function syncReasoningCustom() {
+    reasoning?.syncCustom(reasoningSelect(), reasoningCustom());
+  }
+
+  /** 当前选择 → 交给后端的值（`''` = 显式清空；永不为 undefined，见文件头） */
+  function reasoningValue() {
+    return reasoning?.valueOf(reasoningSelect(), reasoningCustom()) || '';
   }
 
   function mappingPreview() {
@@ -451,7 +560,9 @@
     const upstream = upstreamValue() || '<上游模型>';
     const provider = $('mapping-provider')?.value;
     const label = providerOptions().find(item => item.id === provider)?.label || provider || '(全局)';
-    $('mapping-preview').innerHTML = `下游请求 <b>${esc(alias)}</b> → 转发 <b>${esc(upstream)}</b>（${esc(label)}）`;
+    const level = reasoningValue();
+    const suffix = level ? ` · 思考等级 <b>${esc(level)}</b>` : '';
+    $('mapping-preview').innerHTML = `下游请求 <b>${esc(alias)}</b> → 转发 <b>${esc(upstream)}</b>（${esc(label)}）${suffix}`;
   }
 
   /**
@@ -465,15 +576,45 @@
    * 而入口校验以广告视图为准 —— 手输一个清单里没有的名字，映射建了也永远调不通
    * （实测 400 `model_not_found`），只会让用户以为配好了。要用清单外的模型，
    * 得先让它进清单（刷新远程目录 / 修该家的静态表）。
+   *
+   * `context.alias` 有值时走「只改这条映射的思考等级」形态：alias 与 target
+   * 都是那一条的身份，全部锁定，只留等级可动。共用一个弹窗而不是另开一个
+   * 「设置等级」的小窗：两者要填的字段完全重合，独立窗口只会让「等级」和
+   * 「映射」在界面语言里变成两件不相干的事，而它们本就是一条记录。
    */
   function openMapping(context) {
     mappingContext = context || null;
+    // 索引在这里再建一次：本函数是**唯一**读 `reasoningOf` 的地方，而它可能被
+    // 非渲染路径调到（行内点击、将来的快捷键）。重建是一遍 Map 填充（几十到
+    // 上百项），比「依赖 render() 刚跑过」这条隐式前提划算得多 ——
+    // 那个前提一旦不成立，表现是「弹窗里的等级是空的」，而保存时会把用户
+    // 已有的绑定静默清掉。
+    rebuildReasoningIndex();
     const locked = Boolean(mappingContext);
+    /** 改等级形态：alias 也是锁定的（它来自 chip，就是那条映射的对外名） */
+    const editing = Boolean(mappingContext?.alias);
+    /** 编辑形态的提供商：它就是那条映射的属性，必须能在下拉里选中 */
+    const contextProvider = mappingContext?.provider || '';
     const options = providerOptions();
+    // ── 为什么要把上下文里那家补进候选（`providerOptions` 收不全）──────
+    // `providerOptions()` 是从**表格行**里收集的（有行才有这家），而孤儿映射
+    // 恰恰常常属于「整个没进表格」的家（那家没加账号，一个行都没有）。
+    // 不补的话 `providerSelect.value = provider` 会静默落到空串
+    //（把 value 设成不存在的选项 = 不选中任何项），用户在「设置思考等级」里
+    // 点保存就会把 provider 一起发成空 —— 三元组一变，命中的是**另一条**规则
+    //（或新建一条 provider 为 null 的旧版全局条目），等级也就存到了错的地方。
+    if (contextProvider && !options.some(item => item.id === contextProvider)) {
+      options.push({
+        id: contextProvider,
+        // 展示名走注册表（`wbProviders.labelOf`，查不到原样回显 id）——
+        // 与 orphanSection 里那句小字同一口径，不在这里另写一份 id → 名字的映射
+        label: window.wbProviders?.labelOf?.(contextProvider) || contextProvider,
+      });
+    }
     const providerSelect = $('mapping-provider');
     providerSelect.innerHTML = options.map(item =>
       `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('');
-    const provider = mappingContext?.provider || options[0]?.id || '';
+    const provider = contextProvider || options[0]?.id || '';
     providerSelect.value = provider;
     // 锁定 = 行内入口：提供商与上游模型就是这一行，不允许改（改了就变成另一条映射）
     providerSelect.disabled = locked;
@@ -484,17 +625,32 @@
     // 所以直接按 keep 灌即可；万一清单在这期间刷新过、目标已不在，仍由
     // fillUpstreamSelect 退回首项 —— 但那种情况上游下拉是禁用的，
     // 用户看到的是「这一行的模型」，不会被误导成别的选择
-    fillUpstreamSelect(provider, locked ? mappingContext.target : '');
+    // 锁定态的 keep 一定要保住（第三个参数 true，理由见 fillUpstreamSelect）
+    fillUpstreamSelect(provider, locked ? mappingContext.target : '', locked);
     // 上游下拉在锁定态也不可改：它就是这一行
     select.disabled = locked;
     window.wbSelect?.sync?.(select);
 
-    $('mapping-alias').value = '';
+    const aliasInput = $('mapping-alias');
+    aliasInput.value = editing ? mappingContext.alias : '';
+    aliasInput.disabled = editing;
+    // 等级回填：改等级形态用 chip 上那条映射的现值；新建形态一律「不覆盖」
+    //（照抄 OmniProxy 的「no override」默认值 —— 不替用户绑一个他没选的档位）
+    const current = editing ? reasoningOf(mappingContext.alias, mappingContext.target, provider) : '';
+    fillReasoningSelect(current);
+
     $('mapping-modal-status').textContent = '';
-    $('mapping-modal-title').textContent = locked ? '添加模型映射' : '添加模型映射（自选提供商与上游）';
+    $('mapping-modal-title').textContent = editing
+      ? '设置思考等级'
+      : locked ? '添加模型映射' : '添加模型映射（自选提供商与上游）';
+    $('mapping-modal-save').textContent = editing ? '保存等级' : '保存映射';
     mappingPreview();
     $('mapping-modal').classList.add('open');
-    setTimeout(() => $('mapping-alias').focus(), 0);
+    setTimeout(() => {
+      // 改等级形态没别的可填，把焦点直接放在等级下拉上
+      if (editing) $('mapping-reasoning')?.focus();
+      else aliasInput.focus();
+    }, 0);
   }
 
   function closeMapping() {
@@ -504,9 +660,11 @@
 
   async function saveMapping() {
     if (mappingSaving) return;
-    const alias = $('mapping-alias').value.trim();
+    const editing = Boolean(mappingContext?.alias);
+    const alias = editing ? mappingContext.alias : $('mapping-alias').value.trim();
     const target = upstreamValue();
     const provider = $('mapping-provider').value;
+    const reasoning = reasoningValue();
     const status = $('mapping-modal-status');
     if (!alias) { status.textContent = '请填写对外映射名'; return; }
     // 下拉为空 = 这一家清单里一个模型都没有（还没加账号 / 清单没拉到）
@@ -516,10 +674,14 @@
     $('mapping-modal-save').disabled = true;
     status.textContent = '保存中…';
     try {
-      accept(await workbuddyDesktop.addModelMapping(alias, target, provider));
+      // 第 4 个参数**总是显式给出**（空串 = 清空绑定）：
+      // 「三元组相同」走的也是这条接口，而用户在这个弹窗里看到的就是他要的结果 ——
+      // 传 undefined（= 不改）会让「从 high 改成不覆盖」这一步静默无效。
+      accept(await workbuddyDesktop.addModelMapping(alias, target, provider, reasoning));
       mappingSaving = false;
       closeMapping();
-      toast(`✅ 已添加映射 ${alias} → ${target}（${provider}）`);
+      const suffix = reasoning ? ` · 思考等级 ${reasoning}` : '';
+      toast(editing ? `✅ 已更新 ${alias} 的思考等级` : `✅ 已添加映射 ${alias} → ${target}（${provider}）${suffix}`);
     } catch (error) {
       status.textContent = `保存失败：${error.message}`;
     } finally {
@@ -643,6 +805,13 @@
   });
   $('mapping-upstream')?.addEventListener('change', mappingPreview);
   $('mapping-upstream')?.addEventListener('keydown', event => { if (event.key === 'Enter') void saveMapping(); });
+  // 等级下拉：选中「自定义等级」时露出输入框；其余值直接进预览
+  $('mapping-reasoning')?.addEventListener('change', () => {
+    syncReasoningCustom();
+    mappingPreview();
+  });
+  $('mapping-reasoning-custom')?.addEventListener('input', mappingPreview);
+  $('mapping-reasoning-custom')?.addEventListener('keydown', event => { if (event.key === 'Enter') void saveMapping(); });
   $('mapping-modal')?.addEventListener('click', event => { if (event.target === $('mapping-modal')) closeMapping(); });
 
   const refreshButton = $('btn-refresh-models');

@@ -121,7 +121,7 @@
 .report-rank-grid > .panel[hidden] { display: none; }
 
 /* ─── 排行行（两张卡共用）───
-   每行「名字 + 条 + 请求数 + 百分比」四列。用 HTML + 百分比宽度而不是 SVG：
+   每行「名字 + 条 + Token 用量 + 百分比」四列。用 HTML + 百分比宽度而不是 SVG：
    这一块没有坐标轴与刻度，条宽只要跟着容器伸缩即可，SVG 反而要多挂一个
    ResizeObserver 去量宽度重绘（三张图的观察器是给坐标轴用的，这里用不上）。
 
@@ -155,8 +155,14 @@
 .rank-shares {
   display: grid;
   /* 名字列 minmax(0, max-content)：取本卡最长名字的宽度，放不下时能一路收到 0
-     （不收的话整行会顶出卡片）；条 minmax(56px, 1fr)：保底 56px 再吃剩余空间 */
-  grid-template-columns: minmax(0, max-content) minmax(56px, 1fr) 56px 48px;
+     （不收的话整行会顶出卡片）；条 minmax(56px, 1fr)：保底 56px 再吃剩余空间。
+
+     第三列是 Token 读数，比改造前的请求数要宽：请求数最多四位（含千分位五位），
+     而 Token 读数是「8400万」「1.2亿」或英文档的「1.20M」，再加上万以内的
+     精确千分位（「9,999」五位、极端时「999,999」七位）。56px 在等宽小字下
+     刚够五到六个字符，取 68px 把这个量级放到「不必截断」的宽度上，省掉
+     一个「本来放得下却被省略号切掉」的读数。 */
+  grid-template-columns: minmax(0, max-content) minmax(56px, 1fr) 68px 48px;
   align-items: center;
   gap: 8px 10px;
   padding: 14px;

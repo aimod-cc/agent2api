@@ -29,11 +29,12 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::{json, Value};
 
+use crate::server::core::key_scope::KeyScope;
 use crate::server::core::protocol::{anthropic, responses};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
@@ -66,12 +67,18 @@ fn parse_object(
 ///
 /// 返回 `(upstream_body, outcome, telemetry, model)`。
 /// `upstream_body` 是**送给转发层**的 Chat 形态请求体（已填好模型）。
+///
+/// `scope` 是本次请求命中的网关 Key 的限制（R9，`None` = 不限制）：
+/// **提供商**那一半进转发层（选路时按承载家过滤），**模型**那一半在调用方
+/// 的 `pipeline::resolve_model` 里已经判过（见那里的说明 —— 两者分工不同：
+/// 模型是入口校验，提供商是选路过滤）。
 async fn forward_chat(
     state: &ServerState,
     payload: Value,
     client_headers: &HeaderMap,
     stream: bool,
     dedupe_key: String,
+    scope: Option<KeyScope>,
 ) -> (Arc<RequestTelemetry>, Result<ForwardOutcome, GatewayError>) {
     let telemetry = Arc::new(RequestTelemetry::with_id());
     let outcome = state
@@ -82,6 +89,7 @@ async fn forward_chat(
             dedupe_key,
             client_headers: client_headers.clone(),
             telemetry: telemetry.clone(),
+            allowed_providers: scope,
         })
         .await;
     (telemetry, outcome)
@@ -93,8 +101,13 @@ async fn forward_chat(
 pub async fn responses_endpoint(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    // R9：中间件放进请求扩展的「命中 Key 的限制」（`None` = 不限制，见
+    // `core::key_scope` 模块头）。用 `Option<Extension<_>>` 而不是裸
+    // `Extension<_>` —— 后者在免鉴权模式下取不到会直接拒绝请求。
+    key_scope: Option<Extension<KeyScope>>,
     body: Bytes,
 ) -> Response {
+    let scope = key_scope.map(|Extension(scope)| scope);
     let started_at = logging::now_ms();
     let path = "/v1/responses";
     let raw = match parse_object(&state, started_at, path, &body) {
@@ -125,8 +138,9 @@ pub async fn responses_endpoint(
         return error.payload_response();
     }
 
-    // 模型解析走公共管道（默认模型回落 / 别名映射 / 目录校验）
-    let requested_model = match pipeline::resolve_model(&state, &mut chat_body) {
+    // 模型解析走公共管道（默认模型回落 / 别名映射 / 目录校验）。
+    // 第三参是这把 Key 的可用模型白名单（None = 不限制），同 /v1/chat/completions
+    let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
             record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &error);
@@ -145,8 +159,10 @@ pub async fn responses_endpoint(
     pipeline::write_debug_files(&body, "POST", path, &user_agent);
 
     // 上游恒走流式（理由见模块头）
+    // scope 的**提供商**那一半进转发层（选路时按承载家过滤）；
+    // 模型那一半已在上面判过（分工见 forward_chat 的说明）
     let (telemetry, outcome) =
-        forward_chat(&state, chat_body, &headers, stream, pipeline::sha256_hex(&body)).await;
+        forward_chat(&state, chat_body, &headers, stream, pipeline::sha256_hex(&body), scope).await;
     let context = RecordContext {
         stats: state.request_stats(),
         telemetry,
@@ -207,8 +223,11 @@ pub async fn responses_endpoint(
 pub async fn messages_endpoint(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    // R9：同 responses_endpoint（`Option` + 取不到 = 不限制）
+    key_scope: Option<Extension<KeyScope>>,
     body: Bytes,
 ) -> Response {
+    let scope = key_scope.map(|Extension(scope)| scope);
     let started_at = logging::now_ms();
     let path = "/v1/messages";
     let raw = match parse_object(&state, started_at, path, &body) {
@@ -226,7 +245,8 @@ pub async fn messages_endpoint(
             return anthropic_error_response(&error);
         }
     };
-    let requested_model = match pipeline::resolve_model(&state, &mut chat_body) {
+    // 第三参是这把 Key 的可用模型白名单（None = 不限制），与另两条入口同源
+    let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
             record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &error);
@@ -244,8 +264,10 @@ pub async fn messages_endpoint(
     );
     pipeline::write_debug_files(&body, "POST", path, &user_agent);
 
+    // scope 的**提供商**那一半进转发层（选路时按承载家过滤）；
+    // 模型那一半已在上面判过（分工见 forward_chat 的说明）
     let (telemetry, outcome) =
-        forward_chat(&state, chat_body, &headers, stream, pipeline::sha256_hex(&body)).await;
+        forward_chat(&state, chat_body, &headers, stream, pipeline::sha256_hex(&body), scope).await;
     let context = RecordContext {
         stats: state.request_stats(),
         telemetry,

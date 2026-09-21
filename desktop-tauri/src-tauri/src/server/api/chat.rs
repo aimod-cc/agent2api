@@ -25,10 +25,10 @@
 //!
 //! ── 内容处理（脱敏）的接入位置 ──────────────────────────────
 //! 本文件**不做内容处理**：请求体按客户端原样交给转发层，去重键也取自原始
-//! 请求体。处理发生在**每家 provider 即将发送前**，按 `desensitize.json` 的
-//! `providers` 作用范围逐家判定（见 `core::upstream::payload` 的 `send_body`）
-//! —— 未勾选的提供商，无论首选还是故障转移，拿到的都是未修改的请求体；
-//! 命中日志与统计也只由在范围内的那一家产生。
+//! 请求体。处理发生在**每家 provider 即将发送前**，按脱敏配置（统一库 `kv`
+//! 表的 `desensitize` 键）里的 `providers` 作用范围逐家判定（见
+//! `core::upstream::payload` 的 `send_body`）—— 未勾选的提供商，无论首选还是
+//! 故障转移，拿到的都是未修改的请求体；命中日志与统计也只由在范围内的那一家产生。
 //!
 //! ── 请求记账（本切片接入）──────────────────────────────────
 //! 本文件是 `RequestStats::record` 的**唯一调用方**（见 `record_entry`）：
@@ -45,7 +45,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
@@ -66,8 +66,15 @@ use super::pipeline::{
 pub async fn chat_completions(
     State(state): State<ServerState>,
     headers: HeaderMap,
+    // R9：中间件放进请求扩展的「命中 Key 的限制」。`Option` 是刻意的 ——
+    // 免鉴权模式、环境变量 Key、转发链路之外的管理调用都没有它，
+    // 而「取不到 = 不限制」正是本需求的语义（见 `core::key_scope` 模块头）。
+    // axum 对 `Option<Extension<T>>` 有专门实现：取不到就是 `None`，不会像
+    // 裸 `Extension<T>` 那样直接拒绝请求（那会把整个免鉴权模式打回 500）。
+    key_scope: Option<Extension<crate::server::core::key_scope::KeyScope>>,
     body: Bytes,
 ) -> Response {
+    let scope = key_scope.map(|Extension(scope)| scope);
     // 请求开始时刻（请求统计用）。放在最前面：它要覆盖 body 解析与选路的耗时
     let started_at = logging::now_ms();
     // ① body 必须是 JSON 对象（数组/标量/null 都算非法）
@@ -104,9 +111,10 @@ pub async fn chat_completions(
 
     // ④ 模型路由走公共管道（默认模型回落 / 别名映射 / 目录校验，
     //    与另外两条协议入口逐条同源）。下游原始请求名在改写前取一次：
-    //    请求日志的「下游模型」显示的是客户端发来的名字，不是解析后的
+    //    请求日志的「下游模型」显示的是客户端发来的名字，不是解析后的。
+    //    第三参是这把 Key 的可用模型白名单（None = 不限制）
     let client_model = model_field_text(&payload);
-    let requested_model = match pipeline::resolve_model(&state, &mut payload) {
+    let requested_model = match pipeline::resolve_model(&state, &mut payload, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
             record_early_failure(&state, started_at, &model_field_text(&payload), &error);
@@ -135,6 +143,9 @@ pub async fn chat_completions(
             dedupe_key,
             client_headers: headers,
             telemetry: telemetry.clone(),
+            // 提供商白名单进转发层（选路时按承载家过滤）；模型白名单已经在
+            // `resolve_model` 里判过（见那里的说明，两者分工不同）
+            allowed_providers: scope,
         })
         .await;
     let stats = state.request_stats();
@@ -199,8 +210,23 @@ pub async fn chat_completions(
 /// 聚合查询需要账号存储判断「哪几家可用」，所以这里用 `state.store()` ——
 /// 句柄是 `Clone` 的轻量 Arc，且绝不在持锁时做网络请求（这是本项目的硬约束，
 /// 聚合层只调 `accounts_for_provider` 做一次文件读取）。
+///
+/// ── R9：带 Key 请求时只返回被授权的模型 ────────────────────────
+/// 这条路由挂在**免鉴权组**（Node 版就是不查 API Key 的只读探针），但它仍然
+/// 要认 Key：客户端带着某把 Key 来拉列表时，只该看到那把 Key 被授权的部分 ——
+/// 否则「限制」在下游看起来根本不存在（列表里有，点了却 404，是最难解释的一种）。
+/// 所以这里主动从请求头解析命中的 Key（`http::key_scope_from_headers`，
+/// 与鉴权中间件**共用同一套匹配口径**），把它的白名单交给
+/// `catalog::models_response` 在列表生成处过滤。
+///
+/// 没带 Key / 带的是没命中的 Key / 网关一把启用的 Key 都没有（免鉴权模式）：
+/// 一律**不过滤**（空 `scope`）。这是刻意的：`/v1/models` 是探针，
+/// 在客户端配好 Key 之前就会被打一次（README 的接口说明也这么写），
+/// 那种请求拿不到完整列表会让「装完先看看有哪些模型」这一步直接失效。
+/// 与 `key_scope` 模块头列的三条「不限制」情形是同一套语义。
 pub async fn list_models(State(state): State<ServerState>, headers: HeaderMap) -> Response {
-    let body = crate::server::core::providers::catalog::models_response(state.store());
+    let scope = crate::server::http::key_scope_from_headers(&headers);
+    let body = crate::server::core::providers::catalog::models_response(state.store(), scope.as_ref());
     // 异步刷新模型目录，不阻塞响应（对照 Node 的 `void refreshModelCatalog()`）
     spawn_catalog_refresh(&state);
     // Anthropic 客户端（Claude Code / Claude Desktop）走同一路径，但它们

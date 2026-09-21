@@ -248,16 +248,52 @@ pub struct ThinkingChoice {
     pub effort: Option<String>,
 }
 
-/// 把下游的思考强度映射成上游接受的值（源实现 `resolveThinking` + `chat.mjs`）。
+/// 下游请求体里表达思考档位的那个原始值（`None` = 三个键**都不存在**）。
 ///
-/// 下游可能用 `reasoning_effort` / `reasoning` / `thinking` 任一字段表达。
-pub fn resolve_thinking(body: &Value, model: &Value) -> ThinkingChoice {
-    let raw = body
-        .get("reasoning_effort")
+/// ── 语义细节：`Some(Value::Null)` 是「键在、值是 null」──────────
+/// 取值链是 `reasoning_effort` → `reasoning` → `thinking`，**命中第一个存在的
+/// 键就停**（不跳过 null）—— 这与本文件原来的写法逐字一致，改这个函数不要动
+/// 这条语义：`resolve_thinking` 的行为完全建立在它之上。
+/// 因此「没表达」与「写了 null」是两件事，调用方按自己的语义区分
+/// （`resolve_thinking` 把两者都当「未指定」处理，见那里；
+/// 适配器判「客户端指定过没有」则只看非 null 的值）。
+///
+/// ── 为什么三个键的取值链只写在这里一份 ───────────────────────
+/// 两个消费方必须同源：
+///   1. [`resolve_thinking`]（真正翻译成上游参数）；
+///   2. 适配器的 `reasoning_patch` 判「映射绑定要不要注入」—— 客户端已经显式
+///      指定时绑定不覆盖（那是比映射默认值更具体的意图）。
+/// 两处各抄一份键名清单的话，将来上游加一个别名时，绑定会开始**覆盖**一个
+/// 「客户端其实已经指定了」的请求，而那种错误没有任何日志会提示。
+pub fn declared_reasoning(body: &Value) -> Option<Value> {
+    body.get("reasoning_effort")
         .or_else(|| body.get("reasoning"))
         .or_else(|| body.get("thinking"))
         .cloned()
-        .unwrap_or(Value::Null);
+}
+
+/// 下游是不是**真的**指定了思考档位（键在且值非 null）。
+///
+/// 与 [`declared_reasoning`] 的差别只有 null 那一档，用在「映射绑定要不要让位」
+/// 的判断上。**把 null 当作「没指定」**（而不是「客户端表达过」）的两条依据：
+///   1. 同一批上游里 CatPaw 的 `resolve_effort` 就是这么做的（显式
+///      `.filter(|value| !value.is_null())` 再往后找），两家的口径应当一致；
+///   2. JSON 的可选字段写 null 是「没设」的常规写法（不少客户端会把未填的
+///      可选字段序列化成 null），把它当成一次表达会让这些客户端的绑定静默失效。
+///
+/// 代价说清：客户端若真的同时写了 `reasoning_effort: null` 与另一个键
+/// （如 `reasoning: "off"`），原实现本来也只认第一个键（见 `declared_reasoning`），
+/// 所以那个「off」在注入前后都是被忽略的 —— 这里没有引入新的覆盖。
+pub fn client_specified_reasoning(body: &Value) -> bool {
+    declared_reasoning(body).is_some_and(|value| !value.is_null())
+}
+
+/// 把下游的思考强度映射成上游接受的值（源实现 `resolveThinking` + `chat.mjs`）。
+///
+/// 下游可能用 `reasoning_effort` / `reasoning` / `thinking` 任一字段表达
+/// （取值链见 [`declared_reasoning`]）。
+pub fn resolve_thinking(body: &Value, model: &Value) -> ThinkingChoice {
+    let raw = declared_reasoning(body).unwrap_or(Value::Null);
 
     let reasoning = model.get("reasoning").map(truthy).unwrap_or(false);
     // 模型不支持思考：直接不指定

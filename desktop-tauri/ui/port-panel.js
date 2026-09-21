@@ -50,7 +50,14 @@
    *
    * 对话协议三种都写出来（Chat Completions / Responses / Anthropic Messages）：
    * 客户端支持哪种就填哪一行，三家共用同一套模型与账号池。
-   * 元素缺失（不在网关页 / 旧 DOM）时静默跳过，别让 render 崩。
+   * 元素缺失（不在「文档」页 / 旧 DOM）时静默跳过，别让 render 崩。
+   *
+   * ── 这些元素住在「文档」页（R8 从「网关 Key」页整块搬过去）──────
+   * 搬迁**没有改任何 id**，所以这里一行都不用动：本函数只按 id 找元素，
+   * 不关心它在哪个页面里。同理 clipboard.js 的 `data-copy-from` 委托也是
+   * 全局的（document 级事件），复制按钮跟着 DOM 一起搬就继续可用。
+   * 这也是当初把 id 定成 `api-*` 而不是「按页面命名」的收益：位置换了，
+   * 引用点零改动。
    */
   function paintGatewayAddress(base) {
     const paint = (id, text) => {

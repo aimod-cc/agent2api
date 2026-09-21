@@ -1,21 +1,46 @@
 //! 账号存储句柄：CRUD、当前账号派生、凭证/会话查询、限额标记、启动迁移。
 //!
 //! 对照 workbuddy-account-store.mjs 的 `createAccountStore` 返回值逐条移植。
-//! 三条硬约束写在 `super::mod` 的头部：未知字段全量保留、优先级**在 provider 内**
-//! 唯一、provider 字段缺失时按 workbuddy 兜底。
+//! 三条硬约束写在 `super::mod` 的头部：未知字段全量保留、优先级**全局唯一**
+//! （所有提供商共用一条队列 —— 不是在 provider 内唯一，那是加多 provider 之前
+//! 的旧口径）、provider 字段缺失时按 workbuddy 兜底。
+//! 「全局唯一」的判据落在 `sql::priority_holder` 的 SQL 上（它**不带** provider
+//! 条件），写入侧冲突一律 409，详见 `priority.rs` 模块头。
+//!
+//! ── 持久化：`accounts.json` → SQLite `accounts` 表（本切片的改造）────
+//! 数据从 `{config_dir}/accounts.json` 换到 `{config_dir}/agent2api.db` 的
+//! `accounts` 表（表结构见 `server/db/schema.rs`）。**对外契约一字未改**：
+//! 本文件的 `pub fn` 签名、返回值、错误码全部与改造前相同，调用方
+//! （`api::accounts`、`auth`、`routing`、各 provider 适配器）零改动。
+//!
+//! 行级 SQL 与投影列的口径集中在 `sql.rs`（账号存储里唯一出现 SQL 的文件）。
+//! 这里只负责：句柄与锁、`AccountState` ↔ 表的两个端点、以及派生逻辑。
+//!
+//! ── 锁还在，但它保护的东西变了 ──────────────────────────────
+//! `guard()` 仍然是那把 `Mutex<()>`，`with_lock` / `load_locked` / `save_locked`
+//! 的签名也**必须**保持不变（`account_transfer` 直接用它们，见那边的模块头）。
+//! 变化在于它保护的**不是文件**了：以前它串行化「整份文件读-改-写」，
+//! 现在它串行化「数据库上的一次读改写周期」。语义等价 —— 两边都是「同一时刻
+//! 只有一个账号域的写者」，而数据库自己的事务保证单次写入的原子性。
+//! 为什么还要留着这把锁而不是全靠 SQLite：账号层的**读-改-写**（读出一条 →
+//! 在 Rust 里改 → 写回）跨了多条语句，中间必须有东西挡住另一个写者；
+//! SQLite 的事务做不到这件事，因为「改」发生在 Rust 内存里、不在事务范围内。
+//!
+//! 硬约束不变：持锁期间绝不做网络请求（见 super::mod 头部说明）。
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
+use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::{
     AccountState, CredentialsById, CurrentEntry, SessionById, StoredAccount,
 };
-use crate::server::core::account_store::store_util::{js_truthy, value_or, value_or_nullish};
-use crate::server::core::endpoints::{resolve_edition, EditionInfo};
+use crate::server::core::endpoints::resolve_edition;
 use crate::server::core::providers::DEFAULT_PROVIDER_ID;
-use crate::server::core::proxies::{describe_account_proxy, resolve_account_proxy, ProxyResolution};
+use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution};
+use crate::server::db::Db;
 
 /// 账号存储错误（对应 Node 版 AccountStoreError，带状态码 → 路由层直接用）。
 #[derive(Clone, Debug)]
@@ -36,16 +61,25 @@ impl AccountStoreError {
     pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(message, 404)
     }
-}
 
+    /// 数据库不可用（连接打开失败，或打开后被判定中毒）。
+    ///
+    /// 取 **500 + 一句可读原因**：账号是网关的核心数据，没有库就没有账号可用，
+    /// 这不是「某个字段没填对」那种 400，也不是「这条记录不存在」那种 404 ——
+    /// 是服务端自身没有可用的存储。状态码与改造前的「账号文件保存失败: …」
+    /// 一致（那条同样是 500），因此前端与路由层的分支一行都不用改。
+    pub(crate) fn storage_unavailable(reason: &str) -> Self {
+        Self::new(
+            format!("账号数据库不可用（{reason}）：请检查磁盘空间与配置目录权限后重启应用"),
+            500,
+        )
+    }
+}
 impl std::fmt::Display for AccountStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.message)
     }
 }
-
-/// 账号文件名（Node 版 `join(directory, 'accounts.json')`）
-const FILE_NAME: &str = "accounts.json";
 
 /// 共享的账号存储。
 ///
@@ -59,27 +93,74 @@ pub struct AccountStore {
 }
 
 struct Inner {
+    /// SQLite 句柄。`None` = 数据库打开失败（启动时已记日志）。
+    ///
+    /// ── 为什么不做「文件回退」─────────────────────────────────
+    /// 一个自然的想法是：库不可用时退回读写 `accounts.json`，让账号功能照常。
+    /// 不做，理由有三条：
+    ///   1. **回退路径永远没人测**。数据库打不开是罕见故障（磁盘满、权限、
+    ///      库损坏），而回退分支只在那种时刻才被执行 —— 它是一段只在上线机器
+    ///      上第一次运行的代码，本身就是新的故障源。真到那一刻，用户要的是
+    ///      「一句能读懂的错误」，不是「看起来还能用、但数据写进了另一份文件、
+    ///      下次数据库恢复后两边对不上」。
+    ///   2. **两套实现会让口径分叉**。项目的三条不变量（未知字段全量保留、
+    ///      优先级唯一、provider 兜底）在两套存储上各有实现，改一处忘一处是
+    ///      必然的；而账号数据丢了是**不可逆**的用户损失。
+    ///   3. **失败要吵，不要静默**。`None` 让每个账号操作显式报 500，
+    ///      用户在界面上立刻看到「账号数据库不可用」，而不是过几天才发现
+    ///      「我改的账号怎么没保存」。
+    /// 与之相对，`Db::open` 失败**不阻断启动**（网关仍能跑转发、日志、模型）——
+    /// 这是 `ServerState::bootstrap` 已有的决定，本层只是如实承接它的后果。
+    db: Option<Db>,
+    /// 库文件的**约定路径**（`{config_dir}/agent2api.db`）。
+    ///
+    /// 为什么单独存一份：`file()` / `file_string()` 的契约是「给出账号数据所在的
+    /// 文件位置」，而它有两个消费方都要求这个值非空 —— `/api/session` 的
+    /// `authFile`（显示在面板的「凭证文件」一栏）与 `ServerState::bootstrap`
+    /// 的启动日志。数据库打开失败时若返回空串或空路径，用户看到的是「位置字段
+    /// 是空的」而不是「库没打开」，排查方向会被带偏。
+    /// 库正常时这个值只是备份信息（`Db::file()` 才是权威），因此不该让调用方
+    /// 自己拼路径去猜 —— 拼法只在本层有一份。
     file_path: PathBuf,
-    directory: PathBuf,
-    /// 串行化「读-改-写」整个周期；只保护文件读写与内存构造，不保护网络请求
+    /// 串行化「读-改-写」整个周期；只保护账号域的数据库访问，不保护网络请求
     lock: Mutex<()>,
 }
 
 impl AccountStore {
-    /// 构造存储句柄（不读盘；首次访问才落 IO）
-    pub fn new(directory: PathBuf) -> Self {
-        let file_path = directory.join(FILE_NAME);
+    /// 用数据库句柄构造（**本切片起的主流构造方式**）。
+    ///
+    /// `db` 为 `None` 表示数据库打不开：不阻断构造（`ServerState::bootstrap`
+    /// 需要能继续把状态装起来），但所有账号操作都会以 500 拒绝，理由见
+    /// `Inner::db` 的注释。
+    ///
+    /// `file_path` 由 `db` 自己给出（`Db::file()`），于是「库在哪」这件事只有
+    /// `Db` 一个事实来源；`db` 为 `None` 时退回约定路径（见 `Inner::file_path`）。
+    pub fn with_db(db: Option<Db>) -> Self {
+        let file_path = match db.as_ref() {
+            Some(db) => db.file().to_path_buf(),
+            None => crate::server::config::config_dir().join(crate::server::db::FILE_NAME),
+        };
         Self {
-            inner: Arc::new(Inner { file_path, directory, lock: Mutex::new(()) }),
+            inner: Arc::new(Inner { db, file_path, lock: Mutex::new(()) }),
         }
     }
 
-    /// 使用全局配置目录（`~/.agent2api`）
-    pub fn with_config_dir() -> Self {
-        Self::new(crate::server::config::config_dir())
-    }
+    // ── 改造中**删掉**的构造函数：`with_config_dir()` ──────────────
+    // 它原本是「记住配置目录，读写时现拼 accounts.json 路径」。账号数据搬到
+    // 库里之后它没有存在价值，且有**实际危害**：它会自己 `Db::open` 一次，
+    // 于是同一个库上出现**第二条连接 + 第二把账号锁** —— 而账号层的读-改-写
+    // 跨多条语句，两把锁互相不可见，两条 store 句柄会交错覆盖对方的修改。
+    // 项目里已经有一条针对这个坑的注释（`providers::adapter` 的
+    // 「自己再造一个就成了绕过主句柄的第二把锁」），留着这个入口等于把那个坑
+    // 摆在手边。唯一调用点（`ServerState::bootstrap`）已经改为把自己打开的
+    // `Db` 传进来，所以这里直接删掉，而不是留一个无人调用的构造器配
+    // `#[allow(dead_code)]` 说明。
 
-    /// accounts.json 的完整路径（`/api/session` 的 authFile 字段用它）
+    /// 账号数据所在的**库文件**路径（`/api/session` 的 authFile 字段用它）。
+    ///
+    /// 语义从「账号文件」变成「装着账号数据的库文件」—— 这个字段显示在面板上
+    /// 的「凭证文件」一栏，用户据此知道数据落在哪、该备份什么。库没打开时给的
+    /// 是**约定路径**（而非空路径），理由见 `Inner::file_path`。
     pub fn file(&self) -> &Path {
         &self.inner.file_path
     }
@@ -88,15 +169,30 @@ impl AccountStore {
         self.inner.file_path.to_string_lossy().to_string()
     }
 
-    /// 文件是否已存在（Node 版账号存储导出的 `existsSync: () => existsSync(filePath)`）。
-    /// 当前管理 API 未调用，保留作为该导出的对等物，便于后续「账号文件是否落盘」判定。
+    /// 账号数据是否已落盘（Node 版账号存储导出的
+    /// `existsSync: () => existsSync(filePath)` 的对等物）。
+    ///
+    /// 语义随存储一起变化：从「`accounts.json` 这个文件在不在」变成
+    /// 「装着账号的库文件在不在」。当前管理 API 未调用，保留作为该导出的对等物，
+    /// 便于后续「账号数据是否落盘」判定。
     #[allow(dead_code)]
     pub fn exists(&self) -> bool {
-        self.inner.file_path.exists()
+        self.file().exists()
     }
 
     /// 取锁；锁中毒（某次持锁 panic）不致命：直接接管内部数据继续用，
     /// 总好过让所有管理 API 永久 500。
+    ///
+    /// ── 为什么这里接管、而 `Db::with` 那边返回 None ─────────────
+    /// 两者的取向看似矛盾，其实判据不同：这把锁保护的是**锁本身要串行化的那个
+    /// 周期**（不含数据），它中毒说明某次账号操作 panic 了，锁内的数据（这里
+    /// 根本没有内存数据）没有中间态可言 —— 接管后照常去数据库读写即可，
+    /// 而数据库自己的事务保证每次写入是原子的。
+    /// `Db::with` 那边不同：它持的是**连接**，panic 可能打断一个未提交的事务，
+    /// 接管后会读到半截数据（详见那边的注释）。所以那边保守回落，这边照常接管。
+    ///
+    /// 数据库不可用的判定**不在这里**（这里没有返回值可以表达它）—— 每个操作
+    /// 都经 `with_conn` / `with_conn_mut` 取连接，那两个函数负责返回错误。
     pub(crate) fn guard(&self) -> MutexGuard<'_, ()> {
         match self.inner.lock.lock() {
             Ok(guard) => guard,
@@ -104,74 +200,101 @@ impl AccountStore {
         }
     }
 
-    /// 读磁盘（缺失/损坏都当空列表，对应 Node 版 load 的 catch 分支）
+    /// 在已持锁的前提下执行一段数据库操作；库不可用或 SQL 出错时返回 Err。
+    ///
+    /// 这是本文件里访问数据库的**唯一入口**：`_guard` 参数不是装饰 —— 它把
+    /// 「必须持锁」这条纪律写进签名（Rust 不允许凭空造一个 `MutexGuard`），
+    /// 于是「忘了加锁」在编译期就不成立。参数名带下划线只表示函数体不读它。
+    ///
+    /// SQL 错误一律转成 500：与改造前「账号文件保存失败: {io error}」同级
+    /// （那次也是 500）—— 数据库写入失败就是服务端存储出了问题，不是用户输入
+    /// 的问题。错误文案里带上底层原因，用户与排障都能看到是哪一步坏了。
+    pub(crate) fn with_conn<T>(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        action: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, AccountStoreError> {
+        let Some(db) = self.inner.db.as_ref() else {
+            return Err(AccountStoreError::storage_unavailable("数据库未打开"));
+        };
+        db.with(|conn| action(conn))
+            .ok_or_else(|| AccountStoreError::storage_unavailable("连接不可用（已标记中毒）"))?
+            .map_err(|error| AccountStoreError::new(format!("账号数据库操作失败: {error}"), 500))
+    }
+
+    /// 与 [`with_conn`] 同理，但给 `&mut Connection` —— **需要事务的批量写用这个**。
+    ///
+    /// `save_state`（整份状态的差异写入）与 `batch_update` / `batch_remove` /
+    /// `migrate_startup` 走它：它们的写入要么全成、要么全不成。
+    pub(crate) fn with_conn_mut<T>(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        action: impl FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, AccountStoreError> {
+        let Some(db) = self.inner.db.as_ref() else {
+            return Err(AccountStoreError::storage_unavailable("数据库未打开"));
+        };
+        db.with_mut(|conn| action(conn))
+            .ok_or_else(|| AccountStoreError::storage_unavailable("连接不可用（已标记中毒）"))?
+            .map_err(|error| AccountStoreError::new(format!("账号数据库操作失败: {error}"), 500))
+    }
+
+    /// 读全部账号（**语义要求整份数据**的路径用它，见 `sql::load_all`）。
+    ///
+    /// 库不可用时返回**空列表**而不是报错：这个函数的签名（`pub`，且被
+    /// `load_locked` 直接透出）没有表达失败的位置，而它的消费方多是「读快照
+    /// 做展示/派生」—— 拿不到账号就是「没有可用账号」，各调用方本来就要处理
+    /// 这个分支（未登录、无可用账号）。反过来，**写入**路径一律返回
+    /// `Result`，数据库不可用时明确报 500，绝不让写操作静默成功。
     pub(crate) fn load(&self, _guard: &MutexGuard<'_, ()>) -> AccountState {
-        let Ok(text) = std::fs::read_to_string(&self.inner.file_path) else {
+        let Some(db) = self.inner.db.as_ref() else {
             return AccountState::default();
         };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else {
-            return AccountState::default();
-        };
-        // 根必须是对象（数组/标量都当损坏，与 Node 的 `Array.isArray(json)` 判断一致）
-        if !value.is_object() {
-            return AccountState::default();
-        }
-        let accounts = value
-            .get("accounts")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| StoredAccount::from_value(item.clone()))
-                    .collect()
-            })
+        let accounts = db
+            .with(|conn| sql::load_all(conn))
+            .and_then(Result::ok)
             .unwrap_or_default();
-        let priority_scope = value
-            .get("priorityScope")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let priority_scope = db
+            .with(|conn| sql::load_priority_scope(conn))
+            .and_then(Result::ok)
+            .flatten();
         AccountState { accounts, priority_scope }
     }
 
-    /// 写磁盘：缩进 2 空格（与 Node 的 `JSON.stringify(state, null, 2)` 一致），
-    /// 目录不存在时自动创建。
-    pub(crate) fn save(&self, state: &AccountState, _guard: &MutexGuard<'_, ()>) -> Result<(), AccountStoreError> {
-        if let Err(error) = std::fs::create_dir_all(&self.inner.directory) {
-            return Err(AccountStoreError::new(
-                format!("账号文件保存失败: {error}"),
-                500,
-            ));
-        }
-        let mut payload = json!({
-            "accounts": state.accounts.iter().map(StoredAccount::to_value).collect::<Vec<_>>(),
-        });
-        if let (Some(scope), Some(object)) = (&state.priority_scope, payload.as_object_mut()) {
-            object.insert("priorityScope".to_string(), Value::String(scope.clone()));
-        }
-        let text = match serde_json::to_string_pretty(&payload) {
-            Ok(text) => text,
-            Err(error) => {
-                return Err(AccountStoreError::new(
-                    format!("账号文件保存失败: {error}"),
-                    500,
-                ))
-            }
-        };
-        if let Err(error) = std::fs::write(&self.inner.file_path, text) {
-            return Err(AccountStoreError::new(
-                format!("账号文件保存失败: {error}"),
-                500,
-            ));
-        }
-        Ok(())
+    /// 写回全部账号（**按差异写**，见 `sql::save_state`）。
+    ///
+    /// 这个入口只服务「本来就是整份集合的操作」，眼下三处调用：
+    ///   - `account_transfer::import_accounts`（导入合并，经 `save_locked`）；
+    ///   - `promote_to_front`（置顶要整队重新编号，见 `store_crud.rs`）；
+    ///   - `migrate_startup`（启动迁移的整队与拆池改名，见 `store_admin.rs`）。
+    /// **不属于它的**：单条增删改（各自只碰一行，走 `sql::put` /
+    /// `sql::update_in_place` / `sql::delete`）；批量操作与三家旧数据导入
+    /// （都只需要「逐条写自己那几行」，各自在 `with_conn_mut` 里开事务、
+    /// 直接调 `sql::*`，不经过这里）。
+    /// 换句话说：走到这个函数的都是「手上的 `AccountState` 就是完整目标状态」
+    /// 的场景，`save_state` 的按 id 差异比对才有意义。
+    ///
+    /// ── 错误文案为什么不再是「账号文件保存失败」──────────────
+    /// 那个措辞（以及它带来的 500）是改造前唯一的一个 500 来源，现在账号数据
+    /// 不再有「文件」这个概念 —— 留着它会让用户按「文件」的方向去排查
+    /// （找 accounts.json、查文件锁、看磁盘权限），而真实原因在数据库那边。
+    /// 状态码仍是 500（前端与路由层不按文案分支），文案改由 `with_conn_mut`
+    /// 统一给出「账号数据库操作失败: {底层原因}」，底层原因里带着 SQLite 的
+    /// 错误码与原话 —— 排障需要的那条信息比旧文案更具体。
+    pub(crate) fn save(
+        &self,
+        state: &AccountState,
+        guard: &MutexGuard<'_, ()>,
+    ) -> Result<(), AccountStoreError> {
+        self.with_conn_mut(guard, |conn| sql::save_state(conn, state))
     }
 
-    /// 供导入导出子模块复用：在已持锁的前提下读盘
+    /// 供导入导出子模块复用：在已持锁的前提下读全部账号
     pub fn load_locked(&self, guard: &MutexGuard<'_, ()>) -> AccountState {
         self.load(guard)
     }
 
-    /// 供导入导出子模块复用：在已持锁的前提下写盘
+    /// 供导入导出子模块复用：在已持锁的前提下写回全部账号
     pub fn save_locked(
         &self,
         state: &AccountState,
@@ -184,6 +307,39 @@ impl AccountStore {
     pub fn with_lock<T>(&self, action: impl FnOnce(&MutexGuard<'_, ()>) -> T) -> T {
         let guard = self.guard();
         action(&guard)
+    }
+
+    /// 按 id 取一条记录（**只读一行**；不存在或数据库不可用时 None）。
+    ///
+    /// 给「已经知道账号 id」的读路径用：`get_credentials_by_id` /
+    /// `get_session_by_id` 与各家的 `*_account_record`。改造前它们都要
+    /// 「读全量 → 在数组里 find」，现在是一次主键查询 —— 转发链路上这些函数
+    /// 是**每个请求**都会调到的（`rotate` 按 id 取会话、适配器按 id 取记录），
+    /// 于是「每次转发少解析 20 条记录的 JSON」是这条改造里收益最直接的一处。
+    pub(crate) fn record_by_id(&self, _guard: &MutexGuard<'_, ()>, id: &str) -> Option<StoredAccount> {
+        let db = self.inner.db.as_ref()?;
+        db.with(|conn| sql::load_by_id(conn, id))
+            .and_then(Result::ok)
+            .flatten()
+    }
+
+    /// 取某个 provider 的全部账号（**只读这一家**）。
+    ///
+    /// `current_entry_for_provider` / `accounts_for_provider` 用它：两者的语义
+    /// 都收窄在一家之内（「这一家的队首」/「这一家的启用账号」），
+    /// 没有理由把别家的记录也读出来解析。过滤条件落在投影列 `provider` 上
+    /// （该列的取值口径见 `sql.rs` 模块头）。
+    pub(crate) fn records_for_provider(
+        &self,
+        _guard: &MutexGuard<'_, ()>,
+        provider: &str,
+    ) -> Vec<StoredAccount> {
+        let Some(db) = self.inner.db.as_ref() else {
+            return Vec::new();
+        };
+        db.with(|conn| sql::load_by_provider(conn, provider))
+            .and_then(Result::ok)
+            .unwrap_or_default()
     }
 
     // ─── 派生：当前账号 ──────────────────────────────────────
@@ -242,6 +398,9 @@ impl AccountStore {
     }
 
     /// 全局「当前账号」id（无账号或全部不可用时为 None）—— 全局队首，见 `pick_current`。
+    ///
+    /// 这里必须读**全部**账号：队首是跨家的全局派生（`pick_current` 要在所有
+    /// provider 里比优先级），收窄到某一家就没有意义了。
     pub fn current_account_id(&self) -> Option<String> {
         let _guard = self.guard();
         let state = self.load(&_guard);
@@ -276,16 +435,14 @@ impl AccountStore {
     /// （见 `session_from_record`）。只认 `has_token()` 会让这台机器上
     /// 小浣熊永远选不中账号，转发直接 401。
     ///
-    /// 返回 None 表示该 provider 在账号文件里没有可用账号（此时
+    /// 返回 None 表示该 provider 在账号数据里没有可用账号（此时
     /// `auth::get_current_session_for` 会尝试该 provider 的环境变量旁路）。
     pub fn current_entry_for_provider(&self, provider: &str) -> Option<CurrentEntry> {
         let _guard = self.guard();
-        let state = self.load(&_guard);
-        let mut candidates: Vec<StoredAccount> = state
-            .accounts
-            .iter()
-            .filter(|item| item.provider() == provider && item.enabled() && item.has_credentials())
-            .cloned()
+        let records = self.records_for_provider(&_guard, provider);
+        let mut candidates: Vec<StoredAccount> = records
+            .into_iter()
+            .filter(|item| item.enabled() && item.has_credentials())
             .collect();
         candidates.sort_by_key(StoredAccount::order_key);
         let record = candidates.into_iter().next()?;
@@ -307,7 +464,7 @@ impl AccountStore {
     /// 因此这里把 auth.json 的实时值填进 `auth` —— 否则转发链路的
     /// `has_access_token` 判定会把它当成没有登录态（401），而小浣熊适配器
     /// 也正是从 `auth.accessToken` 取 Authorization 头的。
-    /// 读盘失败（文件缺失/损坏）时退化成空 token：让上层的 401 文案去说明原因，
+    /// 读不到客户端登录态时退化成空 token：让上层的 401 文案去说明原因，
     /// 本函数不制造错误（它是被 CRUD 与选路大量复用的纯取值路径）。
     fn session_from_record(&self, record: &StoredAccount) -> Value {
         let edition = resolve_edition(record.edition().as_deref());
@@ -360,9 +517,8 @@ impl AccountStore {
     /// 「有没有可用凭证」在全仓是一条判据，不能因为凭证存在别处就分叉。
     pub fn get_credentials_by_id(&self, id: &str) -> Option<CredentialsById> {
         let _guard = self.guard();
-        let state = self.load(&_guard);
-        let record = state.accounts.iter().find(|item| item.id() == id)?;
-        let live = live_desktop_credentials(record);
+        let record = self.record_by_id(&_guard, id)?;
+        let live = live_desktop_credentials(&record);
         let (access_token, refresh_token, expires_at) = match live {
             Some(credentials) => credentials,
             None => (
@@ -400,8 +556,7 @@ impl AccountStore {
     /// 指定账号的完整会话形态（Node 版 getSessionById）；不存在/无凭证时 None
     pub fn get_session_by_id(&self, id: &str) -> Option<SessionById> {
         let _guard = self.guard();
-        let state = self.load(&_guard);
-        let record = state.accounts.iter().find(|item| item.id() == id)?;
+        let record = self.record_by_id(&_guard, id)?;
         if !record.has_credentials() {
             return None;
         }
@@ -409,292 +564,10 @@ impl AccountStore {
         let (proxy, proxy_error) = split_resolution(resolution);
         Some(SessionById {
             id: record.id().to_string(),
-            session: self.session_from_record(record),
+            session: self.session_from_record(&record),
             proxy,
             proxy_error,
         })
-    }
-
-    // ─── 公开形态 ────────────────────────────────────────────
-
-    /// 记录 → 公开形态（对照 Node 版 `toPublicAccount`，字段逐个对齐）。
-    ///
-    /// 注意几处 `||` / `??` 的差别：`prefixPath` 是 `??`（空串有效），
-    /// `endpoint` 是 `||`（空串回落版本默认值）；`name` 在 Node 里没有兜底，
-    /// 因此这里也是「缺失则不出键」而不是补空串。
-    pub(crate) fn to_public_account(&self, record: &StoredAccount) -> Value {
-        let edition: &'static EditionInfo = resolve_edition(record.edition().as_deref());
-        let fields = record.fields();
-        let mut public = Map::new();
-        public.insert("id".to_string(), Value::String(record.id().to_string()));
-        // 所属提供商（Agent2API 改造新增字段）：缺失时按 workbuddy 兜底，
-        // 保证界面拿到的每条账号都能直接分组，不必自己判断「没有 provider = 老数据」
-        public.insert(
-            "provider".to_string(),
-            Value::String(record.provider()),
-        );
-        // name 无兜底：原样透出（含非字符串的脏值），缺失时不出现该键
-        if let Some(value) = fields.get("name") {
-            public.insert("name".to_string(), value.clone());
-        }
-        public.insert(
-            "uid".to_string(),
-            value_or(fields.get("uid"), Value::String(String::new())),
-        );
-        public.insert(
-            "nickname".to_string(),
-            value_or(fields.get("nickname"), Value::String(String::new())),
-        );
-        public.insert(
-            "type".to_string(),
-            value_or(fields.get("type"), Value::String("personal".to_string())),
-        );
-        public.insert(
-            "enterpriseId".to_string(),
-            value_or(fields.get("enterpriseId"), Value::String(String::new())),
-        );
-        public.insert(
-            "enterpriseName".to_string(),
-            value_or(fields.get("enterpriseName"), Value::String(String::new())),
-        );
-        public.insert(
-            "tokenTail".to_string(),
-            value_or(fields.get("tokenTail"), Value::String(String::new())),
-        );
-        public.insert(
-            "expiresAt".to_string(),
-            value_or(fields.get("expiresAt"), Value::Null),
-        );
-        public.insert(
-            "hasRefreshToken".to_string(),
-            Value::Bool(
-                fields
-                    .get("refreshToken")
-                    .map(js_truthy)
-                    .unwrap_or(false),
-            ),
-        );
-        public.insert(
-            "prefixPath".to_string(),
-            value_or_nullish(
-                fields.get("prefixPath"),
-                Value::String(edition.prefix_path.to_string()),
-            ),
-        );
-        public.insert(
-            "endpoint".to_string(),
-            value_or(
-                fields.get("endpoint"),
-                Value::String(edition.endpoint.to_string()),
-            ),
-        );
-        public.insert("edition".to_string(), Value::String(edition.id.to_string()));
-        public.insert(
-            "editionLabel".to_string(),
-            Value::String(edition.label.to_string()),
-        );
-        public.insert("priority".to_string(), Value::from(record.priority()));
-        public.insert("enabled".to_string(), Value::Bool(record.enabled()));
-        public.insert("addedAt".to_string(), Value::from(record.added_at()));
-        public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
-        public.insert(
-            "proxy".to_string(),
-            describe_account_proxy(Some(&value_or(fields.get("proxy"), Value::Null))),
-        );
-        // Node 是 `record.rateLimits || {}`：任何真值都原样透出
-        // （手工写成数组/字符串时也照透，前端按对象读会得到 undefined，
-        // 与 Node 的行为保持一致比「顺手修正」重要）
-        public.insert(
-            "rateLimits".to_string(),
-            value_or(fields.get("rateLimits"), Value::Object(Map::new())),
-        );
-        // 本切片所有账号都视为可用（限额/可用性判定属切片 3 的转发层）
-        public.insert("available".to_string(), Value::Bool(true));
-        Value::Object(public)
-    }
-
-    /// 账号列表快照 `{ currentAccountId, currentAccountIds, accounts: [...], providers: [...] }`。
-    ///
-    /// accounts 按**文件顺序**返回（与 Node 版一致）—— 界面自己按优先级排序，
-    /// 不要在这里改成优先级序，否则与 Node 版的行为就分叉了。
-    ///
-    /// ── 「当前账号」的两个字段 ──────────────────────────────
-    ///   · `currentAccountId`：**全局队首**（`pick_current`：启用 + 有可用凭证 +
-    ///     优先级序），与 `/api/session` 的 `session.currentAccountId` 同源。
-    ///     账号页的 ★ / 「首选」读这个。
-    ///   · `currentAccountIds`：provider → 该家队首账号 id（逐家派生，
-    ///     `pick_current_for_provider`）。全局队列之后它只剩「这一家有没有可用账号」
-    ///     的参考意义，保留是为了不破坏读它的旧客户端。
-    ///
-    /// `providers` 是 provider 摘要（`{id,label,count}`）：
-    /// 界面用它渲染账号页的分组标题与「作用提供商」多选，因此**必须在列表接口
-    /// 上就给出**，前端不必再发第二个请求。计数是各 provider 的账号**总数**
-    /// （含禁用账号）—— 与分组标题显示的「N 个账号」口径一致。
-    pub fn list_accounts(&self) -> Value {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
-        self.snapshot(&state)
-    }
-
-    /// 已持锁时的列表快照（CRUD 内部要在同一次锁里连做「写盘 + 取快照」）
-    pub(crate) fn snapshot(&self, state: &AccountState) -> Value {
-        // 逐家派生队首：provider 取值的来源就是账号文件里出现过的家
-        // （含手工塞进来的未知 id —— 它们也有自己的队首，不该被静默忽略）
-        let mut current_ids = Map::new();
-        for record in &state.accounts {
-            let provider = record.provider();
-            if current_ids.contains_key(&provider) {
-                continue;
-            }
-            let head = Self::pick_current_for_provider(&state.accounts, &provider)
-                .map(|record| Value::String(record.id().to_string()))
-                .unwrap_or(Value::Null);
-            current_ids.insert(provider, head);
-        }
-        let global_current = Self::pick_current(&state.accounts)
-            .map(|record| Value::String(record.id().to_string()))
-            .unwrap_or(Value::Null);
-        json!({
-            "currentAccountId": global_current,
-            "currentAccountIds": Value::Object(current_ids),
-            "accounts": state
-                .accounts
-                .iter()
-                .map(|record| self.public_account(record))
-                .collect::<Vec<_>>(),
-            "providers": self.provider_summary(state),
-        })
-    }
-
-    /// 记录 → 公开形态（**按 provider 分派**）。
-    ///
-    /// 各家的公开字段集不同：workbuddy 有 uid/nickname/edition/enterprise…，
-    /// 小浣熊有 userId/tokenExpiresAt/desktop 且**没有**积分字段（架构文档 §5/§6），
-    /// CatPaw 有 uid/loginName/tokenTail/desktop 且**没有**积分/签到（W5-T-d4）。
-    /// 分派点放在这里，调用方（列表快照、批量目标解析、限额事件日志）
-    /// 一行都不用改 —— 它们拿到的就是各自 provider 该有的形状。
-    ///
-    /// 兜底分支给的是 **workbuddy 形状**，这对**未知** provider id 是刻意的
-    /// （与 `StoredAccount::provider()` 的容错口径一致：手改文件塞进来的陌生 id
-    /// 至少还能在界面上显示出来）。AutoClaw 现在**加不了账号**
-    /// （`api::accounts::add_account` 显式 400），将来它的公开形态在适配器接线
-    /// 波次里补一个分支即可 —— 那条分支落地前，万一有手改的账号记录落进这里，
-    /// 走 workbuddy 形状总比整条列表报错好。
-    ///
-    /// ── `hasCredentials` / `chatSupported`：统一注入的**跨家事实** ──────
-    /// 在这里**统一注入**而不是改各家的公开形态函数：判据只有一条
-    /// （`has_credentials` / 适配器的 `supports_chat`），而「谁有凭证」「谁能转发」
-    /// 正是转发选路与「当前账号」派生共用的那两道闸门。前端要按模型
-    /// 自行推算「这一家此刻会走谁」时（后端只给不限模型的队首），必须拿得到同一
-    /// 事实，否则会出现「界面标 ★ 的账号其实转发时会因无凭证被跳过」的分歧。
-    /// 放在分派点让各家形状**同字段名、同语义**，前端不必按 provider 查表。
-    ///
-    /// 纯新增字段：各家的既有字段一个不动，旧客户端忽略它即可。
-    pub(crate) fn public_account(&self, record: &StoredAccount) -> Value {
-        let shaped = if record.provider() == super::RACCOON_PROVIDER_ID {
-            self.to_raccoon_public_account(record)
-        } else if record.provider() == super::CATPAW_PROVIDER_ID {
-            self.to_catpaw_public_account(record)
-        } else if record.provider() == super::AUTOCLAW_PROVIDER_ID {
-            self.to_autoclaw_public_account(record)
-        } else if record.provider() == super::QODER_PROVIDER_ID {
-            self.to_qoder_public_account(record)
-        } else if super::is_cline_family(&record.provider()) {
-            // 两个池（`cline-free` / `cline-pass`）共用这一份公开形态
-            self.to_cline_public_account(record)
-        } else {
-            self.to_public_account(record)
-        };
-        match shaped {
-            Value::Object(mut fields) => {
-                fields.insert(
-                    "hasCredentials".to_string(),
-                    Value::Bool(record.has_credentials()),
-                );
-                // 没有转发能力的家：界面据此说明「启用了也不会被转发」，
-                // 而不是把一个失效的启用开关当成正常账号展示。
-                // 五家现在都能转发，所以正常配置下这里恒为 true ——
-                // 保留这个字段是因为「能用账号管理、但转发还没接上」这种过渡期
-                // 状态将来还会出现，而界面需要有办法如实说出来。
-                fields.insert(
-                    "chatSupported".to_string(),
-                    Value::Bool(forwards_requests(record)),
-                );
-                // 最近一次签到成功的时刻（0 = 从未签过）。跨家统一注入的理由与上面
-                // 两条相同：它是「这条账号的签到状态」这一个事实，五家的存放位置
-                // 一致（`checkinAt`），界面不必按 provider 查表。
-                //
-                // 给出的是**时间戳**而不是「今天签过没」的布尔：自然日的边界要按
-                // 用户本地时区算，而那个判定在界面上已有同款实现（限流恢复时间的
-                // 「今天 / 明天」也是本地自然日，见 accounts-model.js 的 startOfDay）。
-                // 传原始时间戳还让界面能显示「今天 08:30 已签到」这类信息。
-                //
-                // 恒为数字（无记录时 0）而不是缺键：界面按 `Number(...) || 0` 读，
-                // 两种形态都能吃，但恒定的形状让「字段缺失」与「值为 0」不再需要分开判。
-                fields.insert("checkinAt".to_string(), Value::from(record.checkin_at()));
-                Value::Object(fields)
-            }
-            // 各家形状恒为对象；真出现异常形态时原样透出，不在这里改语义
-            other => other,
-        }
-    }
-
-    /// provider 摘要：注册表顺序 + 各 provider 的账号总数。
-    ///
-    /// 计数函数在内存快照上跑（不读盘、不再取锁）—— `snapshot` 的调用方已经持锁。
-    fn provider_summary(&self, state: &AccountState) -> Value {
-        let counts: Vec<(String, usize)> = state
-            .accounts
-            .iter()
-            .fold(Vec::new(), |mut acc, record| {
-                let provider = record.provider();
-                match acc.iter_mut().find(|(id, _)| *id == provider) {
-                    Some((_, count)) => *count += 1,
-                    None => acc.push((provider, 1)),
-                }
-                acc
-            });
-        let value = crate::server::core::providers::summary_json(|id| {
-            counts
-                .iter()
-                .find(|(known, _)| known == id)
-                .map(|(_, count)| *count)
-                .unwrap_or(0)
-        });
-        Value::Array(value)
-    }
-
-    // ─── 按 provider 查询 ────────────────────────────────────
-
-    /// 指定 provider 的启用账号（公开形态，按 priority、addedAt 升序）。
-    ///
-    /// 消费方：聚合目录判断「这一家现在有没有可用登录态」
-    /// （`catalog::provider_available`）—— 直接调适配器会让「有清单但没账号」
-    /// 的家被广告给客户端，所以聚合层必须能按 provider 查可用性。
-    ///
-    /// 转发选路**不用**本函数：`rotate::provider_accounts` 走的是公开快照
-    /// 过滤（那份要**看得见禁用账号**，第三级「全禁用 → 503」的文案依赖它）。
-    ///
-    /// 「启用」口径与选路一致：`enabled !== false`**且**有凭证
-    /// （`has_credentials`：小浣熊的桌面端实时账号记录里没有 token，但凭证在
-    /// auth.json，同样算「有凭证」，见 `state.rs` 的说明）。返回值是**排序后**的：
-    /// 调用方按序尝试即可，不必自己再排一遍 —— 优先级的相对顺序就是主备顺序。
-    pub fn accounts_for_provider(&self, provider: &str) -> Vec<Value> {
-        let _guard = self.guard();
-        let state = self.load(&_guard);
-        let mut records: Vec<StoredAccount> = state
-            .accounts
-            .iter()
-            .filter(|record| {
-                record.provider() == provider && record.enabled() && record.has_credentials()
-            })
-            .cloned()
-            .collect();
-        records.sort_by_key(StoredAccount::order_key);
-        records
-            .iter()
-            .map(|record| self.public_account(record))
-            .collect()
     }
 }
 

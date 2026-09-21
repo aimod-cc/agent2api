@@ -77,7 +77,7 @@ function applyTheme(mode) {
 // ─── 页面导航 ────────────────────────────────
 
 const PAGE_KEY = 'workbuddy-desktop-page';
-const PAGES = ['overview', 'accounts', 'gateway', 'keys', 'desensitize', 'logs', 'tasks', 'requests', 'settings'];
+const PAGES = ['overview', 'accounts', 'gateway', 'keys', 'desensitize', 'docs', 'logs', 'tasks', 'requests', 'settings'];
 /** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」、gateway 的是「模型管理」
  *  （内部标识保持不变：localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它） */
 const PAGE_LABELS = {
@@ -86,6 +86,7 @@ const PAGE_LABELS = {
   gateway: '模型管理',
   keys: '网关 Key',
   desensitize: '脱敏',
+  docs: '文档',
   logs: '日志',
   tasks: '定时任务',
   requests: '请求日志',
@@ -141,6 +142,12 @@ function showPage(name, { persist = true } = {}) {
   if (page === 'keys') {
     window.wbKeysPanel?.load?.();
   }
+  // 文档页显示的是网关地址：切进去时补一次端口同步 —— 端口只在
+  // getBackendStatus 的返回里，render() 那一轮之外的变动（用户换了端口重启）
+  // 到这页才被发现的话，页面上会先显示一段过时的地址，而它就等着被复制
+  if (page === 'docs') {
+    void window.wbPortPanel?.sync?.();
+  }
   renderTopbarStatus();
   // 导航项上的内容随页面变：日志未读徽标交给日志面板，更新提示在这里重画
   // （校验更新提示的可见性与所在页面有关，见 syncUpdateBadge）
@@ -179,6 +186,9 @@ function renderTopbarStatus() {
     gateway: () => (gatewayUp ? chip('监听 127.0.0.1', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
     keys: () => mirror('keys-status'),
     desensitize: () => mirror('desensitize-badge'),
+    // 文档页没有自己的徽标（它只有一组复制的地址），跟着网关的运行状态走 ——
+    // 地址在页面上的意义就是「现在能不能连」，网关没起来时那个状态最要紧
+    docs: () => (gatewayUp ? chip('网关运行中', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
     logs: () => mirror('logs-badge'),
     requests: () => mirror('req-badge'),
     // 定时任务页的徽标由 tasks-panel 自己渲染（「N / M 个已开启」），直接镜像
@@ -760,6 +770,13 @@ void window.wbPortPanel?.sync?.();
  */
 document.addEventListener('DOMContentLoaded', () => {
   void window.wbUpdatePanel?.check?.();
+  // 数据结构升级：这次更新把数据存储换成了单个 SQLite 库，启动时后端只探测
+  // 「还有没有旧文件没搬进库」，有待迁移就直接导入（**不弹窗** —— 升级没有
+  // 选项也不能取消，弹窗只是多余的一道坎）。同样放 DOMContentLoaded：
+  // 面板脚本排在 app.js 之后。
+  // 它**不是**更新检查那种「有新版本就提示」的可选动作 —— 没升级时账号是空的，
+  // 所以过程与结果都要 toast 报出来，不能让用户面对一个「账号怎么空了」的疑问。
+  void window.wbUpgradePanel?.check?.();
 }, { once: true });
 
 // 定时轮询：限额标记（429 + 恢复时间）与账号状态变化自动刷新；窗口隐藏时暂停
