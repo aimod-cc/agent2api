@@ -12,6 +12,29 @@ name: build
 #   · 仅手动 workflow_dispatch（在 Actions 页面选分支触发）：
 #     两个平台一起构建，产物作为 workflow artifact 下载，不发布 Release
 #
+# ── action 版本为什么都钉在大版本 v7（本次升级）─────────────────
+# 原先用 checkout@v4 / setup-node@v4 / upload-artifact@v4，三者都跑在
+# Node.js 20 上，而 GitHub 已宣布 Node 20 弃用、runner 会强制它们跑在
+# Node 24（构建日志里那条 deprecation 注解就是这么来的）。
+# 各版本对 Node runtime 的支持（查各 action 的 action.yml 得到）：
+#   checkout       v4=node20  v5+=node24
+#   setup-node     v4=node20  v5+=node24
+#   upload-artifact v4=node20 v5=node20  v6+=node24
+# 所以三个都升到 v7 —— 直接取最新大版本，不停在 v5/v6 那种「刚够用但已落后」
+# 的中间版本上。v7 的 breaking change 与本文件的用法都不冲突：
+#   · checkout v6 把凭据挪到单独文件、v7 阻止 workflow_run 检出 fork PR
+#     —— 本工作流是 workflow_dispatch，不涉及；
+#   · setup-node v5 起会对有 packageManager 字段的项目**自动开启缓存**，
+#     本项目两个 package.json 都没有那个字段，行为不变（见下面显式 cache 说明）；
+#   · upload-artifact v7 新增的 archive:false 直传与 ESM 化都是增量能力，
+#     name + path 的用法逐字不变。
+#
+# ── npm 缓存（本次一并加上）───────────────────────────────────
+# 原先只缓存了 Rust 依赖，npm 每次都全量下载。setup-node 的 cache 选项
+# 需要显式指定 cache-dependency-path：本项目的依赖装在 desktop-tauri/ 下，
+# 而根 package.json 没有依赖，指错路径会让缓存 key 永远命中不了
+# （甚至因为找不到 lock 文件而直接报错）。
+#
 # ── 签名 ──────────────────────────────────────────────────────
 # 默认**不签名**（ad-hoc）。macOS 上未签名的应用 Gatekeeper 会拦下，
 # 用户需要在「系统设置 → 隐私与安全性」里手动放行一次。要消除这一步需要
@@ -34,12 +57,15 @@ jobs:
     # 代价是 Rust 部分要编两遍，缓存命中时约十几分钟。
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
+          # 依赖在 desktop-tauri/ 下（根 package.json 没有依赖），必须显式指路
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
@@ -65,7 +91,7 @@ jobs:
         run: npm --prefix desktop-tauri run build -- --target universal-apple-darwin
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-universal
           # 只取 .dmg：bundle 目录下还有 .app 与 .dSYM 等调试产物，
@@ -77,12 +103,15 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
+          # 同 macOS job：依赖在 desktop-tauri/ 下
+          cache: npm
+          cache-dependency-path: desktop-tauri/package-lock.json
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
@@ -99,7 +128,7 @@ jobs:
         run: npm --prefix desktop-tauri run build
 
       - name: 上传产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-nsis
           path: target/release/bundle/nsis/*.exe
