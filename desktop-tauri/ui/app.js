@@ -108,6 +108,11 @@ function showPage(name, { persist = true } = {}) {
   const crumb = $('crumb-page');
   if (crumb) crumb.textContent = PAGE_LABELS[page] || page;
   if (persist) localStorage.setItem(PAGE_KEY, page);
+  // 列的设置面板常驻 body（.panel 是 overflow:hidden，留在原处会被裁掉，
+  // 见 table-col-settings.js），不随宿主页面的 display:none 一起消失 ——
+  // 不收起的话，切页之后它会孤零零地浮在新页面上。它自己不认识「页面」，
+  // 由切页这一处统一告诉它。
+  window.wbColSettings?.close?.();
   // 切到报表页时拉一次统计（面板内部自持时间范围与数据，这里只做转发）
   if (page === 'overview') {
     window.wbReport?.load?.();

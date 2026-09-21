@@ -2,10 +2,12 @@
 //!
 //! 转发层对上游瞬时错误与传输层失败做「睡一个间隔再原样重发」，次数分两档
 //! （见 `config.rs` 的说明）：
-//!   - `retryCount`：**同一提供商内**重试几次；
-//!   - `retryCrossProviderCount`：**换到别的提供商之后**重试几次。
+//!   - `retryCount`：在**同一个账号**上原地重发几次；
+//!   - `retryCrossProviderCount`：失败后**最多换几个账号**再试（按账号计，
+//!     不分家 —— 键名是旧措辞，语义见 `config.rs`）。
 //!
-//! 循环见 `upstream::provider_loop::send_with_retry`。
+//! 循环见 `upstream::provider_loop`（原地重发在 `send_with_retry`，
+//! 换账号在 `attempt_queue`）。
 //!
 //! 三项统一存在 config.json（键名契约见 `config.rs`），由设置页
 //! 「通用 → 请求重试」经 HTTP 桥读写 —— 与 /api/retention 同一模式：
@@ -20,7 +22,7 @@ use axum::response::Response;
 use serde_json::{json, Value};
 
 use crate::server::config::{
-    self, RetryPatch, RetrySettings, KEY_RETRY_COUNT, KEY_RETRY_CROSS_PROVIDER_COUNT,
+    self, RetryPatch, RetrySettings, KEY_RETRY_ACCOUNT_SWITCH_COUNT, KEY_RETRY_COUNT,
     KEY_RETRY_INTERVAL_SECONDS, RETRY_MAX_COUNT, RETRY_MAX_INTERVAL_SECONDS, RETRY_MIN_COUNT,
     RETRY_MIN_INTERVAL_SECONDS,
 };
@@ -59,11 +61,11 @@ pub async fn put_retry(State(_state): State<ServerState>, body: Bytes) -> Respon
             &mut patch.count,
         ),
         (
-            KEY_RETRY_CROSS_PROVIDER_COUNT,
-            object.get(KEY_RETRY_CROSS_PROVIDER_COUNT),
+            KEY_RETRY_ACCOUNT_SWITCH_COUNT,
+            object.get(KEY_RETRY_ACCOUNT_SWITCH_COUNT),
             RETRY_MIN_COUNT,
             RETRY_MAX_COUNT,
-            &mut patch.cross_provider_count,
+            &mut patch.account_switch_count,
         ),
         (
             KEY_RETRY_INTERVAL_SECONDS,
@@ -102,8 +104,8 @@ pub async fn put_retry(State(_state): State<ServerState>, body: Bytes) -> Respon
         logging::log(
             "[Config]",
             &format!(
-                "请求重试已更新: 同一提供商 {} 次 / 切换提供商 {} 次 / 间隔 {} 秒",
-                settings.count, settings.cross_provider_count, settings.interval_seconds
+                "请求重试已更新: 同一账号 {} 次 / 最多换 {} 个账号 / 间隔 {} 秒",
+                settings.count, settings.account_switch_count, settings.interval_seconds
             ),
         );
     }
@@ -112,10 +114,13 @@ pub async fn put_retry(State(_state): State<ServerState>, body: Bytes) -> Respon
 
 /// 三个重试字段的响应体（GET 与 PUT 共用，键名与 config.rs 的常量必然一致 ——
 /// 与 `stats_api::retention_json` 同一手法：键用常量标识符而不是手写字符串）。
+///
+/// 键名对前端是**契约**（`settings-panel.js` 的 RETRY_FIELDS 逐字对齐），
+/// 其中第二档仍是旧措辞 `retryCrossProviderCount`（配置兼容，见 config.rs）。
 fn retry_json(settings: RetrySettings) -> Value {
     json!({
         KEY_RETRY_COUNT: settings.count,
-        KEY_RETRY_CROSS_PROVIDER_COUNT: settings.cross_provider_count,
+        KEY_RETRY_ACCOUNT_SWITCH_COUNT: settings.account_switch_count,
         KEY_RETRY_INTERVAL_SECONDS: settings.interval_seconds,
     })
 }

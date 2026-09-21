@@ -25,7 +25,7 @@
 use serde_json::{json, Map, Value};
 
 use super::{
-    content_parts, content_text, event_frame, is_truthy, json_text, random_id,
+    content_parts, content_text, event_frame, freeform, is_truthy, json_text, random_id,
     string_field, string_value, SseLineBuffer,
 };
 use crate::server::logging;
@@ -78,7 +78,45 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
     // 工具：Responses 的形态是 `{type:"function", name, parameters}`（扁平的），
     // Chat 要的是 `{type:"function", function:{name, parameters}}`（嵌套一层）
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        let converted: Vec<Value> = tools.iter().filter_map(tool_to_chat).collect();
+        let mut converted: Vec<Value> = Vec::new();
+        let mut downgraded: Vec<String> = Vec::new();
+        let mut ignored: Vec<String> = Vec::new();
+        for tool in tools {
+            if let Some(function) = tool_to_chat(tool) {
+                converted.push(function);
+                continue;
+            }
+            // 没转出来的分两类。custom（freeform）是**要**降级的 —— 漏了就是
+            // 静默失效（2026-09 起 Codex 的 exec / apply_patch 全部失效即由此
+            // 而来）；其余（web_search / local_shell 等 Responses 原生工具）
+            // 上游确实没有对应物，只能丢，但要留痕，否则同样是静默失效
+            if freeform::is_custom_tool(tool) {
+                if let Some(function) = freeform::downgrade_custom_tool(tool) {
+                    downgraded.push(string_field(tool, "name"));
+                    converted.push(function);
+                    continue;
+                }
+            }
+            ignored.push(tool_kind_label(tool));
+        }
+        if !ignored.is_empty() {
+            logging::log(
+                "[Responses]",
+                &format!(
+                    "⚠️ 上游 Chat 接口无对应形态，已丢弃这些工具声明：{}",
+                    ignored.join(", ")
+                ),
+            );
+        }
+        if !downgraded.is_empty() {
+            logging::verbose(
+                "[Responses]",
+                &format!(
+                    "自由文本（custom）工具已降级为 function：{}",
+                    downgraded.join(", ")
+                ),
+            );
+        }
         if !converted.is_empty() {
             out.insert("tools".to_string(), Value::Array(converted));
         }
@@ -170,6 +208,44 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
                 "content": tool_output_text(item.get("output")),
             }));
         }
+        // 自由文本工具（custom）的调用与结果：形态与 function_call 同构，只是
+        // 「参数」在 `input` 里而不是 `arguments`。必须还原成同一对消息，否则
+        // 多轮里模型看不到自己上一步调过什么 —— 工具调用即便成功，第二轮也会
+        // 退化成凭空重问。
+        "custom_tool_call" => {
+            let name = string_field(item, "name");
+            // 两种来源都要认：客户端回传的原生形态是 `input` 裸文本；
+            // 但历史若来自我们自己的回程（已降级），id 相同、字段也可能是
+            // `arguments`。取到哪个用哪个，都不丢内容
+            let raw = {
+                let input = string_field(item, "input");
+                if input.is_empty() {
+                    json_text(item.get("arguments").unwrap_or(&Value::Null))
+                } else {
+                    input
+                }
+            };
+            messages.push(json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": call_id_of(item),
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        // 按降级时的约定包成 `{"input": "…"}`，与出站声明一致
+                        "arguments": freeform::wrap_freeform_input(&raw),
+                    },
+                }],
+            }));
+        }
+        "custom_tool_call_output" => {
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id_of(item),
+                "content": tool_output_text(item.get("output")),
+            }));
+        }
         // reasoning 项：它的正文不属于任何一轮对话，跳过（Chat 侧没有对应位置）
         "reasoning" => {}
         "input_text" | "text" => {
@@ -187,6 +263,16 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
             };
             let content = item.get("content").or_else(|| item.get("text"));
             let Some(content) = content else {
+                // 认不出的项在这里被丢掉。原实现直接 return，不报错也不记日志 ——
+                // 一旦是工具相关的新类型（如 local_shell_call），症状就是「历史
+                // 莫名其妙少了东西」，无从归因。宁可吵一点，也要留下类型名。
+                let unknown = string_field(item, "type");
+                if !unknown.is_empty() && unknown != "message" {
+                    logging::log(
+                        "[Responses]",
+                        &format!("⚠️ 输入项类型 {unknown} 无法转换，已跳过（内容会缺一段）"),
+                    );
+                }
                 return Ok(());
             };
             let content = content_to_chat(content, &role);
@@ -323,6 +409,26 @@ fn image_url_of(part: &Value) -> String {
     }
 }
 
+/// 工具声明在日志里的可读标签（`function:bash` / `web_search` / …）。
+///
+/// 丢工具时必须留下它叫什么：只报「丢了 N 条」，排查的人无从判断丢的是不是
+/// 关键能力 —— 2026-09 那次 Codex 工具失效，症状是模型把调用当正文吐出来，
+/// 若当时有这行日志，一眼就能定位。
+fn tool_kind_label(tool: &Value) -> String {
+    let name = string_field(tool, "name");
+    if name.is_empty() {
+        let kind = string_field(tool, "type");
+        if kind.is_empty() { "未命名工具".to_string() } else { kind }
+    } else {
+        let kind = string_field(tool, "type");
+        if kind.is_empty() || kind.eq_ignore_ascii_case("function") {
+            name
+        } else {
+            format!("{kind}:{name}")
+        }
+    }
+}
+
 /// Responses 工具 → Chat 工具（扁平 → 嵌套 `function`）
 fn tool_to_chat(tool: &Value) -> Option<Value> {
     // 字符串形态的工具名（`tools: ["web_search"]`）：不是 function，丢掉
@@ -335,8 +441,10 @@ fn tool_to_chat(tool: &Value) -> Option<Value> {
         return Some(tool.clone());
     }
     if kind != "function" && !kind.is_empty() {
-        // 非 function 类型（web_search 等）：上游的 Chat 接口不认，丢掉而不是
-        // 发过去让上游报错 —— 客户端要的是「能跑」，不是「原样报错」
+        // 非 function 类型：上游的 Chat 接口不认，丢掉而不是发过去让上游报错
+        // —— 客户端要的是「能跑」，不是「原样报错」。
+        // custom（freeform）也落在这里，但调用方会先把它捞去降级
+        // （见 `chat_from_responses` 的工具循环），不会真的丢。
         return None;
     }
     let name = string_field(tool, "name");
@@ -386,6 +494,41 @@ fn tool_choice_to_chat(choice: &Value) -> Value {
     choice.clone()
 }
 
+/// 一次工具调用 → Responses 的 output item。
+///
+/// 名字命中 `custom_names`（请求里原本声明为 custom 的那批）时输出
+/// `custom_tool_call`：它的「参数」是裸文本 `input`，不是 `arguments` JSON。
+/// 客户端据此决定用哪条执行路径 —— 类型给错的话，Codex 会把自由文本当成
+/// JSON 参数去解析，工具照样跑不起来。
+///
+/// `call_id` 由调用方给（上游的真实 id，或自造兜底）：三个回程出口
+/// （非流式 / 流式 / 聚合）共用这一处口径，避免各写各的、日后只改一处。
+fn tool_call_item(
+    name: &str,
+    call_id: &str,
+    arguments: &str,
+    custom_names: &std::collections::BTreeSet<String>,
+) -> Value {
+    if custom_names.contains(name) {
+        return json!({
+            "type": "custom_tool_call",
+            "id": random_id("ctc"),
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "input": freeform::unwrap_freeform_input(arguments),
+        });
+    }
+    json!({
+        "type": "function_call",
+        "id": random_id("fc"),
+        "status": "completed",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    })
+}
+
 /// Responses 的 `text.format` → Chat 的 `response_format`
 fn format_to_chat(format: &Value) -> Value {
     let kind = string_field(format, "type");
@@ -411,6 +554,7 @@ fn format_to_chat(format: &Value) -> Value {
 /// （instructions / temperature / tools / …）如实回显，客户端据此确认
 /// 「我发的参数被接受了」。
 pub fn responses_from_chat(chat: &Value, model: &str, request: &Value) -> Value {
+    let custom_names = freeform::custom_tool_names(request.get("tools"));
     let choice = chat.pointer("/choices/0");
     let message = choice.and_then(|choice| choice.get("message")).cloned().unwrap_or(Value::Null);
     let finish = choice
@@ -445,17 +589,16 @@ pub fn responses_from_chat(chat: &Value, model: &str, request: &Value) -> Value 
     }
     if let Some(calls) = tool_calls {
         for call in calls {
-            output.push(json!({
-                "type": "function_call",
-                "id": random_id("fc"),
-                "status": "completed",
-                "call_id": string_field(call, "id"),
-                "name": call.pointer("/function/name").map(string_value).unwrap_or_default(),
-                "arguments": call
-                    .pointer("/function/arguments")
-                    .map(json_text)
-                    .unwrap_or_else(|| "{}".to_string()),
-            }));
+            let name = call.pointer("/function/name").map(string_value).unwrap_or_default();
+            let arguments = call
+                .pointer("/function/arguments")
+                .map(json_text)
+                .unwrap_or_else(|| "{}".to_string());
+            let call_id = {
+                let raw = string_field(call, "id");
+                if raw.is_empty() { random_id("call") } else { raw }
+            };
+            output.push(tool_call_item(&name, &call_id, &arguments, &custom_names));
         }
     }
 
@@ -635,6 +778,10 @@ pub struct ResponsesStream {
     created: i64,
     model: String,
     request: Value,
+    /// 请求里声明为 custom（freeform）的工具名：命中时工具项要发
+    /// `custom_tool_call` 与 `response.custom_tool_call_input.*`，
+    /// 而不是 `function_call` 与 `response.function_call_arguments.*`
+    custom_names: std::collections::BTreeSet<String>,
     /// 事件序号（Responses 要求每个事件带单调递增的 sequence_number）
     sequence: i64,
     created_sent: bool,
@@ -670,6 +817,18 @@ struct ToolAccum {
     announced: bool,
 }
 
+/// 收尾阶段一个工具的定稿（`close_tools` 用）。
+///
+/// 单独开一个结构体而不是元组：字段已有六个，元组下标读起来谁是谁全靠数。
+struct ToolFinal {
+    index: i64,
+    item_id: String,
+    call_id: String,
+    name: String,
+    announced: bool,
+    item: Value,
+}
+
 impl ResponsesStream {
     pub fn new(model: &str, request: &Value) -> Self {
         Self {
@@ -678,6 +837,7 @@ impl ResponsesStream {
             created: logging::now_ms() / 1000,
             model: model.to_string(),
             request: request.clone(),
+            custom_names: freeform::custom_tool_names(request.get("tools")),
             sequence: 0,
             created_sent: false,
             finished: false,
@@ -913,6 +1073,12 @@ impl ResponsesStream {
                 if tool.call_id.is_empty() {
                     tool.call_id = random_id("call");
                 }
+                // custom 项的 id 前缀与 function 不同（ctc_ vs fc_），而这里
+                // 是唯一能改的时刻：宣告之后 item_id 已经在事件里发出去，
+                // 再改就对不上了
+                if self.custom_names.contains(&tool.name) {
+                    tool.item_id = random_id("ctc");
+                }
                 tool.announced = true;
             }
             (
@@ -925,35 +1091,37 @@ impl ResponsesStream {
             )
         };
 
+        let is_custom = self.custom_names.contains(&name);
         if announced_now {
+            // 自由文本工具的「参数」是裸文本 input，item 形态与 function 不同
+            // —— 见官方 custom_tool_call 项的定义
+            let item = if is_custom {
+                json!({
+                    "type": "custom_tool_call",
+                    "id": item_id,
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": name,
+                    "input": "",
+                })
+            } else {
+                json!({
+                    "type": "function_call",
+                    "id": item_id,
+                    "status": "in_progress",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": "",
+                })
+            };
             out.push(response_event(
                 &mut self.sequence,
                 "response.output_item.added",
-                json!({
-                    "output_index": index,
-                    "item": {
-                        "type": "function_call",
-                        "id": item_id,
-                        "status": "in_progress",
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": "",
-                    },
-                }),
+                json!({ "output_index": index, "item": item }),
             ));
             // 宣告前已攒下的参数要补发（名字与参数可能同一帧到达）
             if !buffered.is_empty() {
-                out.push(response_event(
-                    &mut self.sequence,
-                    "response.function_call_arguments.delta",
-                    json!({
-                        "output_index": index,
-                        "item_id": item_id,
-                        "call_id": call_id,
-                        "name": name,
-                        "delta": buffered,
-                    }),
-                ));
+                out.extend(self.tool_delta_event(index, &item_id, &call_id, &name, &buffered, is_custom));
             }
         }
         let arguments = call
@@ -961,19 +1129,44 @@ impl ResponsesStream {
             .and_then(Value::as_str)
             .unwrap_or("");
         if !arguments.is_empty() && !announced_now {
-            out.push(response_event(
-                &mut self.sequence,
-                "response.function_call_arguments.delta",
-                json!({
-                    "output_index": index,
-                    "item_id": item_id,
-                    "call_id": call_id,
-                    "name": name,
-                    "delta": arguments,
-                }),
-            ));
+            out.extend(self.tool_delta_event(index, &item_id, &call_id, &name, arguments, is_custom));
         }
         out
+    }
+
+    /// 工具增量的一个事件帧（function 与 custom 的形态完全不同）。
+    ///
+    /// **custom 一律不发增量**，返回空。理由是内容形态对不上：上游按 JSON 分片
+    /// 吐 `{"input": "…"}`，而 `custom_tool_call_input.delta` 的语义是**自由文本
+    /// 本身的增量** —— 原样转发会让客户端把这些 JSON 外壳当成输入累积起来，最后
+    /// 拿到的是一段带 `{"input":` 前缀的文本，工具照样执行不了。而增量是分片
+    /// 到达的，中途无法可靠地剥出 JSON 外壳（可能停在转义序列中间）。
+    ///
+    /// 完整输入由收尾的 `custom_tool_call_input.done` 一次性交付（见
+    /// `close_tools`），那一路拿到的是完整 `arguments`，可以正确解包。
+    /// 客户端本来就必须处理 `.done`，少发增量不影响结果。
+    fn tool_delta_event(
+        &mut self,
+        index: i64,
+        item_id: &str,
+        call_id: &str,
+        name: &str,
+        delta: &str,
+        is_custom: bool,
+    ) -> Vec<bytes::Bytes> {
+        if is_custom {
+            return Vec::new();
+        }
+        vec![self.event(
+            "response.function_call_arguments.delta",
+            json!({
+                "output_index": index,
+                "item_id": item_id,
+                "call_id": call_id,
+                "name": name,
+                "delta": delta,
+            }),
+        )]
     }
 
     fn emit_created(&mut self) -> Vec<bytes::Bytes> {
@@ -1151,7 +1344,7 @@ impl ResponsesStream {
         keys.sort_by_key(|key| self.tools.get(key).map(|tool| tool.index).unwrap_or(0));
         // 先把每个工具收成「待收尾的值」，再统一构造事件 —— 与 consume_tool
         // 同一理由：事件构造要动 `self.sequence`，不能与 `self.tools` 的借用重叠
-        let mut finals: Vec<(i64, String, String, String, String)> = Vec::new();
+        let mut finals: Vec<ToolFinal> = Vec::new();
         for key in keys {
             let Some(tool) = self.tools.get_mut(&key) else {
                 continue;
@@ -1161,39 +1354,67 @@ impl ResponsesStream {
             // 但也不能丢 —— 补一个占位名，否则客户端少一次工具调用
             let name = if tool.name.is_empty() { "unknown".to_string() } else { tool.name.clone() };
             let arguments = if tool.arguments.is_empty() { "{}".to_string() } else { tool.arguments.clone() };
-            let item = json!({
-                "type": "function_call",
-                "id": tool.item_id,
-                "status": "completed",
-                "call_id": call_id,
-                "name": name,
-                "arguments": arguments,
-            });
+            // 用统一口径构造 item：custom 命中时要输出 custom_tool_call 与
+            // 裸文本 input，类型给错客户端就按 JSON 解析，工具照样跑不起来
+            let item = {
+                let mut value = tool_call_item(&name, &call_id, &arguments, &self.custom_names);
+                // item_id 要沿用宣告时那个：客户端按它对上号
+                if let Some(map) = value.as_object_mut() {
+                    map.insert("id".to_string(), Value::String(tool.item_id.clone()));
+                }
+                value
+            };
             self.output_items.push((tool.index, item.clone()));
-            if tool.announced {
-                out.push(response_event(
-                    &mut self.sequence,
-                    "response.function_call_arguments.done",
-                    json!({
-                        "output_index": tool.index,
-                        "item_id": tool.item_id,
-                        "call_id": call_id,
-                        "name": name,
-                        "arguments": arguments,
-                    }),
-                ));
-            }
-            out.push(response_event(
-                &mut self.sequence,
-                "response.output_item.done",
-                json!({ "output_index": tool.index, "item": item }),
-            ));
-            finals.push((tool.index, call_id, name, arguments, tool.item_id.clone()));
+            finals.push(ToolFinal {
+                index: tool.index,
+                item_id: tool.item_id.clone(),
+                call_id,
+                name,
+                announced: tool.announced,
+                item,
+            });
         }
-        let _ = finals;
+        // 事件构造与状态借用分开（同上）：这里已不再借 `self.tools`
+        for final_ in finals {
+            let is_custom = final_
+                .item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "custom_tool_call");
+            if final_.announced {
+                if is_custom {
+                    // 自由文本工具按 `input` 收尾，且不带 call_id / name
+                    let input = string_field(&final_.item, "input");
+                    out.push(self.event(
+                        "response.custom_tool_call_input.done",
+                        json!({
+                            "output_index": final_.index,
+                            "item_id": final_.item_id,
+                            "input": input,
+                        }),
+                    ));
+                } else {
+                    let arguments = string_field(&final_.item, "arguments");
+                    out.push(response_event(
+                        &mut self.sequence,
+                        "response.function_call_arguments.done",
+                        json!({
+                            "output_index": final_.index,
+                            "item_id": final_.item_id,
+                            "call_id": final_.call_id,
+                            "name": final_.name,
+                            "arguments": arguments,
+                        }),
+                    ));
+                }
+            }
+            out.push(self.event(
+                "response.output_item.done",
+                json!({ "output_index": final_.index, "item": final_.item }),
+            ));
+        }
         out
     }
-
     /// 构造一个带 sequence_number 的事件帧。
     ///
     /// 内部转调自由函数 [`response_event`]：事件构造要动 `sequence`，
@@ -1319,6 +1540,7 @@ impl ResponsesCollector {
 
     /// 收成一个 Responses 响应对象
     pub fn into_response(self, model: &str, request: &Value) -> Value {
+        let custom_names = freeform::custom_tool_names(request.get("tools"));
         let mut output: Vec<Value> = Vec::new();
         if !self.reasoning.is_empty() {
             output.push(json!({
@@ -1337,15 +1559,12 @@ impl ResponsesCollector {
             }));
         }
         for (_, tool) in self.tools {
+            let name = if tool.name.is_empty() { "unknown".to_string() } else { tool.name };
+            let call_id = if tool.call_id.is_empty() { random_id("call") } else { tool.call_id };
             let arguments = if tool.arguments.is_empty() { "{}".to_string() } else { tool.arguments };
-            output.push(json!({
-                "type": "function_call",
-                "id": random_id("fc"),
-                "status": "completed",
-                "call_id": if tool.call_id.is_empty() { random_id("call") } else { tool.call_id },
-                "name": if tool.name.is_empty() { "unknown".to_string() } else { tool.name },
-                "arguments": arguments,
-            }));
+            // 与另外两个回程出口共用口径：custom 命中时输出 custom_tool_call
+            // （item id 的前缀由 tool_call_item 内部按类型选，不必在这里管）
+            output.push(tool_call_item(&name, &call_id, &arguments, &custom_names));
         }
         let incomplete = match self.finish_reason.as_deref() {
             Some("length") => Some("max_output_tokens"),

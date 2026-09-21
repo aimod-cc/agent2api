@@ -413,7 +413,7 @@
     close: closeSettings,
     openBatch,
     closeBatch,
-    /** 「登录 / 添加账号」弹窗打开时可用：按 providers 摘要重建选项并复位到 WorkBuddy */
+    /** 「添加账号」弹窗打开时可用：按 providers 摘要重建选项并复位到 WorkBuddy */
     syncAddProvider: () => window.wbAccountAddForms?.syncAddProvider(),
     /** 账号列表刷新后调用：Clash 端口可能已在 Clash 侧改过 */
     invalidate: () => {

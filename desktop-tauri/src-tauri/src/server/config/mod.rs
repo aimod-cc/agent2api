@@ -682,11 +682,11 @@ pub fn set_retry(patch: RetryPatch) -> bool {
             config.raw.insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
             next.count = count;
         }
-        if let Some(count) = patch.cross_provider_count {
+        if let Some(count) = patch.account_switch_count {
             config
                 .raw
-                .insert(KEY_RETRY_CROSS_PROVIDER_COUNT.to_string(), Value::from(count));
-            next.cross_provider_count = count;
+                .insert(KEY_RETRY_ACCOUNT_SWITCH_COUNT.to_string(), Value::from(count));
+            next.account_switch_count = count;
         }
         if let Some(seconds) = patch.interval_seconds {
             config

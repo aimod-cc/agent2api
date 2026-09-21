@@ -36,6 +36,11 @@
   <link rel="stylesheet" href="css/select.css">
   <!-- 小问号提示外观（tooltip.js 增强出来的气泡）：同样排在页面样式之后 -->
   <link rel="stylesheet" href="css/tooltip.css">
+  <!-- 表格列设置（浮层 + 列对齐）：必须排在所有页面样式之后 ——
+       列对齐是**用户配置**，要盖过各表为「这一列靠哪边」写死的默认值
+       （.models-table th.r / .acct-table td.cell-pick / .req-head .req-dur …），
+       靠级联顺序取胜而不是堆特异性。与 select.css / tooltip.css 同一编排。 -->
+  <link rel="stylesheet" href="css/table-col-settings.css">
 </head>
 <body>
   <div class="shell">
@@ -303,7 +308,7 @@
               <div class="actions">
                 <button id="btn-query-usage">查询积分</button>
                 <button id="btn-checkin-all">全部签到</button>
-                <button id="btn-add-account-2" class="primary">登录 / 添加账号</button>
+                <button id="btn-add-account-2" class="primary">添加账号</button>
               </div>
             </div>
 
@@ -855,13 +860,13 @@
                 <!-- ── 通用：请求重试 ──
                      三项读写的都是后端 config.json（经 /api/retry，HTTP 桥），
                      转发层对上游瞬时错误与传输层失败按这里设置退避重发。
-                     次数分两档（同一提供商 / 切换提供商），分界与判定见
+                     次数分两档（同一账号原地重发 / 换账号），判定见
                      config.rs 的 RetrySettings 说明。
                      行样式复用数据保留那一套（.retention-*，见 page-settings.css）。 -->
                 <section class="panel">
                   <div class="panel-head">
                     <h2>请求重试</h2>
-                    <span class="tip-q" data-tip="请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11128 敏感词拦截），网关会等一段间隔后原样重发。次数分两档：先用「同一提供商」的次数在最初那家反复试（该家名下换账号不重置），用尽后切换到下一个提供商，再按「切换提供商」的次数试一轮。设为 0 表示该档不重试。账号级限额（429）不在此列 —— 那类失败由「冷却该账号并换下一个账号」处理，与这里的原地重试是两条路。"></span>
+                    <span class="tip-q" data-tip="请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11128 敏感词拦截），网关会等一段间隔后再发一次。次数分两档，管的是两件事：①「同一账号重试次数」在同一账号上原地重发几次 —— 一般是提示词被上游拦截、或链路瞬时抖动，等一会儿重发往往就好了；②「切换账号重试次数」这份请求最多再换几个账号试 —— 首发的那个账号不算，每换一个扣一次，不分是不是同一家（换到同一家的下一个账号也算一次），换满还失败就把错误返回给客户端。两项都设为 0 表示失败不重试、直接报错。注意账号级限额（429）不占这里的换号次数 —— 那类失败走「冷却该账号并换下一个账号」的降级，与这里的重试是两条路。"></span>
                     <span id="retry-badge" class="badge">检测中…</span>
                     <div class="head-actions">
                       <button id="btn-retry-refresh">刷新</button>
@@ -870,20 +875,20 @@
                   <div class="panel-body">
                     <div class="retention-list">
                       <div class="retention-row">
-                        <label for="settings-retry-count">同一提供商重试次数</label>
+                        <label for="settings-retry-count">同一账号重试次数</label>
                         <span class="retention-input">
                           <input type="number" id="settings-retry-count" min="0" max="10" step="1" inputmode="numeric">
                           <span class="unit">次</span>
                         </span>
-                        <div class="hint">在最初选中的提供商上重试几次（该家名下换账号不重置这个计数），0 表示该档不重试，可填 0–10。</div>
+                        <div class="hint">在同一个账号上原地重发几次（不含首发；整条请求共用一份，用完后换来的账号只发一次就继续换）。可填 0–10，0 表示失败立即换号。</div>
                       </div>
                       <div class="retention-row">
-                        <label for="settings-retry-cross-provider-count">切换提供商重试次数</label>
+                        <label for="settings-retry-cross-provider-count">切换账号重试次数</label>
                         <span class="retention-input">
                           <input type="number" id="settings-retry-cross-provider-count" min="0" max="10" step="1" inputmode="numeric">
                           <span class="unit">次</span>
                         </span>
-                        <div class="hint">同一提供商那档用尽、切换到下一个提供商后，再重试几次（换一家就重新计一份），可填 0–10。</div>
+                        <div class="hint">失败后最多再换几个账号试（填 N = 最多换 N 个，首发那个不算）。换到同一家名下另一个账号、或换到另一家，都各算一次；换满仍失败就返回错误。可填 0–10，0 表示失败立即报错。</div>
                       </div>
                       <div class="retention-row">
                         <label for="settings-retry-interval">重试间隔</label>
@@ -891,7 +896,7 @@
                           <input type="number" id="settings-retry-interval" min="0" max="300" step="1" inputmode="numeric">
                           <span class="unit">秒</span>
                         </span>
-                        <div class="hint">两次重试之间的等待时间，两档共用，可填 0–300 秒。</div>
+                        <div class="hint">两次重试之间的等待时间，两项共用，可填 0–300 秒。</div>
                       </div>
                     </div>
                     <div class="hint retention-note">保存后立即生效，不用重启；次数用尽仍失败时，错误原样返回给客户端。</div>
@@ -1555,6 +1560,11 @@
   </div>
 
   <script src="icons.js"></script>
+  <!-- 表格列设置（显示 / 隐藏、顺序、对齐）：四张表共用一个面板。
+       必须排在所有表格脚本之前 —— 各表在**加载期**就 register 自己的列定义
+       （顺序、表头文案、默认对齐），排到它们后面会错过注册，
+       面板按钮与列设置能力就整块不出现。它只依赖 icons.js（按钮上那枚齿轮）。 -->
+  <script src="table-col-settings.js"></script>
   <!-- 下拉控件增强：必须在 app.js 之前 —— 业务模块（accounts-view / logs-panel /
        proxy-form）执行时就会读写原生 select，外壳要在这之前就位。
        静态 select 在解析到这里时已存在，弹窗与代理表单里动态生成的由它自己的
@@ -1660,7 +1670,7 @@
   <!-- 「登录 / 添加账号」弹窗的提供商分叉（提供商分段控件 / 各家的表单块 / 弹窗内 .seg 的交互）。
        add-qoder.js / add-cline.js 先于 add-provider-forms.js：后者在加载期读它们的表单配置。
        两者都必须在 account-panel.js 之前：它们自带加载期绑定（mountAddProviderUi
-       等，需要 #add-modal 已解析），且「登录 / 添加账号」按钮的监听要按
+       等，需要 #add-modal 已解析），且「添加账号」按钮的监听要按
        「add-account.js → 本文件 → account-panel.js」的顺序注册（同元素同事件按注册顺序触发）。 -->
   <script src="add-qoder.js"></script>
   <script src="add-cline.js"></script>

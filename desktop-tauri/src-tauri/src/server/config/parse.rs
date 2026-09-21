@@ -209,10 +209,10 @@ pub(super) fn retry_from(map: &Map<String, Value>) -> RetrySettings {
             RETRY_MIN_COUNT,
             RETRY_MAX_COUNT,
         ),
-        cross_provider_count: bounded_int_field(
+        account_switch_count: bounded_int_field(
             map,
-            KEY_RETRY_CROSS_PROVIDER_COUNT,
-            defaults.cross_provider_count,
+            KEY_RETRY_ACCOUNT_SWITCH_COUNT,
+            defaults.account_switch_count,
             RETRY_MIN_COUNT,
             RETRY_MAX_COUNT,
         ),

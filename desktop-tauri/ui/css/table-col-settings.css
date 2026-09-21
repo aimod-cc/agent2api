@@ -1,0 +1,255 @@
+/* ─────────────────────────────────────────────
+   表格列设置（table-col-settings.js）：浮层面板 + 列对齐。
+   四张表（账号 / 模型管理 / 网关 Key / 请求日志）共用。
+
+   ── 为什么独立成一个文件、且排在最后 ────────────────────────
+   这里有两块必须压在页面样式之上的东西：
+
+   1. **列对齐**。各表都为「这一列该靠哪边」写了默认值
+      （`.models-table th.r`、`.acct-table td.cell-pick`、`.req-head .req-dur` …），
+      选择器特异性都在 (0,1,1) 一档。列设置的对齐是**用户选择**，必须能盖过它们 ——
+      靠提高特异性硬拼（写成 `.acct-table td.cell-pick.ta-center` 之类）意味着
+      每加一张表、每加一列都要再补一条；排到页面样式之后、用同等特异性即可，
+      级联顺序本身就是「用户配置优先于作者默认」的表达。
+      与 select.css / tooltip.css 「排在页面样式之后，需要时可覆盖各页面约束」
+      的编排一致。
+
+   2. **浮层**。.panel 是 overflow:hidden，面板留在 DOM 原处会被卡片裁掉，
+      所以它常驻 body 用 fixed 定位（与 .tip-bubble / 下拉浮层同因同法）。
+   ───────────────────────────────────────────── */
+
+/* ─── 浮层面板 ─── */
+.colset-panel {
+  position: fixed;
+  /* 与 .tip-bubble、下拉浮层同档（35）：在弹窗遮罩（.modal-mask，30）之上 ——
+     表在弹窗里也要能调列；轻提示（40）仍压在它上面 */
+  z-index: 35;
+  display: flex;
+  flex-direction: column;
+  width: 336px;
+  max-height: min(70vh, 560px);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-3);
+  animation: colset-in .14s cubic-bezier(.2, .9, .3, 1);
+}
+
+@keyframes colset-in {
+  from { opacity: 0; transform: translateY(-4px) scale(.985); }
+}
+
+/* 表头与数据行共用同一套网格：手柄 / 列名 / 显隐开关 / 对齐段。
+   列名 minmax(78px, 1fr)：长列名（「对外映射名」）省略而不是把对齐段挤出去；
+   对齐段固定 116px（三颗按钮各 38 + 缝隙）。 */
+.colset-head,
+.colset-row {
+  display: grid;
+  grid-template-columns: 18px minmax(78px, 1fr) 44px 116px;
+  align-items: center;
+  gap: 8px;
+}
+
+.colset-head {
+  padding: 9px 12px 7px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .05em;
+}
+
+.colset-head > span { text-align: center; }
+
+/* 行区滚动：列多时面板不跟着长，最大高度由 .colset-panel 的 max-height 兜底 */
+.colset-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 12px;
+}
+
+.colset-row {
+  padding: 5px 0;
+  border-radius: var(--r-sm);
+}
+
+.colset-row:hover { background: var(--nav-hover); }
+
+/* 被拖动的那一行压淡：让下面的落点更醒目。节点本身不参与重排
+   （重排是数据层的事 + renderPanel 重画，见 table-col-settings.js 的 startDrag） */
+.colset-row.dragging { opacity: .5; }
+body.colset-dragging { cursor: grabbing; user-select: none; }
+
+.colset-grip {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-3);
+  cursor: grab;
+  opacity: .55;
+}
+
+.colset-grip:hover { opacity: 1; }
+.colset-grip svg { display: block; }
+
+.colset-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.colset-switch { justify-content: center; }
+
+/* 对齐段：三颗按钮共享一个外框，与 .seg 同一形制但更小 ——
+   面板一行里要塞下四组，用整档分段控件会把列名挤没 */
+.colset-aligns {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  padding: 1px;
+  border: 1px solid var(--control-border);
+  border-radius: var(--r-sm);
+  background: var(--control-bg);
+}
+
+.colset-align {
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: calc(var(--r-sm) - 1px);
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.colset-align:hover:not(.active) { background: var(--nav-hover); color: var(--text); }
+
+.colset-align.active {
+  background: var(--primary-soft);
+  color: var(--primary-fg);
+  font-weight: 600;
+}
+
+.colset-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px 9px;
+  border-top: 1px solid var(--hairline);
+}
+
+.colset-hint { flex: 1 1 auto; color: var(--text-3); font-size: 11px; }
+
+/* 触发按钮：齿轮 + 文案。被选中（面板开着）时给一层浅底，
+   与它旁边那些「一次性动作」按钮区分开 —— 它是个开关。 */
+.colset-btn { display: inline-flex; align-items: center; gap: 5px; }
+.colset-btn svg { display: block; opacity: .8; }
+.colset-btn.open { border-color: var(--primary-bd); background: var(--primary-soft); color: var(--primary-fg); }
+.colset-btn.open svg { opacity: 1; }
+
+/* ─── 列对齐（三档）───
+   由列设置把 ta-left / ta-center / ta-right 写在表头格与数据格上。
+   「靠哪边」在不同布局里由三个不同属性决定，所以分三层：
+
+   1. `text-align` —— 管行内级内容（文字、badge、button、inline-flex 的
+      label.switch）。格子里若是块级 flex 容器，这一条不动它，见第 2 层。
+   2. `justify-content` —— 管块级 flex 容器的**主轴**对齐。各表都给这些容器
+      写了默认值（.acct-actions 是 flex-end、.prio 是 flex-start …），
+      所以选择器要够强。
+   3. `align-items` / `justify-self` —— 管竖排 flex 列（.req-dur 是右对齐的
+      两行读数）与靠边站的 grid 项（.req-detail）。
+
+   ── 特异性为什么写成「表前缀 + 格 + 类」 ──────────────────────
+   各表的默认对齐就在 (0,2,1) 这一档（`.models-table th.r`、
+   `.acct-table td.cell-pick`、`.acct-table thead th` 是 (0,1,2)），
+   所以规则必须 ≥ 该档；本文件排在所有页面样式**之后**，
+   同档时由级联顺序取胜（也就是「用户配置」压过「作者默认」）。
+   比它更高的那些（如 `.models-table tr.off td` 的透明度）不涉及对齐，互不干扰。 */
+
+/* ── 1. 文本对齐 ── */
+/* 账号表：`.acct-table thead th` (0,1,2) 与 `.acct-table td.cell-pick` (0,2,1) 都要压过 */
+.acct-table th.ta-left, .acct-table td.ta-left { text-align: left; }
+.acct-table th.ta-center, .acct-table td.ta-center { text-align: center; }
+.acct-table th.ta-right, .acct-table td.ta-right { text-align: right; }
+
+/* 模型管理 / 网关 Key：同表共用 models-table 类，压过 `.models-table th.r` */
+.models-table th.ta-left, .models-table td.ta-left { text-align: left; }
+.models-table th.ta-center, .models-table td.ta-center { text-align: center; }
+.models-table th.ta-right, .models-table td.ta-right { text-align: right; }
+
+/* 请求日志：格子是 grid 项（span），压过 `.req-head .req-dur` 与 `.req-row .req-dur` */
+.req-head > .ta-left, .req-row > .ta-left { text-align: left; }
+.req-head > .ta-center, .req-row > .ta-center { text-align: center; }
+.req-head > .ta-right, .req-row > .ta-right { text-align: right; }
+
+/* ── 2. 块级 flex 容器的主轴对齐 ── */
+
+/* 账号表 */
+.acct-table td.ta-center > .acct-actions,
+.acct-table td.ta-center > .prio,
+.acct-table td.ta-center > .pv,
+.acct-table td.ta-center > .acct-name,
+.acct-table td.ta-center > .acct-sub,
+.acct-table td.ta-center > .status-tags { justify-content: center; }
+
+.acct-table td.ta-right > .acct-actions,
+.acct-table td.ta-right > .prio,
+.acct-table td.ta-right > .pv,
+.acct-table td.ta-right > .acct-name,
+.acct-table td.ta-right > .acct-sub,
+.acct-table td.ta-right > .status-tags { justify-content: flex-end; }
+
+/* 模型管理 / 网关 Key */
+.models-table td.ta-center > .mid,
+.models-table td.ta-center > .aliases,
+.models-table td.ta-center > .row-actions,
+.models-table td.ta-center > .keycell { justify-content: center; }
+
+.models-table td.ta-right > .mid,
+.models-table td.ta-right > .aliases,
+.models-table td.ta-right > .row-actions,
+.models-table td.ta-right > .keycell { justify-content: flex-end; }
+
+/* ── 3. 竖排读数与靠边的 grid 项 ── */
+
+/* 这些格子里是「竖着排的几行」（时间 / 提供商账号 / 用时 / 用量 / 重试标签），
+   靠 align-items 决定整块贴哪边 —— 它们的 text-align 管不到自己的子项
+   （align-items: flex-end 之类的默认值写在各自的列样式里）。
+   底部的 .req-time 还自带 flex-direction: column，所以这一层同样必要。 */
+.req-row > .req-time.ta-left,
+.req-row > .req-target.ta-left,
+.req-row > .req-retry.ta-left,
+.req-row > .req-usage.ta-left { align-items: flex-start; }
+
+.req-row > .req-time.ta-center,
+.req-row > .req-target.ta-center,
+.req-row > .req-retry.ta-center,
+.req-row > .req-usage.ta-center { align-items: center; }
+
+.req-row > .req-time.ta-right,
+.req-row > .req-target.ta-right,
+.req-row > .req-retry.ta-right,
+.req-row > .req-usage.ta-right { align-items: flex-end; }
+
+/* 用时列是「右对齐」的两行读数：grid 项默认 stretch、内容自身 align-items: flex-end，
+   所以要改的是内容盒的 align-items，而不是格子的 text-align。 */
+.req-row > .req-dur.ta-left { align-items: flex-start; }
+.req-row > .req-dur.ta-center { align-items: center; }
+.req-row > .req-dur.ta-right { align-items: flex-end; }
+
+/* 详情列靠 justify-self 贴右（它不是靠 text-align）：跟随用户选择移动 */
+.req-row > .req-detail.ta-left { justify-self: start; }
+.req-row > .req-detail.ta-center { justify-self: center; }
+.req-row > .req-detail.ta-right { justify-self: end; }
+
+/* ─── 窄窗口下把对齐让回页面的重排规则 ───
+   请求日志在 1200px 以下重排成四行，那时列位置由媒体查询接管（轨道已经不是
+   八条、顺序也变了），用户设的对齐不再适用于「第几列」这个前提。
+   这里不做额外处理：媒体查询里的 grid-row / grid-column 与上面的对齐声明
+   互不干扰，只是重排后「按列对齐」失去意义，窗口拉宽自然恢复。 */

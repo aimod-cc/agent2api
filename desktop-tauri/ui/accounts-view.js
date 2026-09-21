@@ -161,7 +161,7 @@
     renderBatchBar(all, lastVisibleIds);
 
     if (!all.length) {
-      list.innerHTML = '<div class="empty">暂无账号，请点击右上角「登录 / 添加账号」</div>';
+      list.innerHTML = '<div class="empty">暂无账号，请点击右上角「添加账号」</div>';
       return;
     }
     if (!visible.length) {

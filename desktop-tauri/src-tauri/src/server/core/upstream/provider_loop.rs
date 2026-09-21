@@ -97,19 +97,20 @@ struct OutboundFailure {
     error: GatewayError,
 }
 
-/// 一个「提供商阶段」的退避重试预算（见 `send_with_retry` 的说明）。
+/// **原地重发**的退避预算（见 `send_with_retry` 的说明）。
 ///
-/// 为什么需要「阶段」这个概念：退避重试的次数分两档 —— 最初那家用
-/// `retryCount`，换到别家之后用 `retryCrossProviderCount`。而账号循环会在
-/// **同一家名下的多个账号**之间来回走，那些轮次属于**同一个阶段**、共用
-/// 一份预算；只有换到另一家才开一份新的。
+/// 整份请求共用一份：从第一个账号开始扣，扣完后面的账号就不再原地重发。
+/// 这就是「同一账号重试 N 次」在本实现里的口径（见 `config::RetrySettings`）。
+///
+/// 与「还能换几个账号」是**两套独立的预算**：那份归 `attempt_queue` 的
+/// `switches_left` 管，两者互不抵扣。
 ///
 /// `total` 只用于日志里的「第 n/N 次」，不参与判定 —— 判定看 `remaining`。
 #[derive(Clone, Copy, Debug)]
 struct RetryBudget {
-    /// 本阶段总共几次（日志用）
+    /// 总共几次（日志用）
     total: usize,
-    /// 本阶段还剩几次
+    /// 还剩几次
     remaining: usize,
 }
 
@@ -118,10 +119,30 @@ impl RetryBudget {
         Self { total, remaining: total }
     }
 
-    /// 本阶段已经用掉几次（适配器要这个来写文案）
+    /// 已经用掉几次（适配器要这个来写文案）
     fn used(&self) -> usize {
         self.total.saturating_sub(self.remaining)
     }
+}
+
+/// 换账号前扣一次预算：还能换返回 true，已经换满返回 false。
+///
+/// 换满时顺手写一行终端日志 —— 这是「为什么这次只试了 N 个账号就收尾」的
+/// 唯一落点（请求日志的尝试链只显示试过谁，不回答为什么停在那个数）。
+///
+/// 两条顺延路径（会话式失败、普通错误）共用它，保证「最多换几个账号」在
+/// 两条路上口径一致。**429 降级不走这里**：那是「冷却该账号再换下一个」的
+/// 降级动作，与「重试换号」是两条路（见设置页那段说明）。
+fn take_switch(switches_left: &mut usize, total: usize) -> bool {
+    if *switches_left == 0 {
+        logging::console_line(
+            "[Upstream]",
+            &format!("⚠️ 换账号次数已用尽（最多 {total} 个），不再顺延，返回本次错误"),
+        );
+        return false;
+    }
+    *switches_left -= 1;
+    true
 }
 
 /// 瞬时 HTTP 状态码：适配器没声明专属重试时，按全局重试设置原样重发再看一眼。
@@ -133,7 +154,7 @@ const TRANSIENT_RETRY_STATUSES: &[u16] = &[408, 500, 502, 503, 504];
 
 /// 瞬时 HTTP 错误的统一退避建议（设置页「请求重试」的全局兜底）。
 ///
-/// `remaining` 是本阶段**还剩几次**退避可用（见 `send_with_retry` 的说明）；
+/// `remaining` 是原地重发**还剩几次**（见 [`RetryBudget`] 的说明）；
 /// 用尽即返回 None，由调用方收敛成终态错误。
 fn transient_retry_advice(status: u16, remaining: usize) -> Option<RetryAdvice> {
     if remaining == 0 || !TRANSIENT_RETRY_STATUSES.contains(&status) {
@@ -159,9 +180,9 @@ fn transport_retry_advice(remaining: usize) -> Option<RetryAdvice> {
 /// 退避重试的运行日志行：`⚠️ {原因}；{n} 秒后重试（第 {i}/{N} 次）`。
 ///
 /// 原因来自 `RetryAdvice::reason`（provider 专属措辞），进度由这里补 ——
-/// 「第几次 / 共几次」只有编排层知道（预算按提供商阶段走，见 `RetryBudget`）。
-/// 改造前这句整句由适配器与两个兜底函数各自拼好，措辞与现在一致，只是
-/// 分隔符统一成「；」（原先瞬时错误与连接失败那两句用「，」）。
+/// 「第几次 / 共几次」只有编排层知道（预算归 [`RetryBudget`]，适配器只看到
+/// 一个已经算好的数）。改造前这句整句由适配器与两个兜底函数各自拼好，
+/// 措辞与现在一致，只是分隔符统一成「；」（原先瞬时错误与连接失败那两句用「，」）。
 fn retry_log_line(reason: &str, delay_ms: u64, used: usize, total: usize) -> String {
     format!("⚠️ {reason}；{} 秒后重试（第 {used}/{total} 次）", delay_ms / 1000)
 }
@@ -298,21 +319,24 @@ async fn attempt_queue(
     let model = model_of(ctx.body);
     let model_label = if model.is_empty() { "(默认)".to_string() } else { model.clone() };
     let mut tried_ids: Vec<String> = Vec::new();
-    // ── 重试预算的两档怎么分（见 config::RetrySettings）─────────────────
-    // 用户描述的行为：「同一提供商重试 3 次，然后切换到下一个提供商，
-    // 在那边再重试 5 次」。落到这里就是一条规则 ——
-    // **这一轮的提供商与上一轮相同 → 沿用现有预算；不同 → 开一份新的**
-    // （新的一份用「切换提供商」档的次数，而不是接着上一档扣剩下的）。
+    // ── 两份独立的预算（见 config::RetrySettings）─────────────────────
+    //   - `budget`：同一个账号上还能**原地重发**几次。整份请求共用一份，
+    //     由 `send_with_retry` 逐次扣减 —— 于是它天然花在「第一个真正发出去的
+    //     账号」上，这正是「同一账号重试 N 次」该有的样子。
+    //   - `switches_left`：这份请求还能**换几个账号**。换一次扣一次，由下面
+    //     两条顺延路径扣（会话式失败 / 普通错误）。
     //
-    // 两个推论都对得上直觉：
-    //   - 同一家名下换账号（A1 → A2）**不**重置预算，所以「同一提供商 3 次」
-    //     是该家总共 3 次，而不是每个账号各 3 次；
-    //   - A → B → A 的第三段算「换过家」，拿的是一份完整的 5 次
-    //     （而不是沿用 B 阶段的残额）。
+    // 两者互不抵扣：原地重发用尽不吃掉换号额度，换号也不重置重发预算 ——
+    // 「先在当前账号试几次，实在不行再换号」这条直觉因此成立。
     //
-    // `last_provider` 为 None = 还没发过请求（首次选路），用「同一提供商」档。
-    let mut last_provider: Option<&'static str> = None;
-    let mut budget = RetryBudget::new(0);
+    // 第二档按**账号**计、不分家：换到同一家的下一个账号，与换到另一家，
+    // 都算一次换号。旧实现按提供商分段（同一家名下共用一份、只有跨家才重开），
+    // 结果是「能换几个账号」根本没人管 —— 某家囤了 9 个账号时一次请求会一路
+    // 试到第 10 个，而用户填的那个数字要等跨家才生效。
+    let settings = config::retry_settings();
+    let mut budget = RetryBudget::new(settings.resend_budget());
+    let switch_total = settings.switch_budget();
+    let mut switches_left = switch_total;
     // 各家的发送体：某一家即将发送前按作用范围决定一次，换到**同一家同池**的
     // 另一个账号时复用（不重复处理、不重复统计）。键带账号的池（Cline 的账号
     // 记录有 `free`/`pass`）：发送名跟着实际承载的账号所在池走
@@ -337,14 +361,9 @@ async fn attempt_queue(
         };
         let adapter = adapter_for(kind);
         let provider_id = kind_id(kind);
-        // 本轮的重试预算：与上一轮同一家 → 沿用（同一家名下换账号不重置）；
-        // 换了家（或这是第一轮）→ 开一份新的，用对应档位的完整次数。
-        // 第一轮用「同一提供商」档（`last_provider` 还是 None）。
-        let switched = matches!(last_provider, Some(previous) if previous != provider_id);
-        if switched || last_provider.is_none() {
-            budget = RetryBudget::new(config::retry_settings().budget(switched));
-        }
-        last_provider = Some(provider_id);
+        // 没有「按家重置预算」这一步了：两份预算都在循环外开好、整份请求共用
+        // （理由见上面的注释）。`provider_id` 仍然要取 —— 下面的发送体缓存、
+        // 日志与遥测记账都用它。
         if adapter.is_stateful() {
             // 会话式转发（CatPaw）内部没有轮换，但**队列的兜底仍然生效**：
             // 它失败了就把它记入已尝试、回到循环挑下一个账号 —— 可能已经换了一家。
@@ -360,6 +379,12 @@ async fn attempt_queue(
                     }
                     match rotate::pick_next_account(service, provider_ids, &model, &tried_ids) {
                         Some(next) => {
+                            // 换号额度用尽 → 队列里即使还有人也不再顺延
+                            // （`take_switch` 已写过那行终端日志），本次错误原样
+                            // 返回：与「没有下一个可用账号」同一个出口。
+                            if !take_switch(&mut switches_left, switch_total) {
+                                return Err(error);
+                            }
                             // 顺延这件事本身由请求日志的尝试链回答（本轮明细已经
                             // 定稿为失败、下一轮会追加新明细），这里只留终端一行
                             logging::console_line(
@@ -775,6 +800,10 @@ async fn attempt_queue(
                     // 这层兜底收敛成「换下一个账号」—— 可能是同家的下一位，也可能
                     // 直接换了一家。只有确实多出「没试过的账号」才继续（否则会拿
                     // 同一个默认登录态空转），没有就原样透传本次错误。
+                    //
+                    // 换号受「切换账号重试次数」约束（`switches_left`）：额度用尽
+                    // 时即使队列里还有人也不再顺延 —— 这是「一次请求最多牵连几个
+                    // 账号」的唯一闸门（429 那条降级路径不受它管，见设置页说明）。
                     if let Some(account_id) = target.account_id.clone() {
                         if !tried_ids.contains(&account_id) {
                             tried_ids.push(account_id);
@@ -782,6 +811,9 @@ async fn attempt_queue(
                     }
                     match rotate::pick_next_account(service, provider_ids, &model, &tried_ids) {
                         Some(next) => {
+                            if !take_switch(&mut switches_left, switch_total) {
+                                return Err(failure.error);
+                            }
                             let next_home = {
                                 let next_provider = rotate::provider_of(&next);
                                 if next_provider == provider_id {
@@ -1158,17 +1190,14 @@ fn model_rewrite_of(adapter: &dyn ProviderAdapter, model: &str) -> Option<super:
 /// 就能看到「为什么重试了几次」；控制台仍留一行（`console_line`），
 /// 方便用终端排障时实时看到。
 ///
-/// ── `budget` 为什么要 `&mut`（两档设置怎么落地）──────────────
-/// 退避重试的次数是**每个「提供商阶段」各一份**的：在最初那一家上用
-/// `retryCount`，换到别家之后用 `retryCrossProviderCount`（见
-/// `config::RetrySettings`）。而「换家」是**账号循环**才知道的事 ——
-/// 同一家名下可能有好几个账号，循环会在这几个账号之间来回走。
+/// ── `budget` 为什么要 `&mut`（原地重发这一档怎么落地）────────
+/// 「同一个账号重试 N 次」的预算是**整份请求共用一份**：由 `attempt_queue`
+/// 在循环外按 `RetrySettings::resend_budget()` 开好，本函数每退避一次就减一。
+/// 于是它天然花在第一个真正发出去的账号上 —— 那份用完，后面换来的账号就只发
+/// 一次（不再原地重发），这正是「同一账号重试 3 次」该有的样子。
 ///
-/// 所以预算不在这里从零算，而是由调用方按「本阶段还剩几次」传进来、由本函数
-/// **逐次扣减**：调用方在进入某个阶段时把该档的完整次数放进来，本函数每退避
-/// 一次就减一。这样同一家名下换账号不会重置预算（用户设的 3 次就是这一家总共
-/// 3 次），而换到另一家时调用方给的是一个**新的完整预算**（不是接着扣）——
-/// 「换家之后还能试 5 次」正是用户填那个数字时的直觉。
+/// 与「还能换几个账号」是两套独立预算：那份归 `attempt_queue` 的 `switches_left`
+/// 管（见 [`take_switch`]），两者互不抵扣。
 async fn send_with_retry(
     adapter: &dyn ProviderAdapter,
     transport: &TransportRequest,

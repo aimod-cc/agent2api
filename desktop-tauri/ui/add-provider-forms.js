@@ -790,7 +790,7 @@
   });
 
   /**
-   * 「登录 / 添加账号」按钮：打开弹窗后同步提供商选项并复位到 WorkBuddy。
+   * 「添加账号」按钮：打开弹窗后同步提供商选项并复位到 WorkBuddy。
    *
    * add-account.js 把按钮绑到它自己的 openModal（加 .open 类、复位 WorkBuddy 表单）。
    * 这里再挂一个监听，在它之后执行（add-account.js 先加载、监听先注册，同元素同事件按注册
@@ -809,7 +809,7 @@
   }
 
   window.wbAccountAddForms = {
-    /** 「登录 / 添加账号」弹窗打开时可用：按 providers 摘要重建选项并复位到 WorkBuddy */
+    /** 「添加账号」弹窗打开时可用：按 providers 摘要重建选项并复位到 WorkBuddy */
     syncAddProvider: () => {
       addProvider = 'workbuddy';
       syncAddProviderOptions();

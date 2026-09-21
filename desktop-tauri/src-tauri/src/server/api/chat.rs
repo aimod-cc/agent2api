@@ -163,7 +163,17 @@ pub async fn chat_completions(
                 client_model: client_model.clone(),
                 status: i64::from(status.as_u16()),
             };
-            sse_response(status, Box::new(RecordingStream::new(source, context))).into_response()
+            // 收尾帧特征取 Chat 的：客户端读到 `data: [DONE]` 就停是常态写法，
+            // 那时连接会被立刻关掉、`Drop` 不会被拉到 EOF（见 `RecordingStream`）
+            sse_response(
+                status,
+                Box::new(RecordingStream::with_terminals(
+                    source,
+                    context,
+                    pipeline::terminal::CHAT,
+                )),
+            )
+            .into_response()
         }
         Ok(ForwardOutcome::Completion { body }) => {
             record_entry(

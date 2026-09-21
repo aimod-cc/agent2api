@@ -482,10 +482,10 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// `attempt` 是**已经重试过**的次数（0 表示首次失败、还没重试过）。
     ///
-    /// `budget` 是**本轮的退避预算**（还能退避几次），由编排层按「这次尝试
-    /// 是不是落在切换后的另一家提供商」给出（两档设置见 `config::RetrySettings`）。
+    /// `budget` 是**本轮的原地重发预算**（还能退避几次），由编排层按
+    /// 「同一账号重试」那一档给出（见 `config::RetrySettings`）。
     /// 适配器据此判断该不该再退避 —— 而不是自己去读全局设置：那样写的话
-    /// 「换了家要换一档次数」这条规则就会漏进每个适配器里各实现一遍。
+    /// 「哪一档管什么」这条规则就会漏进每个适配器里各实现一遍。
     fn retry_advice(&self, _error_body: &Value, _attempt: usize, _budget: usize) -> Option<RetryAdvice> {
         None
     }

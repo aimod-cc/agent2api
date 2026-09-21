@@ -140,7 +140,7 @@ const workbuddyLogin = window.wbWebLogin.create({
 
 // 关窗就是放弃等待：closeModal 里统一处理（两家同一出口）
 
-// 报表页那个「登录 / 添加账号」按钮已随会话状态卡片一起删除，现在只剩账号页这一个：
+// 报表页那个「添加账号」按钮已随会话状态卡片一起删除，现在只剩账号页这一个：
 // 加可选链是必需的 —— 上面几行与它无关，但这里一抛错，后面所有监听都注册不上。
 $('btn-add-account')?.addEventListener('click', openModal);
 $('btn-add-account-2').addEventListener('click', openModal);

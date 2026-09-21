@@ -30,6 +30,7 @@ OpenAI client / any SDK
 ## Table of Contents
 
 - [Quick Start](#quick-start)
+- [Screenshots](#screenshots)
 - [Data Storage](#data-storage)
 - [Default Sensitive Word List](#default-sensitive-word-list)
 - [Project Layout](#project-layout)
@@ -44,7 +45,7 @@ OpenAI client / any SDK
 Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\Program Files\Agent2API` by default, and needs administrator approval during setup), then launch it — **no Node or any other runtime required**.
 
 1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If an older version's data directory or data files are found, a dialog walks you through the migration (see [Data Storage](#data-storage) for details).
-2. Click "Login / Add account" on the Report or Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw / Qoder / Cline), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again).
+2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw / Qoder / Cline), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again).
 3. Set your OpenAI client's `base_url` to `http://127.0.0.1:3065/v1` and put anything in `api_key` (for example `sk-local`; the server does not check it while authentication is disabled).
 
 Closing the window only minimizes to the tray by default, and the gateway keeps forwarding in the background; to quit for real, right-click the tray icon and choose "Exit".
@@ -76,6 +77,36 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+---
+
+## Screenshots
+
+### Accounts
+
+Every provider's accounts share one **global queue** (the second column from the left is the priority) and can be toggled individually. The rate-limit row shows the per-model cooldown state and when it recovers, while expiry and balance are kept fresh by background tasks such as "Credential maintenance" and the scheduled balance query.
+
+![Accounts page: global queue, per-model rate-limit cooldown, expiry and balance](./assets/screenshots/accounts.png)
+
+When adding an account you pick the provider first, then sign in however that vendor supports. One vendor can hold several account versions at once (WorkBuddy's China and Global editions, for example), and forwarding picks the right one by model name:
+
+![Add account: choose provider and edition, then sign in on the web](./assets/screenshots/add-account.png)
+
+### Report
+
+The overview gives total requests, success rate, total tokens and the top model, with rankings by account and by provider beside it; underneath sits a fixed 365-day activity heatmap:
+
+![Report overview: stat cards, top accounts / providers, activity heatmap](./assets/screenshots/report-overview.png)
+
+Further down are the trends: the last 24 hours of **cache hit rate** (left axis, line) and **token consumption** (right axis, area) are overlaid in one chart so a dip in hit rate can be read as a change in traffic mix versus a cache miss; at the bottom is a per-day token bar chart whose range follows the time window at the top:
+
+![Report trends: dual-axis cache hit rate and token consumption, per-day token bars](./assets/screenshots/report-trends.png)
+
+### Scheduled Tasks
+
+Background tasks are managed on one page: toggle, interval, last result and next fire time all live here, and you can also run one immediately without waiting out the interval. The task list itself is stored in the `scheduledTasks` field of `~/.agent2api/config.json`, and edits take effect immediately — no restart needed.
+
+![Scheduled tasks page: toggles and intervals for check-in, credential maintenance, word list updates and more](./assets/screenshots/scheduled-tasks.png)
 
 ---
 
@@ -183,6 +214,7 @@ agent2api/
 │  ├─ ui/                        Frontend (plain HTML/CSS/JS, no framework)
 │  └─ src-tauri/tauri.conf.json  Bundle configuration (NSIS)
 ├─ build/make-icon.mjs           Generates the app icon source image
+├─ assets/screenshots/           Images used by the READMEs (UI screenshots)
 └─ package.json                  Build script entry points (tauri:dev / tauri:build / build:icon)
 ```
 

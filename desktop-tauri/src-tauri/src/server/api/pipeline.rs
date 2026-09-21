@@ -56,6 +56,33 @@ const ERROR_SUMMARY_CHARS: usize = 200;
 /// HTTP 状态早就发出去了（2xx），明细里只能靠这条文案解释「为什么没有 token」。
 pub const STREAM_ABORTED: &str = "响应流未完整下发（客户端中断或服务退出）";
 
+/// 一条「本协议收尾帧」的字节特征（见 [`RecordingStream`] 的说明）。
+///
+/// 由**调用方**按自己那条协议给出（三条入口各知道自己发什么收尾），本模块
+/// 只当字节比对，不认识任何协议 —— 这是 `api::pipeline` 的既定边界
+/// （见模块头：「本模块不认识任何具体协议」）。
+///
+/// 匹配串**必须带帧尾**：收尾帧在线上是完整的一帧（`data: [DONE]\n\n` /
+/// `event: response.completed\n`），带上 `\n` 才不会误命中正文里出现的同名字符串
+/// —— 模型完全可以吐出一段包含 `data: [DONE]` 的文字，那种命中会让一次**真的**
+/// 中断被记成成功。这个精度是刻意的：宁可少认（退化成改前的行为，
+/// 只是多一条摘要），也不能把真实中断洗成成功。
+pub type TerminalFrames = &'static [&'static [u8]];
+
+/// SSE 收尾帧的字节特征表（三条入口各取自己那几条）。
+///
+/// 单独定义在这几个常量里而不是散在调用点：它们与各状态机的产出是**成对**
+/// 的事实，写在一起才能一眼看出「谁跟谁对得上」。
+pub mod terminal {
+    /// Chat Completions：`ReasoningCoalescer` 透传的 `data: [DONE]\n\n`
+    pub const CHAT: super::TerminalFrames = &[b"data: [DONE]\n\n"];
+    /// Responses：正常收尾 `response.completed`，失败收尾 `response.failed`
+    pub const RESPONSES: super::TerminalFrames =
+        &[b"event: response.completed\n", b"event: response.failed\n"];
+    /// Anthropic Messages：`message_stop`（成功与流内错误都以它收尾）
+    pub const ANTHROPIC: super::TerminalFrames = &[b"event: message_stop\n"];
+}
+
 // ─── 模型解析 ───────────────────────────────────────────────
 
 /// 解析并落地请求体里的模型名，返回**实际使用**的模型。
@@ -427,18 +454,100 @@ pub fn truncate_chars(text: &str, limit: usize) -> String {
 /// ── 透传是否受影响 ──────────────────────────────────────────
 /// 不影响：本类型对每个 `Item` 原样转发（只补一个「是不是到 None 了」的
 /// 观察），不读、不改、不缓存字节，也不吞错误。
+///
+/// ── 为什么还要认「收尾帧」（`terminals`）─────────────────────
+/// 上面那条「跑到 `None` 才算成功」的判据，对**按帧收尾**的客户端是不成立的：
+/// 它们在收到本协议的收尾帧时就已知这一轮结束，**当场关连接**，从不读到 EOF。
+/// 于是 `Drop` 里那支「没跑到 None」的分支会被触发 —— 一次**成功**的请求被记成
+/// 「响应流未完整下发」，并因「失败清零 token」的归一（`NewRequestEntry::normalize`）
+/// 把真实用量一并抹掉。这不是偶发竞态：只要客户端这么收尾，它就**稳定**复现。
+///
+/// 实测到的两类客户端都这样：
+///   - Codex Desktop（`/v1/responses`）：收到 `response.completed` 即断开；
+///   - 任何读到 `data: [DONE]` 就停的 Chat 客户端（含 Node 的
+///     `reader.cancel()` 写法）：`/v1/chat/completions` 同样中招。
+///
+/// 所以判据补一条：**已经下发过本协议的收尾帧** ⇒ 这一轮在协议层已经完整，
+/// 之后客户端怎么关都算正常收尾。收尾帧表由调用方给（各入口知道自己发什么），
+/// 本类型只做字节比对。
+///
+/// 注意这不改变「谁先到算谁」的语义：真中断（客户端在收尾帧之前就跑掉）仍然
+/// 按 `STREAM_ABORTED` 记，`error` 也仍然由各转发层写进 telemetry。
+struct TerminalScan {
+    /// 待匹配的收尾帧字节特征
+    frames: TerminalFrames,
+    /// 跨 chunk 的匹配窗口：收尾帧可能被 TCP 分片切开
+    ///
+    /// 窗口只留「最长特征 - 1」个字节 —— 够接上被切开的那一段，又不会
+    /// 随着整段响应无界增长（一次 SSE 响应动辄数百 KB）。
+    window: Vec<u8>,
+    /// 已经命中过（幂等标记，命中后不再扫）
+    seen: bool,
+}
+
+impl TerminalScan {
+    fn new(frames: TerminalFrames) -> Self {
+        Self { frames, window: Vec::new(), seen: false }
+    }
+
+    /// 吃一段刚下发的字节，返回「本次是否首次命中收尾帧」。
+    fn push(&mut self, chunk: &[u8]) -> bool {
+        if self.seen || self.frames.is_empty() {
+            return false;
+        }
+        // 窗口 = 上次残留 + 本段：收尾帧被 TCP 分片切开时，靠这段残留把两半接上
+        self.window.extend_from_slice(chunk);
+        let hit = self
+            .frames
+            .iter()
+            .any(|frame| contains(&self.window, frame));
+        // 只留「最长特征 - 1」个字节：比这更长的残留接不上任何一帧的开头，
+        // 留着只会让窗口随响应体积无界增长（一次 SSE 响应动辄数百 KB）
+        let longest = self.frames.iter().map(|frame| frame.len()).max().unwrap_or(0);
+        let keep = longest.saturating_sub(1);
+        if self.window.len() > keep {
+            let drop = self.window.len() - keep;
+            self.window.drain(..drop);
+        }
+        if hit {
+            self.seen = true;
+        }
+        hit
+    }
+}
+
+/// `haystack` 里是否包含 `needle`（空 needle 恒假）。
+///
+/// 逐字节朴素匹配：特征串最长也就 30 来个字节、窗口不超过它的两倍，
+/// 单段响应里扫这点字节的开销可以忽略（对比之下，为它引一个字符串搜索
+/// 依赖或写 KMP 都是过度设计）。
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
 pub struct RecordingStream {
     inner: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
     /// 收尾上下文；`take()` 走即表示「已记账」（保证恰好记一条）
     context: Option<RecordContext>,
+    /// 收尾帧扫描器（`None` = 该入口没提供特征，等价于改前的行为）
+    terminal: Option<TerminalScan>,
 }
 
 impl RecordingStream {
-    pub fn new(
+    /// 带收尾帧识别的构造（见 [`RecordingStream`] 的说明）。
+    ///
+    /// `frames` 由调用方按自己那条协议给出（`terminal::CHAT` 等）——
+    /// 三条入口**都必须**传自己那份：漏传等于退回改前的行为（客户端按帧收尾时
+    /// 成功请求被记成中断），所以这里不再提供「不带特征」的构造入口。
+    pub fn with_terminals(
         inner: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
         context: RecordContext,
+        frames: TerminalFrames,
     ) -> Self {
-        Self { inner, context: Some(context) }
+        let terminal = if frames.is_empty() { None } else { Some(TerminalScan::new(frames)) };
+        Self { inner, context: Some(context), terminal }
     }
 
     /// 记账并清空上下文（幂等：第二次调用什么都不做）
@@ -446,6 +555,11 @@ impl RecordingStream {
         if let Some(context) = self.context.take() {
             record_entry(&context, fallback_error);
         }
+    }
+
+    /// 本协议收尾帧是否已下发（`true` = 这一轮在协议层已经完整）
+    fn terminal_seen(&self) -> bool {
+        self.terminal.as_ref().is_some_and(|scan| scan.seen)
     }
 }
 
@@ -464,12 +578,26 @@ impl futures::Stream for RecordingStream {
             return std::task::Poll::Ready(None);
         }
         let polled = this.inner.poll_next_unpin(cx);
-        // 首响采集：**下发的第一个字节**到达时记一次（挂在透传流上而不是
-        // 上游字节流上，于是各条转发路径在此收敛为同一处）
-        if let std::task::Poll::Ready(Some(_)) = &polled {
-            if let Some(context) = &this.context {
-                context.telemetry.note_first_frame();
+        match &polled {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                // 首响采集：**下发的第一个字节**到达时记一次（挂在透传流上而不是
+                // 上游字节流上，于是各条转发路径在此收敛为同一处）
+                if let Some(context) = &this.context {
+                    context.telemetry.note_first_frame();
+                }
+                // 收尾帧识别：命中即说明客户端接下来随时可能断开，那属于正常收尾
+                if let Some(scan) = &mut this.terminal {
+                    if scan.push(bytes) {
+                        logging::verbose(
+                            "[Stats]",
+                            "已下发协议收尾帧：此后客户端断开按正常收尾记账",
+                        );
+                    }
+                }
             }
+            std::task::Poll::Ready(Some(Err(_))) => {}
+            std::task::Poll::Ready(None) => {}
+            std::task::Poll::Pending => {}
         }
         if matches!(polled, std::task::Poll::Ready(None)) {
             this.settle(None);
@@ -480,9 +608,15 @@ impl futures::Stream for RecordingStream {
 
 impl Drop for RecordingStream {
     fn drop(&mut self) {
-        // 还能走到这里，说明响应流**没有**跑到 None 就被丢弃了
-        // （客户端断开 / 服务退出）。仍记一条 —— 请求确实发生了
-        self.settle(Some(STREAM_ABORTED.to_string()));
+        // 走到这里说明响应流**没有**跑到 None 就被丢弃了。分两种：
+        //   · 本协议的收尾帧已经下发过 → 客户端按协议收尾（正常），不写摘要；
+        //   · 否则是真的提前丢弃（客户端中途断开 / 服务退出）→ 记一条中断摘要。
+        // 两者都仍记一条 —— 请求确实发生了，控制流已经走到 settle 之外。
+        if self.terminal_seen() {
+            self.settle(None);
+        } else {
+            self.settle(Some(STREAM_ABORTED.to_string()));
+        }
     }
 }
 
@@ -498,6 +632,9 @@ impl Drop for RecordingStream {
 /// `transform` 是一个「吃字节吐字节」的闭包：转换状态机自己持有，
 /// 本函数不认识任何协议。
 ///
+/// `terminals` 是**本协议收尾帧的字节特征**，由调用方按自己那条入口给出
+/// （见 [`RecordingStream`] 的说明）—— 本函数同样只当字节比对，不做协议判断。
+///
 /// ── 为什么收 `Box<dyn Stream>` 而不是泛型 `S` ────────────────
 /// 泛型要额外要求 `S: Unpin`（`flat_map` 的组合流不自动 Unpin），
 /// 而调用点手里本来就是 `ForwardOutcome::Stream` 给的装箱流 —— 直接收装箱
@@ -505,6 +642,7 @@ impl Drop for RecordingStream {
 pub fn transformed_stream(
     source: Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin>,
     context: RecordContext,
+    terminals: TerminalFrames,
     mut transform: impl FnMut(&[u8]) -> Vec<Bytes> + Send + 'static,
 ) -> Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin> {
     use futures::StreamExt;
@@ -517,7 +655,7 @@ pub fn transformed_stream(
         };
         futures::stream::iter(frames.into_iter().map(Ok)).boxed()
     });
-    Box::new(RecordingStream::new(Box::new(converted), context))
+    Box::new(RecordingStream::with_terminals(Box::new(converted), context, terminals))
 }
 
 // ─── 响应构造 ───────────────────────────────────────────────

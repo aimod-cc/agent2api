@@ -651,6 +651,10 @@ input[type="number"] { max-width: 130px; }
 /* 拖动中：全局换光标并禁用选中（拖过文本会触发原生的拖选，把手就「断」了） */
 body.col-resizing { cursor: col-resize; user-select: none; }
 
+/* 表格列设置（浮层与列对齐）在 css/table-col-settings.css ——
+   它必须排在页面样式之后（要盖过各表写死的默认对齐），所以独立成一层，
+   与 select.css / tooltip.css 同一编排。 */
+
 /* ─── 页面级分段布局辅助 ─── */
 /* 端点卡片（网关页 / 设置页） */
 .endpoint-grid {

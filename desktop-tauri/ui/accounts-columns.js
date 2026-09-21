@@ -82,13 +82,23 @@
     return map;
   }
 
-  /** 表格里第 index 个 <col> 与它对应列的 key（顺序由表头 th 的类名给出） */
+  /**
+   * 第 index 个表头格对应的「列 key + 它的 <col>」。
+   *
+   * 列设置（table-col-settings.js）能藏列、能换顺序，所以**不能**只按位置认列：
+   * 位置只是拿表头格用的，真正的身份是 `data-col`（表头 th 与 colgroup 的 <col>
+   * 上同名），拿到 key 之后再按 key 找那个 <col> —— 两处口径一致，用户拖过顺序
+   * 之后也不会把宽度写到别的列上。
+   * `data-col` 缺失（老标记）时退回按类名 `cell-xxx` 解析，两种写法同一个 key。
+   */
   function columnAt(table, index) {
-    const header = table?.querySelector('thead th:nth-child(' + (index + 1) + ')');
-    const match = header?.className.match(/cell-([a-z]+)/);
-    const key = match?.[1];
-    const col = table?.querySelectorAll('colgroup col')[index];
-    return key && col ? { key, col } : null;
+    const header = table?.querySelector(`thead th:nth-child(${index + 1})`);
+    const key = header?.dataset.col || header?.className.match(/cell-([a-z]+)/)?.[1];
+    if (!key) return null;
+    const col = table?.querySelector(`colgroup col[data-col="${CSS.escape(key)}"]`)
+      // 没有 data-col 的骨架（老标记）退回按位置取
+      || table?.querySelectorAll('colgroup col')[index];
+    return col ? { key, col } : null;
   }
 
   /** 把一次宽度落进 <col>（拖动中实时调用的就是它） */

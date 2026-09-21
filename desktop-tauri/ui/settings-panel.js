@@ -19,9 +19,9 @@
  *   · 数据保留天数（getRetention / saveRetention → /api/retention）——
  *     三项保留期存在后端 config.json 里，改小会让后端**立即删除**超出的历史数据
  *     （接口语义见 server/api/stats_api.rs），所以它在保存前多一道二次确认；
- *   · 请求重试（getRetry / saveRetry → /api/retry）—— 转发层退避的两档次数
- *     与间隔，同样存在后端 config.json 里，无副作用（接口语义见
- *     server/api/retry_api.rs）；
+ *   · 请求重试（getRetry / saveRetry → /api/retry）—— 转发层的两项重试次数
+ *     （同账号原地重发 / 最多换几个账号）与间隔，同样存在后端 config.json 里，
+ *     无副作用（接口语义见 server/api/retry_api.rs）；
  *   · 调试模式（getDebug / saveDebug → /api/debug）—— 上游原始报文的采集开关，
  *     开启后请求日志页的「详情」列才有内容可看（接口语义见
  *     server/api/debug_api.rs）。
@@ -528,20 +528,26 @@
     await commitRetention(field, input, parsed.days, shrinking);
   }
 
-  // ─── 请求重试：两档次数与间隔 ──────────────
+  // ─── 请求重试：两项次数与间隔 ──────────────
 
   /**
    * 三个重试字段的字段名 / 控件 id / 展示名只在这里对齐一次：
-   * 字段名必须与后端 `config.rs` 的 KEY_RETRY_* 完全一致（大小写也一样），
-   * 否则 PUT 会被当成「不认识的键」静默忽略 —— 界面提示保存成功，值却没变。
+   * 字段名必须与后端 `config.rs` 的 KEY_RETRY_* **指向的 JSON 键**完全一致
+   * （大小写也一样），否则 PUT 会被当成「不认识的键」静默忽略 ——
+   * 界面提示保存成功，值却没变。
+   *
+   * 注意第二项：键名 `retryCrossProviderCount` 是**旧措辞**（配置兼容，
+   * 改名会让老配置读不到、静默回落默认值），后端常量已经改叫
+   * `KEY_RETRY_ACCOUNT_SWITCH_COUNT` 了 —— 这里必须沿用旧字符串，
+   * 只有展示名跟着真语义走。
    * 交互与数据保留同构，只是**没有**二次确认：改重试设置不删任何数据。
    *
-   * 两档次数的含义（同一提供商 / 切换提供商）见 `config.rs` 的 RetrySettings
+   * 两项的含义（同一账号原地重发 / 换账号）见 `config.rs` 的 RetrySettings
    * 与 index.html 里那段 tooltip —— 前端只负责如实读写，不自己解释语义。
    */
   const RETRY_FIELDS = [
-    { key: 'retryCount', inputId: 'settings-retry-count', label: '同一提供商重试次数', min: 0, max: 10 },
-    { key: 'retryCrossProviderCount', inputId: 'settings-retry-cross-provider-count', label: '切换提供商重试次数', min: 0, max: 10 },
+    { key: 'retryCount', inputId: 'settings-retry-count', label: '同一账号重试次数', min: 0, max: 10 },
+    { key: 'retryCrossProviderCount', inputId: 'settings-retry-cross-provider-count', label: '切换账号重试次数', min: 0, max: 10 },
     { key: 'retryIntervalSeconds', inputId: 'settings-retry-interval', label: '重试间隔', min: 0, max: 300 },
   ];
 

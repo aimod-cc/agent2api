@@ -71,60 +71,105 @@
    * `hint` 是表头里那小字副标题（如「全局队列」），`title` 是悬停说明。
    * 两者都写在这里而不是散在 headRowHtml 的三元表达式里：列一多，
    * 那种链式判定就要为每列各加一层，改一处得先读懂整串。
+   *
+   * `render` 是该列**内容**的渲染函数（不含 `<td>` 外壳），签名统一为
+   * `(account, ctx)`：本表从「按固定顺序拼单元格」改成「按列定义逐列渲染」，
+   * 是为了让「列设置」里的显示 / 隐藏与顺序调整对数据行同样生效 ——
+   * 否则藏起来的列仍在行里占位，表格与表头对不上。
+   * 只有勾选列没有 render：它的内容要用行上下文里的 `picked`，单独处理。
+   * `align` 是该列在「列设置」里的**默认**对齐（用户可以逐列改，见 table-col-settings.js）。
    */
   const COLUMNS = [
-    { key: 'pick', label: '' },
+    // 勾选列的 label 给「选择」而不是空串：它在表格里确实没有表头文案（那一格是
+    // 「全选」复选框），但**列设置面板里必须有个名字** —— 面板按 label 显示，
+    // 空串会退化成原始 key「pick」，用户看不懂这是哪一列。
+    { key: 'pick', label: '选择' },
     {
       key: 'priority', label: '优先级', hint: '全局队列',
       title: '全局一条队列：数值越小越先用，不分提供商',
+      render: priorityCell,
     },
-    { key: 'provider', label: '提供商' },
-    { key: 'account', label: '账号' },
+    // providerCell 原本的入参是 (provider, account)：这里就地适配成统一的
+    // (account, ctx)，免得为它一个人破例 —— 破例一次，后面每加一列都要先
+    // 去确认「这一列的入参是哪个顺序」。
+    { key: 'provider', label: '提供商', render: (account, ctx) => providerCell(providerOf(account), account, ctx) },
+    { key: 'account', label: '账号', render: accountCell },
     {
       // 不加 hint 小字：这一列只有 56px，「连接数」三个字加副标题会撑破表头。
       // 口径说明放在 title 里（悬停可见）。
       key: 'connections', label: '连接数',
       title: '此刻正在使用这个账号的请求数（含还在下发内容的流式请求）；为 0 时不显示',
+      align: 'center',
+      render: connectionsCell,
     },
-    { key: 'status', label: '状态' },
+    { key: 'status', label: '状态', render: statusCell },
     {
       key: 'limits', label: '限流', hint: '按模型',
       title: '该账号当前限流中的模型；点徽章看明细',
+      render: limitsCell,
     },
-    { key: 'expiry', label: '有效期' },
+    { key: 'expiry', label: '有效期', render: expiryCell },
     // 「余额 / 积分」改成「余额」（本次改造）：这一列现在只放**读数**，
     // 那颗查询按钮已移到操作列（见 usageCell 与 actionsCell）——
     // 一个只显示余额数字的列叫「余额 / 积分」会让人以为这里还能点。
     // 而「余额」这个词也容得下各家的不同叫法（WorkBuddy 是积分、
     // 小浣熊是积分、AutoClaw 是余额），不必在表头枚举。
-    { key: 'usage', label: '余额' },
-    { key: 'actions', label: '操作' },
+    { key: 'usage', label: '余额', render: usageCell },
+    { key: 'actions', label: '操作', align: 'right', render: actionsCell },
   ];
 
-  const columnCount = () => COLUMNS.length;
-  const columnKeys = () => COLUMNS.map(column => column.key);
+  /**
+   * 「列设置」登记的列定义（顺序、表头文案、默认对齐）。
+   *
+   * `apply` 是唯一入口：传入 COLUMNS 就拿到「用户配置的顺序 + 只保留可见列，
+   * 每项带 align」的新数组。表头、colgroup、数据行三处都走它，所以三者的
+   * 列集合与顺序天然一致 —— 不必各自再判一遍显隐（那正是最容易漂移的地方）。
+   */
+  const colSettings = window.wbColSettings?.register({
+    id: 'accounts',
+    label: '账号表',
+    columns: COLUMNS.map(column => ({ key: column.key, label: column.label, align: column.align })),
+    // 挂载点是批量栏右侧的操作组（「批量操作 / 取消选择」那两颗）：齿轮插在最前，
+    // 正好落在「批量操作」左边。放在这里而不是工具条右侧的操作组，是因为工具条
+    // 那组已经被「查询积分 / 全部签到 / 添加账号」占满，齿轮挤在它们前面时
+    // 会与三段筛选抢同一行的右端；批量栏这组按钮本就偏「对当前这张表做什么」，
+    // 列设置（怎么看这张表）排头更顺。
+    mount: () => document.querySelector('#batch-bar .batch-actions'),
+    onChange: () => window.wbAccountsView?.render?.(),
+  });
+
+  const visibleColumns = () => (colSettings ? colSettings.apply(COLUMNS) : COLUMNS);
 
   /** 表头行：优先级 / 限流 / 连接数列带口径说明；勾选列放「全选当前筛选结果」的第二个入口。
-   *  每个可拖列的右缘放一枚把手（accounts-columns.js 委托 mousedown / dblclick）。 */
+   *  每个可拖列的右缘放一枚把手（accounts-columns.js 委托 mousedown / dblclick）。
+   *  列集合与顺序由 `visibleColumns()` 给（见 colSettings 的说明）。 */
   function headRowHtml() {
-    const cells = COLUMNS.map(column => {
+    const columns = visibleColumns();
+    const cells = columns.map((column, index) => {
       const hint = column.hint ? `<span class="th-hint">${esc(column.hint)}</span>` : '';
-      const grip = column.key === 'pick' || column.key === 'actions'
+      // 把手不放勾选列（26px 宽，把手会压住复选框），也不放最后一列 ——
+      // 它绝对定位在右缘（right: -4px），钉在表格右缘会顶出一条横向滚动条
+      // （见模块头）。「哪一列在最后」是用户配置出来的，所以按渲染后的位置判。
+      const grip = column.key === 'pick' || index === columns.length - 1
         ? ''
         : '<span class="col-grip" title="拖动调整列宽（双击还原）"></span>';
       if (column.key === 'pick') {
-        return `<th class="cell-${column.key}"><input type="checkbox" id="acct-select-all"`
+        return `<th class="cell-${column.key} ta-${column.align}" data-col="${esc(column.key)}">`
+          + '<input type="checkbox" id="acct-select-all"'
           + ` title="全选 / 取消全选当前筛选结果（与批量栏同一个选择）"></th>`;
       }
-      return `<th class="cell-${column.key}"><span class="th-label"${column.title ? ` title="${esc(column.title)}"` : ''}>${esc(column.label)}${hint}</span>${grip}</th>`;
+      // data-col 是列的身份：列设置能换顺序，列宽（accounts-columns.js 的
+      // columnAt）与它自己的 <col> 都靠这个属性认列，不再靠「第几个」。
+      return `<th class="cell-${column.key} ta-${column.align}" data-col="${esc(column.key)}">`
+        + `<span class="th-label"${column.title ? ` title="${esc(column.title)}"` : ''}>${esc(column.label)}${hint}</span>${grip}</th>`;
     }).join('');
     return `<thead><tr>${cells}</tr></thead>`;
   }
 
   /** 列宽骨架：默认宽度来自 CSS（.cell-* 类），用户拖过的列由 style 覆盖 */
   function colGroupHtml(widths) {
-    const cols = columnKeys().map(key =>
-      `<col data-col="${esc(key)}"${widths?.[key] ? ` style="width:${Number(widths[key])}px"` : ''}>`).join('');
+    const cols = visibleColumns().map(column =>
+      `<col data-col="${esc(column.key)}"${widths?.[column.key] ? ` style="width:${Number(widths[column.key])}px"` : ''}>`).join('');
     return `<colgroup>${cols}</colgroup>`;
   }
 
@@ -309,15 +354,17 @@
   }
 
   /**
-   * 状态：启用 / 禁用开关 + 健康徽章。
+   * 状态：启用 / 禁用开关（+ 需要留意时的健康徽章）。
    *
    * 开关直接落 `PATCH { enabled }`（与「⋯」菜单里的启用/禁用是同一条链，语义一致），
    * 不做二次确认 —— 这个动作可逆，且关掉后账号记录仍在列表里（不是删除）。
-   * 徽章沿用 accounts-model 的 accountTags：启用 / 代理异常 / 不可用 / 禁用。
+   * 徽章沿用 accounts-model 的 accountTags：代理异常 / 不可用 / 仅账号管理；
+   * 一切正常时它返回空串，这里就**不渲染徽章那一行** —— 启用状态由开关的
+   * 轨道位置与滑块表达，再补一枚「启用」是同一格里的第二次说明。
    */
   function statusCell(account) {
     const enabled = isEnabled(account);
-    const tags = accountTags(account) || '<span class="badge tag plain">—</span>';
+    const tags = accountTags(account);
     // 开关没有可见文字（这一列很窄），所以必须有 aria-label：
     // 冒号后面补的是账号名，读屏时能听出「启用 <账号名>」而不是孤零零一个「复选框」
     const who = account.nickname || account.name || identifierOf(account) || account.id;
@@ -328,7 +375,8 @@
       + `<input type="checkbox" data-toggle="${esc(account.id)}"${enabled ? ' checked' : ''}`
       + ` aria-label="${enabled ? '禁用' : '启用'}${esc(who)}">`
       + `<span class="track"></span></label>`
-      + `<div class="status-tags">${tags}</div></td>`;
+      + (tags ? `<div class="status-tags">${tags}</div>` : '')
+      + '</td>';
   }
 
   /**
@@ -527,22 +575,31 @@
    *   connections      该账号此刻的活跃请求数（实时轮询的结果，缺失 = 0）
    *   draft            正在编辑中的优先级草稿（重绘时保住用户没提交完的输入）
    */
+  /**
+   * 把该列的对齐贴到单元格上（列设置换对齐后重绘即可生效，不必改样式表）。
+   *
+   * 各个 `*Cell` 函数返回的都是 `<td class="cell-xxx">…` 这一形态，所以在
+   * class 里补一个后缀就行。补不上（以后有人改了外壳写法）时**回退到包裹**：
+   * 让用户看到「设了没完全生效」好过静默丢掉对齐 —— 前者能查出来，后者只能猜。
+   */
+  function withAlign(html, align) {
+    const replaced = html.replace(/^<td class="([^"]*)"/, `<td class="$1 ta-${align}"`);
+    return replaced === html ? `<td class="ta-${align}">${html}</td>` : replaced;
+  }
+
   function rowHtml(account, ctx) {
     const classes = ['acct-row'];
     if (!isEnabled(account)) classes.push('disabled');
     if (ctx.picked) classes.push('selected');
+    // 逐列渲染（顺序与显隐都来自列设置）。勾选列的内容依赖 ctx.picked，
+    // 所以它不走 COLUMNS 里的 render —— 其余列都是「账号 + 行上下文」的纯函数。
+    const cells = visibleColumns().map(column => withAlign(
+      column.key === 'pick' ? pickCell(account, ctx.picked) : (column.render?.(account, ctx) || ''),
+      column.align,
+    )).join('');
     return `<tr class="${classes.join(' ')}" data-id="${esc(account.id)}"`
       + `${isDesktopAccount(account) ? ' data-desktop="1"' : ''}>`
-      + pickCell(account, ctx.picked)
-      + priorityCell(account, ctx)
-      + providerCell(providerOf(account), account)
-      + accountCell(account)
-      + connectionsCell(account, ctx)
-      + statusCell(account)
-      + limitsCell(account, ctx)
-      + expiryCell(account)
-      + usageCell(account, ctx)
-      + actionsCell(account, ctx)
+      + cells
       + '</tr>';
   }
 
@@ -550,10 +607,13 @@
    * 展开的明细行（限流 / 积分 / 签到）。挂在账号行**之后**的独立 `<tr>` 上而不是
    * 塞进某个单元格：明细是整宽内容，放进单元格会被那一列的宽度锁死。
    * 未展开时调用方根本不渲染这一行 —— 多一个空 `<tr>` 会白白多出一条分隔线。
+   *
+   * colspan 取**当前可见列数**：列设置里藏起几列之后，仍按 COLUMNS.length 铺开
+   * 会让这一行比表体宽出一截（多出来的格子把整张表顶出横向滚动）。
    */
   function panelsRowHtml(account, panelsHtml) {
     return `<tr class="acct-panels" data-panels-for="${esc(account.id)}">`
-      + `<td colspan="${columnCount()}">${panelsHtml}</td></tr>`;
+      + `<td colspan="${visibleColumns().length}">${panelsHtml}</td></tr>`;
   }
 
   // ─── 编辑中的输入框：跨重绘保住 ───────────────
@@ -587,7 +647,6 @@
     tableHtml,
     rowHtml,
     panelsRowHtml,
-    columnKeys,
     // 连接数格子由视图侧**就地更新**（2 秒轮询只改这一格，不重绘整表；
     // 见 accounts-view.js 的 syncConnections），所以这个渲染函数要导出
     connectionsHtml,

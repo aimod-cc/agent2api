@@ -41,25 +41,41 @@
   const GRIP_HTML = `<span class="${GRIP_CLASS}" title="拖动调整列宽（双击还原）"></span>`;
 
   /**
-   * 三张表的登记：columns 的顺序就是列顺序。
+   * 四张表的登记：columns 的顺序就是列顺序。
    *
    * · table 模式：只给 key，靠表头与 <col> 上的 data-col 属性定位（不依赖列序，
    *   以后在中间插一列不会让旧数据错位）。
    * · grid 模式：给表头单元格的选择器 sel 与默认轨道 track（与 page-requests.css
    *   的 grid-template-columns 一一对应），varName 是写到容器上的变量名。
+   *
+   * ── columnsOf：列设置与列宽的同源 ─────────────────────────────
+   * 四张表都接了列设置（能藏列、能换顺序），而列宽这一层有多处要按**当前可见列**
+   * 算：覆盖值落到哪个 <col>、轨道列表有几条、以及「末列不给把手」。各自的
+   * columnsOf 从那张表的渲染模块取可见列，再用本登记的列对象对齐 —— 本登记是
+   * 列宽（track / 默认宽度）的权威，列设置那头只管显隐与顺序，两者同一个答案。
+   * 取不到（脚本未加载、表格还没就绪）就退回全部列，行为与接入前一致。
    */
+  const visibleColumnsOf = read => function columnsOf() {
+    const visible = read();
+    if (!Array.isArray(visible)) return this.columns;
+    const byKey = new Map(this.columns.map(column => [column.key, column]));
+    return visible.map(column => byKey.get(column.key)).filter(Boolean);
+  };
+
   const TABLES = [
     {
       id: 'models',
       mode: 'table',
       root: 'table.models-table:not(.keys-table)',
       columns: ['model', 'rate', 'source', 'alias', 'state', 'act'].map(key => ({ key })),
+      columnsOf: visibleColumnsOf(() => window.wbModelsPanel?.visibleColumns?.()),
     },
     {
       id: 'keys',
       mode: 'table',
       root: 'table.keys-table',
       columns: ['name', 'key', 'time', 'state', 'act'].map(key => ({ key })),
+      columnsOf: visibleColumnsOf(() => window.wbKeysPanel?.visibleColumns?.()),
     },
     {
       id: 'requests',
@@ -78,6 +94,13 @@
         { key: 'error', sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
         { key: 'detail', sel: '.req-detail', track: '60px' },
       ],
+      /**
+       * 当前该渲染哪些列、按什么顺序（见上面 visibleColumnsOf 的说明）。
+       *
+       * 只返回**可见**列：`track` 从本登记取（这里才是列宽的权威），
+       * 列设置那头只管显隐与顺序。
+       */
+      columnsOf: visibleColumnsOf(() => window.wbRequestsPanel?.visibleColumns?.()),
     },
   ];
 
@@ -126,13 +149,25 @@
     const head = root.querySelector(table.head);
     if (!head) return root.getBoundingClientRect().width;
     const style = getComputedStyle(head);
-    // 列间距不参与分列，必须扣掉：算漏了就会拖出一条横向滚动条
-    const gap = (parseFloat(style.columnGap) || 0) * (table.columns.length - 1);
+    // 列间距不参与分列，必须扣掉：算漏了就会拖出一条横向滚动条。
+    // 缝隙数是**当前可见列**减一（藏列之后轨道也跟着少，见 activeColumns）。
+    const gap = (parseFloat(style.columnGap) || 0) * Math.max(0, activeColumns(table).length - 1);
     return head.clientWidth
       - (parseFloat(style.paddingLeft) || 0)
       - (parseFloat(style.paddingRight) || 0)
       - gap;
   }
+
+  /**
+   * 一张表**当前该渲染哪些列**（顺序即渲染顺序）。
+   *
+   * 列设置（table-col-settings.js）可以藏列、换顺序，所以「列宽」这一层也必须
+   * 跟着变 —— grid 模式的轨道列表是逐列拼出来的，条数与顺序一旦与渲染出的
+   * 格子对不上，整行会错位（第一格吃掉第二格的宽度）。
+   * 表自己在 spec 里给 `columnsOf`（返回可见列及其 track）；没给就是全部列，
+   * 也就是「没有接入列设置」的那些表。
+   */
+  const activeColumns = table => (table.columnsOf ? table.columnsOf() : table.columns);
 
   /** 把当前覆盖值落到 DOM 上（恢复、拖动中、还原都走它） */
   function paint(table) {
@@ -141,7 +176,7 @@
     const { overrides } = stateOf(table);
 
     if (table.mode === 'table') {
-      for (const column of table.columns) {
+      for (const column of activeColumns(table)) {
         const col = root.querySelector(`col[data-col="${column.key}"]`);
         if (!col) continue;
         const width = overrides[column.key];
@@ -152,22 +187,54 @@
       return;
     }
 
-    // grid 模式：整条轨道列表写到容器上，行由继承拿到
-    if (!table.columns.some(column => overrides[column.key])) {
+    // grid 模式：整条轨道列表写到容器上，行由继承拿到。
+    //
+    // 写出的条件有两个，**缺一不可**：
+    //   · 有拖过的列 → 用户宽度得有人表达；
+    //   · 当前可见列与登记的全集不同（藏了列 / 换了顺序）→ CSS 里那条写死的
+    //     默认轨道（page-requests.css 的 9 条）是按**全集 + 原始顺序**排的，
+    //     藏一列就少一格、换个顺序就对不上位置，不写变量的话格子数与轨道数
+    //     对不上，整行错位（第一格吃掉第二格的宽度）。这一条以前漏了：
+    //     藏列之后只要没拖过任何列宽，就退回 CSS 默认 —— 正是最容易踩到的路径
+    //     （新用户第一次试列设置）。
+    // 两者都不成立时摘掉变量，走 CSS 默认 —— 与接入列设置之前完全一致。
+    const columns = activeColumns(table);
+    const untouched = columns.length === table.columns.length
+      && columns.every((column, index) => column === table.columns[index]);
+    if (untouched && !columns.some(column => overrides[column.key])) {
       root.style.removeProperty(table.varName);
       return;
     }
-    root.style.setProperty(table.varName, table.columns
+    root.style.setProperty(table.varName, columns
       .map(column => (overrides[column.key] ? `${overrides[column.key]}px` : column.track))
       .join(' '));
   }
 
-  /** 表头里补把手（不是最后一列；已有的不重复插，重绘后补也安全） */
+  /**
+   * 表头里补把手，并把不该留的摘掉。
+   *
+   * 「哪一列在最后」跟着列设置走（末列不给把手，见模块头），所以每次列集合
+   * 变化都要重新对一遍：藏列 / 换顺序之后，上一轮插下的把手会跟着它所在的
+   * <th> 一起留着 —— 那一列可能已经不是末列（该有把手却没有），也可能原本
+   * 有把手的那一列变成了末列（把手顶出横向滚动条）。已有的不重复插，
+   * 所以重绘后反复调用是安全的。
+   */
   function paintGrips(table) {
     const root = rootOf(table);
     if (!root) return;
-    table.columns.forEach((column, index) => {
-      if (table.mode === 'table' && index === table.columns.length - 1) return;
+    const columns = activeColumns(table);
+    const last = columns[columns.length - 1];
+
+    for (const grip of [...root.querySelectorAll(`.${GRIP_CLASS}`)]) {
+      const column = columnOfCell(table, root, grip.parentElement);
+      // 认不出所属列（列表头被重绘过）→ 留着，由渲染方那边的重绘逻辑接管
+      if (!column) continue;
+      // 表格模式下末列不给把手：它 right: -4px 定位，钉在表格右缘会顶出横向滚动条
+      if (table.mode === 'table' && column === last) grip.remove();
+    }
+
+    columns.forEach((column, index) => {
+      if (table.mode === 'table' && index === columns.length - 1) return;
       const cell = headCellOf(table, root, column);
       if (!cell || cell.querySelector(`:scope > .${GRIP_CLASS}`)) return;
       cell.insertAdjacentHTML('beforeend', GRIP_HTML);
@@ -189,11 +256,11 @@
     return fixed ? Math.max(MIN_WIDTH, Math.round(parseFloat(fixed[1]))) : MIN_WIDTH;
   }
 
-  /** 被拖这一列的宽度上限 */
-  function limitOf(table, total, index, startWidth) {
+  /** 被拖这一列的宽度上限（others 按**可见列**算，藏起来的列不占宽度） */
+  function limitOf(table, total, key, startWidth) {
     const { overrides } = stateOf(table);
-    const others = table.columns.reduce((sum, column, i) => (
-      i === index ? sum : sum + (overrides[column.key] || reservedOf(table, column))
+    const others = activeColumns(table).reduce((sum, column) => (
+      column.key === key ? sum : sum + (overrides[column.key] || reservedOf(table, column))
     ), 0);
     // 不允许低于当前宽度：现状是上一轮拖动留下的，往回缩一下更难看
     return Math.max(MIN_WIDTH, Math.round(total - others), Math.round(startWidth));
@@ -202,19 +269,23 @@
   const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
   /** 落一次宽度：写内存 → 立即重画（拖动中每帧都调，所以只改被拖的那一列） */
-  function applyWidth(table, index, width) {
-    stateOf(table).overrides[table.columns[index].key] = Math.round(width);
+  function applyWidth(table, key, width) {
+    stateOf(table).overrides[table.columns.find(column => column.key === key)?.key || key] = Math.round(width);
     paint(table);
   }
 
-  function indexOfCell(table, root, cell) {
-    if (!cell) return -1;
-    return table.columns.findIndex(column => headCellOf(table, root, column) === cell);
+  /** 命中的表头格属于哪一列（按**当前可见列**找，藏列后索引会变） */
+  function columnOfCell(table, root, cell) {
+    if (!cell) return null;
+    return activeColumns(table).find(column => headCellOf(table, root, column) === cell) || null;
   }
 
   /**
    * 委托绑定：mousedown 开拖、dblclick 还原。挂在表格/列表容器上一次即可，
    * 内部节点被重绘后监听仍然有效（委托到容器，不依赖具体节点）。
+   *
+   * 全程按**列 key** 而不是索引定位：列设置能换顺序、能藏列，索引随时会变，
+   * 而 key 是稳定的身份（宽度覆盖值也是按 key 存的，两处口径一致）。
    */
   function bind(table) {
     const root = rootOf(table);
@@ -222,19 +293,19 @@
 
     root.addEventListener('mousedown', event => {
       const grip = event.target.closest?.(`.${GRIP_CLASS}`);
-      // 委托挂在各自的表上，所以命中的把手一定在这张表里；indexOfCell 再确认它属于哪一列
-      const index = indexOfCell(table, root, grip?.parentElement);
-      if (index < 0) return;
+      // 委托挂在各自的表上，所以命中的把手一定在这张表里；columnOfCell 再确认它属于哪一列
+      const column = columnOfCell(table, root, grip?.parentElement);
+      if (!column) return;
       event.preventDefault();
 
       const startX = event.clientX;
       const startWidth = grip.parentElement.getBoundingClientRect().width;
-      const limit = limitOf(table, trackSpace(table, root), index, startWidth);
+      const limit = limitOf(table, trackSpace(table, root), column.key, startWidth);
       grip.classList.add('active');
       document.body.classList.add('col-resizing');
 
       const move = moveEvent => {
-        applyWidth(table, index, clamp(startWidth + moveEvent.clientX - startX, MIN_WIDTH, limit));
+        applyWidth(table, column.key, clamp(startWidth + moveEvent.clientX - startX, MIN_WIDTH, limit));
       };
       const up = () => {
         grip.classList.remove('active');
@@ -250,27 +321,37 @@
     root.addEventListener('dblclick', event => {
       const grip = event.target.closest?.(`.${GRIP_CLASS}`);
       if (!grip) return;
-      const index = indexOfCell(table, root, grip.parentElement);
-      if (index < 0) return;
+      const column = columnOfCell(table, root, grip.parentElement);
+      if (!column) return;
       const { overrides } = stateOf(table);
-      const key = table.columns[index].key;
-      if (!overrides[key]) return;
+      if (!overrides[column.key]) return;
       // 还原这一列：删掉覆盖值 → 它回到 CSS 的默认宽度，腾出的宽度由其余列按权重分掉
-      delete overrides[key];
+      delete overrides[column.key];
       persist(table);
       paint(table);
     });
   }
 
   /**
-   * 请求日志的表头是整块重绘出来的（渲染方每次刷新都换掉 .req-head），
-   * 重绘后补一次把手。观察者只在子节点变动时跑一次，且对已有把手直接跳过。
+   * 请求日志是整块重绘出来的（每次刷新都换掉表头与全部行），重绘后补一次
+   * 把手与轨道。
+   *
+   * 轨道（`--req-cols`）也得跟着重算，不能只在注册时算一次：本文件比
+   * requests-panel.js **先加载**，注册那一刻读不到「用户可见哪些列」，
+   * 只能按全集算一遍；而面板首屏/每次刷新渲染出的是配置后的列集合。
+   * 第一次重绘后立刻校准，从此两者一致。
+   *
+   * 观察者只对子节点变动触发；而 paint 写的是容器自身的 style，不会引发
+   * 子节点变动，所以不存在自激循环。对已有把手直接跳过，重复调用也安全。
    */
   function watch(table) {
     if (typeof MutationObserver !== 'function') return;
     const root = rootOf(table);
     if (!root) return;
-    new MutationObserver(() => paintGrips(table)).observe(root, { childList: true, subtree: true });
+    new MutationObserver(() => {
+      paint(table);
+      paintGrips(table);
+    }).observe(root, { childList: true, subtree: true });
   }
 
   /** 接入一张表：恢复列宽 → 补把手 → 绑事件（grid 模式再加一个重绘观察者） */
@@ -284,6 +365,19 @@
 
   for (const table of TABLES.slice()) register(table);
 
+  /**
+   * 按 id 重画某张表：列设置改了显隐 / 顺序之后调它。
+   *
+   * 列宽与把手两件事都要重对一遍 —— 轨道条数（grid 模式）、覆盖值落到哪个
+   * <col>（table 模式）、以及「末列不给把手」这条规则，全都按当前可见列算。
+   */
+  function repaint(id) {
+    const table = TABLES.find(item => item.id === id);
+    if (!table) return;
+    paint(table);
+    paintGrips(table);
+  }
+
   // 供别处重画用（表格自己重绘了列宽骨架时调一次）
-  window.wbTableColumns = { paint, grips: paintGrips, register };
+  window.wbTableColumns = { paint, grips: paintGrips, register, repaint };
 })();

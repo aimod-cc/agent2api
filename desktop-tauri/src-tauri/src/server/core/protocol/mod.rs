@@ -32,6 +32,7 @@
 //! 不做网络、不碰文件、不认识 axum（纯函数 + 状态机，便于单独推演）。
 
 pub mod anthropic;
+pub mod freeform;
 pub mod responses;
 
 use serde_json::Value;

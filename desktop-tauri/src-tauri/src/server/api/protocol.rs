@@ -185,6 +185,7 @@ pub async fn responses_endpoint(
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
+                    pipeline::terminal::RESPONSES,
                     move |chunk| machine.push(chunk),
                 );
                 return sse_response(status, transformed);
@@ -290,6 +291,7 @@ pub async fn messages_endpoint(
                 let transformed = pipeline::transformed_stream(
                     source,
                     context,
+                    pipeline::terminal::ANTHROPIC,
                     move |chunk| machine.push(chunk),
                 );
                 return sse_response(status, transformed);

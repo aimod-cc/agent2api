@@ -13,6 +13,14 @@
 //!   - token 临期刷新      ← `auth::{get_current_session, is_token_expiring, refresh_account}`
 //!   - 模型清单            ← `core::models::global_catalog()`
 //!
+//! ── 出站归一化（2026-09 新增，子模块 `normalize`）──────────────
+//! 上表里「system 注入」那一行的**职责被拆开了一部分**：`developer→system`
+//! 角色归一现在发生在 `normalize::normalize_outbound` 里，且**必须先于**
+//! system 兜底注入（顺序理由见 `build_chat_request` 的函数头）。同一管线还做
+//! tool_choice / image_url / max_tokens / tool 配对修复与前缀缓存键注入。
+//! 那是从参考项目 workbuddy2api 移植的本家形态适配，与「搬」进本模块的既有
+//! 逻辑不同源 —— 见 `normalize.rs` 模块头。
+//!
 //! ── 为什么清单与刷新放在这里而不是只做转发 ────────────────────
 //! 聚合目录（`providers/catalog.rs`）在 W2a 里按 `ProviderKind` 分支直接读
 //! `core::models`，并注明「W3 换成适配器注册表时改的就只是 manifest_for」。
@@ -42,6 +50,10 @@ use super::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
 };
 use super::ProviderKind;
+
+/// 出站请求体归一化（角色 / tool_choice / image_url / max_tokens / tool 配对 /
+/// 前缀缓存键），从参考项目 workbuddy2api 移植。见该模块头的完整说明。
+mod normalize;
 
 /// 上游错误码 11128（历史文案：Illegal API invocation from an unapproved channel）。
 ///
@@ -87,6 +99,16 @@ impl ProviderAdapter for WorkBuddyAdapter {
     /// `account` 是账号会话形态：`core::auth` 的 `build_auth_headers` 直接读
     /// `auth.accessToken` / `account.uid` / `auth.domain` 等字段即可，
     /// 与改造前 `session_for` 拿到的对象完全同形。
+    ///
+    /// ── 出站归一化的位置与顺序（2026-09 新增）─────────────────────
+    /// 本函数是「**这一家的**请求即将发出」的唯一汇聚点（`provider_loop` 对同一家
+    /// 同池的重试复用同一份 body，见 `send_cache`），所以本家上游的形态要求
+    /// （role 白名单 / tool_choice 只认字符串 / image_url 只认对象 / 只认
+    /// max_tokens）在这里一次改对 —— 换了账号也不会重新踩同一批 400。
+    ///
+    /// **归一化必须在 `ensure_leading_system_message` 之前**：客户端用
+    /// `developer` 打头时，先归一成 `system` 才判得出「首条已是 system」；
+    /// 反过来会多注入一条兜底 system，而上游对多 system 的行为未实测。
     fn build_chat_request(
         &self,
         account: &Value,
@@ -96,7 +118,19 @@ impl ProviderAdapter for WorkBuddyAdapter {
         let session = account;
         // 上游只支持流式：编排层在进来之前已把 body.stream 置 true（见
         // `upstream::forward` 的说明），这里不重复设置。
-        let with_system = match ensure_leading_system_message(body) {
+        //
+        // 出站归一（本家形态要求，见函数头的顺序说明）。`notable()` 为假时
+        // 不写日志：常规请求唯一的改动是注入了 prompt_cache_key（几乎每次都发生），
+        // 为它写一行会让详细日志被淹没；真正的修复（角色/tool 配对/图片形态等）
+        // 才值得留痕 —— 那是用户排查「网关对我的请求动了什么」的唯一入口。
+        let (normalized, report) = normalize::normalize_outbound(body, session);
+        if report.notable() {
+            crate::server::logging::verbose(
+                "[Upstream]",
+                &format!("WorkBuddy 出站归一：{}", report.describe()),
+            );
+        }
+        let with_system = match ensure_leading_system_message(&normalized) {
             Some(next) => {
                 crate::server::logging::verbose(
                     "[Upstream]",
@@ -104,7 +138,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
                 );
                 next
             }
-            None => body.clone(),
+            None => normalized,
         };
         let url = chat_completions_url(session);
         let headers = chat_headers(

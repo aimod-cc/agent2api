@@ -31,6 +31,50 @@
   const $ = id => document.getElementById(id);
   const { esc, toast } = wbApp;
 
+  // ─── 列设置（显示 / 隐藏、顺序、对齐）──────────
+  //
+  // 本表是 CSS grid 形态（没有 <table>），所以列的显隐与顺序靠**轨道列表**表达：
+  // 渲染方按可见列产出格子，table-columns.js 按同一个列集合拼 `--req-cols`
+  // （见那边 spec 里的 columnsOf）。两处必须读同一份配置，否则格子与轨道
+  // 条数对不上，整行会错位。
+  //
+  // key 取 tab-group.js（table-columns.js）里登记的同一套：time / target / retry /
+  // status / model / dur / usage / error / detail，与 CSS 里的 `.req-xxx` 类同名。
+  // `sel` 是表头格的选择器、`track` 是默认轨道，两者都从 table-columns.js 的登记
+  // 同源复制过来 —— 那份登记管「列宽」，这里管「列的显隐与顺序」，
+  // 列的集合只有一套（改列时两处要一起改，见各自的注释）。
+  const COLUMNS = [
+    { key: 'time', label: '时间', sel: '.req-time', track: '92px' },
+    { key: 'target', label: '提供商 / 账号', sel: '.req-target', track: 'minmax(0, 1.1fr)' },
+    { key: 'retry', label: '重试', sel: '.req-retry', track: '52px' },
+    { key: 'status', label: '状态', sel: '.req-status', track: '68px' },
+    { key: 'model', label: '模型', sel: '.req-model', track: 'minmax(0, 1.3fr)' },
+    { key: 'dur', label: '用时', sel: '.req-dur', track: '96px', align: 'right' },
+    { key: 'usage', label: '用量', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
+    { key: 'error', label: '错误', sel: '.req-error-cell', track: 'minmax(0, 1.2fr)' },
+    { key: 'detail', label: '详情', sel: '.req-detail', track: '60px', align: 'right' },
+  ];
+
+  const colSettings = window.wbColSettings?.register({
+    id: 'requests',
+    label: '请求日志表',
+    columns: COLUMNS.map(({ key, label, align }) => ({ key, label, align })),
+    mount: () => document.querySelector('.page[data-page="requests"] .panel-head .head-actions'),
+    // 顺序很关键：先重画列表（格子按新列集合产出），再让 table-columns.js
+    // 重算轨道变量 —— 它读的 visibleColumns() 已经是新配置了，
+    // 于是「格子数 = 轨道数」在同一次任务里对齐，不会闪出一次错位的中间态。
+    onChange: () => { render(); window.wbTableColumns?.repaint?.('requests'); },
+  });
+
+  /**
+   * 当前可见的列（顺序即配置顺序）。
+   *
+   * 返回的项带 `sel` / `track`：`sel` 给渲染方定位表头格与数据格，
+   * `track` 交给 table-columns.js 拼轨道 —— 两处都从这一个函数拿，
+   * 所以「藏了哪几列」在两边是同一个答案。
+   */
+  const visibleColumns = () => (colSettings ? colSettings.apply(COLUMNS) : COLUMNS);
+
   /**
    * 自动刷新间隔兜底值（毫秒）= 后端的默认间隔
    * （`DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS`）：读不到配置时与用户没改过时一致。
@@ -210,7 +254,7 @@
    * 判据与文案的完整说明见 request-hover.js 的 `hasProcessFacts`。
    *
    * ── 敏感词标签为什么只写一个「敏」字（本次改造）──────────────
-   * 表头已经收窄成「重试」（见 REQ_HEAD 的说明），这一列只有 52px 宽：
+   * 表头已经收窄成「重试」（见 headHtml 的说明），这一列只有 52px 宽：
    * 「敏感词」三个字会把标签撑得比「重试 N」还宽，两枚标签竖排时右边留一大块
    * 空白、列也容易被挤到换行。命中是**有没有**的问题，不是**几个字**的问题，
    * 所以缩成一个「敏」字，完整含义交给两个既有出口：`title` 悬停提示与
@@ -355,22 +399,47 @@
       + ` data-detail="${esc(id)}" title="查看该请求的上游原始报文">详情</button></span>`;
   }
 
+  /**
+   * 数据单元格：按列 key 建表，每个函数返回**该格本身**（网格项，带 `.req-xxx`
+   * 列类名 —— 原设计如此：这一列的一切排版都由那个类名上的声明决定）。
+   *
+   * 拆成表而不是行内联的 9 个 `${}`：`rowHtml` 只回答「按哪些列、什么顺序」，
+   * 而「某一格长什么样」只有一处实现 —— 列设置重排时才不会各画一个样。
+   */
+  const CELLS = {
+    // 注意 timeCell 收的是**时间戳**（它同时被别处按 ts 调用），不是 entry
+    time: entry => timeCell(entry.ts),
+    target: entry => targetCell(entry),
+    retry: entry => retryCell(entry),
+    status: entry => statusCell(entry),
+    model: entry => modelCell(entry),
+    dur: entry => '<span class="req-num req-dur">'
+      + `<span class="req-dur-line">${esc(formatDuration(entry.durationMs))}</span>`
+      + `<span class="req-dur-line sub" title="首响：上游首帧到达的耗时">首响 ${esc(formatFirstResponse(entry.firstResponseMs))}</span></span>`,
+    usage: entry => usageCell(entry),
+    // 没有错误时用「-」占位（空着会被当成渲染缺失，与重试列同一手法）
+    error: entry => (entry.error
+      ? `<span class="req-error" title="${esc(String(entry.error))}">${esc(String(entry.error))}</span>`
+      : '<span class="req-none req-error-cell">-</span>'),
+    detail: entry => detailCell(entry),
+  };
+
+  /** 把该列的对齐贴到格子上（与 accounts-table.js 的 withAlign 同一手法） */
+  function withAlign(html, align) {
+    const replaced = html.replace(/^<span class="([^"]*)"/, `<span class="$1 ta-${align}"`);
+    return replaced === html ? `<span class="ta-${align}">${html}</span>` : replaced;
+  }
+
+  /**
+   * 一行：按**可见列**逐格产出，顺序与表头一致（两处都走 visibleColumns）。
+   * 每个格子仍是带 `.req-xxx` 的网格项，只是多一个用户选的对齐类。
+   */
   function rowHtml(entry) {
     const ok = isOk(entry);
-    const error = entry.error ? String(entry.error) : '';
-    return `<div class="req-row${ok ? '' : ' failed'}">
-        ${timeCell(entry.ts)}
-        ${targetCell(entry)}
-        ${retryCell(entry)}
-        ${statusCell(entry)}
-        ${modelCell(entry)}
-        <span class="req-num req-dur"><span class="req-dur-line">${esc(formatDuration(entry.durationMs))}</span><span class="req-dur-line sub" title="首响：上游首帧到达的耗时">首响 ${esc(formatFirstResponse(entry.firstResponseMs))}</span></span>
-        ${usageCell(entry)}
-        ${error
-          ? `<span class="req-error" title="${esc(error)}">${esc(error)}</span>`
-          : '<span class="req-none req-error-cell">-</span>'}
-        ${detailCell(entry)}
-      </div>`;
+    const cells = visibleColumns()
+      .map(column => withAlign(CELLS[column.key]?.(entry) || '', column.align))
+      .join('');
+    return `<div class="req-row${ok ? '' : ' failed'}">${cells}</div>`;
   }
 
   // ─── 整块渲染 ────────────────────────────────
@@ -385,18 +454,20 @@
    * 第三列的表头是「重试」而不是「重试 / 敏感词」：敏感词那枚标签已经缩成
    * 一个「敏」字（见 retryCell 的说明），表头跟着收窄才配得上这一列 52px 的
    * 宽度 —— 原来那五个字在这点宽度里只能靠省略号收住，等于没写。
-   * 这一列的两枚标签各自带悬停面板，含义不靠表头解释。 */
-  const REQ_HEAD = `<div class="req-head">
-      <span class="req-time">时间</span>
-      <span class="req-target">提供商 / 账号</span>
-      <span class="req-retry">重试</span>
-      <span class="req-status">状态</span>
-      <span class="req-model">模型</span>
-      <span class="req-num req-dur">用时</span>
-      <span class="req-usage">用量</span>
-      <span class="req-error-cell">错误</span>
-      <span class="req-detail">详情</span>
-    </div>`;
+   * 这一列的两枚标签各自带悬停面板，含义不靠表头解释。
+   *
+   * ── 格子为什么由 JS 拼（本次改造）───────────────────────────
+   * 列的显隐与顺序可调之后，表头不能再是一段写死的 HTML：要按可见列逐格产出，
+   * 顺序与数据行逐格一致（两处都走 visibleColumns）。类名沿用 `.req-xxx`
+   * —— 它是列的身份（渲染方按它选表头格、CSS 按它配色、窄窗口按它重排）。
+   */
+  function headHtml() {
+    const cells = visibleColumns().map(column => {
+      const cls = column.sel.slice(1) + (column.key === 'dur' ? ' req-num' : '');
+      return `<span class="${cls} ta-${column.align}" data-col="${column.key}">${esc(column.label)}</span>`;
+    }).join('');
+    return `<div class="req-head">${cells}</div>`;
+  }
 
   function emptyText() {
     if (!total) return '暂无请求日志，网关还没有转发过请求';
@@ -453,7 +524,7 @@
       list.innerHTML = `<div class="log-empty">${esc(emptyText())}</div>`;
       return;
     }
-    list.innerHTML = REQ_HEAD + entries.map(rowHtml).join('');
+    list.innerHTML = headHtml() + entries.map(rowHtml).join('');
   }
 
   // ─── 加载 ──────────────────────────────────
@@ -726,6 +797,9 @@
     load,
     // 「定时任务」页改完间隔后推给本面板（见 applyAutoRefresh 的说明）
     applyAutoRefresh,
+    // 当前可见列（顺序即配置顺序）：table-columns.js 拼 `--req-cols` 轨道时
+    // 读它 —— 轨道条数与顺序必须与渲染出的格子一一对应，两处同源才不会错位
+    visibleColumns,
   };
 
   // 首屏自持加载：即便 app.js 的 refresh 失败，本页也能独立显示真实状态。

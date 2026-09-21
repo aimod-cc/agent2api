@@ -73,6 +73,54 @@
   /** 行内操作在途标记：防同一行连点 */
   const pending = new Set();
 
+  // ─── 列设置（显示 / 隐藏、顺序、对齐）──────────
+  //
+  // 本表的 <colgroup> 与 <thead> 写死在 index.html 里（不随数据重绘），所以列的
+  // 顺序与显隐由 wbColSettings.syncStaticHead 就地**重排既有元素**，不按字符串重建
+  // —— <col> 上带着拖出来的列宽、<th> 里插着列宽把手，重建会把两者一起丢掉。
+  //
+  // key 用表格里既有的 `data-col`（model / rate / source / alias / state / act）：
+  // index.html 的 `<col class="c-xxx" data-col="xxx">`、表头 th、table-columns.js
+  // 的列宽登记三处同名，键名只有一套。
+  const COLUMNS = [
+    { key: 'model', label: '上游模型' },
+    { key: 'rate', label: '倍率' },
+    { key: 'source', label: '来源' },
+    { key: 'alias', label: '对外映射名' },
+    { key: 'state', label: '启用' },
+    { key: 'act', label: '操作', align: 'right' },
+  ];
+
+  const colSettings = window.wbColSettings?.register({
+    id: 'models',
+    label: '模型管理表',
+    columns: COLUMNS,
+    mount: () => document.querySelector('.page[data-page="gateway"] .panel-head .head-actions'),
+    // 表头重排 + 数据行按新的列集合重画（两处读同一份配置，不会各画一个样）
+    onChange: () => { syncHead(); render(); },
+  });
+
+  const syncHead = () => window.wbColSettings
+    ?.syncStaticHead('models', document.querySelector('table.models-table:not(.keys-table)'));
+
+  /** 该表当前可见的列（顺序即配置顺序；列设置未就绪时退回全部列） */
+  const visibleColumns = () => (colSettings ? colSettings.apply(COLUMNS) : COLUMNS);
+
+  /**
+   * 跨整行的单元格（分组带 / 展开更多 / 空态 / 孤儿映射区）该跨几列。
+   *
+   * 必须跟着**可见列数**走：写死 6 之后，用户在列设置里藏起两列，这些整行
+   * 单元格会比表体宽出两格 —— 多出来的格子把整张表顶出横向滚动，
+   * 而滚动条一出现，吸顶表头与表体的对齐也跟着偏。
+   */
+  const span = () => visibleColumns().length;
+
+  /** 把该列的对齐贴到单元格外壳上（与 accounts-table.js 的 withAlign 同一手法） */
+  function withAlign(html, align) {
+    const replaced = html.replace(/^<td class="([^"]*)"/, `<td class="$1 ta-${align}"`);
+    return replaced === html ? `<td class="ta-${align}">${html}</td>` : replaced;
+  }
+
   // ─── 数据 ─────────────────────────────────
 
   function models() { return Array.isArray(data?.models) ? data.models : []; }
@@ -214,21 +262,39 @@
     return `<div class="aliases">${chips}${add}</div>`;
   }
 
+  /**
+   * 各列的单元格（不含 `<td>` 外壳；入参统一为 `(m, busyRow)`）。
+   *
+   * 放在一个表里而不是行内联的三元链，是为了让 `row()` 只回答「按哪些列、什么顺序」
+   * —— 列一多，那种链式拼接读起来要先数逗号才知道哪个 td 属于哪一列；
+   * 而「某一列长什么样」只有一处实现，列设置重排时才不会各画一个样。
+   */
+  const CELLS = {
+    model: m => {
+      const name = m.name && m.name !== m.id ? `<div class="mname">${esc(m.name)}</div>` : '';
+      return `<td class="cell-model"><div class="mid"><span class="t">${esc(m.id)}</span>`
+        + `<button type="button" class="cp" data-copy="${esc(m.id)}" title="复制模型 ID">⧉</button></div>${name}</td>`;
+    },
+    rate: m => `<td class="cell-rate">${m.credits
+      ? `<span class="rate">${esc(formatCredits(m.credits))}</span>`
+      : '<span class="rate">—</span>'}</td>`,
+    source: m => `<td class="cell-source">${sourceCell(m)}</td>`,
+    alias: m => `<td class="cell-alias">${aliasChips(m)}</td>`,
+    state: (m, busyRow) => `<td class="cell-state state"><label class="switch">`
+      + `<input type="checkbox" data-act="toggle" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"`
+      + `${m.enabled ? ' checked' : ''}${m.hidden || busyRow ? ' disabled' : ''}><span class="track"></span></label></td>`,
+    act: (m, busyRow) => `<td class="cell-act r"><div class="row-actions">`
+      + (m.hidden
+        ? `<button type="button" class="sm ghost" data-act="restore" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>恢复</button>`
+        : `<button type="button" class="sm ghost danger-text" data-act="hide" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>删除</button>`)
+      + '</div></td>',
+  };
+
   function row(m) {
     const busyRow = pending.has(rowKey(m));
-    const name = m.name && m.name !== m.id ? `<div class="mname">${esc(m.name)}</div>` : '';
-    const credits = m.credits ? `<span class="rate">${esc(formatCredits(m.credits))}</span>` : '<span class="rate">—</span>';
-    const actions = m.hidden
-      ? `<button type="button" class="sm ghost" data-act="restore" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>恢复</button>`
-      : `<button type="button" class="sm ghost danger-text" data-act="hide" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>删除</button>`;
     return `<tr class="${m.enabled && !m.hidden ? '' : 'off'}" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}">`
-      + `<td><div class="mid"><span class="t">${esc(m.id)}</span>`
-      + `<button type="button" class="cp" data-copy="${esc(m.id)}" title="复制模型 ID">⧉</button></div>${name}</td>`
-      + `<td>${credits}</td>`
-      + `<td>${sourceCell(m)}</td>`
-      + `<td>${aliasChips(m)}</td>`
-      + `<td class="state"><label class="switch"><input type="checkbox" data-act="toggle" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${m.enabled ? ' checked' : ''}${m.hidden || busyRow ? ' disabled' : ''}><span class="track"></span></label></td>`
-      + `<td class="r"><div class="row-actions">${actions}</div></td></tr>`;
+      + visibleColumns().map(column => withAlign(CELLS[column.key](m, busyRow), column.align)).join('')
+      + '</tr>';
   }
 
   /** 「来源」列：这一家的清单当前是远程拉的还是内置静态表（后端给的 `source`）。
@@ -301,7 +367,7 @@
     if (!all.length) {
       // 一条模型都没有（没加账号）：此时把映射全列成「未挂载」只是噪音，
       // 「请先添加账号」才是用户该看到的话
-      body.innerHTML = `<tr><td colspan="6" class="empty">${data ? '暂无模型（请先添加账号）' : '加载中…'}</td></tr>`;
+      body.innerHTML = `<tr><td colspan="${span()}" class="empty">${data ? '暂无模型（请先添加账号）' : '加载中…'}</td></tr>`;
       return;
     }
     // 孤儿映射不随模型的启停 / 删除筛选走：那些维度是「模型的状态」，
@@ -310,7 +376,7 @@
     const orphans = (stateFilter === 'all' || stateFilter === 'mapped') ? orphanSection(keyword) : '';
     if (!shown.length) {
       body.innerHTML = orphans
-        || `<tr><td colspan="6" class="empty">没有匹配${keyword ? `「${esc(keyword)}」` : '当前筛选'}的模型</td></tr>`;
+        || `<tr><td colspan="${span()}" class="empty">没有匹配${keyword ? `「${esc(keyword)}」` : '当前筛选'}的模型</td></tr>`;
       return;
     }
     // 折叠只在「无搜索、全部状态」下生效（见文件头）
@@ -325,11 +391,11 @@
       const open = expanded.has(key) || !collapsible;
       const items = open ? group.items : group.items.slice(0, GROUP_LIMIT);
       const rest = group.items.length - items.length;
-      const head = `<tr class="tr-group"><td colspan="6"><span class="prov-tag">${esc(group.label)}</span>${group.items.length} 个模型</td></tr>`;
+      const head = `<tr class="tr-group"><td colspan="${span()}"><span class="prov-tag">${esc(group.label)}</span>${group.items.length} 个模型</td></tr>`;
       const more = rest > 0
-        ? `<tr class="tr-more"><td colspan="6"><button type="button" class="sm ghost" data-act="expand" data-provider="${esc(key)}">展开其余 ${rest} 个模型 ▾</button></td></tr>`
+        ? `<tr class="tr-more"><td colspan="${span()}"><button type="button" class="sm ghost" data-act="expand" data-provider="${esc(key)}">展开其余 ${rest} 个模型 ▾</button></td></tr>`
         : (open && collapsible && group.items.length > GROUP_LIMIT
-          ? `<tr class="tr-more"><td colspan="6"><button type="button" class="sm ghost" data-act="collapse" data-provider="${esc(key)}">收起 ▴</button></td></tr>`
+          ? `<tr class="tr-more"><td colspan="${span()}"><button type="button" class="sm ghost" data-act="collapse" data-provider="${esc(key)}">收起 ▴</button></td></tr>`
           : '');
       return head + items.map(row).join('') + more;
     }).join('') + orphans;
@@ -370,7 +436,7 @@
       return `${mapping.alias} ${mapping.target}`.toLowerCase().includes(keyword);
     });
     if (!orphans.length) return '';
-    const head = `<tr class="tr-group tr-orphan"><td colspan="6">`
+    const head = `<tr class="tr-group tr-orphan"><td colspan="${span()}">`
       + `<span class="prov-tag">未挂载的映射</span>${orphans.length} 条</td></tr>`;
     const rows = orphans.map(mapping => {
       // 展示名从**注册表**查（`wbProviders.labelOf`），不是从表格行里收集：
@@ -407,16 +473,24 @@
         : hasProviderRows
           ? `${label} 的清单里没有这个模型`
           : `${label} 还没有账号，它的模型都没有列出`);
+      // 与正常行同样按可见列拼单元格（键 → HTML），否则藏起几列之后这一行
+      // 会比表体多出格子来，把整张表顶出横向滚动。它只有「名称 / 映射名 / 操作」
+      // 三格有内容，其余列按破折号占位 —— 列设置里把某一列露出来时，
+      // 这里给的是「这一行在这一维上没有值」，而不是让它整格错位。
+      const cells = {
+        model: `<td class="cell-model"><div class="mid"><span class="t">${esc(mapping.target)}</span></div>`
+          + `<div class="mname">${why}</div></td>`,
+        alias: `<td class="cell-alias">${chips}</td>`,
+        act: '<td class="cell-act r"><div class="row-actions">'
+          + `<button type="button" class="sm ghost danger-text" ${del}${busy ? ' disabled' : ''}>删除映射</button>`
+          + '</div></td>',
+      };
       return `<tr class="off" data-id="${esc(mapping.target)}" data-provider="${esc(mapping.provider || '')}">`
-        + `<td><div class="mid"><span class="t">${esc(mapping.target)}</span></div>`
-        + `<div class="mname">${why}</div></td>`
-        + '<td><span class="rate">—</span></td>'
-        + '<td><span class="rate">—</span></td>'
-        + `<td>${chips}</td>`
-        + '<td class="state"><span class="rate">—</span></td>'
-        + '<td class="r"><div class="row-actions">'
-        + `<button type="button" class="sm ghost danger-text" ${del}${busy ? ' disabled' : ''}>删除映射</button>`
-        + '</div></td></tr>';
+        + visibleColumns().map(column => withAlign(
+          cells[column.key] || '<td><span class="rate">—</span></td>',
+          column.align,
+        )).join('')
+        + '</tr>';
     }).join('');
     return head + rows;
   }
@@ -980,8 +1054,18 @@
   const refreshHint = $('models-refresh-hint');
   if (refreshHint) refreshHint.textContent = REFRESH_TITLE;
 
+  // visibleColumns 导出给 table-columns.js：列宽那一层要按当前可见列算
+  // （覆盖值落到哪个 <col>、末列不给把手），两边读同一份配置才不会各算一个样。
+  // 必须在下面的 syncHead() **之前**挂好 —— 那次同步会顺带重算列宽与把手，
+  // 挂晚了它读到的是「全列」，「末列不给把手」就会判到错的那一列上。
+  window.wbModelsPanel = { render, load, refreshModels, visibleColumns };
+
+  // 首屏同步一次静态表头：load() 只重画数据行，表头是本文件加载后按本地配置
+  // 重排过的（顺序 / 显隐 / 对齐）—— 不补这一下，用户改过列设置后刷新页面会看到
+  // 表头回到 index.html 里的原始顺序，而数据行已经是新顺序（一眼就对不上）。
+  syncHead();
+
   // 首次进入模型管理页时 load()；app.js 的 render() 只触发重绘（数据自持）
-  window.wbModelsPanel = { render, load, refreshModels };
   // app.js 末尾的 showPage() 跑在本文件之前：启动时若记住的就是本页，那次调用
   // 拿不到 wbModelsPanel，这里补拉一次
   if (wbApp.currentPage === 'gateway') void load();

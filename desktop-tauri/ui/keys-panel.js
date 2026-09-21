@@ -53,6 +53,42 @@
   const { esc, toast, formatTime } = wbApp;
   const $ = id => document.getElementById(id);
 
+  // ─── 列设置（显示 / 隐藏、顺序、对齐）──────────
+  //
+  // 与模型管理表同一套做法（那张表的注释里有详细理由）：本表的 <colgroup> 与
+  // <thead> 写死在 index.html 里，所以列的顺序与显隐由 wbColSettings.syncStaticHead
+  // 就地重排既有元素 —— <col> 上的列宽、<th> 里的把手都跟着元素走。
+  //
+  // key 取 index.html 里既有的 `data-col`（name / key / time / state / act），
+  // 与 `<col class="k-xxx" data-col="xxx">`、table-columns.js 的列宽登记三处同名。
+  const COLUMNS = [
+    { key: 'name', label: '名称' },
+    { key: 'key', label: 'Key' },
+    { key: 'time', label: '创建时间' },
+    { key: 'state', label: '启用' },
+    { key: 'act', label: '操作', align: 'right' },
+  ];
+
+  const colSettings = window.wbColSettings?.register({
+    id: 'keys',
+    label: '网关 Key 表',
+    columns: COLUMNS,
+    mount: () => document.querySelector('.page[data-page="keys"] .panel-head .head-actions'),
+    onChange: () => { syncHead(); render(); },
+  });
+
+  const syncHead = () => window.wbColSettings
+    ?.syncStaticHead('keys', document.querySelector('table.keys-table'));
+
+  /** 该表当前可见的列（顺序即配置顺序；列设置未就绪时退回全部列） */
+  const visibleColumns = () => (colSettings ? colSettings.apply(COLUMNS) : COLUMNS);
+
+  /** 把该列的对齐贴到单元格外壳上（与 accounts-table.js 的 withAlign 同一手法） */
+  function withAlign(html, align) {
+    const replaced = html.replace(/^<td class="([^"]*)"/, `<td class="$1 ta-${align}"`);
+    return replaced === html ? `<td class="ta-${align}">${html}</td>` : replaced;
+  }
+
   let data = null;
   let loading = false;
   /** 已切到明文显示的 key id */
@@ -177,21 +213,37 @@
     return lines.join('\n');
   }
 
-  function row(k) {
-    const busyRow = pending.has(k.id);
-    const shown = revealed.has(k.id);
-    const restriction = `<div class="mname" title="${esc(restrictionTitle(k))}">${esc(restrictionText(k))}</div>`;
-    return `<tr class="${k.enabled ? '' : 'off'}" data-id="${esc(k.id)}">`
-      + `<td><div class="mid"><span class="t">${esc(k.name || '未命名')}</span></div>${restriction}</td>`
-      + `<td><div class="keycell"><code class="kv">${esc(shown ? k.key : k.masked)}</code>`
-      + `<button type="button" class="sm ghost" data-act="reveal" data-id="${esc(k.id)}">${shown ? '隐藏' : '显示'}</button>`
-      + `<button type="button" class="sm ghost" data-copy="${esc(k.key)}" title="复制 Key">复制</button></div></td>`
-      + `<td><span class="muted">${k.createdAt ? esc(formatTime(k.createdAt)) : '—'}</span></td>`
-      + `<td class="state"><label class="switch"><input type="checkbox" data-act="toggle" data-id="${esc(k.id)}"${k.enabled ? ' checked' : ''}${busyRow ? ' disabled' : ''}><span class="track"></span></label></td>`
-      + `<td class="r"><div class="row-actions">`
+  /**
+   * 各列的单元格（不含 `<td>` 外壳；入参统一为 `(k, busyRow)`）。
+   * 拆成表而不是行内联的拼接：`row()` 只回答「按哪些列、什么顺序」，
+   * 而「某一列长什么样」只有一处实现（列设置重排时才不会各画一个样）。
+   */
+  const CELLS = {
+    name: k => {
+      const restriction = `<div class="mname" title="${esc(restrictionTitle(k))}">${esc(restrictionText(k))}</div>`;
+      return `<td class="cell-name"><div class="mid"><span class="t">${esc(k.name || '未命名')}</span></div>${restriction}</td>`;
+    },
+    key: k => {
+      const shown = revealed.has(k.id);
+      return `<td class="cell-key"><div class="keycell"><code class="kv">${esc(shown ? k.key : k.masked)}</code>`
+        + `<button type="button" class="sm ghost" data-act="reveal" data-id="${esc(k.id)}">${shown ? '隐藏' : '显示'}</button>`
+        + `<button type="button" class="sm ghost" data-copy="${esc(k.key)}" title="复制 Key">复制</button></div></td>`;
+    },
+    time: k => `<td class="cell-time"><span class="muted">${k.createdAt ? esc(formatTime(k.createdAt)) : '—'}</span></td>`,
+    state: (k, busyRow) => `<td class="cell-state state"><label class="switch">`
+      + `<input type="checkbox" data-act="toggle" data-id="${esc(k.id)}"${k.enabled ? ' checked' : ''}${busyRow ? ' disabled' : ''}>`
+      + '<span class="track"></span></label></td>',
+    act: (k, busyRow) => `<td class="cell-act r"><div class="row-actions">`
       + `<button type="button" class="sm ghost" data-act="restrict" data-id="${esc(k.id)}"${busyRow ? ' disabled' : ''}>可用范围</button>`
       + `<button type="button" class="sm ghost danger-text" data-act="remove" data-id="${esc(k.id)}"${busyRow ? ' disabled' : ''}>删除</button>`
-      + `</div></td></tr>`;
+      + '</div></td>',
+  };
+
+  function row(k) {
+    const busyRow = pending.has(k.id);
+    return `<tr class="${k.enabled ? '' : 'off'}" data-id="${esc(k.id)}">`
+      + visibleColumns().map(column => withAlign(CELLS[column.key](k, busyRow), column.align)).join('')
+      + '</tr>';
   }
 
   function render() {
@@ -199,9 +251,11 @@
     if (!body) return;
     renderStatus();
     const list = keys();
+    // 空态的 colspan 跟着可见列数走：写死 5 之后藏起两列，这一格会比表体
+    // 宽出两格，把整张表顶出横向滚动（同 models-panel 的 span()）
     body.innerHTML = list.length
       ? list.map(row).join('')
-      : `<tr><td colspan="5" class="empty">${data ? '还没有 Key，当前不鉴权' : '加载中…'}</td></tr>`;
+      : `<tr><td colspan="${visibleColumns().length}" class="empty">${data ? '还没有 Key，当前不鉴权' : '加载中…'}</td></tr>`;
     // 顶栏徽标镜像的是 #keys-status，重绘后同步一次
     wbApp.renderTopbarStatus?.();
   }
@@ -425,6 +479,16 @@
   $('key-allowed-models')?.addEventListener('change', paintRestrictionState);
   $('key-modal')?.addEventListener('click', event => { if (event.target === $('key-modal')) closeModal(); });
 
-  window.wbKeysPanel = { load, render };
+  // visibleColumns 导出给 table-columns.js：列宽那一层要按当前可见列算
+  // （覆盖值落到哪个 <col>、末列不给把手），两边读同一份配置才不会各算一个样。
+  // 必须在下面的 syncHead() **之前**挂好 —— 那次同步会顺带重算列宽与把手，
+  // 挂晚了它读到的是「全列」，「末列不给把手」就会判到错的那一列上。
+  window.wbKeysPanel = { load, render, visibleColumns };
+
+  // 首屏同步一次静态表头：load() 只重画数据行，表头是本文件加载后按本地配置
+  // 重排过的（顺序 / 显隐 / 对齐）—— 不补这一下，用户改过列设置后刷新页面会看到
+  // 表头回到 index.html 里的原始顺序，而数据行已经是新顺序（一眼就对不上）。
+  syncHead();
+
   if (wbApp.currentPage === 'keys') void load();
 })();

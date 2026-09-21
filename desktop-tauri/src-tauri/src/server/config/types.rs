@@ -262,42 +262,62 @@ pub struct IntervalTaskPatch {
 
 // ─── 请求重试设置的键名与边界（config.json 里的字段名**就是契约**）─────
 //
-// 转发层的退避重试读这三个值（见 `upstream::provider_loop::send_with_retry`）。
+// 转发层的退避重试读这三个值（见 `upstream::provider_loop::send_with_retry`
+// 与 `attempt_queue`）。
 //
-// ── 为什么分两档次数（同一家 / 换了家）──────────────────────
-// 一次转发失败后的处置有两条路：**在原提供商上再试**（可能换该家的下一个
-// 账号，也可能只是同账号重发），以及**换一家提供商再试**。这两件事的代价与
-// 收益完全不同：前者便宜、可能只是瞬时抖动；后者要跨到另一家的额度与限流上，
-// 用户往往希望「先在本家多试几次，实在不行再换家」。所以两档各有一个次数，
-// 而不是共用一个。
+// ── 为什么分两档次数（同账号原地重发 / 换账号）──────────────
+// 一次转发失败后的处置有两条路，代价与收益完全不同：
+//   - **在同一个账号上原地重发**：便宜，可能只是瞬时抖动或敏感词误拦，
+//     等一个间隔再发一次往往就好了 —— 这是 `retryCount`；
+//   - **换一个账号再试**：换号要走另一份额度与限流，还可能是另一家，
+//     用户往往希望「先在当前账号多试几次，实在不行再换号」—— 这是
+//     `retryCrossProviderCount`。
 //
 // 判定口径（`provider_loop::attempt_queue` 记账）：
-//   - 请求**首次选中的那一家**用 `retryCount`；
-//   - 一旦选中的账号属于**另一家**，预算就换成 `retryCrossProviderCount`，
-//     且从零开始计（不是接着上一档扣）—— 「换家之后还能试 5 次」是用户填
-//     这个数字时的直觉，接着扣会得到「换家后只剩 2 次」这种没人能预期的结果。
+//   - 请求**首次选中的那个账号**用 `retryCount`，原地重发几次；
+//   - **每换一个账号**（不分是同家的下一个还是另一家的）扣一次
+//     `retryCrossProviderCount`，扣满就带着最后一次的错误收尾，
+//     不再往下顺延。
+//
+// ── 第二档为什么按「账号」而不是按「提供商」（2026-09 修正）────
+// 旧实现按提供商分段：同一家名下的所有账号算一段、共用一份原地重发预算，
+// 只有跨家才重新给一份。这有两个后果，都与用户对这个数字的预期不符：
+//   - 「能换几个账号」根本没有任何设置管 —— 只受队列里账号总数限制，
+//     某家囤了 9 个账号时，一次请求会一路试到第 10 个（用户实测截图）；
+//   - 用户填的 5 只在「跨家之后」生效，而跨家本身已经是队列走完的副产品，
+//     等到那时往往早就没有可用账号了。
+// 现在改成「换账号次数」：不管换到哪一家，换一次扣一次。键名保留
+// `retryCrossProviderCount` 不变（改名会让老配置读不到、回落默认值，
+// 得额外做迁移，不划算）—— 键名是历史包袱，语义以本节为准。
 
-/// **同一提供商内**的重试次数（0 = 失败立即报错，不重试）
+/// **同一账号内**的原地重发次数（0 = 失败立即换号，不重发）
 pub const KEY_RETRY_COUNT: &str = "retryCount";
-/// **换到别的提供商之后**的重试次数（0 = 换家后不再重试）
-pub const KEY_RETRY_CROSS_PROVIDER_COUNT: &str = "retryCrossProviderCount";
+/// **换账号**的次数（0 = 不换号，直接收尾）。
+///
+/// ── 常量名与 JSON 键名为什么对不上 ─────────────────────────
+/// 键名（`retryCrossProviderCount`）是**配置契约**：改名会让改了名的老配置
+/// 读不到、静默回落成默认值，还得额外做一次迁移，不划算 —— 所以字符串
+/// 原样冻结。常量名（Rust 侧标识符）说的才是真语义：**按账号计，不分家**，
+/// 换到同家的下一个账号与换到另一家都算一次。语义详见本节开头的说明。
+pub const KEY_RETRY_ACCOUNT_SWITCH_COUNT: &str = "retryCrossProviderCount";
 /// 两次重试之间的等待秒数
 pub const KEY_RETRY_INTERVAL_SECONDS: &str = "retryIntervalSeconds";
 
-/// 同一提供商的重试次数默认值：失败后再试 3 次（连同首次共 4 次发送）
+/// 同一账号的原地重发次数默认值：失败后再试 3 次（连同首发共 4 次发送）
 pub const DEFAULT_RETRY_COUNT: i64 = 3;
-/// 换家后的重试次数默认值：换到另一家后再试 5 次。
+/// 换账号的次数默认值：失败后最多换 5 个账号。
 ///
-/// 比同一家那档更宽是刻意的：能走到换家说明本家确实不通（额度耗尽 / 持续
-/// 5xx），此时多给几次试错机会比快速失败更符合预期。
-pub const DEFAULT_RETRY_CROSS_PROVIDER_COUNT: i64 = 5;
+/// 比原地重发那档更宽是刻意的：换号的成本主要在「等到下一个可用账号」，
+/// 而一个账号失败往往说明它这份额度确实不通，多换几个比快速失败更符合预期。
+pub const DEFAULT_RETRY_SWITCH_COUNT: i64 = 5;
 /// 重试间隔默认值：5 秒
 pub const DEFAULT_RETRY_INTERVAL_SECONDS: i64 = 5;
 
 /// 次数与间隔的合法范围。
 ///
 /// 上限 10 次 / 300 秒：次数过多或间隔过长都会让客户端干等（重试是「再发一次」，
-/// 与「换一个账号」不是一回事）。下限 0：次数 0 = 关闭该档重试，间隔 0 = 立即重发。
+/// 换号也是「换个人再发一次」，都不是把请求拆成多次）。下限 0：次数 0 = 关闭
+/// 该档（不重发 / 不换号），间隔 0 = 立即重发。
 pub const RETRY_MIN_COUNT: i64 = 0;
 pub const RETRY_MAX_COUNT: i64 = 10;
 pub const RETRY_MIN_INTERVAL_SECONDS: i64 = 0;
@@ -309,10 +329,15 @@ pub const RETRY_MAX_INTERVAL_SECONDS: i64 = 300;
 /// 都取），打包成 `Copy` 值让调用方一次拿到、不必多次读锁。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetrySettings {
-    /// **同一提供商内**的最大重试次数（0 = 不重试）
+    /// **同一账号内**的原地重发次数（0 = 失败立即换号）
     pub count: i64,
-    /// **换到别的提供商之后**的最大重试次数（0 = 换家后不重试）
-    pub cross_provider_count: i64,
+    /// **换账号**的次数上限（0 = 不换号，直接收尾）。
+    ///
+    /// 字段名保留了旧措辞、JSON 键名也没变（见
+    /// [`KEY_RETRY_ACCOUNT_SWITCH_COUNT`]）—— 键名是配置契约，改名会让老配置
+    /// 读不到。此处标识符说的是真语义：**按账号计，不分家**，换到同家的下一个
+    /// 账号与换到另一家都算一次。
+    pub account_switch_count: i64,
     /// 两次重试之间的间隔（秒）
     pub interval_seconds: i64,
 }
@@ -323,13 +348,17 @@ impl RetrySettings {
         self.interval_seconds.max(0) as u64 * 1000
     }
 
-    /// 某个阶段的重试预算（`switched` = 已经换到别的提供商）。
+    /// 同一账号的原地重发预算（与 [`Self::switch_budget`] 是两个独立的口径）。
     ///
     /// 负值按 0 处理：`bounded_int_field` 已保证范围，这里是防御性的
     /// （负数转 `usize` 会回绕成天文数字，那会让重试变成死循环）。
-    pub fn budget(&self, switched: bool) -> usize {
-        let value = if switched { self.cross_provider_count } else { self.count };
-        value.max(0) as usize
+    pub fn resend_budget(&self) -> usize {
+        self.count.max(0) as usize
+    }
+
+    /// 换账号的次数上限（换一次扣一次，扣满即收尾）。
+    pub fn switch_budget(&self) -> usize {
+        self.account_switch_count.max(0) as usize
     }
 }
 
@@ -337,7 +366,7 @@ impl Default for RetrySettings {
     fn default() -> Self {
         Self {
             count: DEFAULT_RETRY_COUNT,
-            cross_provider_count: DEFAULT_RETRY_CROSS_PROVIDER_COUNT,
+            account_switch_count: DEFAULT_RETRY_SWITCH_COUNT,
             interval_seconds: DEFAULT_RETRY_INTERVAL_SECONDS,
         }
     }
@@ -347,6 +376,6 @@ impl Default for RetrySettings {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RetryPatch {
     pub count: Option<i64>,
-    pub cross_provider_count: Option<i64>,
+    pub account_switch_count: Option<i64>,
     pub interval_seconds: Option<i64>,
 }
