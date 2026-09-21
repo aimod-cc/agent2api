@@ -5672,7 +5672,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workbuddy-proxy-desktop"
-version = "2.4.4"
+version = "2.4.5"
 dependencies = [
  "aes",
  "aes-gcm",

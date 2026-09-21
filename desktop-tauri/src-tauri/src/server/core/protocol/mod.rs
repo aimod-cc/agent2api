@@ -34,6 +34,7 @@
 pub mod anthropic;
 pub mod freeform;
 pub mod responses;
+pub mod tool_plan;
 
 use serde_json::Value;
 

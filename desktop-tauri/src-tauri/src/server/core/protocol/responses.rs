@@ -26,7 +26,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     content_parts, content_text, event_frame, freeform, is_truthy, json_text, random_id,
-    string_field, string_value, SseLineBuffer,
+    string_field, string_value, tool_plan, SseLineBuffer,
 };
 use crate::server::logging;
 
@@ -75,18 +75,16 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
             }
         }
     }
-    // 工具声明有两个来源，都要收：
-    //   1) 顶层 `tools`（标准 Responses 形态）
-    //   2) `input[]` 里 `type:"additional_tools"` 的项（Codex 的 Responses Lite
-    //      路径：工具塞在 input 里，顶层 `tools` 为 null）
-    // 第 2 条是 2026-09 那次「Codex 调不动工具」的根因 —— 只认顶层字段时，
-    // Lite 路径的声明会被整个跳过，模型看不到任何工具，于是把调用当正文吐出来
-    let tool_decls = collect_tool_declarations(body);
-    if !tool_decls.is_empty() {
+    // 工具声明：收集 + 摊平（namespace 展开、custom 记名）。两个来源都要收 ——
+    // 顶层 `tools`，以及 `input[]` 里 `type:"additional_tools"` 的项（Codex 的
+    // Responses Lite 路径把工具塞在 input 里、顶层 `tools` 为 null）。详见
+    // `tool_plan` 模块头：只认顶层字段是 2026-09「Codex 调不动工具」的根因。
+    let plan = tool_plan::plan_tools(body);
+    if !plan.declarations.is_empty() {
         let mut converted: Vec<Value> = Vec::new();
         let mut downgraded: Vec<String> = Vec::new();
         let mut ignored: Vec<String> = Vec::new();
-        for tool in &tool_decls {
+        for tool in &plan.declarations {
             if let Some(function) = tool_to_chat(tool) {
                 converted.push(function);
                 continue;
@@ -102,7 +100,7 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
                     continue;
                 }
             }
-            ignored.push(tool_kind_label(tool));
+            ignored.push(tool_plan::tool_kind_label(tool));
         }
         if !ignored.is_empty() {
             logging::log(
@@ -123,6 +121,14 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
             );
         }
         if !converted.is_empty() {
+            logging::verbose(
+                "[Responses]",
+                &format!(
+                    "工具声明 {} 条（含命名空间展开）→ 已转发 {} 条",
+                    plan.declarations.len(),
+                    converted.len()
+                ),
+            );
             out.insert("tools".to_string(), Value::Array(converted));
         }
     }
@@ -142,49 +148,6 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
 
 fn has_effort(value: &Value) -> bool {
     !string_value(value).trim().is_empty()
-}
-
-/// `additional_tools` 输入项的 type 字面量。
-///
-/// Codex 的 Responses Lite 路径用它承载工具声明：顶层 `tools` 置 null，工具
-/// 改放在 `input[]` 的这一个项里（见 OpenAI 文档「Add tools at a specific point
-/// in the input」）。本网关的上游是 Chat 接口，没有「对话中途追加工具」的概念，
-/// 所以统一提升成请求级工具声明。
-const ADDITIONAL_TOOLS_ITEM: &str = "additional_tools";
-
-/// 收集请求里的全部工具声明（顶层 `tools` + `input[]` 里的 `additional_tools`）。
-///
-/// 两个来源合并成一份扁平数组交给调用方转换，调用方不必关心它们原先放在哪。
-/// 顶层排在前面：它是请求级声明，语义上先于中途追加。
-fn collect_tool_declarations(body: &Value) -> Vec<Value> {
-    let mut decls: Vec<Value> = Vec::new();
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        decls.extend(tools.iter().cloned());
-    }
-    let Some(items) = body.get("input").and_then(Value::as_array) else {
-        return decls;
-    };
-    for item in items {
-        if !string_field(item, "type").eq_ignore_ascii_case(ADDITIONAL_TOOLS_ITEM) {
-            continue;
-        }
-        // 规范形态是 `tools: [完整工具定义]`。但 Lite 路径在不同 Codex 版本里
-        // 出现过只给名字（`tool_names: [...]`）的变体 —— 那种形态没有可转换的
-        // 定义，只能留痕跳过，硬编一份假 schema 会让模型按错误参数调用
-        if let Some(tools) = item.get("tools").and_then(Value::as_array) {
-            decls.extend(tools.iter().cloned());
-        } else if let Some(names) = item.get("tool_names").and_then(Value::as_array) {
-            let listed: Vec<String> = names.iter().map(string_value).collect();
-            logging::log(
-                "[Responses]",
-                &format!(
-                    "⚠️ additional_tools 只给了工具名、没有定义，无法转发：{}",
-                    listed.join(", ")
-                ),
-            );
-        }
-    }
-    decls
 }
 
 /// `instructions` + `input` → Chat 的 `messages` 数组。
@@ -234,7 +197,9 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
         // 上游要求 tool 消息必须紧跟对应的 assistant，所以这里一次推两条。
         "function_call" => {
             let call_id = call_id_of(item);
-            let name = string_field(item, "name");
+            // 命名空间工具的历史里，名字在 `name`、分组在 `namespace` 两个字段；
+            // 给上游必须是展平后的名字，否则模型看到的工具名前后不一致
+            let name = tool_plan::flatten_call_name(item);
             let arguments = {
                 let raw = json_text(item.get("arguments").unwrap_or(&Value::Null));
                 if raw.is_empty() { "{}".to_string() } else { raw }
@@ -261,7 +226,7 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
         // 多轮里模型看不到自己上一步调过什么 —— 工具调用即便成功，第二轮也会
         // 退化成凭空重问。
         "custom_tool_call" => {
-            let name = string_field(item, "name");
+            let name = tool_plan::flatten_call_name(item);
             // 两种来源都要认：客户端回传的原生形态是 `input` 裸文本；
             // 但历史若来自我们自己的回程（已降级），id 相同、字段也可能是
             // `arguments`。取到哪个用哪个，都不丢内容
@@ -303,10 +268,12 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
             // 裸内容块（不在 message 里）：包成一条 user 消息
             messages.push(json!({ "role": "user", "content": [item.clone()] }));
         }
-        // 工具声明项：不是对话内容，已经在 `collect_tool_declarations` 里
+        // 工具声明项：不是对话内容，已经在 `tool_plan::plan_tools` 里
         // 提升成请求级工具声明。这里静默跳过 —— 落到下面的兜底分支会报一条
-        // 误导性的「内容会缺一段」（它本来就不该出现在对话里）
-        ADDITIONAL_TOOLS_ITEM => {}
+        // 误导性的「内容会缺一段」（它本来就不该出现在对话里）。
+        // 注意这里必须写字面量：用常量名会被当成变量绑定，从而吞掉**所有**
+        // 输入项（编译器只在有后续分支时才报 unreachable pattern）
+        "additional_tools" => {}
         // 消息项（含 type 缺失/为 "message" 的常规形态）
         _ => {
             let role = {
@@ -461,37 +428,17 @@ fn image_url_of(part: &Value) -> String {
     }
 }
 
-/// 工具声明在日志里的可读标签（`function:bash` / `web_search` / …）。
-///
-/// 丢工具时必须留下它叫什么：只报「丢了 N 条」，排查的人无从判断丢的是不是
-/// 关键能力 —— 2026-09 那次 Codex 工具失效，症状是模型把调用当正文吐出来，
-/// 若当时有这行日志，一眼就能定位。
-fn tool_kind_label(tool: &Value) -> String {
-    let name = string_field(tool, "name");
-    if name.is_empty() {
-        let kind = string_field(tool, "type");
-        if kind.is_empty() { "未命名工具".to_string() } else { kind }
-    } else {
-        let kind = string_field(tool, "type");
-        if kind.is_empty() || kind.eq_ignore_ascii_case("function") {
-            name
-        } else {
-            format!("{kind}:{name}")
-        }
-    }
-}
-
 /// Responses 工具 → Chat 工具（扁平 → 嵌套 `function`）
 fn tool_to_chat(tool: &Value) -> Option<Value> {
     // 字符串形态的工具名（`tools: ["web_search"]`）：不是 function，丢掉
     if tool.is_string() {
         return None;
     }
-    let kind = string_field(tool, "type").to_lowercase();
     // 已经嵌套好的（客户端混用两种形态）：原样保留
-    if kind == "function" && tool.get("function").is_some() {
+    if tool_plan::is_nested_function(tool) {
         return Some(tool.clone());
     }
+    let kind = string_field(tool, "type").to_lowercase();
     if kind != "function" && !kind.is_empty() {
         // 非 function 类型：上游的 Chat 接口不认，丢掉而不是发过去让上游报错
         // —— 客户端要的是「能跑」，不是「原样报错」。
@@ -499,26 +446,7 @@ fn tool_to_chat(tool: &Value) -> Option<Value> {
         // （见 `chat_from_responses` 的工具循环），不会真的丢。
         return None;
     }
-    let name = string_field(tool, "name");
-    if name.is_empty() {
-        return None;
-    }
-    let parameters = tool
-        .get("parameters")
-        .filter(|value| is_truthy(value))
-        .cloned()
-        .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
-    let mut function = Map::new();
-    function.insert("name".to_string(), Value::String(name));
-    if let Some(description) = tool.get("description").filter(|value| is_truthy(value)) {
-        function.insert("description".to_string(), description.clone());
-    }
-    function.insert("parameters".to_string(), parameters);
-    // strict 是 Responses 的字段，Chat 的 function 里也认（部分上游支持）
-    if let Some(strict) = tool.get("strict") {
-        function.insert("strict".to_string(), strict.clone());
-    }
-    Some(json!({ "type": "function", "function": Value::Object(function) }))
+    tool_plan::nested_from_flat(tool)
 }
 
 /// Responses 的 tool_choice → Chat 的 tool_choice
@@ -548,37 +476,37 @@ fn tool_choice_to_chat(choice: &Value) -> Value {
 
 /// 一次工具调用 → Responses 的 output item。
 ///
-/// 名字命中 `custom_names`（请求里原本声明为 custom 的那批）时输出
-/// `custom_tool_call`：它的「参数」是裸文本 `input`，不是 `arguments` JSON。
-/// 客户端据此决定用哪条执行路径 —— 类型给错的话，Codex 会把自由文本当成
-/// JSON 参数去解析，工具照样跑不起来。
+/// 两件事都由 `plan` 决定：
+///   · 名字原本是 custom（自由文本）→ 输出 `custom_tool_call`，参数是裸文本
+///     `input` 而不是 `arguments` JSON。类型给错的话，Codex 会把自由文本当成
+///     JSON 参数去解析，工具照样跑不起来；
+///   · 名字来自命名空间 → 补回 `namespace` 字段并把 `name` 还原成原名。Codex
+///     的工具路由按 `{name, namespace}` 精确查表，缺了它直接报
+///     `unsupported call`。
 ///
 /// `call_id` 由调用方给（上游的真实 id，或自造兜底）：三个回程出口
 /// （非流式 / 流式 / 聚合）共用这一处口径，避免各写各的、日后只改一处。
-fn tool_call_item(
-    name: &str,
-    call_id: &str,
-    arguments: &str,
-    custom_names: &std::collections::BTreeSet<String>,
-) -> Value {
-    if custom_names.contains(name) {
-        return json!({
+fn tool_call_item(name: &str, call_id: &str, arguments: &str, plan: &tool_plan::ToolPlan) -> Value {
+    let item = if plan.is_custom(name) {
+        json!({
             "type": "custom_tool_call",
             "id": random_id("ctc"),
             "status": "completed",
             "call_id": call_id,
             "name": name,
             "input": freeform::unwrap_freeform_input(arguments),
-        });
-    }
-    json!({
-        "type": "function_call",
-        "id": random_id("fc"),
-        "status": "completed",
-        "call_id": call_id,
-        "name": name,
-        "arguments": arguments,
-    })
+        })
+    } else {
+        json!({
+            "type": "function_call",
+            "id": random_id("fc"),
+            "status": "completed",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+        })
+    };
+    tool_plan::restore_namespace(item, name, plan)
 }
 
 /// Responses 的 `text.format` → Chat 的 `response_format`
@@ -606,7 +534,7 @@ fn format_to_chat(format: &Value) -> Value {
 /// （instructions / temperature / tools / …）如实回显，客户端据此确认
 /// 「我发的参数被接受了」。
 pub fn responses_from_chat(chat: &Value, model: &str, request: &Value) -> Value {
-    let custom_names = freeform::custom_tool_names_from_request(request);
+    let plan = tool_plan::plan_tools(request);
     let choice = chat.pointer("/choices/0");
     let message = choice.and_then(|choice| choice.get("message")).cloned().unwrap_or(Value::Null);
     let finish = choice
@@ -650,7 +578,7 @@ pub fn responses_from_chat(chat: &Value, model: &str, request: &Value) -> Value 
                 let raw = string_field(call, "id");
                 if raw.is_empty() { random_id("call") } else { raw }
             };
-            output.push(tool_call_item(&name, &call_id, &arguments, &custom_names));
+            output.push(tool_call_item(&name, &call_id, &arguments, &plan));
         }
     }
 
@@ -833,7 +761,7 @@ pub struct ResponsesStream {
     /// 请求里声明为 custom（freeform）的工具名：命中时工具项要发
     /// `custom_tool_call` 与 `response.custom_tool_call_input.*`，
     /// 而不是 `function_call` 与 `response.function_call_arguments.*`
-    custom_names: std::collections::BTreeSet<String>,
+    plan: tool_plan::ToolPlan,
     /// 事件序号（Responses 要求每个事件带单调递增的 sequence_number）
     sequence: i64,
     created_sent: bool,
@@ -889,7 +817,7 @@ impl ResponsesStream {
             created: logging::now_ms() / 1000,
             model: model.to_string(),
             request: request.clone(),
-            custom_names: freeform::custom_tool_names_from_request(request),
+            plan: tool_plan::plan_tools(request),
             sequence: 0,
             created_sent: false,
             finished: false,
@@ -1128,7 +1056,7 @@ impl ResponsesStream {
                 // custom 项的 id 前缀与 function 不同（ctc_ vs fc_），而这里
                 // 是唯一能改的时刻：宣告之后 item_id 已经在事件里发出去，
                 // 再改就对不上了
-                if self.custom_names.contains(&tool.name) {
+                if self.plan.is_custom(&tool.name) {
                     tool.item_id = random_id("ctc");
                 }
                 tool.announced = true;
@@ -1143,7 +1071,7 @@ impl ResponsesStream {
             )
         };
 
-        let is_custom = self.custom_names.contains(&name);
+        let is_custom = self.plan.is_custom(&name);
         if announced_now {
             // 自由文本工具的「参数」是裸文本 input，item 形态与 function 不同
             // —— 见官方 custom_tool_call 项的定义
@@ -1166,6 +1094,9 @@ impl ResponsesStream {
                     "arguments": "",
                 })
             };
+            // 命名空间工具要在这里就带上 `namespace`：客户端在**宣告时**就按
+            // `{name, namespace}` 建路由，等到收尾才补已经晚了
+            let item = tool_plan::restore_namespace(item, &name, &self.plan);
             out.push(response_event(
                 &mut self.sequence,
                 "response.output_item.added",
@@ -1409,7 +1340,7 @@ impl ResponsesStream {
             // 用统一口径构造 item：custom 命中时要输出 custom_tool_call 与
             // 裸文本 input，类型给错客户端就按 JSON 解析，工具照样跑不起来
             let item = {
-                let mut value = tool_call_item(&name, &call_id, &arguments, &self.custom_names);
+                let mut value = tool_call_item(&name, &call_id, &arguments, &self.plan);
                 // item_id 要沿用宣告时那个：客户端按它对上号
                 if let Some(map) = value.as_object_mut() {
                     map.insert("id".to_string(), Value::String(tool.item_id.clone()));
@@ -1592,7 +1523,7 @@ impl ResponsesCollector {
 
     /// 收成一个 Responses 响应对象
     pub fn into_response(self, model: &str, request: &Value) -> Value {
-        let custom_names = freeform::custom_tool_names_from_request(request);
+        let plan = tool_plan::plan_tools(request);
         let mut output: Vec<Value> = Vec::new();
         if !self.reasoning.is_empty() {
             output.push(json!({
@@ -1616,7 +1547,7 @@ impl ResponsesCollector {
             let arguments = if tool.arguments.is_empty() { "{}".to_string() } else { tool.arguments };
             // 与另外两个回程出口共用口径：custom 命中时输出 custom_tool_call
             // （item id 的前缀由 tool_call_item 内部按类型选，不必在这里管）
-            output.push(tool_call_item(&name, &call_id, &arguments, &custom_names));
+            output.push(tool_call_item(&name, &call_id, &arguments, &plan));
         }
         let incomplete = match self.finish_reason.as_deref() {
             Some("length") => Some("max_output_tokens"),

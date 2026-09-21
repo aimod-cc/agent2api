@@ -484,6 +484,46 @@
     setState('点击「检查更新」查询 GitHub 上的最新发布版本。');
   }
 
+  /**
+   * 「检测到更新」弹窗点「去更新」时进入：带着弹窗已有的检查结果进来，
+   * 并把界面铺好之后**直接开始下载**。
+   *
+   * 为什么不在这里再调一次 check()：弹窗里的版本号、更新日志就是那次
+   * checkUpdate 的结果，再查一次既多一次网络往返，又可能出现「弹窗说有
+   * 新版、面板却查到没有」的不一致。直接把结果交进来，两边永远同源。
+   *
+   * 已有遗留任务 / 已下载完成时不重复下载，交给 load() 的既有逻辑接管 ——
+   * 重复触发下载会把正在下的任务顶掉。
+   */
+  async function openAndDownload(checkedInfo) {
+    if (checkedInfo?.hasUpdate === true) {
+      info = checkedInfo;
+      checkedAt = Date.now();
+      if (info.repository) applyRepository(info.repository);
+      renderCheckResult();
+      renderChangelog();
+      wbApp.updateUpdateBadge?.(info);
+    }
+    await load();
+    // 已有下载在跑或安装包已就绪：那两种状态下按钮分别是「取消下载」与
+    // 「安装并重启」，自动再触发一次语义就错了
+    if (downloading || $('btn-update-download')?.dataset.installPath) return;
+    if (!info?.hasUpdate) return;
+    // downloadOrCancel 开头有 `if (busy) return`，而 busy 在**别的**检查 / 下载
+    // 正在进行时为真（后端的定时检查每 5 分钟一轮，正好卡在这个瞬间的话，
+    // 这一下会被静默吞掉，人看到的就是「点了没反应」）。每轮先等再判，
+    // 给在跑的那件事让出时间；三轮仍占用就放弃 —— 按钮本来就在面板上，
+    // 用户手点一下即可，不值得为它无限重试。
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (busy) {
+        await new Promise(resolve => setTimeout(resolve, 400));
+        continue;
+      }
+      await downloadOrCancel();
+      return;
+    }
+  }
+
   // ─── 绑定 ─────────────────────────────────────
 
   $('btn-update-check')?.addEventListener('click', check);
@@ -492,5 +532,5 @@
   // 面板内的外链统一走委托（含「关于作者」与日志正文里的链接）
   $('update-notes')?.closest('.panel')?.addEventListener('click', onPanelClick);
 
-  window.wbUpdatePanel = { load, check };
+  window.wbUpdatePanel = { load, check, openAndDownload };
 })();

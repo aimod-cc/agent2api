@@ -490,6 +490,11 @@ function maybeShowUpdateModal(info) {
 $('update-modal-go')?.addEventListener('click', () => {
   closeUpdateModal();
   showPage('settings');
+  // 跳到设置页后直接把下载跑起来，别让人再点一次「下载并安装」——
+  // 他点「去更新」的意图就是要更新，停在面板上等下一步是多余的。
+  // 用 lastUpdateInfo（弹窗自己那次 checkUpdate 的结果）而不是让面板重查：
+  // 省一次往返，也避免「弹窗说有新版、面板查到没有」的不一致。
+  void window.wbUpdatePanel?.openAndDownload?.(lastUpdateInfo);
 });
 $('update-modal-skip')?.addEventListener('click', () => {
   try { localStorage.setItem(UPDATE_SKIP_KEY, promptedUpdateVersion); } catch { /* 忽略：下次照常弹 */ }
