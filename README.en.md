@@ -31,6 +31,7 @@ OpenAI client / any SDK
 
 - [Quick Start](#quick-start)
 - [Data Storage](#data-storage)
+- [Default Sensitive Word List](#default-sensitive-word-list)
 - [Project Layout](#project-layout)
 - [Development & Build](#development--build)
 - [Usage Notice](#usage-notice)
@@ -87,6 +88,32 @@ The database runs in WAL mode, so while the app is running you will also see `ag
 > **Upgrading from an older version**: earlier versions scattered data across 8 JSON / JSONL files (`accounts.json`, `config.json`, `logs.jsonl`, `requests.jsonl`, `request-daily.jsonl`, `debug-traffic.jsonl`, `desensitize.json`, `desktop-settings.json`). On first launch the new version **detects** them and shows a dialog explaining that storage has moved to SQLite; the import only starts after you press "Upgrade" in that dialog. Choosing "Later" skips the import for this run (accounts and history stay unavailable, and the dialog appears again on the next launch).
 >
 > After a successful import the old files are **renamed** to `name.migrated` (for example `accounts.json.migrated`) and kept in place as backups — they are **never deleted**. You can open them at any time to roll back or cross-check your data; rename one back and restart to be prompted to upgrade again.
+
+---
+
+## Default Sensitive Word List
+
+The default word list used by the **Desensitize** page comes from two places, and together they decide what gets a zero-width space inserted:
+
+- **Built-in list** (compiled into the binary, `DEFAULT_TERMS` in `engine.rs`): the offline fallback, and the starting list for brand-new users.
+- **Remote list** (the repository's [`sensitive-words.json`](./sensitive-words.json)): fetched once at startup, then **every 10 minutes** by the **"Sensitive word list update"** task on the Scheduled Tasks page. Upstream moderation rules change constantly; this path lets the list keep up without waiting for a client release.
+
+Both share one version number (`version` in the file / `defaultsVersion` locally). When the remote version is newer than what has been merged locally, terms you do not have yet are **appended** to your list.
+
+> **Sync only adds, never removes**: it will not overwrite or delete terms you maintain yourself, and it will not touch the desensitize switch, roles, or providers. The flip side: **a built-in term you deleted will come back on the next sync** — the remote file is a full snapshot, so it cannot tell "you deleted this" from "this is new". To disable a term for good, remove that provider from the desensitize scope instead, or turn the "Sensitive word list update" task off.
+
+Fetching uses `raw.githubusercontent.com` (which does not count against GitHub's anonymous API rate limit). A failed fetch **does not affect forwarding** — the list simply stays as it is until the next successful sync. Override the default URL with the `AGENT2API_SENSITIVE_WORDS_URL` environment variable (useful for forks pointing at their own repository). The "Default word list" block on the Desensitize page shows the current version, last sync time and result, and offers a manual "Sync now".
+
+File format:
+
+```json
+{
+  "version": 4,
+  "terms": ["DoS", "exploit", "x-anthropic-billing-header"]
+}
+```
+
+Fields like `$comment` are ignored, and a bare array also works (treated as version 0). **Terms must not contain zero-width characters themselves** — the zero-width space is inserted at runtime. Bump `version` whenever you append terms.
 
 ---
 

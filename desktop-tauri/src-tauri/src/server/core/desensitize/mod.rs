@@ -3,6 +3,7 @@
 //!   engine.rs  纯函数：词表清洗、匹配构造、文本改写、content/messages/body 遍历
 //!   sql.rs     `kv` 表里 `desensitize` 键的行级读写（本模块唯一出现 SQL 的文件）
 //!   state.rs   持久化状态的形态：序列化 / 解析 / 迁移项的两个入口
+//!   remote.rs  远程词库：从仓库拉 `sensitive-words.json` 并按版本合并
 //!   mod.rs     状态化：词表读写、默认词表迁移、命中统计（本文件）
 //!
 //! ── 持久化：`kv` 表的 `desensitize` 键（本切片从 desensitize.json 迁过来）──
@@ -50,6 +51,7 @@
 //! （`save_locked`）、迁移项搬旧文件（`import_legacy`）。
 
 mod engine;
+pub mod remote;
 mod sql;
 mod state;
 
@@ -582,6 +584,11 @@ impl Desensitizer {
     /// （也不该）在持锁期间再去做一次与状态无关的取值。
     pub fn state(&self) -> Value {
         let file = self.file().to_string_lossy().to_string();
+        // 远程同步状态在锁外取：`last_state` 用的是它自己那把锁（`remote::STATE`），
+        // 而本方法已在 `with_read` 的读锁里 —— 两把锁无嵌套关系，但要避免
+        // 「持读锁时再去拿另一把可能被写锁等待的锁」这种没必要的耦合。
+        let remote_state = remote::last_state();
+        let remote_url = remote::remote_url();
         self.with_read(|guard| {
             json!({
                 "enabled": guard.enabled,
@@ -595,6 +602,17 @@ impl Desensitizer {
                     "roles": DEFAULT_ROLES.iter().map(|role| role.to_string()).collect::<Vec<_>>(),
                     "providers": default_provider_scope(),
                     "version": DEFAULT_TERMS_VERSION,
+                },
+                // 远程词库（仓库里那份可随时追加的词表）：版本号 + 上次同步结果。
+                // 界面据此显示「词库已同步到 vN」，并让用户看到「拉取失败」这类
+                // 静默降级 —— 没有这一块时，拉不到网络在界面上是完全不可见的。
+                "remote": {
+                    "url": remote_url,
+                    "mergedVersion": guard.defaults_version,
+                    "lastSyncAt": if remote_state.last_sync_at > 0 { Value::from(remote_state.last_sync_at) } else { Value::Null },
+                    "remoteVersion": remote_state.remote_version,
+                    "added": remote_state.added,
+                    "message": remote_state.message,
                 },
                 "file": file,
                 "stats": guard.stats.snapshot(),
@@ -643,6 +661,54 @@ impl Desensitizer {
     /// 当前词条数（路由日志里的 `before → after` 需要）
     pub fn term_count(&self) -> usize {
         self.with_read(|guard| guard.terms.len())
+    }
+
+    /// 已合并到的默认词表版本（远程同步据此判断「远端有没有新词」）
+    pub fn defaults_version(&self) -> f64 {
+        self.with_read(|guard| guard.defaults_version)
+    }
+
+    /// 合并一批**远程**词条（只补不删），返回真正补进去的词条。
+    ///
+    /// ── 与 `migrate_defaults` 的差异（有意，不是漏改）────────────
+    /// 内置迁移表按「版本区间」登记词条，用户删过的词不会被补回（保护删除权）；
+    /// 这里拿到的是一份**当前全量**的远端词表，分不出「用户删掉的」与「远端新增的」，
+    /// 所以只能「本地没有就补」。取舍理由见 `remote.rs` 模块头：漏一个词的代价是
+    /// 整条请求被上游 400，比「用户删过的词又回来」重得多。
+    ///
+    /// `version` 是远端声明的版本号：合并后把本地版本推进到它（**只前进不后退** ——
+    /// 远端版本比本地低时保持本地值，否则一次「远端回退」会让后续每次同步都
+    /// 重新合并一遍全量词表）。远端版本为 0（裸数组形态）时不动版本号。
+    ///
+    /// 返回补进去的词条（按远端顺序，忽略大小写去重后）。
+    pub fn merge_remote_terms(&self, terms: &[String], version: f64) -> Vec<String> {
+        let Ok(mut guard) = self.inner.write() else {
+            return Vec::new();
+        };
+        let mut known: Vec<String> = guard.terms.iter().map(|term| term.to_lowercase()).collect();
+        let mut added: Vec<String> = Vec::new();
+        for term in terms {
+            let key = term.to_lowercase();
+            if known.iter().any(|item| item == &key) {
+                continue;
+            }
+            known.push(key);
+            added.push(term.clone());
+        }
+        if !added.is_empty() {
+            let mut merged = guard.terms.clone();
+            merged.extend(added.iter().cloned());
+            guard.terms = normalize_terms(&merged);
+            guard.matcher = Self::rebuild(&guard.terms);
+        }
+        // 版本号只前进：远端回退（或被改小）不该让本地版本跟着退
+        if version > guard.defaults_version {
+            guard.defaults_version = version;
+        }
+        // 即使没有新增词条也要落库：版本号可能被推进了，不写盘会让每次同步
+        // 都重新比对一遍（并在下次启动时又合并一次全量）
+        self.save_locked(&guard);
+        added
     }
 
     /// 全量替换词表（对应 setTerms）

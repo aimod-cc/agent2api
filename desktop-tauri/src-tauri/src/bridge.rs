@@ -192,6 +192,10 @@ const BRIDGE_JS: &str = r#"
       alias, target, provider, ...(reasoning === undefined ? {} : { reasoning }),
     }),
     removeModelMapping: (alias, target, provider) => call('POST', '/api/models/mappings/remove', { alias, target, provider }),
+    // 自定义模型（手动登记上游目录里没有的模型）。「移除」而不是「隐藏」——
+    // 见后端 `api::model_manage::remove_custom` 的说明。
+    addCustomModel: (provider, id) => call('POST', '/api/models/custom', { provider, id }),
+    removeCustomModel: (provider, id) => call('POST', '/api/models/custom/remove', { provider, id }),
 
     // ── 网关 API Key（多把）──
     getKeys: () => call('GET', '/api/keys'),
@@ -321,6 +325,10 @@ const BRIDGE_JS: &str = r#"
     removeDesensitizeTerm: term => call('DELETE', '/api/desensitize/terms', { terms: [term] }),
     resetDesensitizeTerms: () => call('POST', '/api/desensitize/reset', {}),
     resetDesensitizeStats: () => call('POST', '/api/desensitize/stats/reset', {}),
+    // 立即同步远程词库（force：忽略版本号比对，把远端词条全量补一遍）。
+    // 会真打一次 GitHub raw，因此可能慢（几秒）—— 按钮的 loading 态由
+    // desensitize-panel 的 guard() 负责，这里不另做超时。
+    syncDesensitizeTerms: () => call('POST', '/api/desensitize/remote-sync', {}),
 
     // ── 运行日志 ──
     getLogs: query => call('GET', '/api/logs' + toQuery(query)),

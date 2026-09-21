@@ -27,6 +27,12 @@
 mod client;
 mod version;
 
+/// 出网取文件的通用入口（带出口重试）：软件版本检查与**敏感词库拉取**共用。
+///
+/// 对外开放而不是各自复制一份：两处都需要「直连优先、Clash 兜底」与同一套
+/// 超时 / UA 口径，抄一份出来就会出现「一处改了出口策略、另一处没改」的分叉。
+pub(crate) use client::fetch_with_egress;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

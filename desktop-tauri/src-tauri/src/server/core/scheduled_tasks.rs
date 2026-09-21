@@ -94,6 +94,8 @@ pub const TASK_MODEL_REFRESH: &str = config::KEY_MODEL_REFRESH;
 pub const TASK_UPDATE_CHECK: &str = config::KEY_UPDATE_CHECK;
 /// 定时查询积分
 pub const TASK_USAGE_QUERY: &str = config::KEY_USAGE_QUERY;
+/// 敏感词库更新（从仓库拉取 `sensitive-words.json`，按版本把新词合并进本地词表）
+pub const TASK_SENSITIVE_SYNC: &str = config::KEY_SENSITIVE_SYNC;
 /// 日志页自动刷新（前端定时器）
 pub const TASK_LOGS_AUTO_REFRESH: &str = config::KEY_LOGS_AUTO_REFRESH;
 /// 请求日志页自动刷新（前端定时器）
@@ -102,7 +104,7 @@ pub const TASK_REQUESTS_AUTO_REFRESH: &str = config::KEY_REQUESTS_AUTO_REFRESH;
 pub const TASK_REPORT_AUTO_REFRESH: &str = config::KEY_REPORT_AUTO_REFRESH;
 
 /// 任务清单（顺序 = 界面上的显示顺序：先后端、后前端，同类按重要性）
-pub const TASKS: [TaskDef; 7] = [
+pub const TASKS: [TaskDef; 8] = [
     TaskDef {
         id: TASK_CREDENTIAL_MAINTENANCE,
         label: "凭证自动维护",
@@ -125,6 +127,19 @@ pub const TASKS: [TaskDef; 7] = [
         min: config::INTERVAL_MIN_MINUTES,
         max: config::INTERVAL_MAX_MINUTES,
         default_interval: config::DEFAULT_USAGE_QUERY_MINUTES,
+    },
+    TaskDef {
+        id: TASK_SENSITIVE_SYNC,
+        label: "敏感词库更新",
+        description: "定期从本项目的 GitHub 仓库拉取最新默认敏感词库（sensitive-words.json），\
+                      把新增词条合并进本地词表 —— 上游的敏感词审核规则随时在变，这条任务让词库\
+                      不必等客户端升级就能跟上。只补不删：不会覆盖或删除你自己维护的词条。\
+                      拉取失败不影响转发（词表保持原样），只在下一次成功时补上。",
+        unit: "minutes",
+        runner: Runner::Backend,
+        min: config::INTERVAL_MIN_MINUTES,
+        max: config::INTERVAL_MAX_MINUTES,
+        default_interval: config::DEFAULT_SENSITIVE_SYNC_MINUTES,
     },
     TaskDef {
         id: TASK_MODEL_REFRESH,
@@ -324,6 +339,8 @@ fn settings_of(settings: config::ScheduledSettings, id: &str) -> config::Interva
         settings.update_check
     } else if id == TASK_USAGE_QUERY {
         settings.usage_query
+    } else if id == TASK_SENSITIVE_SYNC {
+        settings.sensitive_sync
     } else if id == TASK_LOGS_AUTO_REFRESH {
         settings.logs_auto_refresh
     } else if id == TASK_REQUESTS_AUTO_REFRESH {
@@ -606,6 +623,15 @@ async fn run_backend(
                 }
                 Err(error) => format!("查询失败：{}", error.message),
             }
+        }
+        TASK_SENSITIVE_SYNC => {
+            // 拉取仓库里的默认词库并按版本合并（只补不删，见
+            // `core::desensitize::remote` 的模块头）。
+            //
+            // 手动必须 force：用户点「立即执行」的预期是「现在真的去拉一次」，
+            // 而版本号没变时普通路径会直接返回「已是最新」—— 那与「任务坏掉了」
+            // 在界面上无法区分。force 也**只补不删**，不会破坏用户词表。
+            crate::server::core::desensitize::remote::sync(trigger == Trigger::Manual).await
         }
         _ => {
             with_run(task.id, |entry| entry.running = false);

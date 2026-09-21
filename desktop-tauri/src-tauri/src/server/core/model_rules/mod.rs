@@ -1,4 +1,4 @@
-//! 模型管理规则（config.json 的 `modelRules` 字段）：禁用 / 隐藏 / 映射。
+//! 模型管理规则（config.json 的 `modelRules` 字段）：禁用 / 隐藏 / 映射 / 自定义模型。
 //!
 //! 形状：
 //! ```json
@@ -7,6 +7,7 @@
 //!   "hidden":   [{ "provider": "raccoon", "id": "sn-glm-5-3" }],
 //!   "mappings": [{ "alias": "gpt-4o", "target": "deepseek-v4-pro", "provider": "raccoon",
 //!                  "reasoning": "high" }],
+//!   "custom":   [{ "provider": "catpaw", "id": "kimi-k3-preview" }],
 //!   "seeded":   ["workbuddy:hy3"]
 //! }
 //! ```
@@ -47,6 +48,23 @@
 //!   只影响「要不要再种一次默认值」，保守方向是正确的）。
 //!   种子只在模型**首次出现**时生效一次：之后用户在管理页的手动调整
 //!   （重新启用、删除映射）不会被下一次清单刷新悄悄改回去。
+//!
+//! ── 自定义模型（`custom`）────────────────────────────────────
+//! 用户在管理页手动登记「这家还有这个上游模型」。它解决的是一个具体的死角：
+//! 上游目录接口没广告、但实际能路由的模型（灰度中的新模型、按账号下发但没进
+//! 目录的模型），此前网关既列不出、也调不通。
+//!
+//! 这些条目**不是**禁用 / 隐藏那种「规则」——它们是**清单的补充来源**：
+//! `providers::catalog::manifest_for` 把该家的自定义条目拼在自己的清单后面，
+//! 于是能力判定、路由候选链、`/v1/models`、管理页、入口校验**一次全通**。
+//! 因此「删除自定义模型」是从本数组里**移除**，而不是打 `hidden` 标记：
+//! 打标记会让它留在清单里、只是不接收请求，恢复后又会回来 —— 而用户要的是
+//! 「这个模型我登记错了，删掉」，语义上不存在「恢复」这一步。
+//!
+//! 这里刻意**不存** `maxOutputTokens` / `supportsImages` 之类的能力位：
+//! 用户无从知道这些值，而编一个默认值会让 `/v1/models` 对下游**撒谎**
+//! （例如声明支持图片实际不支持）。缺字段的后果只是 `list_item` 里少几个
+//! 元数据键（与图像模型同款行为），下游据此保守处理 —— 比给错值好。
 //!
 //! 所有比对忽略大小写（与 `catalog::providers_for_model` 同口径）。
 //!
@@ -136,6 +154,37 @@ impl RuleEntry {
     }
 }
 
+/// 一条**自定义模型**：用户手动登记「这家还有这个上游模型」。
+///
+/// 与 [`RuleEntry`] 的区别值得强调：`RuleEntry` 是**规则**（对清单里已有的
+/// 条目做启停），本结构是**清单的补充**（往清单里加一个原本没有的条目）。
+/// 两者的 `provider` 都是必填 —— 规则那边的 None 是旧版全局语义的兼容形态，
+/// 这里没有历史包袱，缺 provider 的条目在读取时直接丢弃（见 `from_raw`）。
+///
+/// 字段只有两个：模型 id 与它所属的家。**展示名不单独存** —— 用户填的就是
+/// 上游 id，再让他编一个显示名只会多一处要维护的事实；清单里的 `name` 由
+/// [`custom_models_for`] 用 id 顶替（下游看到的名称与请求名一致，不会混淆）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomModel {
+    pub provider: String,
+    pub id: String,
+}
+
+impl CustomModel {
+    fn to_value(&self) -> Value {
+        json!({ "provider": self.provider, "id": self.id })
+    }
+
+    /// 是否命中 `(provider, id)`（都忽略大小写）。
+    ///
+    /// `pub`：管理页判「来源 = 手动」时要在 `catalog` 侧按同一口径比对
+    /// （见 `catalog::manage_entries`）—— 在那里另写一遍忽略大小写的比较，
+    /// 迟早会与这里的口径分叉。
+    pub fn matches(&self, provider: &str, id: &str) -> bool {
+        self.provider.eq_ignore_ascii_case(provider) && self.id.eq_ignore_ascii_case(id)
+    }
+}
+
 impl Mapping {
     /// 落盘的 JSON 形态。
     ///
@@ -159,6 +208,8 @@ pub struct ModelRules {
     pub disabled: Vec<RuleEntry>,
     pub hidden: Vec<RuleEntry>,
     pub mappings: Vec<Mapping>,
+    /// 用户手动登记的上游模型（清单的补充来源，见模块头）
+    pub custom: Vec<CustomModel>,
     pub seeded: Vec<String>,
 }
 
@@ -193,6 +244,43 @@ fn entries_from(value: Option<&Value>) -> Vec<RuleEntry> {
                         Some(RuleEntry::new(provider, id))
                     }
                     _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 从 JSON 数组还原自定义模型列表。
+///
+/// 容错口径比 `entries_from` **更严**：那里字符串条目有「旧版全局规则」的
+/// 合法含义，这里的 `provider` 是**必填**（没有 provider 就不知道该把条目
+/// 拼进哪一家的清单，等于一条永远不生效的死数据）。因此缺 provider / 缺 id /
+/// 非对象形态的条目一律丢弃 —— 静默留一条不生效的记录，比丢掉它更难排查。
+fn custom_from(value: Option<&Value>) -> Vec<CustomModel> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let object = item.as_object()?;
+                    let id = object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    let provider = object
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if id.is_empty() || provider.is_empty() {
+                        return None;
+                    }
+                    Some(CustomModel {
+                        provider: provider.to_string(),
+                        id: id.to_string(),
+                    })
                 })
                 .collect()
         })
@@ -243,6 +331,7 @@ impl ModelRules {
             disabled: entries_from(object.get("disabled")),
             hidden: entries_from(object.get("hidden")),
             mappings,
+            custom: custom_from(object.get("custom")),
             seeded: object
                 .get("seeded")
                 .and_then(Value::as_array)
@@ -264,6 +353,10 @@ impl ModelRules {
             "disabled": self.disabled.iter().map(RuleEntry::to_value).collect::<Vec<_>>(),
             "hidden": self.hidden.iter().map(RuleEntry::to_value).collect::<Vec<_>>(),
             "mappings": self.mappings.iter().map(Mapping::to_value).collect::<Vec<_>>(),
+            // `custom` 必须在这里写出：本函数是**整份替换**（`save` → 
+            // `config::update_raw_field`），漏掉哪个键，任何一次写规则
+            // （启停 / 加映射 / 删映射 / 四个种子）都会把那个键的数据整份抹掉。
+            "custom": self.custom.iter().map(CustomModel::to_value).collect::<Vec<_>>(),
             "seeded": self.seeded,
         })
     }
@@ -492,6 +585,97 @@ pub fn add_mapping(
         save(&rules);
     }
     rules
+}
+
+/// 新增一条自定义模型（幂等：同 `(provider, id)` 已存在时不动）。
+///
+/// 与 `add_mapping` 的幂等口径一致：重复提交同一条不算错误、也不产生第二条 ——
+/// 管理页的保存键被连点两次是最常见的来源。
+pub fn add_custom(provider: &str, id: &str) -> ModelRules {
+    let mut rules = current();
+    let exists = rules.custom.iter().any(|item| item.matches(provider, id));
+    if !exists {
+        rules.custom.push(CustomModel {
+            provider: provider.to_string(),
+            id: id.to_string(),
+        });
+        save(&rules);
+    }
+    rules
+}
+
+/// 删除一条自定义模型；返回 `(规则快照, 是否真的删掉了)`。
+///
+/// ── 为什么顺带清理针对它的规则 ──────────────────────────────
+/// 自定义条目一旦移除，它就彻底不在清单里了（不像隐藏那样还能恢复），
+/// 此时 `disabled` / `hidden` 里针对它的条目、以及指向它的映射，都成了
+/// 永远挂不上任何一行的孤儿：管理页的「已删除」筛选里会常驻一条点不开的记录，
+/// 「未挂载的映射」里会多一条永远解释不清的条目。所以在这里一并清掉。
+///
+/// 清理是**尽力而为**：`(provider, id)` 精确匹配的那几条删掉，旧版全局条目
+/// （provider 为 None）不动 —— 它可能同时服务别家，删它会误伤（与 `enable_on`
+/// 的取舍一致：展开与清理都只碰能精确定位的那部分）。
+pub fn remove_custom(provider: &str, id: &str) -> (ModelRules, bool) {
+    let mut rules = current();
+    let before = rules.custom.len();
+    rules.custom.retain(|item| !item.matches(provider, id));
+    let removed = rules.custom.len() != before;
+    if removed {
+        // 精确匹配的启停规则
+        rules
+            .disabled
+            .retain(|entry| !entry.matches(provider, id));
+        rules.hidden.retain(|entry| !entry.matches(provider, id));
+        // 指向这个模型的映射（带 provider 的那种才算得准）
+        rules.mappings.retain(|mapping| {
+            !(mapping.target.eq_ignore_ascii_case(id)
+                && mapping
+                    .provider
+                    .as_deref()
+                    .is_some_and(|owner| owner.eq_ignore_ascii_case(provider)))
+        });
+        save(&rules);
+    }
+    (rules, removed)
+}
+
+/// 该 `(provider, id)` 是否是用户手动登记的自定义模型。
+///
+/// 消费方：管理页判「来源 = 手动」（`catalog::manage_entries`）、以及 AutoClaw
+/// 的模型路由解析（未知名字不静默回落，见 `autoclaw::models::resolve_model_route`）。
+pub fn is_custom(provider: &str, id: &str) -> bool {
+    current().custom.iter().any(|item| item.matches(provider, id))
+}
+
+/// 某一家当前登记的自定义模型，转成**聚合层认的条目形态**。
+///
+/// ── 形状（为什么只有这几个键）───────────────────────────────
+/// `id` / `name` 都用用户填的那个 id：下游看到的名称与请求名一致，不会出现
+/// 「列表里叫 A、请求要用 B」的困惑。**不编造能力位**（`maxOutputTokens` 等）——
+/// 用户无从知道真实值，给一个默认值等于让 `/v1/models` 对下游撒谎。
+/// `list_item` 对缺失键的行为是「整键省略」（与图像模型同款），下游据此保守
+/// 处理，比给错值好。
+///
+/// `isDefault` 恒 false：默认模型是各家目录自己的概念（当前只有 workbuddy 认），
+/// 手动登记的条目不该去争这个位。
+///
+/// ── 为什么是「调用时现算」而不是缓存 ─────────────────────────
+/// 数据源是 `model_rules::current()`（内存快照），条目通常只有几条，
+/// 现算一次的成本远低于维护一份会与配置失同步的缓存。
+pub fn custom_models_for(provider: &str) -> Vec<Value> {
+    current()
+        .custom
+        .iter()
+        .filter(|item| item.provider.eq_ignore_ascii_case(provider))
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "name": item.id,
+                "isDefault": false,
+                "kind": "chat",
+            })
+        })
+        .collect()
 }
 
 /// 删除一条映射（按 alias + target + provider 精确定位）；返回是否存在。

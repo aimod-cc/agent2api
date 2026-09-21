@@ -218,6 +218,24 @@ async fn dispatch(
         return ok_json(desensitizer.state());
     }
 
+    // 立即同步远程词库（force：忽略版本号比对，把远端词条全量补一遍）。
+    //
+    // 与定时任务那条走**同一个** `remote::sync`：两条入口的差异只有 force 这一个
+    // 参数（定时走版本闸、手动是「现在真的去拉一次」），因此「定时能成功、手动却
+    // 失败」这类分叉不可能出现。
+    //
+    // 挂在本模块的路径下而不是 /api/scheduled-tasks：它是**脱敏**这个领域里的动作
+    //（同步完要刷新的也是脱敏页），与「定时任务的开关 / 间隔」不是一回事 ——
+    // 定时任务页那边仍可通过「立即执行」按钮触发同一条链路。
+    if method == Method::POST && action == "remote-sync" {
+        let summary = crate::server::core::desensitize::remote::sync(true).await;
+        let mut payload = desensitizer.state();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("message".to_string(), Value::String(summary));
+        }
+        return ok_json(payload);
+    }
+
     // 已注册路径上的其它方法：Node 落到本模块自己的 404 信封
     management_error(404, format!("Not found: {} {full_path}", method.as_str()))
 }

@@ -26,8 +26,9 @@
 //! 参与：消息的 `type`（或 `role`）、每个块的 `type` / `text` / `toolCallId` /
 //! `toolName` / `toolParams` / `toolResult`。
 //! **不参与**：`messageId`（归一化时对缺失 id 的消息会生成随机 UUID，
-//! 塞进去等于每条消息都不稳定）、`finished`、`reasoningContent`、
-//! 图片块的 `imageUrl`（图片块只贡献字面量 `"image_url"`）。
+//! 塞进去等于每条消息都不稳定 —— 反过来说，正是因为它不参与，归一化那边
+//! 才可以放心用随机 UUID 兜底，见 `messages::message_id`）、`finished`、
+//! `reasoningContent`、图片块的 `imageUrl`（图片块只贡献字面量 `"image_url"`）。
 //! 空 text 块（`text` 与 `reasoningContent` 都为空）整体跳过 —— 上游返回的
 //! 纯工具调用消息常带一个空 text 块，而客户端回显时会把它丢掉
 //! （content 为 null），保留会导致同一条消息两边指纹不同、误判历史被改写。

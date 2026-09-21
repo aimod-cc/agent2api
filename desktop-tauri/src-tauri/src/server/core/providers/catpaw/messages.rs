@@ -31,7 +31,10 @@
 //!      tool 消息（`toolResult: "[工具调用被用户中断]"`）保持配对，
 //!      该合成消息只用于让校验通过，**不会单独提交给上游**；
 //!   6. 图片块 `{type:"image_url", image_url:{url,detail}}` →
-//!      `{type:"image_url", imageUrl:{url,detail}}`，data: URL 与 http(s) 都支持。
+//!      `{type:"image_url", imageUrl:{url,detail}}`，data: URL 与 http(s) 都支持；
+//!   7. 每条消息的 `messageId` 必须非空：客户端给了就用它的 `id`，没给就
+//!      生成随机 UUID（上游 2026-09 起在 round 阶段逐条校验，空串会被拒，
+//!      见 [`message_id`]）。
 //!
 //! ── 错误怎么报 ──────────────────────────────────────────────
 //! 全部走 [`GatewayError::bad_request`]（400，客户端可见中文文案），
@@ -227,14 +230,9 @@ fn normalize_directive(
 
 /// user：内容非空。
 ///
-/// ── 唯一一处有意的行为差异：不生成随机 messageId ─────────────
-/// 原实现对缺失 id 的消息生成 `randomUUID()`。随机值会污染指纹
-/// （同一条消息两轮之间指纹不同 → 误判「客户端改写了历史」→ 会话被作废
-/// 全量重建）。原实现没出事，是因为它的指纹算法**不读 messageId**
-/// （见 `fingerprint.rs` 模块头），Rust 侧同样不读，所以这里把 id 留成空串：
-/// 既不影响指纹、也不影响上游（上游对 messageId 缺失是宽容的），
-/// 还省掉一次随机数生成。**不要**在后续波次「修复」成生成 UUID ——
-/// 那会让同一条历史消息在两次请求里拿到不同 id，给上游留下历史被改写的痕迹。
+/// `messageId` 由 [`message_id`] 兜底（缺失时生成随机 UUID）——
+/// 这里曾有一处「不生成随机 messageId」的有意差异，2026-09 上游收紧
+/// `messageId` 校验后已废弃，原因见 [`message_id`] 的说明。
 fn normalize_user(object: &Map<String, Value>, index: usize) -> Result<Stage1, GatewayError> {
     if has_tool_fields(object) {
         return Err(GatewayError::bad_request(format!(
@@ -551,6 +549,9 @@ fn resolve_tool_message(
 }
 
 /// 合成「工具调用被用户中断」的 tool 消息（原实现第 311-320 行）。
+///
+/// `messageId` 同样要非空（上游逐条校验，见 [`message_id`]）—— 原实现这里
+/// 也是 `randomUUID()`。
 fn synth_interrupt_message(pending: &[(String, String)]) -> Value {
     let blocks: Vec<Value> = pending
         .iter()
@@ -565,7 +566,7 @@ fn synth_interrupt_message(pending: &[(String, String)]) -> Value {
         .collect();
     json!({
         "type": "tool",
-        "messageId": "",
+        "messageId": crate::server::core::upstream::request::new_request_id(),
         "content": blocks,
         "finished": true,
     })
@@ -654,12 +655,23 @@ fn has_tool_fields(object: &Map<String, Value>) -> bool {
         .any(|key| object.get(*key).map(js_truthy).unwrap_or(false))
 }
 
-/// `messageId` 取值：非空字符串用它（**原样，不 trim**），否则空串
-/// （差异说明见 [`normalize_user`]）。
+/// `messageId` 取值：非空字符串用它（**原样，不 trim**），否则生成随机 UUID
+/// （对齐原实现的 `randomUUID()` 兜底）。
+///
+/// ── 为什么必须兜底成非空（2026-09 上游收紧）──────────────────
+/// 这里一度改成「缺失时留空串」，理由是「上游对 messageId 缺失是宽容的」。
+/// 上游现在会在 round 阶段校验：`消息列表第 N 条消息校验失败：
+/// errorCode=400, unifyCode=1005010001, errorMsg=messageId 不能为空`，
+/// 空串与缺失一样被拒（HTTP 仍是 200，业务码非 0，见
+/// `openai::unwrap_api_data`）。所以每条消息都必须带一个非空 id。
+///
+/// 兜底用随机 UUID **不会**影响增量会话：指纹（`fingerprint.rs`）不读
+/// `messageId`，同一条历史消息在两次请求里拿到不同 id 也不会被上游判成
+/// 「历史被改写」—— 原实现（`catpaw-upstream-messages.mjs`）正是这么做的。
 fn message_id(object: &Map<String, Value>) -> Value {
     match object.get("id").and_then(Value::as_str) {
         Some(id) if !id.trim().is_empty() => Value::String(id.to_string()),
-        _ => Value::String(String::new()),
+        _ => Value::String(crate::server::core::upstream::request::new_request_id()),
     }
 }
 

@@ -244,8 +244,26 @@ fn remote_route_by_catalog_name(name: &str) -> Option<String> {
 ///   3. 已知前缀开头 → 原样当路由 ID，body 剥前缀（**大小写原样保留**：
 ///      未知自定义 route 不做小写改写）；
 ///   4. 合法路由 ID 形态 → 原样透传，body 剥前缀（没有已知前缀时不剥，等于原样）；
-///   5. 都不中 → 默认路由（**只兜真正未知的名字**：目录能认的名字在上面就解析
+///   5. **手动登记的自定义模型** → 原样透传（见下）；
+///   6. 都不中 → 默认路由（**只兜真正未知的名字**：目录能认的名字在上面就解析
 ///      掉了，不会因大小写差异落到这里）。
+///
+/// ── 第 5 档为什么必须存在（本次修复）────────────────────────
+/// 用户可以在管理页手动登记上游模型（`modelRules.custom`），`manifest_for` 把
+/// 它们拼进了清单，于是**入口校验与路由候选链都会放行**。但本函数此前不认识
+/// 它们：`gpt-5.5-preview` 这种名字既不在静态表、也不在远程目录、还不是合法
+/// route ID 形态（连字符不算），于是掉进第 6 档**静默回落 `zai_auto`** ——
+/// 客户端要 A、上游跑了 B，日志上还是一次「成功」。用户看到的症状是「自定义
+/// 模型加上了、也能调，但回答牛头不对马嘴」，而没有任何一处提示出错。
+///
+/// 放在第 4 档**之后**而不是最前面：名字若本来就长得像路由 ID（`zai_xxx`），
+/// 那套前缀语义（`X-Request-Model` 带前缀、body 剥前缀）才是这家上游认的形态，
+/// 自定义登记不该把用户从既有正确路径上挤下来。这一档只接住「前四档全不中、
+/// 否则就会静默回落」的那些名字。
+///
+/// 代价说明：`is_custom` 要读一次规则快照（`config::current()` 的 clone），
+/// 但只在这一档被求值 —— 前面四档命中时完全不付这个成本，而前四档覆盖了
+/// 全部目录内模型（也就是绝大多数请求）。
 ///
 /// `requested_model` 始终保留客户端请求里的名字（响应回写用），不被规范化。
 pub fn resolve_model_route(raw_model: &str) -> ModelRoute {
@@ -285,6 +303,21 @@ pub fn resolve_model_route(raw_model: &str) -> ModelRoute {
         }
     }
     if is_route_id(name) {
+        return ModelRoute {
+            route_model_id: name.to_string(),
+            body_model_id: strip_route_prefix(name).to_string(),
+            requested_model: name.to_string(),
+        };
+    }
+    // 手动登记的自定义模型：原样透传，**不要**掉进下面的默认路由回落。
+    // 判据与聚合目录同源（`model_rules::is_custom`），所以「清单里认它」
+    // 与「发送时也认它」是同一件事，不存在「校验放行、发送时换成别的模型」。
+    if crate::server::core::model_rules::is_custom(
+        crate::server::core::providers::kind_id(
+            crate::server::core::providers::ProviderKind::AutoClaw,
+        ),
+        name,
+    ) {
         return ModelRoute {
             route_model_id: name.to_string(),
             body_model_id: strip_route_prefix(name).to_string(),

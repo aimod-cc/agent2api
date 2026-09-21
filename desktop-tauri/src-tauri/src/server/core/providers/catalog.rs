@@ -84,8 +84,43 @@ use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVID
 /// **这是「能力」口径的清单**（`providers_for_model` / 路由候选链用）：
 /// 客户端点名一个模型时，这里有的才允许转发。**不要**在这里过滤
 /// （要按偏好收窄广告用 `advertised_manifest_for`，见 `list_models` 的契约说明）。
+///
+/// ── 自定义模型的注入点（就在这一处）──────────────────────────
+/// 用户手动登记的上游模型（`modelRules.custom`）拼在该家清单之后。选这里而不是
+/// 各家自己的 `list()`，有两个硬理由：
+///
+///   1. **一处覆盖全部出口**：本函数是能力判定、路由候选链、发送名改写、
+///      `/v1/models`、`/api/session`、管理页、Key 页候选与入口校验的共同上游，
+///      改这一处它们全部认识自定义模型。改各家 `list()` 则是六家六套改法
+///      （其中四家是 `const` 静态数组，要改成 `Vec` 拼接）。
+///   2. **不会被远程刷新冲掉**：workbuddy 的 `apply_remote` 会**整体替换**
+///      自己的 `CatalogState.models`，注进各家的清单里会被下一次刷新抹掉，
+///      还会被 `seed_default_enabled` 判成「不在默认白名单 → 默认禁用」。
+///      本函数是每次调用现算的，刷新与种子都碰不到它。
+///
+/// **同名不追加**：该家清单里已有同名条目时跳过 —— 否则管理页会出现两行同
+/// `(provider, id)`（`manage_entries` 不去重），而两行的启停开关会互相打架。
+/// 上游目录后来真的广告了这个模型时，用户登记的那条自动让位给目录那份
+/// （目录条目带完整能力位，比手动条目信息更全），这是想要的方向。
 fn manifest_for(kind: ProviderKind) -> Vec<Value> {
-    adapter_for(kind).list_models()
+    let mut models = adapter_for(kind).list_models();
+    let custom = model_rules::custom_models_for(kind_id(kind));
+    if !custom.is_empty() {
+        // 先滤成一个独立列表再拼接：`models.extend(iter)` 里 iter 若还借着
+        // `models` 就是同时可变借用 + 不可变借用，编译不过
+        let additions: Vec<Value> = custom
+            .into_iter()
+            .filter(|item| {
+                let id = model_id(item);
+                !id.is_empty()
+                    && !models
+                        .iter()
+                        .any(|existing| model_id(existing).eq_ignore_ascii_case(&id))
+            })
+            .collect();
+        models.extend(additions);
+    }
+    models
 }
 
 /// 某一 provider 的**广告用**清单：`manifest_for` 再经适配器的
@@ -1139,12 +1174,25 @@ fn manage_entries(store: &AccountStore, rules: &model_rules::ModelRules) -> Vec<
     let mut entries: Vec<Value> = Vec::new();
     for (kind, manifest) in active_manifests(store) {
         let provider_id = kind_id(kind);
+        // 家级的来源（远程 / 内置）。**逐条**判定见下面的 `manual` 覆盖：
+        // 手动登记的自定义模型与这家清单的来源无关，标「远程」或「内置」都是
+        // 在回答另一个问题（用户要知道的是「这条是我自己加的」）。
         let source = catalog_source(kind);
         let mut items = manifest;
         // 组内排序：启用的排前（同一家内按该家自己的启停状态）
         items.sort_by_key(|item| rules.is_disabled(provider_id, &model_id(item)));
         for item in items {
-            entries.push(manage_entry_json(provider_id, &item, source));
+            let id = model_id(&item);
+            let item_source = if rules
+                .custom
+                .iter()
+                .any(|custom| custom.matches(provider_id, &id))
+            {
+                "manual"
+            } else {
+                source
+            };
+            entries.push(manage_entry_json(provider_id, &item, item_source));
         }
     }
     entries
@@ -1157,6 +1205,11 @@ fn manage_entries(store: &AccountStore, rules: &model_rules::ModelRules) -> Vec<
 /// （`list()` 全是「远程非空 → 返回远程；否则返回静态」这一种形状，见各家
 /// 的清单模块）。模型条目本身不携带来源位，所以来源是这一家的属性，
 /// 同一次渲染里该家所有行标同一个值。
+///
+/// ── 唯一的例外：手动登记的自定义模型（"manual"）──────────────
+/// 它们不是从这家清单来的（见 `manifest_for` 的注入说明），标「远程」或
+/// 「内置」都是在回答另一个问题。所以 `manage_entries` 对这类条目**逐条**改成
+/// `"manual"` —— 本函数只负责「家级」那部分，不知道也不该知道手动条目。
 ///
 /// ── 为什么复用 `refresh_meta` ────────────────────────────────
 /// 它已经给出「这家是否远程刷新成功过」的判据（各家的判定细节不同：WorkBuddy

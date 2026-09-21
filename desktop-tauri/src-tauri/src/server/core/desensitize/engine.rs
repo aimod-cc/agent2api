@@ -86,10 +86,14 @@ pub const DEFAULT_TERMS: &[&str] = &[
     "Main branch (you will usually use this for PRs)",
     "You are Claude Code",
     "Anthropic's official CLI for Claude",
+    // v4：Claude Code 客户端 system 首行的计费头字段名。上游只在它**位于
+    // 报文最开头**时拦截（前面多一个字符就放过），实测 2026-09：命中 11128，
+    // 插一个 ZWSP 后同一份报文即恢复 200。
+    "x-anthropic-billing-header",
 ];
 
 /// 默认词表当前版本：每次往 DEFAULT_TERMS 追加新词条时 +1，并在迁移表登记
-pub const DEFAULT_TERMS_VERSION: u32 = 3;
+pub const DEFAULT_TERMS_VERSION: u32 = 4;
 
 /// 默认词表补词迁移表：版本号 → 该版本新增的默认词条。
 ///
@@ -101,6 +105,7 @@ pub const DEFAULT_TERMS_VERSION: u32 = 3;
 pub const DEFAULT_TERM_MIGRATIONS: &[(u32, &[&str])] = &[
     (2, &["Main branch (you will usually use this for PRs)"]),
     (3, &["You are Claude Code", "Anthropic's official CLI for Claude"]),
+    (4, &["x-anthropic-billing-header"]),
 ];
 
 // ─── JS 语义小工具 ──────────────────────────────────────────

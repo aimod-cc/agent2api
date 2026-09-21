@@ -187,6 +187,12 @@ pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
             INTERVAL_MIN_MINUTES,
             INTERVAL_MAX_MINUTES,
         ),
+        sensitive_sync: task(
+            KEY_SENSITIVE_SYNC,
+            defaults.sensitive_sync.interval,
+            INTERVAL_MIN_MINUTES,
+            INTERVAL_MAX_MINUTES,
+        ),
     }
 }
 

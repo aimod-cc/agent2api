@@ -233,6 +233,9 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/models/state", post(api::model_manage::set_state))
         .route("/api/models/mappings", post(api::model_manage::add_mapping))
         .route("/api/models/mappings/remove", post(api::model_manage::remove_mapping))
+        // 自定义模型（手动登记上游目录里没有的模型）
+        .route("/api/models/custom", post(api::model_manage::add_custom))
+        .route("/api/models/custom/remove", post(api::model_manage::remove_custom))
         .route("/api/keys", get(api::keys_api::list_keys).post(api::keys_api::create_key))
         .route("/api/keys/{id}", patch(api::keys_api::update_key).delete(api::keys_api::delete_key))
         // ── 内容脱敏（对照 workbuddy-desensitize-routes.mjs）──

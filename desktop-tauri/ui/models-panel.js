@@ -1,4 +1,4 @@
-/* Agent2API · 模型管理页：表格渲染 + 筛选 + 启停 / 删除 / 恢复 + 模型映射 + 刷新模型清单 */
+/* Agent2API · 模型管理页：表格渲染 + 筛选 + 启停 / 删除 / 恢复 + 自定义模型 + 模型映射 + 刷新模型清单 */
 /* global workbuddyDesktop, wbApp */
 
 /**
@@ -16,6 +16,17 @@
  * 同一对外名可以在多个提供商各建一条（每行的映射 chips 只属于自己那行），
  * 下游用同一个名字请求时，网关在「原生承载家 + 各映射提供商」之间按账号
  * 全局优先级主备切换，发送时按承载家自动换成它认识的真名。
+ *
+ * ── 自定义模型（顶部「＋ 添加自定义模型」）─────────────────────
+ * 手动登记一个「上游目录里没有、但实际能路由」的模型（灰度中的新模型、按账号
+ * 下发却没进目录的模型）。登记后它**真的进入该家清单**（后端在
+ * `catalog::manifest_for` 里拼接），于是表格里出现这一行、`/v1/models` 会广告
+ * 它、路由与转发也都认它 —— 与内置模型相比只少几个能力位元数据（用户无从
+ * 知道那些值，编一个等于对下游撒谎）。
+ *
+ * 它的「删除」是**直接移除这条登记**，不是内置模型那种隐藏：内置模型的存在性
+ * 由上游清单决定（隐藏后还能恢复），自定义模型的存在性完全由这次登记决定。
+ * 「来源」列因此多一个 `manual` 值（后端逐条标出，前端只做文案映射）。
  *
  * ── 思考等级（照抄 OmniProxy 的手动绑定，R7）─────────────────
  * 每条映射可以带一个「思考等级」，值取自**后端下发的** `reasoningLevels`
@@ -222,8 +233,15 @@
 
   /** 「来源」列：这一家的清单当前是远程拉的还是内置静态表（后端给的 `source`）。
       它是**家**级属性（同一家所有行同值），前端只做文案映射与样式，不自己推断。
-      认不出的值显示破折号：后端没给 `source`（旧版网关）时不该硬说「内置」 */
+      认不出的值显示破折号：后端没给 `source`（旧版网关）时不该硬说「内置」。
+
+      唯一的**条**级例外是 `manual`：用户手动登记的自定义模型（见顶部
+      「＋ 添加自定义模型」）。它不属于该家清单的任何一种来源，后端逐条标出来，
+      前端照实显示。 */
   function sourceCell(m) {
+    if (m.source === 'manual') {
+      return '<span class="badge tag brand" title="手动登记的上游模型；删除它会直接移除这条登记（不是隐藏）">手动</span>';
+    }
     if (m.source !== 'remote' && m.source !== 'builtin') return '<span class="rate">—</span>';
     const remote = m.source === 'remote';
     const hint = remote
@@ -436,6 +454,30 @@
     if (act === 'collapse') { expanded.delete(provider); render(); return; }
     if (act === 'hide') {
       // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认）—— 下同
+      //
+      // 自定义模型走**另一条**删除语义（从登记里移除，不是隐藏）：
+      // 它的存在完全由这次登记决定，没有「上游刷新会把它带回来」这回事，
+      // 打隐藏标记只会留下一条既没用、又占着「已删除」筛选的死数据。
+      // 判据用后端给的 `source`，前端不自己推断（见 sourceCell）。
+      const custom = models().find(
+        item => item.id === id && (item.provider || '') === (provider || ''),
+      )?.source === 'manual';
+      if (custom) {
+        if (!(await window.wbConfirm?.ask?.({
+          title: '删除自定义模型',
+          html: `确定删除自定义模型「<strong>${esc(id)}</strong>」？`
+            + `这条登记会被<b>直接移除</b>（不是隐藏），之后 <code>/v1/models</code> 不再广告它、请求它也会被拒。`
+            + `内置模型那种「在『已删除』筛选里恢复」的路径对它不适用。`,
+          okText: '删除',
+          okClass: 'danger',
+        }))) return;
+        void runRowAction(
+          key,
+          () => workbuddyDesktop.removeCustomModel(provider, id),
+          '自定义模型已删除',
+        );
+        return;
+      }
       if (!(await window.wbConfirm?.ask?.({
         title: '删除模型',
         html: `确定删除模型「<strong>${esc(id)}</strong>」？只是从该提供商的清单隐藏，可在「已删除」筛选里恢复。`,
@@ -574,8 +616,12 @@
    * 上游模型 ID」，已删除：对外名只有在**目标模型已被广告**时才会跟着进广告视图
    * （`catalog::models_response` 是「遍历已广告的模型 → 补它的别名」这个方向），
    * 而入口校验以广告视图为准 —— 手输一个清单里没有的名字，映射建了也永远调不通
-   * （实测 400 `model_not_found`），只会让用户以为配好了。要用清单外的模型，
-   * 得先让它进清单（刷新远程目录 / 修该家的静态表）。
+   * （实测 400 `model_not_found`），只会让用户以为配好了。
+   *
+   * 要用清单外的模型，正确做法是让那家的清单收录它 —— 现在有正规入口了：
+   * 顶部的「＋ 添加自定义模型」（见 `openCustomModel`）会把它真的登记进该家清单，
+   * 之后它自然出现在这里的下拉里。**在映射里手输名字这条路仍然不开**：
+   * 那是绕过清单，而登记是补充清单，两者只在后者才真正可路由。
    *
    * `context.alias` 有值时走「只改这条映射的思考等级」形态：alias 与 target
    * 都是那一条的身份，全部锁定，只留等级可动。共用一个弹窗而不是另开一个
@@ -687,6 +733,104 @@
     } finally {
       mappingSaving = false;
       $('mapping-modal-save').disabled = false;
+    }
+  }
+
+  // ─── 自定义模型弹窗 ───────────────────────────
+
+  let customSaving = false;
+
+  /** 自定义模型弹窗的提供商候选。
+   *
+   *  与映射弹窗的 `providerOptions()` **刻意不同**：那个只列「表格里出现过的家」
+   *  （因为映射必须挂到一行上），而这里要列**全部已注册的家** —— 用户完全可能
+   *  先给还没登录的家配好模型清单，等加上账号就生效。`wbProviders.all()` 读的是
+   *  `/api/session` 的 `accounts.providers`（注册表全量，含 count=0 的家）。
+   *
+   *  退化路径：`wbProviders` 没加载时回落到表格里出现过的家（少几个选项，
+   *  但不会让弹窗空着打不开）。 */
+  function customProviderOptions() {
+    const all = window.wbProviders?.all?.();
+    if (Array.isArray(all) && all.length) {
+      return all.map(item => ({ id: item.id, label: item.label || item.id }));
+    }
+    return providerOptions();
+  }
+
+  function fillCustomProvider(keep) {
+    const select = $('custom-model-provider');
+    if (!select) return;
+    const options = customProviderOptions();
+    select.innerHTML = options.map(item =>
+      `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('');
+    const wanted = (keep || '').trim();
+    if (wanted && options.some(item => item.id === wanted)) {
+      select.value = wanted;
+    } else if (options.length) {
+      select.value = options[0].id;
+    }
+    window.wbSelect?.sync?.(select);
+  }
+
+  function customModelPreview() {
+    const provider = $('custom-model-provider')?.value || '';
+    const id = $('custom-model-id')?.value.trim() || '<上游模型 ID>';
+    const label = customProviderOptions().find(item => item.id === provider)?.label || provider || '(未选)';
+    $('custom-model-preview').innerHTML =
+      `在 <b>${esc(label)}</b> 上登记上游模型 <b>${esc(id)}</b>（登记后即可用这个名字请求）`;
+  }
+
+  /** 打开自定义模型弹窗。无上下文（只有顶部按钮一个入口），每次都是新增。 */
+  function openCustomModel() {
+    const status = $('custom-model-modal-status');
+    if (status) status.textContent = '';
+    const input = $('custom-model-id');
+    if (input) input.value = '';
+    // 预选当前正在筛选的那一家：用户点了某家的分段再来加模型时，这就是他要的家
+    const preferred = providerFilter !== 'all' ? providerFilter : '';
+    fillCustomProvider(preferred);
+    customModelPreview();
+    $('custom-model-modal').classList.add('open');
+    setTimeout(() => input?.focus(), 0);
+  }
+
+  function closeCustomModel() {
+    // 保存中不许关：关掉会让「到底存没存进去」变成未知状态
+    if (customSaving) return;
+    $('custom-model-modal').classList.remove('open');
+  }
+
+  async function saveCustomModel() {
+    if (customSaving) return;
+    const provider = $('custom-model-provider')?.value || '';
+    const id = $('custom-model-id')?.value.trim() || '';
+    const status = $('custom-model-modal-status');
+    if (!provider) { status.textContent = '请选择提供商'; return; }
+    if (!id) { status.textContent = '请填写上游模型 ID'; return; }
+    customSaving = true;
+    $('custom-model-modal-save').disabled = true;
+    status.textContent = '保存中…';
+    try {
+      const next = await workbuddyDesktop.addCustomModel(provider, id);
+      accept(next);
+      customSaving = false;
+      closeCustomModel();
+      // 登记成功但表格里看不到这一行时，必须说清为什么 —— 表格只列「当前有
+      // 可用登录态」的家（后端的 active_manifests 过滤），给一个还没加账号的
+      // 家登记模型不会立刻出现。不说的话用户会以为没保存成功，然后再加一遍。
+      const visible = Array.isArray(next?.models)
+        && next.models.some(item => item.id === id && (item.provider || '') === provider);
+      const label = customProviderOptions().find(item => item.id === provider)?.label || provider;
+      if (visible) {
+        toast(`✅ 已登记自定义模型 ${id}（${label}）`);
+      } else {
+        toast(`✅ 已登记 ${id}（${label}），但该提供商还没有可用账号，这一行要加上账号后才会显示`, 'err');
+      }
+    } catch (error) {
+      status.textContent = `保存失败：${error.message}`;
+    } finally {
+      customSaving = false;
+      $('custom-model-modal-save').disabled = false;
     }
   }
 
@@ -813,6 +957,20 @@
   $('mapping-reasoning-custom')?.addEventListener('input', mappingPreview);
   $('mapping-reasoning-custom')?.addEventListener('keydown', event => { if (event.key === 'Enter') void saveMapping(); });
   $('mapping-modal')?.addEventListener('click', event => { if (event.target === $('mapping-modal')) closeMapping(); });
+
+  // ── 自定义模型弹窗的绑定（与映射弹窗同构：关闭 / 取消 / 保存 / 回车 / 点遮罩）──
+  $('btn-add-custom-model')?.addEventListener('click', openCustomModel);
+  $('custom-model-modal-close')?.addEventListener('click', closeCustomModel);
+  $('custom-model-modal-cancel')?.addEventListener('click', closeCustomModel);
+  $('custom-model-modal-save')?.addEventListener('click', () => { void saveCustomModel(); });
+  $('custom-model-provider')?.addEventListener('change', customModelPreview);
+  $('custom-model-id')?.addEventListener('input', customModelPreview);
+  $('custom-model-id')?.addEventListener('keydown', event => {
+    if (event.key === 'Enter') void saveCustomModel();
+  });
+  $('custom-model-modal')?.addEventListener('click', event => {
+    if (event.target === $('custom-model-modal')) closeCustomModel();
+  });
 
   const refreshButton = $('btn-refresh-models');
   if (refreshButton) {

@@ -4,6 +4,8 @@
 //! - `POST /api/models/state`           `{id, enabled?, hidden?}` 启停 / 隐藏（删除）/ 恢复
 //! - `POST /api/models/mappings`        `{alias, target, reasoning?}` 新增映射 / 改思考等级
 //! - `POST /api/models/mappings/remove` `{alias, target, provider?}` 删除映射
+//! - `POST /api/models/custom`          `{provider, id}` 登记一个上游目录里没有的模型
+//! - `POST /api/models/custom/remove`   `{provider, id}` 移除该登记
 //!
 //! 写接口都返回最新的 `{models, mappings, reasoningLevels}`，前端就地重绘、不必再拉一次。
 //!
@@ -206,5 +208,88 @@ pub async fn remove_mapping(State(state): State<ServerState>, body: Bytes) -> Re
         return errors::management_error(404, format!("映射不存在: {alias} → {target}"));
     }
     logging::log("[Models]", &format!("删除映射 {alias} → {target}"));
+    ok_json(catalog::manage_view(state.store()))
+}
+
+/// POST /api/models/custom
+///
+/// 手动登记一个上游模型：`{provider, id}`。
+///
+/// ── 解决什么死角 ────────────────────────────────────────────
+/// 上游目录接口没广告、但实际能路由的模型（灰度中的新模型、按账号下发却没进
+/// 目录的模型）。此前网关既列不出、也调不通 —— 用户没有任何入口把它加进来。
+///
+/// ── 校验为什么这么写 ────────────────────────────────────────
+///   1. **provider 必须已注册**：它决定这条条目拼进哪一家的清单。写错名字
+///      （或写一家不存在的家）的后果是「保存成功、表格里没有、也永远调不通」，
+///      与 `add_mapping` 拒未知 provider 同一理由。
+///   2. **id 复用 `alias_valid`**：那套字符集（字母数字与 `- _ . / :`，≤128）
+///      正是各家上游模型 id 的实际形态（含 Cline 的 `pool/model` 斜杠形态与
+///      Qoder 的点号形态）。另写一份只会两处分叉。
+///   3. **拒纯数字**：CatPaw 的数字模型 ID 有特殊语义（上游按数字识别、
+///      网关不知道它的档位与能力，见 `catpaw::models`），走这条手动通道进去
+///      会得到一个「能列出来但调不通」的条目。这种模型本来就该走 CatPaw 自己的
+///      目录，明确拒掉比静默收下更有用。
+pub async fn add_custom(State(state): State<ServerState>, body: Bytes) -> Response {
+    let object = match body_object(&body) {
+        Ok(object) => object,
+        Err(response) => return response,
+    };
+    let provider = text_field(&object, "provider");
+    let id = text_field(&object, "id");
+    if provider.is_empty() {
+        return errors::management_error(400, "缺少提供商");
+    }
+    if crate::server::core::providers::kind_from_id(&provider).is_none() {
+        return errors::management_error(400, format!("未知的提供商: {provider}"));
+    }
+    if id.is_empty() {
+        return errors::management_error(400, "缺少上游模型 ID");
+    }
+    if !model_rules::alias_valid(&id) {
+        return errors::management_error(
+            400,
+            "模型 ID 只能包含字母、数字与 - _ . / :，且不超过 128 个字符",
+        );
+    }
+    if id.chars().all(|ch| ch.is_ascii_digit()) {
+        return errors::management_error(
+            400,
+            "纯数字 ID 只对 CatPaw 有意义，且需要该家目录里的档位信息；请改用它自己的模型清单",
+        );
+    }
+    model_rules::add_custom(&provider, &id);
+    logging::log("[Models]", &format!("登记自定义模型 [{provider}] {id}"));
+    ok_json(catalog::manage_view(state.store()))
+}
+
+/// POST /api/models/custom/remove
+///
+/// 移除一条自定义模型登记：`{provider, id}`。
+///
+/// ── 为什么是「移除」而不是「隐藏」────────────────────────────
+/// 自定义模型的存在性完全由 `modelRules.custom` 决定，没有「上游刷新会把它
+/// 带回来」这回事。打隐藏标记的话它仍留在清单里（只是不接收请求），恢复后
+/// 又会回来 —— 而用户的意图是「这条登记我不要了」。移除才是那个语义，
+/// 且移除后 `/v1/models`、管理页、路由三处同时干净消失。
+/// 顺带清掉针对它的孤儿规则（见 `model_rules::remove_custom`）。
+pub async fn remove_custom(State(state): State<ServerState>, body: Bytes) -> Response {
+    let object = match body_object(&body) {
+        Ok(object) => object,
+        Err(response) => return response,
+    };
+    let provider = text_field(&object, "provider");
+    let id = text_field(&object, "id");
+    if provider.is_empty() || id.is_empty() {
+        return errors::management_error(400, "缺少提供商或上游模型 ID");
+    }
+    let (_, removed) = model_rules::remove_custom(&provider, &id);
+    if !removed {
+        return errors::management_error(
+            404,
+            format!("自定义模型不存在: [{provider}] {id}"),
+        );
+    }
+    logging::log("[Models]", &format!("移除自定义模型 [{provider}] {id}"));
     ok_json(catalog::manage_view(state.store()))
 }

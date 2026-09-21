@@ -180,6 +180,48 @@
       : '';
 
     if (data_.file) $('desensitize-file').textContent = data_.file;
+
+    renderRemote(data_.remote);
+  }
+
+  /**
+   * 默认词库（远程同步）区块。
+   *
+   * ── 为什么要把这三项显示出来 ──
+   * 词表从「升级才更新」改成「从仓库定时拉取」之后，拉取是**后台静默**发生的：
+   * 网络不通、仓库改名、raw 被墙都只会让词表停在原地，而界面上毫无痕迹 ——
+   * 用户看到的是「上游又开始 400 了」，却无从知道词库其实早就没同步上。
+   * 版本号 + 上次同步时间 + 结果文案这三项，就是让这条链路可见的最小集合。
+   *
+   * 后端未提供 `remote`（旧版代理）时整块留空：显示「—」比显示 0 更诚实。
+   */
+  function renderRemote(remote) {
+    if (!remote || typeof remote !== 'object') return;
+    const version = $('sensitive-merged-version');
+    if (version) {
+      const merged = Number(remote.mergedVersion);
+      version.textContent = Number.isFinite(merged) ? `v${merged}` : '—';
+    }
+    const at = $('sensitive-last-sync');
+    if (at) {
+      const ts = Number(remote.lastSyncAt);
+      at.textContent = ts > 0 ? new Date(ts).toLocaleString() : '本次启动后还未同步';
+    }
+    const message = $('sensitive-sync-message');
+    if (message) message.textContent = remote.message || '—';
+    const url = $('sensitive-source-url');
+    if (url && remote.url) url.textContent = remote.url;
+
+    // 徽标：最近一次同步成功（added 有值或文案是「已是最新」）为 ok，失败为 warn。
+    // 判据用后端给的那句文案里有没有「失败」二字，而不是另加一个 success 字段 ——
+    // 文案是后端唯一的结论表达，再加一个布尔就会有两处可能对不上的状态。
+    const badge = $('sensitive-sync-badge');
+    if (badge) {
+      const text = String(remote.message || '');
+      const failed = text.includes('失败');
+      badge.className = failed ? 'badge warn' : (text ? 'badge ok' : 'badge');
+      badge.textContent = failed ? '同步失败' : (text ? '已同步' : '未同步');
+    }
   }
 
   /** 从后端拉完整状态并渲染 */
@@ -344,6 +386,16 @@
     await guard($('btn-reset-stats'), '清空中…', async () => {
       apply(await api.resetDesensitizeStats());
       toast('命中统计已清空');
+    });
+  });
+  // 立即同步远程词库：成功后用响应里的 message 直接报结果（后端已经把
+  // 「补了几个词 / 已是最新 / 拉取失败」写成一句话，前端不再自己拼一遍）
+  $('btn-sync-terms')?.addEventListener('click', async () => {
+    await guard($('btn-sync-terms'), '同步中…', async () => {
+      const next = await api.syncDesensitizeTerms();
+      apply(next);
+      const message = next && typeof next === 'object' ? next.message : '';
+      toast(message ? `✅ ${message}` : '✅ 词库同步完成');
     });
   });
 

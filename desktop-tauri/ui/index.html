@@ -347,6 +347,7 @@
               <h2>模型管理</h2>
               <span class="models-count" id="models-count"></span>
               <div class="head-actions">
+                <button type="button" class="sm" id="btn-add-custom-model">＋ 添加自定义模型</button>
                 <button type="button" class="sm" id="btn-add-mapping">＋ 添加映射</button>
                 <!-- 「刷新模型清单」：title 由 models-panel.js 在加载时写入（含
                      「CatPaw / AutoClaw 用固定清单」那句），只有一处事实来源 -->
@@ -470,6 +471,34 @@
               </div>
 
               <div class="terms" id="term-list"><div class="empty" style="padding:14px 0">正在加载词表…</div></div>
+            </div>
+          </section>
+
+          <!-- 默认词库（远程同步）：词表从「升级才更新」改成「从仓库定时拉取」之后，
+               用户需要能看到「当前合并到哪一版、上次同步成没成」—— 没有这一块时，
+               拉取失败（网络不通、仓库改名）在界面上是完全不可见的静默降级。
+               「立即同步」走 POST /api/desensitize/remote-sync（force 语义）。 -->
+          <section class="panel">
+            <div class="panel-head">
+              <h2>默认词库</h2>
+              <span id="sensitive-sync-badge" class="badge">—</span>
+              <div class="head-actions">
+                <button id="btn-sync-terms">立即同步</button>
+              </div>
+            </div>
+            <div class="panel-body">
+              <div class="retention-list storage-counts">
+                <div class="storage-count"><span class="k">词库版本</span><span class="v" id="sensitive-merged-version">—</span></div>
+                <div class="storage-count"><span class="k">上次同步</span><span class="v" id="sensitive-last-sync">—</span></div>
+              </div>
+              <!-- 同步结果是一整句话（「远端 v4 补入 2 个词条」/「拉取失败：…」），
+                   塞进上面那种大字号格子里会溢出，所以单独一行用 .detail 呈现 -->
+              <div class="detail" id="sensitive-sync-message">—</div>
+              <p class="hint">
+                默认词库随本项目的 GitHub 仓库发布（<code id="sensitive-source-url">—</code>），
+                「定时任务」页的「敏感词库更新」每 10 分钟自动拉取一次，这里可以手动立即拉一次。
+                同步只补不删：不会覆盖或删除你自己维护的词条，也不会改动脱敏开关与作用范围。
+              </p>
             </div>
           </section>
 
@@ -1379,8 +1408,10 @@
                    广告**时才会跟着进广告视图（catalog::models_response 遍历已
                    广告的模型再补别名），而入口校验以广告视图为准 —— 手输一个
                    清单里没有的名字，映射建了也永远调不通，白白让用户以为配好了。
-                   要用清单外的模型，正确做法是让那家的清单收录它（刷新远程目录，
-                   或修该家的静态表），而不是绕过清单。 -->
+                   要用清单外的模型，正确做法是让那家的清单收录它 —— 现在有了
+                   正规入口：面板顶部的「＋ 添加自定义模型」（登记后该模型真的
+                   进入该家清单，于是这里就能在下拉里选到它），而不是在映射里
+                   绕过清单。 -->
               <select id="mapping-upstream"></select>
             </div>
           </div>
@@ -1416,6 +1447,51 @@
         <div class="spacer"></div>
         <button id="mapping-modal-cancel">取消</button>
         <button id="mapping-modal-save" class="primary">保存映射</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── 添加自定义模型弹窗（models-panel.js）───
+       登记一个上游目录里没有、但实际能路由的模型（灰度中的新模型、
+       按账号下发却没进目录的模型）。保存后它会真的进入该家的模型清单，
+       于是能出现在表格里、能被 /v1/models 广告、也能被路由与转发。 -->
+  <div id="custom-model-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="custom-model-modal-title">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="custom-model-modal-title">添加自定义模型</h2>
+        <button id="custom-model-modal-close" title="关闭">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="modal-section">
+          <div class="mapping-row mapping-row-single">
+            <div class="mapping-col">
+              <label for="custom-model-provider">提供商</label>
+              <select id="custom-model-provider"></select>
+            </div>
+          </div>
+          <div class="mapping-row mapping-row-single" style="margin-top:10px">
+            <div class="mapping-col">
+              <label for="custom-model-id">上游模型 ID</label>
+              <input id="custom-model-id" type="text" maxlength="128" placeholder="例如 gpt-5.5-preview" autocomplete="off" spellcheck="false">
+            </div>
+          </div>
+          <div class="mapping-preview" id="custom-model-preview"></div>
+          <p class="detail">
+            填上游真正认识的那个模型 ID（不是给下游用的名字）。登记后它会进入该家的模型清单：
+            表格里出现这一行、<code>/v1/models</code> 会广告它、请求它也会被转发到这家。
+            支持字母、数字与 <code>- _ . / :</code>。
+          </p>
+          <p class="detail">
+            「来源」列会标成<b>手动</b>，与远程目录 / 内置清单区分开。删除自定义模型是
+            <b>直接移除</b>这条登记（不像内置模型那样只是隐藏），因为它的存在完全由这次登记决定。
+          </p>
+        </div>
+        <div class="detail" id="custom-model-modal-status" style="min-height:18px"></div>
+      </div>
+      <div class="modal-foot">
+        <div class="spacer"></div>
+        <button id="custom-model-modal-cancel">取消</button>
+        <button id="custom-model-modal-save" class="primary">保存</button>
       </div>
     </div>
   </div>
