@@ -69,11 +69,14 @@ use rusqlite::Connection;
 /// 清单，那个删除只能放宽成「删掉所有不在新配置里的键」—— 桌面设置、账号
 /// 优先级作用域、日志下一个 id 会在用户改一次 API Key 时全部消失。
 ///
-/// 它是**事实来源**：各使用方自己的常量（`desensitize::sql::KEY`、
-/// `logs_store::sql::NEXT_ID_KEY`）仍是它们各自读写时用的名字，本清单只服务
+/// 它是**事实来源**：各使用方自己的常量（`logs_store::sql::NEXT_ID_KEY`）
+/// 仍是它们各自读写时用的名字，本清单只服务
 /// 「配置写侧要排除哪些键」这一个判断。两处若不一致，症状是配置写入误删状态
 /// —— 所以新增固定键时**两处都要加**（使用方常量 + 本清单），
 /// [`is_reserved`] 是唯一的判断入口。
+///
+/// 清单里可能有**没有使用方常量**的项（如遗留的 `desensitize`）：那些是
+/// 「功能已删、数据留着」的键，登记它们的唯一目的就是让配置写入别去动它。
 pub const RESERVED_KV_KEYS: &[&str] = &[
     // 账号优先级的全局作用域（core::account_store::sql）
     "priorityScope",
@@ -83,7 +86,13 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 桌面设置是整体读写单元（前端一次 PUT 整份），拆键会让一次写入变成
     // 多行更新，徒增事务与冲突面。
     "desktopSettings",
-    // 内容脱敏的整份状态（core::desensitize::sql）
+    // **遗留**：旧「敏感词脱敏」的整份状态（词表 / 开关 / 作用角色 / 作用提供商）。
+    //
+    // 那个功能已随规则集换成硬编码指纹脱敏（`core::sanitize`）而整体删除，
+    // 这个键**不再有任何读写方**。仍然登记在这里是有意的：它意味着配置写入
+    // 不会顺手把这行删掉 —— 老用户库里那份自定义词表原样留着（想查还能
+    // `sqlite3` 看），而不是因为改一次 API Key 就静默消失。真要清理时手工
+    // 删这一行即可。
     "desensitize",
     // config.json 迁移的完成标记（db::migrate::config）。为什么配置这一项
     // **需要**标记键而其余项不需要：配置项是开放集合，没法问「配置迁过了
@@ -110,7 +119,7 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
 ///
 /// 唯一入口：`config::save_raw` 用它决定哪些行不参与「删除已不存在的键」。
 /// 做成函数而不是让调用方自己 `.contains()`：将来若固定键改成带前缀的命名，
-/// 改一处即可（与 `desensitize::legacy_present` 包一层 `sql::has_key` 同一手法）。
+/// 改一处即可（与 `db::migrate` 各迁移项包一层 `sql::has_key` 同一手法）。
 pub fn is_reserved(key: &str) -> bool {
     RESERVED_KV_KEYS.contains(&key)
 }
@@ -344,9 +353,10 @@ const V2_SCHEMA: &str = "
 -- attempt_details：每次上游尝试的明细 `[{provider,status,error}]`，
 --   按发生顺序。条数 <= attempts（采集侧一一对应），另受
 --   `core::upstream::usage::MAX_ATTEMPT_DETAILS`（24）的体积闸约束。
--- sensitive_hits：本次请求命中的敏感词 `[{word,count}]`，按次数降序。
---   来源是脱敏模块 `process_body` 已经算出的 term_counts（见
---   `core::desensitize::ProcessedBody`），此前只喂给聚合统计。
+-- sensitive_hits：本次请求命中的脱敏规则 `[{word,count}]`，按次数降序。
+--   来源是脱敏模块算出的命中明细（改造前是「命中的敏感词」，现在是
+--   「命中的硬编码规则标签」，见 `core::sanitize`；列名与结构未动，
+--   前端请求日志的「敏」标签因此照常工作）。
 -- 两列都 NOT NULL DEFAULT '[]'：见上面「默认值为什么是 '[]'」。
 -- 「DEFAULT 后面的值必须是常量」——SQLite 对带非常量默认值的 ADD COLUMN 会
 -- 直接报错，`'[]'` 是字面量，满足这条。

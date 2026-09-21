@@ -74,20 +74,48 @@
    *      下一次自己拖到想要的位置）；
    *   3. align 只认三档，脏值退回该列默认。
    * 顺序以存盘为准 —— 顺序正是用户拖出来的东西。
+   *
+   * ── 对齐：要能分辨「存的是用户挑的」与「存的是当时的默认值」────────
+   * 显示与顺序一律以存盘为准，对齐不能 —— **默认值本身会随版本调整**
+   * （账号表本次就从「除操作列外全部左对齐」改成「操作列居右、其余居中」），
+   * 一律以存盘为准的话，老用户永远看不到新默认值，改了默认值等于没改。
+   *
+   * 判据是「存盘值 ≠ 当时那份默认值」即视为用户挑过，于是需要知道**当时**的默认值，
+   * 两种存盘形态各有一个来源：
+   *   · v2 `{ v, defaults, items }`：defaults 是上次写盘时各列的默认对齐快照
+   *     （见 persist）。精确 —— 用户改过的列一定与快照不同。
+   *   · v1 裸数组（本次改造前的形态，没有快照）：用列上声明的 `legacyAlign`
+   *     （= 上一版的默认对齐）。它只对那些**默认值改过的列**有必要，
+   *     其余列的旧默认就是当前默认，不声明也精确。
+   *
+   * 两种形态都只在「值恰好等于旧默认」时改判成新默认，所以除这一种歧义
+   * （用户主动选了与旧默认相同的值，无从分辨）外不会覆盖用户的选择；
+   * 顺序与显隐完全不受这套判定影响。
    */
   function normalize(spec, saved) {
+    // v1 是裸数组，v2 是 { v, defaults, items }。两种都当「列表 + 可选快照」读
+    const legacy = Array.isArray(saved);
+    const items = legacy ? saved : (Array.isArray(saved?.items) ? saved.items : []);
+    const snapshot = !legacy && saved?.defaults && typeof saved.defaults === 'object' ? saved.defaults : null;
+
     const byKey = new Map(spec.columns.map(column => [column.key, column]));
     const defaults = new Map(defaultsOf(spec).map(item => [item.key, item]));
     const out = [];
     const seen = new Set();
-    for (const item of Array.isArray(saved) ? saved : []) {
+    for (const item of items) {
       const key = String(item?.key || '');
       if (!byKey.has(key) || seen.has(key)) continue;
       seen.add(key);
+      const column = byKey.get(key);
+      const fallback = column.align || 'left';
+      // 「当时那份默认值」：v2 读快照，v1 读列上声明的旧默认（未声明即当前默认）
+      const before = snapshot ? (snapshot[key] ?? fallback) : (column.legacyAlign ?? fallback);
+      const stored = ALIGNS.some(a => a.value === item.align) ? item.align : null;
       out.push({
         key,
         visible: item.visible !== false,
-        align: ALIGNS.some(a => a.value === item.align) ? item.align : (defaults.get(key)?.align || 'left'),
+        // 存盘值等于旧默认 → 用户没动过这一列 → 让新默认生效
+        align: stored && stored !== before ? stored : fallback,
       });
     }
     for (const column of spec.columns) {
@@ -107,9 +135,24 @@
     }
   }
 
+  /**
+   * 写盘。存 `{ v, defaults, items }`：
+   *   · `items` 是配置本体（key / visible / align），与 v1 的裸数组同形；
+   *   · `defaults` 是**本次写盘时各列的默认对齐**，只为下次启动时能分辨
+   *     「存的这一档是用户挑的」还是「当时的默认值」—— 见 normalize。
+   *     不写这份快照，将来再改默认值时就没法只对「没动过的列」生效。
+   * 多出来的 v / defaults 两个键不影响老版本读它（老代码只读数组本身会失败，
+   * 于是退回默认 —— 那正是升级前的行为，不会更糟）。
+   */
   function persist(spec) {
     try {
-      localStorage.setItem(STORE_PREFIX + spec.id, JSON.stringify(spec.config));
+      const defaults = {};
+      for (const column of spec.columns) defaults[column.key] = column.align || 'left';
+      localStorage.setItem(STORE_PREFIX + spec.id, JSON.stringify({
+        v: 2,
+        defaults,
+        items: spec.config,
+      }));
     } catch { /* 隐私模式等存不了就算了：本次会话内仍然生效 */ }
   }
 

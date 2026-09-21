@@ -1,6 +1,6 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "2.4.5"
+version = "2.4.6"
 description = "Agent2API 桌面端 — 多提供商本地网关与会话管理"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -76,6 +76,12 @@ base64 = "0.22"
 # （那套只够做 CSRF 口径的 state）。getrandom 0.2 本来就在依赖树里
 # （ring / aes-gcm 拉的），这里只是把它提升为直接依赖，不新增编译产物。
 getrandom = "0.2"
+# 出站请求体的指纹脱敏（core/sanitize.rs）：表头键名与 cc_* 键值要按正则整段
+# 剥离。规则集照搬 workbuddy2api 的 sanitize.go，那三条正则的**语义必须逐字对齐**
+# （大小写不敏感、`\b` 关掉 Unicode 模式、`\s` 收窄成 ASCII 空白），用字符串查找
+# 表达不了。regex 1.13.1 本来就在依赖树里（tauri-utils / urlpattern 拉的），
+# 这里只是提升为直接依赖，不新增编译产物。
+regex = "1"
 # AutoClaw 适配器的 encryption 侧（providers/autoclaw/crypto.rs）：Electron
 # safeStorage 的 os_crypt 密文是 AES-256-GCM，密钥由 DPAPI 解出。
 # 刻意 **关掉 default**：默认特性里的 getrandom/rand_core 是给「生成密钥」用的，

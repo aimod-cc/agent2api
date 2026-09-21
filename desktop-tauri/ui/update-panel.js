@@ -2,7 +2,7 @@
 /* global workbuddyDesktop, wbApp, wbMarkdown */
 
 /**
- * 独立面板模块（与 settings-panel / desensitize-panel 同构）。
+ * 独立面板模块（与 settings-panel 同构）。
  *
  * 壳命令契约（本文件只按此调用）：
  *   checkUpdate()                       → { currentVersion, latestVersion, hasUpdate,

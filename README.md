@@ -2,14 +2,14 @@
 
 **简体中文** | [English](./README.en.md)
 
-把多家 AI 桌面客户端的登录态包装成本地 **OpenAI 兼容 API 网关**，统一暴露一个 `base_url`，附带多提供商账号管理、模型管理（启停 / 删除 / 映射）、内容脱敏、出网代理与请求报表，并提供一个开箱即用的 Tauri 桌面端。任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 为端点调用这几家的模型额度——不需要 API Key，不需要改客户端源码。
+把多家 AI 桌面客户端的登录态包装成本地 **OpenAI 兼容 API 网关**，统一暴露一个 `base_url`，附带多提供商账号管理、模型管理（启停 / 删除 / 映射）、出站指纹脱敏、出网代理与请求报表，并提供一个开箱即用的 Tauri 桌面端。任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 为端点调用这几家的模型额度——不需要 API Key，不需要改客户端源码。
 
 ```
 OpenAI 客户端 / 任意 SDK
         │  POST /v1/chat/completions   （OpenAI 兼容，SSE）
         ▼
   Agent2API 网关（Rust 进程内服务）              ← 本机 127.0.0.1:3065
-  模型映射 · 账号候选链（全局优先级）· 429 降级 · 出网代理 · 内容脱敏
+  模型映射 · 账号候选链（全局优先级）· 429 降级 · 出网代理 · 出站指纹脱敏
         │  HTTPS（按模型名决定去谁家）
         ├──▶ workbuddy  copilot.tencent.com（国内版）/ www.workbuddy.ai（国际版）
         ├──▶ raccoon    xiaohuanxiong.com/api/web/llm/v2 · Authorization: Bearer <JWT>
@@ -35,7 +35,7 @@ OpenAI 客户端 / 任意 SDK
 - [快速开始](#快速开始)
 - [界面预览](#界面预览)
 - [数据存储](#数据存储)
-- [默认敏感词库](#默认敏感词库)
+- [出站指纹脱敏](#出站指纹脱敏)
 - [项目结构](#项目结构)
 - [开发与构建](#开发与构建)
 - [使用声明](#使用声明)
@@ -119,35 +119,37 @@ print(resp.choices[0].message.content)
 
 数据库用 WAL 模式，所以运行时同目录下还会有 `agent2api.db-wal` / `agent2api.db-shm` 两个附属文件，备份时请一并带上（或先退出程序，退出时会把 WAL 内容合并回主库）。
 
-> **从旧版本升级**：早期版本把数据分散在 8 个 JSON / JSONL 文件里（`accounts.json`、`config.json`、`logs.jsonl`、`requests.jsonl`、`request-daily.jsonl`、`debug-traffic.jsonl`、`desensitize.json`、`desktop-settings.json`）。新版本首次启动会**检测**到这些文件并弹窗告知「数据结构已换成 SQLite」，你点弹窗里的「升级」按钮后才开始导入；点「稍后」则本次不导入（账号与历史记录暂时不可用，下次启动照常提示）。
+> **从旧版本升级**：早期版本把数据分散在 JSON / JSONL 文件里（`accounts.json`、`config.json`、`logs.jsonl`、`requests.jsonl`、`request-daily.jsonl`、`debug-traffic.jsonl`、`desktop-settings.json`）。新版本首次启动会**检测**到这些文件并弹窗告知「数据结构已换成 SQLite」，你点弹窗里的「升级」按钮后才开始导入；点「稍后」则本次不导入（账号与历史记录暂时不可用，下次启动照常提示）。
 >
 > 导入成功后，旧文件**只改名**为 `原名.migrated`（例如 `accounts.json.migrated`）作为备份留在原处，**不会被删除**。要回退或人工核对数据，随时可以打开这些文件；把某个文件改回原名再重启，程序会重新提示升级。
 
 ---
 
-## 默认敏感词库
+## 出站指纹脱敏
 
-「脱敏」页用的默认词表分两份，共同决定请求里哪些内容会被插入零宽空格：
+上游的内容审核是**逐字精确匹配**（不是语义审核）：客户端（Claude Code / Codex 一类 CLI）在 system prompt 里注入的固定模板句、计费头字段名、以及某些裸错误码出现在报文里就会整单拦截，返回 HTTP 400。这类拦截与内容是否真的有害无关，只要那几个固定字符串在场就会被拦。
 
-- **内置词表**（编译进程序，`engine.rs` 的 `DEFAULT_TERMS`）：离线兜底，也是全新用户的初始词表。
-- **远程词库**（仓库根目录的 [`sensitive-words.json`](./sensitive-words.json)）：客户端启动时拉一次，之后由「定时任务」页的**「敏感词库更新」每 10 分钟**拉一次。上游的审核规则随时在变，这条链路让词库不必等客户端升级就能跟上。
+开启**指纹脱敏**（设置页「通用 → 指纹脱敏」，默认开）后，网关在每次转发前改写这些指纹：
 
-两份共用一个版本号（`version` 字段 / 本地的 `defaultsVersion`）。远端版本高于本地已合并版本时，把本地还没有的词条**追加**进用户词表。
+- **表头键值整段删除**：`x-anthropic-billing-header: ...` 与尾随的 `cc_*=` 键值对整个删掉；残留的裸键名缩写成 `x-anthropic-billing-hdr`（破坏逐字匹配、语义不变）。
+- **承载语义的模板句最小改写**（每句只换一个词，语义完全不变）：
 
-> **同步只补不删**：不会覆盖或删除你自己维护的词条，也不会改动脱敏开关、作用角色与作用提供商。反过来说，**你手动删掉的内置词会在下次同步时被补回来** —— 远端给的是一份「当前全量」词表，分不出「你删掉的」和「新加的」。要彻底停用某个词，请改用「作用提供商」把该家移出脱敏范围，或关掉「敏感词库更新」这条定时任务。
+  | 原文 | 改写为 |
+  | --- | --- |
+  | `You are Claude Code, Anthropic's official CLI for Claude` | `...official CLI **tool** for Claude` |
+  | `Main branch (you will usually use this for PRs)` | `**Default** branch (you will usually use this for PRs)` |
+  | `You are a coding agent running in the Codex CLI, a terminal-based coding assistant.` | `...running in the Codex CLI **tool**, a terminal-based...` |
+  | `To give feedback, users should report...` | `To **provide** feedback, users should report...` |
 
-拉取走 `raw.githubusercontent.com`（不计入 GitHub API 的匿名限额），失败**不影响转发**（词表保持原样），只在下一次成功时补上。默认地址可用环境变量 `AGENT2API_SENSITIVE_WORDS_URL` 覆盖（fork 的用户指向自己的仓库）。「脱敏」页的「默认词库」区块显示当前版本、上次同步时间与结果，也可以点「立即同步」手动拉一次。
+- **裸错误码 `11128` → `11-128`**：这串数字是上游反探测的触发条件，只要出现在请求体里就整单拦截（`code=11128`、裸 `11128`、`错误码 11128` 全部命中，而与上下文无关）。代价是**用户对话里出现的 `11128` 也会被改写** —— 但它出现在请求里本身就是拦截条件，不改写必然失败。这里用连字符而非零宽空格，是因为实测上游会对零宽字符做归一化。
 
-词表文件格式：
+规则集是**硬编码**的（照搬 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的 `internal/upstream/sanitize.go`），没有可维护的词表，也不需要联网更新。开关关掉后客户端模板会原样发往上游，可能重新出现模板句被误拦的报错。
 
-```json
-{
-  "version": 4,
-  "terms": ["DoS", "exploit", "x-anthropic-billing-header"]
-}
-```
+命中明细会记进请求日志的「敏」标签（悬停看命中了哪几条规则）；`11128` 这类拦截本身则走转发层的退避重试，见「请求重试」。
 
-`$comment` 之类的说明字段会被忽略，也可以直接给一个裸数组（此时按版本 0 处理）。**词条本身不要自带零宽字符** —— 零宽空格由运行时插入。往词表追加词条时记得把 `version` 加 1。
+> 本项只改**发给上游的副本**，客户端看到的响应内容不变。
+
+---
 
 ---
 
@@ -200,7 +202,7 @@ agent2api/
 │  │  │  │  │                    loopback 回调、qoder 的设备授权）
 │  │  │  │  ├─ routing.rs / billing/   账号选路（全局优先级 + 限额冷却）/ 积分签到运营
 │  │  │  │  ├─ proxies.rs / clash.rs / egress.rs   出网代理与按出口缓存 Client
-│  │  │  │  ├─ desensitize/     脱敏引擎与词表（按 provider + role 生效）
+│  │  │  │  ├─ sanitize.rs      出站指纹脱敏（硬编码规则集：表头剥离 + 模板句最小改写）
 │  │  │  │  ├─ credential_maintenance.rs  已过期 / 临期凭证的批量刷新
 │  │  │  │  ├─ usage_query.rs     余额 / 积分查询（跨账号并发 + 定时那一轮的快照）
 │  │  │  │  ├─ scheduled_tasks.rs  间隔型定时任务注册表与调度循环（开关 / 间隔 /
@@ -209,7 +211,7 @@ agent2api/
 │  │  │  │                       导入导出（含身份归一）/ 定时签到 / 软件更新
 │  │  │  └─ api/                 各路由 handler（health/session/accounts/accounts_usage/
 │  │  │                          chat/models/keys/model_manage/stats/logs/billing/
-│  │  │                          desensitize/auto-checkin/scheduled-tasks/update/…）
+│  │  │                          sanitize/auto-checkin/scheduled-tasks/update/…）
 │  │  ├─ lib.rs                 应用入口（配置目录迁移 → 设置 → 托盘 → 主窗口 → 启动后端）
 │  │  ├─ backend.rs              进程内服务器生命周期
 │  │  ├─ legacy_install.rs       旧「当前用户」安装的清理（目录 / 快捷方式 / 卸载项 / 自启；仅 release）

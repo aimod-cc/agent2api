@@ -71,6 +71,24 @@ pub(crate) fn run(store: &AccountStore) {
     if let Some(summary) = model_rules::migrate_cline_split() {
         logging::log("[Models]", &summary);
     }
+    // 限额冷却键的存量修复：把按**请求名**记下的键（映射别名）清掉。
+    //
+    // 位置必须在这里 —— 它读 `model_rules::current()` 的映射表（要已导入配置，
+    // 与 `migrate_cline_split` 同一条依赖），且要早于任何转发（否则那些孤儿键
+    // 会继续在账号页上显示成「限流中」，用户以为账号还被限着）。
+    // 清的是**已存在的错位记录**，读写两侧的新口径在 `routing::CooldownKeys`
+    // 与 `payload::SendBody` 里，不需要额外迁移。
+    let stale_keys = store.migrate_rate_limit_keys();
+    if !stale_keys.is_empty() {
+        logging::log(
+            "[Accounts]",
+            &format!(
+                "🧹 已清理 {} 条错位的限流记录（旧版把映射别名当成冷却键，实际额度按上游真名记）：{}",
+                stale_keys.len(),
+                stale_keys.join("；"),
+            ),
+        );
+    }
     // 小浣熊旧数据一次性导入（架构文档 §3.3，W3-T4）：
     //   `~/.raccoon-proxy/accounts.json`（旧网关多账号）+
     //   `~/.box-agent/config/auth.json`（桌面端实时登录态）→ raccoon 账号。

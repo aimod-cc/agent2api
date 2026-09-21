@@ -72,7 +72,6 @@
     void window.wbRequestsPanel?.load?.();
     void window.wbReport?.load?.();
     void window.wbSettingsPanel?.load?.();
-    void window.wbDesensitizePanel?.load?.();
   }
 
   /**

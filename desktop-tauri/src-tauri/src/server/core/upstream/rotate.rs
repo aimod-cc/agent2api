@@ -23,6 +23,15 @@
 //! 这个模型名，它就不在 `providers` 里。限额冷却键仍是账号记录内的
 //! `rateLimits[model]`，账号唯一确定 provider，无需改结构。
 //!
+//! ── 冷却键里的 `model` 是**上游真名**（本文件另一个要紧的口径）──────
+//! 上面那个「账号唯一确定 provider」的结论正是真名解析的前提：同一个请求名
+//! 在 workbuddy 与 catpaw 两家可能各自映射到**不同**的上游模型，而每条账号
+//! 记录只属于一家，所以「按账号所属的家解析真名」永远只有一个答案。
+//! 判定侧用 [`routing::CooldownKeys`]，写入侧（`mark_account_limited`）由调用方
+//! 传入已经解析好的真名 —— 两处必须同源，否则冷却会写在一个键上、查在另一个
+//! 键上（那正是 2026-09 那次「映射生效了、请求却仍然打到已限额账号」的成因，
+//! 见 `routing::CooldownKeys` 的说明）。
+//!
 //! ── 11128 退避去哪了 ───────────────────────────────────────
 //! 改造前 `request_with_waf_retry` 在本文件里（含「11128 → 10s/25s」的判定）。
 //! 那个码是 workbuddy 的专属知识，已随转发改造搬进
@@ -82,10 +91,14 @@ pub(super) async fn session_for(
 ///   3. 全部禁用 → 明确报 503，绝不回退到已禁用账号。
 ///
 /// 候选集合 = `providers` 里各家的全部账号（见模块头）。`providers` 非空。
+///
+/// `keys` 是请求名到各家上游真名的解析器：限额冷却按**真名**判定（理由见
+/// `routing::CooldownKeys`）—— 传请求名会让别名请求的冷却查不到、已限额的
+/// 账号被反复选中。第三级「恢复最早的那个」同样按真名读 `resetAt`。
 pub(super) async fn select_target_account(
     service: &UpstreamService,
     providers: &[&str],
-    model: &str,
+    keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
 ) -> Result<RouteTarget, GatewayError> {
     let accounts = accounts_in_providers(service, providers);
@@ -104,7 +117,7 @@ pub(super) async fn select_target_account(
     let mut excluded: Vec<String> = tried_ids.to_vec();
     let now = logging::now_ms();
     loop {
-        let picked = routing::pick_account_by_priority(&accounts, model, &excluded, now);
+        let picked = routing::pick_account_by_priority(&accounts, keys, &excluded, now);
         let Some(picked) = picked else {
             break;
         };
@@ -140,7 +153,7 @@ pub(super) async fn select_target_account(
         if tried_ids.iter().any(|tried| tried == id) {
             continue;
         }
-        let reset = routing::rate_limit_reset_at(account, model, now);
+        let reset = routing::rate_limit_reset_at(account, keys, now);
         let reset = if reset > 0 { reset as f64 } else { f64::INFINITY };
         if reset < best_reset {
             best_reset = reset;
@@ -168,6 +181,13 @@ pub(super) async fn select_target_account(
 /// 实现与出处都在 `routing` —— 那里也要按 provider 收窄候选（`pick_for_model`），
 /// 一处实现两处用，免得「缺失回落默认家」这条规则被抄成两份、日后改歪一份。
 pub(super) use crate::server::core::routing::provider_of;
+
+/// 限额冷却键的解析器（请求名 → 各家上游真名）。
+///
+/// 与 `provider_of` 同一模式：定义与论证都在 `routing`，这里只做转出 ——
+/// 编排层（`provider_loop`）要建它、本模块的选路函数要收它，两处都写全路径
+/// 只会让签名更长；而它是**冷却键口径**的单一事实来源，不该在别处再写一遍。
+pub(super) use crate::server::core::routing::CooldownKeys;
 
 /// 候选账号池：`providers` 里各家的全部账号（公开形态，文件顺序）。
 ///
@@ -228,6 +248,10 @@ pub(super) fn with_proxy_notice(
 ///
 /// `account_id` 已经唯一确定了 provider（id 在整份账号文件里唯一、且每条记录
 /// 只属于一家），所以冷却键 = `provider×账号×模型` 天然成立。
+///
+/// `model` 必须是**上游实际收到的真名**（不是客户端请求名）—— 调用方从
+/// `SendBody::wire_model` 取（见 `upstream::payload`）。传请求名会把冷却写在
+/// 上游永远不会记额度的键上，判定侧也就查不到它（见 `routing::CooldownKeys`）。
 pub(super) fn mark_account_limited(
     service: &UpstreamService,
     account_id: &str,
@@ -263,7 +287,9 @@ pub(super) fn mark_account_limited(
 }
 
 /// 该账号对某模型当前的限额恢复时间戳（未限额 0）——上报事件时用，
-/// 与 Node 的 `limitEntry?.resetAt` 同源（都从账号记录里现读）
+/// 与 Node 的 `limitEntry?.resetAt` 同源（都从账号记录里现读）。
+///
+/// `model` 是上游真名（见 `mark_account_limited` 的说明），与写入侧同一个键。
 pub(super) fn account_limit_reset_at(service: &UpstreamService, account_id: &str, model: &str) -> i64 {
     let snapshot = service.store.list_accounts();
     let accounts = routing::accounts_of(&snapshot);
@@ -282,18 +308,24 @@ pub(super) fn account_limit_reset_at(service: &UpstreamService, account_id: &str
         .unwrap_or(0)
 }
 
-/// 下一个可用账号（全局队列，限定在 `providers` 各家的账号里，跳过已尝试的）
+/// 下一个可用账号（全局队列，限定在 `providers` 各家的账号里，跳过已尝试的）。
+///
+/// `keys` 见 [`select_target_account`]：冷却按各家真名判定。
 pub(super) fn pick_next_account(
     service: &UpstreamService,
     providers: &[&str],
-    model: &str,
+    keys: &routing::CooldownKeys<'_>,
     tried_ids: &[String],
 ) -> Option<Value> {
     let accounts = accounts_in_providers(service, providers);
-    routing::pick_account_by_priority(&accounts, model, tried_ids, logging::now_ms())
+    routing::pick_account_by_priority(&accounts, keys, tried_ids, logging::now_ms())
 }
 
-/// 该账号对该模型此前是否处于限额状态（用于「已恢复可用」日志的去噪）
+/// 该账号对该模型此前是否处于限额状态（用于「已恢复可用」日志的去噪）。
+///
+/// `model` 是上游真名（见 `mark_account_limited` 的说明）：读的键必须与写入
+/// 侧同一个，否则「清掉一条不存在的记录」会被误判成「恢复可用」而多打一行日志
+/// （或者反过来，真正的恢复不写日志）。
 pub(super) fn account_had_limit(service: &UpstreamService, account_id: &str, model: &str) -> bool {
     let snapshot = service.store.list_accounts();
     routing::accounts_of(&snapshot)

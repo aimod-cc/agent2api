@@ -28,13 +28,11 @@
    * 漂移的症状：用户双击把手「还原」后列宽跳到另一个值（还原读的是这里的
    * DEFAULTS，而首屏渲染走的是 CSS）。
    *
-   * 本次改造调了两列：usage 100 → 84、actions 190 → 250。
-   * 原因是查询余额按钮从余额列挪进了操作列（见 accounts-table.js 的
-   * usageCell / actionsCell）：按钮数多了一颗、最坏组合变成
-   * 「设为首选 + 余额 + 设置 + 已签到 + ⋯」，两处必须一起动 ——
-   * 只改一处会让「已签到」被省略号切掉（那是不可点的状态，
-   * 切掉之后用户看不到「今天没得签了」）。
-   * 250 这个值是量出来的（算式见 page-accounts-table.css 里那条声明）。
+   * 本次改造只动了一列：actions 250 → 200。原因是「设为首选」从行上
+   * 搬进了 ⋯ 菜单（见 accounts-table.js 的 actionsCell 与 accounts-model.js 的
+   * moreMenuHtml），最坏组合从五颗按钮变成四颗
+   * 「签到 + 余额 + 设置 + 已签到 + ⋯」里的四颗实际同现组合 ——
+   * 算式见 page-accounts-table.css 那条声明。省下的 50px 全部归账号列。
    */
   const DEFAULTS = {
     pick: 26,
@@ -46,7 +44,7 @@
     limits: 148,
     expiry: 80,
     usage: 84,
-    actions: 250,
+    actions: 200,
   };
 
   /** 拖动的下限：再窄就该点不准里面的控件了 */

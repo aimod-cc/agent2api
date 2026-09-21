@@ -1,11 +1,10 @@
 /* Agent2API · 提供商目录（provider 摘要与 provider 维度读写的唯一前端入口） */
 
 /**
- * 提供商目录：把「当前有哪些提供商、各自叫什么、有多少账号」收在一处，供三处面板共用：
+ * 提供商目录：把「当前有哪些提供商、各自叫什么、有多少账号」收在一处，供两处面板共用：
  *   · 设置页「转发路由」的优先级编辑（route-panel.js）
- *   · 脱敏页「作用提供商」多选（desensitize-panel.js）
  *   · 请求日志的「提供商」列（requests-panel.js）
- * 为什么不让三处各拉一份：三处都在渲染里读这份数据，而请求日志会随轮询反复
+ * 为什么不让两处各拉一份：三处都在渲染里读这份数据，而请求日志会随轮询反复
  * 重渲；各发一次请求不但浪费，还会出现「同一家 provider 在两处名字不一样」的瞬间
  * （两个响应先后到达）。集中一份也对得上「新 provider 注册后自动出现」这条要求 ——
  * 摘要本身就含注册表里的**全部** provider，界面不必知道任何一家具体名字。
@@ -17,6 +16,8 @@
  *
  * 与 accounts-model.js 的分工：那个文件管「账号」维度的判定与标签，本文件只管
  * 「提供商」这份目录本身，不碰账号数据。
+ *
+ * 曾经的第三个消费者是脱敏页的「作用提供商」多选，随该页一起删除。
  */
 (() => {
   const api = workbuddyDesktop;
@@ -98,32 +99,5 @@
     }
   }
 
-  /**
-   * 保存脱敏作用提供商（`PUT /api/desensitize/providers`，body `{providers:[id…]}`）。
-   *
-   * 为什么要分两条路：桥接层（src-tauri/src/bridge.rs 的 BRIDGE_JS）已经暴露了
-   * `setDesensitizeProviders`，桌面端走的都是它；下面那条直连 `api_request` 只是
-   * 「壳里还没有这个方法」时的兜底（旧版壳、或将来桥接层漏加方法时界面不炸）。
-   * 两条路的入参与返回值口径一致（都是管理 API 的 request 对象、返回值同样是被
-   * 解包过的 data），错误照旧是 rejected Promise 里的可读消息。
-   *
-   * 注意 `__TAURI_INTERNALS__` 是 Tauri 注入的底层 IPC，`withGlobalTauri: false`
-   * 不影响它 —— bridge.rs 自己也是这么取的。非桌面环境（浏览器直开 ui/）下它会缺失，
-   * 此时给一句与桥接层同款的错误，界面按普通失败处理。
-   */
-  function saveScope(providers) {
-    const list = (Array.isArray(providers) ? providers : [])
-      .filter(id => typeof id === 'string' && id);
-    const bridged = api.setDesensitizeProviders;
-    if (typeof bridged === 'function') return bridged(list);
-    const internals = window.__TAURI_INTERNALS__;
-    if (!internals || typeof internals.invoke !== 'function') {
-      return Promise.reject(new Error('桌面运行时不可用（Tauri 未初始化）'));
-    }
-    return internals.invoke('api_request', {
-      request: { method: 'PUT', path: '/api/desensitize/providers', body: { providers: list } },
-    });
-  }
-
-  window.wbProviders = { all, labelOf, load, saveScope };
+  window.wbProviders = { all, labelOf, load };
 })();

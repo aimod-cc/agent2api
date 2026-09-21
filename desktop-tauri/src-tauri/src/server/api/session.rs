@@ -23,7 +23,7 @@
 //!   defaultModel    ← config.json 的 defaultModel
 //!   proxies         ← Clash 摘要（切片 3 起为实时读取的真实值）
 //!   models          ← 模型目录（切片 4 起为真实清单，含远程刷新结果）
-//!   desensitize     ← 脱敏摘要（切片 5 起为真值：enabled/termCount/roles）
+//!   sanitizeBlacklistFingerprints ← 出站指纹脱敏开关（与 GET /api/sanitize 同源）
 
 use std::time::Duration;
 
@@ -90,9 +90,8 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
         // 路由不到的模型名去调（改造前这里只读 workbuddy 单家，另三家在界面上不可见）。
         // 每条另带 provider / providerLabel，供网关页按家分组。
         "models": crate::server::core::providers::catalog::session_models(state.store()),
-        // 脱敏摘要（对照 server.mjs 805-808）：只有 enabled/termCount/roles，
-        // 完整词表在 GET /api/desensitize（前端面板不许它覆盖完整状态）
-        "desensitize": state.desensitize().summary(),
+        // 指纹脱敏开关（与 GET /api/sanitize 同一个键、同一个值）
+        config::KEY_SANITIZE_FINGERPRINTS: snapshot.sanitize_fingerprints(),
     }))
 }
 

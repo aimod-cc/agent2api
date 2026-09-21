@@ -28,14 +28,8 @@
 //!   - `config`：**必须** `reload()`。它的快照在 `bootstrap` 里装入，而那时
 //!     迁移还没跑，快照是从旧 `config.json` **回落读**出来的；迁移把配置搬进
 //!     库之后，库才是真相来源，重装一次让本次运行就用上与库一致的那一份
-//!     （论证见 `config::reload`）。
-//!   - `core::desensitize`：**必须**重载。它构造时读一次库（`with_db` →
-//!     `load()`），把词表 / 开关 / 作用提供商 / 默认词表版本装进内部 `RwLock`，
-//!     之后热路径全程只用内存快照、不再碰库（模块头「热路径零数据库调用」）。
-//!     不重载的后果很具体：用户升级前配的词表进不了内存，**脱敏按默认词表跑**，
-//!     界面上显示的还是默认词条（用户会以为自己的词表丢了）。
-//!     用 `set_terms` 之类「重读后写回」的入口是错的 —— 那会把当前内存里的
-//!     默认词表**写回库**，正好覆盖掉刚导进来的用户词表。
+//!     （论证见 `config::reload`）。指纹脱敏开关也走这份快照（它读
+//!     `config::current().sanitize_fingerprints()`），因此随 config 一起生效。
 //!   - `AccountStore` / `LogStore` / `RequestStats` / `debug_traffic`：**不需要**
 //!     额外处理。四者都持 `Db` 句柄、每次操作现读库（没有全量内存快照），
 //!     所以迁移导入的行下一个查询就能看到。
@@ -146,8 +140,6 @@ pub async fn run_upgrade(State(state): State<ServerState>) -> Response {
         if matches!(outcomes, Some(ref list) if !list.is_empty()) {
             // 配置快照必须重装：迁移把配置搬进库之后，库才是真相来源（见模块头）。
             crate::server::config::reload();
-            // 脱敏状态必须重载（见模块头那一节：它构造时读一次库就只吃内存快照）。
-            crate::server::core::desensitize::reload();
             // 账号侧的启动期迁移必须**补做一次**（见 `account_bootstrap` 的
             // 模块头）：启动时它们被整块跳过了（那时 `accounts` 表还空着，
             // 跑它们会把 `import_accounts` 的幂等闸门永久关上）。现在账号已经

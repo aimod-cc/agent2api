@@ -78,8 +78,8 @@ pub(crate) const LEGACY_FILE_NAME: &str = "desktop-settings.json";
 /// 设置数据所在的文件（**就是库文件**；界面展示与排障用）。
 ///
 /// 语义从「设置文件路径」变成「装着这份设置的库文件」—— 与 T2~T6 对
-/// `AccountStore::file()` / `LogStore::file()` / `RequestStats::file()` /
-/// `desensitize::file()` 的处理一致，五个 store 的说法统一。
+/// `AccountStore::file()` / `LogStore::file()` / `RequestStats::file()` 的
+/// 处理一致，各 store 的说法统一。
 pub fn file_path() -> PathBuf {
     gateway::config_dir().join(crate::server::db::FILE_NAME)
 }

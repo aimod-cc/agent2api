@@ -1,10 +1,10 @@
 //! `{config_dir}/desktop-settings.json` → `kv` 表的 `desktopSettings` 键。
 //!
-//! ── 幂等判据：键存在（与 `desensitize` 项同款）────────────────
-//! `kv` 是**共享表**（账号的 `priorityScope`、日志的 `logsNextId`、脱敏状态
-//! `desensitize`、配置迁移标记 `configMigrated` 都在里面），所以判据是
-//! 「**自己那个键在不在**」而不是「表为空」。完整论证见 `desensitize.rs`
-//! 的模块头（那一条对 `kv` 的项都成立）。
+//! ── 幂等判据：键存在 ─────────────────────────────────────────
+//! `kv` 是**共享表**（账号的 `priorityScope`、日志的 `logsNextId`、
+//! 配置迁移标记 `configMigrated` 都在里面），所以判据是
+//! 「**自己那个键在不在**」而不是「表为空」。完整论证见框架模块头
+//! 的幂等原则（那一条对写 `kv` 的项都成立）。
 //!
 //! 本项**不需要** `configMigrated` 那样的标记键：桌面设置是**单个数据单元**
 //! （整份设置一个键），「那个键在不在」就是完整的答案 ——
@@ -97,7 +97,7 @@ pub(super) fn import_settings(conn: &Connection, dir: &Path) -> Option<LegacyOut
         return None;
     }
     // 一整份设置就是一行（UPSERT），它本身就是原子的 —— 框架要求的
-    // 「整批一个事务」在这里天然满足（与 `desensitize` 项同款说明）。
+    // 「整批一个事务」在这里天然满足（单键 UPSERT 本身就是原子的）。
     if let Err(error) = settings::write_migrated(conn, &text) {
         logging::console_line(
             "[Storage]",
@@ -110,8 +110,8 @@ pub(super) fn import_settings(conn: &Connection, dir: &Path) -> Option<LegacyOut
         label: LABEL,
         source: path,
         // 桌面设置是单个数据单元（整份一个键），所以这里恒为 1 ——
-        // 与 `desensitize` 项按词条数、`config` 项按顶层键数计数的区别在于
-        // 那几个单元是「一份里有 N 条」，这里一份就是一条。
+        // 与 `config` 项按顶层键数计数的区别在于：那一个是「一份里有 N 条」，
+        // 这里一份就是一条。
         imported: 1,
         backup,
     })

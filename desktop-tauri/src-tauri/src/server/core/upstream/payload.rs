@@ -1,16 +1,22 @@
 //! 一次转发的只读输入与**发送体选择**（从 `provider_loop.rs` 拆出，单文件行数约定）。
 //!
-//! ── 发送体为什么按 provider 逐家决定 ──────────────────────────
+//! ── 发送体为什么在转发前决定 ────────────────────────────────
 //! 请求体从 `api::chat` **原样**进来（去重键也取自原始请求体）。内容处理只在
-//! **某一家 provider 的凭证已就绪、即将发送之前**发生，并按脱敏配置里的
-//! `providers` 作用范围逐家判定（那份配置现在存在统一库的 `kv` 表；范围快照见
-//! [`ProviderContext::desensitize_scope`]）：
-//!   - 未勾选的家 → 客户端**原始**请求体（不处理、不计数）；
-//!   - 勾选的家   → 用 core 的现有处理在**副本**上处理一次（命中日志由 core 打）。
-//! 于是首选与故障转移到的未勾选家拿到的都是未修改的 body，绝不会复用上一家
-//! 处理过的值；同一 provider **同池**换账号重试复用同一份（不重复处理、不重复
-//! 统计 —— 键是「家 × 账号池」，因为发送名跟着账号所在池走，见下）；「这一家
-//! 没有可用凭证」时根本走不到处理点，不产生一次已转发的处理。
+//! **凭证已就绪、即将发送之前**发生，且是否处理由配置里的全局开关
+//! `sanitizeBlacklistFingerprints` 决定（快照见
+//! [`ProviderContext::sanitize_fingerprints`]）：
+//!   - 开关关着 → 客户端**原始**请求体（不处理、不计数）；
+//!   - 开关开着 → 用 `core::sanitize` 在**副本**上处理一次。
+//! 于是首选与故障转移到的家拿到的都是同一份处理结果；同一 provider **同池**
+//! 换账号重试复用同一份（不重复处理、不重复统计 —— 键是「家 × 账号池」，
+//! 因为发送名跟着账号所在池走，见下）；「这一家没有可用凭证」时根本走不到
+//! 处理点，不产生一次已转发的处理。
+//!
+//! ── 与改造前的差异：不再有「按 provider 作用范围」────────────────
+//! 改造前脱敏是按 provider 逐家判定的（配置里勾了哪几家，只有那几家的请求
+//! 过脱敏）。规则集换成硬编码之后这一维**整体去掉**：开关是全局的，
+//! 要么所有出站请求都剥离指纹、要么都不剥离。理由见 `core::sanitize` 的
+//! 模块头（规则是「上游会误拦的固定模板串」，与哪一家上游无关）。
 //!
 //! ── model 字段的按家改写（备援名）────────────────────────────
 //! 候选链经备援扩池后，链上某家的目录里认的可能是**备援名**而不是请求名
@@ -21,6 +27,14 @@
 //! **发出去的字节**上：`ctx.body`（记账 / 限额键 / 日志里的模型）保持客户端
 //! 请求名不变。与脱敏同一个时机与缓存口径：同一家同池换账号重试复用同一份。
 //!
+//! ── 但「限额键」是个例外：它必须是改写后的真名 ──────────────────
+//! 上面那句「限额键保持请求名不变」在 2026-09 之前是这么写的，也正是那次
+//! 事故的根因：限额是**上游按真名记的**，冷却键用请求名会写在一个上游永远
+//! 不认的名字上（映射别名），于是判定侧查不到、已限额的账号被反复选中。
+//! 现在 [`send_body`] 把改写结果一并交出来（[`SendBody::wire_model`]），
+//! 调用方拿它当冷却键 —— 记账 / 日志里的模型仍是请求名，只有 `rateLimits`
+//! 的键跟着上游走。完整论证见 `routing::CooldownKeys`。
+//!
 //! ── 思考等级绑定（`mappings[].reasoning`）为什么也在这一步 ─────
 //! 等级与「这一家收哪个模型名」是**同一条映射**上的两个属性，因此两者在同一次
 //! 解析里一起取出（`catalog::wire_target_for_provider` 返回的 `WireTarget`
@@ -30,7 +44,7 @@
 //! 注入点不认识任何一家的字段名。哪些情况故意不注入（关闭思考、表外自定义值、
 //! 客户端已显式指定、这家翻译不了）见 `model_rules::reasoning` 的模块头。
 //!
-//! 处理算法本身不在这里：脱敏判定与改写在 `core/desensitize`，模型名判定在
+//! 处理算法本身不在这里：指纹改写在 `core::sanitize`，模型名判定在
 //! `core::providers::catalog`（本模块只决定「在什么时机、对哪一家、用哪一份」）。
 
 use std::borrow::Cow;
@@ -54,28 +68,49 @@ pub(super) struct ProviderContext<'a> {
     pub client_headers: &'a HeaderMap,
     /// usage / 尝试次数旁路槽
     pub telemetry: &'a Arc<RequestTelemetry>,
-    /// 本请求的脱敏作用范围**快照**（请求开始时取一次，见 `upstream::forward`）。
+    /// 本次请求的指纹脱敏开关**快照**（请求开始时取一次，见 `upstream::forward`）。
     ///
-    /// 为什么随请求取快照而不是每家转发前现读：同一次请求内作用范围必须一致，
-    /// 否则用户在请求进行中改了设置，会出现「前一家处理过、后一家不处理」
-    /// 这类语义漂移；快照也让判定与日志用的是同一份范围。
-    pub desensitize_scope: &'a [String],
+    /// 为什么随请求取快照而不是每家转发前现读：同一次请求内这个开关必须一致，
+    /// 否则用户在请求进行中改了设置，会出现「前一家脱敏过、后一家没脱敏」
+    /// 这类语义漂移；快照也让判定与日志用的是同一份值。
+    pub sanitize_fingerprints: bool,
     /// 本次请求命中的网关 Key 的**可用提供商**白名单（R9；`None` = 不限制，
     /// 见 `core::key_scope` 模块头）。
     ///
     /// 为什么放在这里（转发上下文）而不是让选路层自己去读请求扩展：本结构就是
-    /// 「一次转发的只读输入」的汇聚点（脱敏范围、客户端头、telemetry 都在这里），
+    /// 「一次转发的只读输入」的汇聚点（脱敏开关、客户端头、telemetry 都在这里），
     /// 候选链的过滤与它同源 —— 两个消费方（候选链过滤、选路循环）读同一份快照，
     /// 语义不会中途漂移。传引用是因为它由 `upstream::forward` 的栈帧持有，
     /// 生命周期覆盖整条转发链。
     pub key_scope: Option<&'a crate::server::core::key_scope::KeyScope>,
 }
 
+/// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用），
+/// 以及这次发送用的上游模型名。
+///
+/// ── 为什么把「上游模型名」和请求体绑在一个返回值里（别拆成两次解析）──
+/// 这个名字是**限额冷却的键**：上游按它记额度，`rateLimits` 也按它落盘
+/// （见 `routing::CooldownKeys`）。它必须与**真正发出去的字节**同源 ——
+/// 若调用方自己再调一次 `wire_target_for_provider` 去算，就有了两处解析、
+/// 两个可能分叉的答案，而分叉的表现正是本项目最忌讳的那类静默错误：
+/// 「冷却写在一个键上、查在另一个键上，于是已限额的账号被反复选中」。
+/// 一次解析、两个产物（字节 + 名字）同源，这种错在结构上就不可能发生。
+///
+/// `wire_model` 在请求体没有 `model` 字段时是空串（那时上游收到的是它自己的
+/// 默认模型，网关无从知道名字，冷却也按空键走 —— 与改造前逐字一致）。
+pub(super) struct SendBody<'a> {
+    /// 实际要发出去的请求体：脱敏未命中且模型名无需改写时借用客户端原始
+    /// body（零拷贝），否则是处理副本。
+    pub body: Cow<'a, Value>,
+    /// 该家实际收到的上游模型名 —— 也是它 `rateLimits` 冷却的键。
+    pub wire_model: String,
+}
+
 /// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用）。
 ///
-/// 返回 `Cow`：脱敏未命中且模型名无需改写时零拷贝借出客户端原始 body；
-/// 脱敏命中或需要把 model 换成该家真名时借出处理副本。判定与处理分别在
-/// `core::desensitize` / `core::providers::catalog`，本函数只负责「在正确的
+/// 返回 [`SendBody`]：指纹脱敏未命中且模型名无需改写时零拷贝借出客户端原始
+/// body；脱敏命中或需要把 model 换成该家真名时借出处理副本。判定与处理分别在
+/// `core::sanitize` / `core::providers::catalog`，本函数只负责「在正确的
 /// 时机问一次」—— 时机是「这一家即将发送之前」，所以同一家内部换账号重试
 /// 不会重复处理、重复统计。
 ///
@@ -84,38 +119,37 @@ pub(super) struct ProviderContext<'a> {
 /// 429 换家后留下的是实际承载那一次的名字）。请求日志的「上游模型」列
 /// 因此不再需要猜测。
 ///
-/// **顺带采集脱敏命中**（本次改造）：`process_body_for_provider` 返回的
-/// `term_counts` 立即写进 telemetry，于是「这次请求命中了哪些词」跟着请求
-/// 一起落进请求日志的 `sensitiveHits`。此前这份明细只被聚合统计与一行日志
-/// 消费掉，逐条请求的命中所见即失（见 `process_body_for_provider` 的说明）。
-/// 采集点只能是这里 —— 只有本函数拿得到那份 `ProcessOutcome`。
+/// **顺带采集脱敏命中**：`sanitize_body` 返回的命中标签立即写进 telemetry，
+/// 于是「这次请求命中了哪几条规则」跟着请求一起落进请求日志的 `sensitiveHits`。
+/// 采集点只能是这里 —— 只有本函数拿得到那份命中明细。
 ///
 /// ── 采集是**累计**而不是覆盖 ─────────────────────────────────
 /// 与 `note_attempt` 的「最后一次为准」不同，命中按**并集**累加：候选链上
-/// A 家处理过、降级到 B 家又处理一次，同一个词会被两轮各命中一次。
-/// 「这次请求命中了词 X」才是用户要的答案（B 家只是同一份内容又匹配了一遍），
+/// A 家处理过、降级到 B 家又处理一次，同一条规则会被两轮各命中一次。
+/// 「这次请求命中了什么」才是用户要的答案（B 家只是同一份内容又匹配了一遍），
 /// 所以同一家重复发送时不重复计（`send_cache` 已经保证了这一点：同一家同池
-/// 的发送体只算一次），跨家则合并计数 —— 这正是「这个词在两家的词表里都命中过」
-/// 的自然读数，不会把次数翻成没有意义的倍数。
+/// 的发送体只算一次），跨家则合并计数。
 /// 实时性上也有必要：命中发生在**某一家即将发送时**，那时请求还没收尾，
 /// telemetry 槽位还开着（记账点读快照在最后）。
 pub(super) fn send_body<'a>(
     ctx: &'a ProviderContext<'_>,
     provider_id: &str,
     account: Option<&Value>,
-) -> Cow<'a, Value> {
-    let mut body = match crate::server::core::desensitize::global().process_body_for_provider(
-        provider_id,
-        ctx.desensitize_scope,
-        ctx.body,
-    ) {
-        Some(processed) => {
-            if !processed.term_counts.is_empty() {
-                ctx.telemetry.note_sensitive_hits(&processed.term_counts);
+) -> SendBody<'a> {
+    let mut body = match ctx.sanitize_fingerprints {
+        true => match crate::server::core::sanitize::sanitize_body(ctx.body) {
+            Some((scrubbed, hits)) => {
+                // 命中表可能为空：`sanitize_text` 末尾的去空白也能单独构成一次
+                // 改动（预检命中、但没有任何规则真正替换）。那时不该往请求日志
+                // 的「敏」标签里写一条空记录。
+                if !hits.is_empty() {
+                    ctx.telemetry.note_sensitive_hits(&hits);
+                }
+                Cow::Owned(scrubbed)
             }
-            Cow::Owned(processed.body)
-        }
-        None => Cow::Borrowed(ctx.body),
+            None => Cow::Borrowed(ctx.body),
+        },
+        false => Cow::Borrowed(ctx.body),
     };
     let requested = body
         .get("model")
@@ -123,25 +157,27 @@ pub(super) fn send_body<'a>(
         .unwrap_or("")
         .trim()
         .to_string();
-    if !requested.is_empty() {
-        // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
-        // （同源，见模块头「思考等级绑定为什么也在这一步」）
-        let wire = crate::server::core::providers::catalog::wire_target_for_provider(
-            &requested,
-            provider_id,
-            account,
-        );
-        ctx.telemetry.note_upstream_model(&wire.model);
-        rewrite_model(&mut body, &requested, &wire.model, provider_id);
-        apply_reasoning(
-            &mut body,
-            provider_id,
-            &requested,
-            &wire.model,
-            wire.reasoning.as_deref(),
-        );
+    if requested.is_empty() {
+        // 没有 model 字段：不改写，也没有可用的冷却键（空串，与改造前一致）
+        return SendBody { body, wire_model: requested };
     }
-    body
+    // 一次解析出两个属性：该家要收的名字 + 跟着那条映射走的思考等级
+    // （同源，见模块头「思考等级绑定为什么也在这一步」）
+    let wire = crate::server::core::providers::catalog::wire_target_for_provider(
+        &requested,
+        provider_id,
+        account,
+    );
+    ctx.telemetry.note_upstream_model(&wire.model);
+    rewrite_model(&mut body, &requested, &wire.model, provider_id);
+    apply_reasoning(
+        &mut body,
+        provider_id,
+        &requested,
+        &wire.model,
+        wire.reasoning.as_deref(),
+    );
+    SendBody { body, wire_model: wire.model }
 }
 
 /// 把发送体里的 model 字段换成该 provider 认识的真名（仅当需要换时才复制）。

@@ -3,7 +3,7 @@
 //! ── 这一层要解决什么问题 ────────────────────────────────────
 //! 改造前所有数据都是「文件 + 全量内存快照」：config.json、accounts.json、
 //! logs.jsonl、requests.jsonl、request-daily.jsonl、debug-traffic.jsonl、
-//! desensitize.json、desktop-settings.json。每个 store 自己实现「载入 / 裁剪 /
+//! desktop-settings.json。每个 store 自己实现「载入 / 裁剪 /
 //! 整文件重写 / 崩溃后从半截文件恢复」，同一件事（比如保留期裁剪、未知字段
 //! 兜底、并发写入的串行化）被抄了七八遍，口径各有细微差别。交给 SQLite 之后：
 //! 事务、索引、原子落盘都由库负责，各 store 不再需要持有全量快照。
@@ -21,17 +21,16 @@
 //!           `migrate::import_requests` / `migrate::import_daily` 一次性搬入）、
 //!           **调试报文**（`core::debug_traffic` → `debug_traffic` 表；
 //!           旧 `debug-traffic.jsonl` 由 `migrate::import_debug` 一次性搬入）、
-//!           **脱敏词表**（`core::desensitize` → `kv` 表的 `desensitize` 键；
-//!           旧 `desensitize.json` 由 `migrate::import_desensitize` 一次性搬入）、
 //!           **网关配置**（`config` → `kv` 表，**每个顶层键一行**；旧
 //!           `config.json` 由 `migrate::import_config` 一次性搬入）、
 //!           **桌面设置**（壳侧 `settings` → `kv` 表的 `desktopSettings` 键；
 //!           旧 `desktop-settings.json` 由 `migrate::import_settings` 一次性搬入）
-//!   未接入：无 —— 八个旧文件全部迁完（本切片是最后一个）。
+//!   未接入：无 —— 七个旧文件全部迁完（本切片是最后一个）。
 //!
 //! ── `kv` 的两类键（本切片起两类的写入方都齐了）───────────────
 //! 配置的顶层键（原名直用）与「其它零散状态」的固定键（`desktopSettings` /
-//! `priorityScope` / `logsNextId` / `desensitize` / `configMigrated`）共用这一张
+//! `priorityScope` / `logsNextId` / `configMigrated`，以及**遗留**的
+//! `desensitize` —— 那个功能已删、数据留着）共用这一张
 //! 表，而**配置的写侧要做「删除已不存在的键」**：它必须知道哪些键不归自己管，
 //! 否则写一次配置就会把别人的状态删掉。这条边界的唯一事实来源是
 //! [`schema::RESERVED_KV_KEYS`]，完整约束见 `schema` 模块头的

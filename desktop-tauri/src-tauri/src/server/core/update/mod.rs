@@ -27,12 +27,6 @@
 mod client;
 mod version;
 
-/// 出网取文件的通用入口（带出口重试）：软件版本检查与**敏感词库拉取**共用。
-///
-/// 对外开放而不是各自复制一份：两处都需要「直连优先、Clash 兜底」与同一套
-/// 超时 / UA 口径，抄一份出来就会出现「一处改了出口策略、另一处没改」的分叉。
-pub(crate) use client::fetch_with_egress;
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -122,7 +116,7 @@ struct Inner {
     download_dir: PathBuf,
 }
 
-/// 更新管理器句柄：内部一把锁 + Clone（与 desensitize / models 同构）。
+/// 更新管理器句柄：内部一把锁 + Clone（与 auto_checkin / models 同构）。
 #[derive(Clone)]
 pub struct UpdateManager {
     inner: Arc<Mutex<Inner>>,
@@ -634,7 +628,7 @@ async fn wait_cancel(flag: &Arc<std::sync::atomic::AtomicBool>) {
 
 // ─── 进程级句柄 ─────────────────────────────────────────────
 
-/// 进程级更新管理器（与 config / logging / desensitize 同一模式）：
+/// 进程级更新管理器（与 config / logging 同一模式）：
 /// bootstrap 时装入一次，路由层与服务启动路径共用同一实例。
 static GLOBAL: std::sync::OnceLock<UpdateManager> = std::sync::OnceLock::new();
 

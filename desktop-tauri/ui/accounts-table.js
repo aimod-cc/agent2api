@@ -17,7 +17,8 @@
  * 逐个尝试，跳过禁用 / 不支持该模型 / 该模型限流中的账号（见 priority.rs 与
  * rotate.rs 的模块头）。所以本表按优先级升序排行，第一列给出全局序号 #N；
  * ↑/↓ 与全局相邻账号交换，「设为首选」只把账号移到全局队列第一位，
- * 不改变启用状态，也不表示请求正在使用该账号。
+ * 不改变启用状态，也不表示请求正在使用该账号（这一项住在 ⋯ 菜单里，
+ * 不在行上 —— 见 actionsCell 与 accounts-model.js 的 moreMenuHtml）。
  *
  * 同理，优先级输入框**不做冲突判定**：冲突只有后端一处判（全局唯一，409 带占位者
  * 姓名），前端拦下来只会出现「界面放过、后端拒绝」或反过来的分歧。
@@ -77,44 +78,70 @@
    * 是为了让「列设置」里的显示 / 隐藏与顺序调整对数据行同样生效 ——
    * 否则藏起来的列仍在行里占位，表格与表头对不上。
    * 只有勾选列没有 render：它的内容要用行上下文里的 `picked`，单独处理。
-   * `align` 是该列在「列设置」里的**默认**对齐（用户可以逐列改，见 table-col-settings.js）。
+   * `align` 是该列在「列设置」里的**默认**对齐（用户可以逐列改，见
+   * table-col-settings.js）。
+   *
+   * ── 默认对齐：操作列居右，其余全部居中（本次改造）──────────────
+   * 这两档各有一个理由，不是随手配的：
+   *   · **操作列居右**：它是行尾的一组按钮，贴住表格右缘时整列有一条整齐的
+   *     竖线（`.acct-actions` 的 `justify-content: flex-end` 与它同源）——
+   *     扫视时不必逐行去找「按钮从哪儿开始」，每行的 ⋯ 都在同一条线上。
+   *   · **其余列居中**：这些格子里装的是徽章、开关、序号、读数这类**等宽或很短**
+   *     的内容，居中之后同一列的各行对齐到一条中轴，比左对齐更好扫读；
+   *     账号列（唯一伸缩的一列）也跟着居中，整张表的中轴才是齐的。
+   * 用户改过的对齐存在 localStorage（按列 key）。默认值这次**变了**，所以
+   * 旧存盘（v1 裸数组，没有默认值快照）靠下面的 `legacyAlign` 辨认：
+   * 值等于上一版默认的列改判成新默认，其余（= 用户真挑过的）原样保留。
+   * 新存盘带默认值快照（v2），将来再改默认值时不必再写 legacyAlign。
+   * 完整判定见 table-col-settings.js 的 normalize。
    */
   const COLUMNS = [
     // 勾选列的 label 给「选择」而不是空串：它在表格里确实没有表头文案（那一格是
     // 「全选」复选框），但**列设置面板里必须有个名字** —— 面板按 label 显示，
     // 空串会退化成原始 key「pick」，用户看不懂这是哪一列。
-    { key: 'pick', label: '选择' },
+    // legacyAlign 只写在「上一版默认与新版不同」的列上（上一版只有操作列声明过
+    // align: 'right'，其余都是隐式的左对齐）—— 写全一份没有信息量，
+    // 反而会让「哪几列的对齐这次变了」看不出来。
+    { key: 'pick', label: '选择', align: 'center', legacyAlign: 'left' },
     {
       key: 'priority', label: '优先级', hint: '全局队列',
       title: '全局一条队列：数值越小越先用，不分提供商',
+      align: 'center', legacyAlign: 'left',
       render: priorityCell,
     },
     // providerCell 原本的入参是 (provider, account)：这里就地适配成统一的
     // (account, ctx)，免得为它一个人破例 —— 破例一次，后面每加一列都要先
     // 去确认「这一列的入参是哪个顺序」。
-    { key: 'provider', label: '提供商', render: (account, ctx) => providerCell(providerOf(account), account, ctx) },
-    { key: 'account', label: '账号', render: accountCell },
+    {
+      key: 'provider', label: '提供商', align: 'center', legacyAlign: 'left',
+      render: (account, ctx) => providerCell(providerOf(account), account, ctx),
+    },
+    { key: 'account', label: '账号', align: 'center', legacyAlign: 'left', render: accountCell },
     {
       // 不加 hint 小字：这一列只有 56px，「连接数」三个字加副标题会撑破表头。
       // 口径说明放在 title 里（悬停可见）。
+      // 这一列上一版就是居中（CSS 里写死了 th/td 一起居中），旧默认 = 新默认，
+      // 所以不给 legacyAlign。
       key: 'connections', label: '连接数',
       title: '此刻正在使用这个账号的请求数（含还在下发内容的流式请求）；为 0 时不显示',
       align: 'center',
       render: connectionsCell,
     },
-    { key: 'status', label: '状态', render: statusCell },
+    { key: 'status', label: '状态', align: 'center', legacyAlign: 'left', render: statusCell },
     {
       key: 'limits', label: '限流', hint: '按模型',
       title: '该账号当前限流中的模型；点徽章看明细',
+      align: 'center', legacyAlign: 'left',
       render: limitsCell,
     },
-    { key: 'expiry', label: '有效期', render: expiryCell },
+    { key: 'expiry', label: '有效期', align: 'center', legacyAlign: 'left', render: expiryCell },
     // 「余额 / 积分」改成「余额」（本次改造）：这一列现在只放**读数**，
     // 那颗查询按钮已移到操作列（见 usageCell 与 actionsCell）——
     // 一个只显示余额数字的列叫「余额 / 积分」会让人以为这里还能点。
     // 而「余额」这个词也容得下各家的不同叫法（WorkBuddy 是积分、
     // 小浣熊是积分、AutoClaw 是余额），不必在表头枚举。
-    { key: 'usage', label: '余额', render: usageCell },
+    { key: 'usage', label: '余额', align: 'center', legacyAlign: 'left', render: usageCell },
+    // 操作列上一版就是右对齐，旧默认 = 新默认，不给 legacyAlign
     { key: 'actions', label: '操作', align: 'right', render: actionsCell },
   ];
 
@@ -124,11 +151,20 @@
    * `apply` 是唯一入口：传入 COLUMNS 就拿到「用户配置的顺序 + 只保留可见列，
    * 每项带 align」的新数组。表头、colgroup、数据行三处都走它，所以三者的
    * 列集合与顺序天然一致 —— 不必各自再判一遍显隐（那正是最容易漂移的地方）。
+   *
+   * 投给列设置的项带上 `legacyAlign`（有的话）：它是**上一版的默认对齐**，
+   * 只被 table-col-settings.js 用来分辨旧存盘里那一档是「用户挑的」还是
+   * 「旧默认值」—— 少了它，这次改的默认对齐对老用户就不生效。见那边的 normalize。
    */
   const colSettings = window.wbColSettings?.register({
     id: 'accounts',
     label: '账号表',
-    columns: COLUMNS.map(column => ({ key: column.key, label: column.label, align: column.align })),
+    columns: COLUMNS.map(column => ({
+      key: column.key,
+      label: column.label,
+      align: column.align,
+      legacyAlign: column.legacyAlign,
+    })),
     // 挂载点是批量栏右侧的操作组（「批量操作 / 取消选择」那两颗）：齿轮插在最前，
     // 正好落在「批量操作」左边。放在这里而不是工具条右侧的操作组，是因为工具条
     // 那组已经被「查询积分 / 全部签到 / 添加账号」占满，齿轮挤在它们前面时
@@ -494,17 +530,30 @@
   }
 
   /**
-   * 操作：设为首选 / 设置 / 查余额（或收起）/ 签到 / ⋯。置顶只看全局位置，
-   * 不按可用性过滤。
+   * 操作：签到 / 查余额（或收起）/ 设置 / ⋯。四颗按钮，顺序固定。
    *
-   * ── 查询余额按钮（本次改造从余额列挪来）──────────────────────
+   * ── 本次改造：按钮从五颗收到四颗，顺序改成「签到 → 余额 → 设置 → ⋯」──
+   * 「设为首选」从行上**移进了 ⋯ 菜单**（见 accounts-model.js 的 moreMenuHtml）。
+   * 理由是这颗按钮在行上占的位置与它的使用频率不符：它是四个字里最长的一颗
+   * （62px，比「已签到」还宽），而它回答的「这个账号排第几」在左起第二列
+   * （优先级列）已经写着 —— 行上留一颗按钮去重复隔壁列的信息，代价是操作列
+   * 要为它多留 50px，那 50px 全是从账号列挤出来的。
+   * 移走之后操作列从 250px 收到 200px（新值同样是量出来的，算式见
+   * page-accounts-table.css 的那条声明），省下的宽度归账号列。
+   * 可达性不受影响：它在 ⋯ 菜单的第二项（紧跟在启用/禁用之后）。
+   *
+   * 顺序按「点的频次」排，签到排头：它是这张表里唯一**每天都会做一次**的动作
+   * （其余几颗都是「需要时才点」），排在第一位让手指有固定的落点 ——
+   * 按钮的显隐会随账号状态变（见下），但**顺序不跟着变**，
+   * 所以「第一颗是签到」这条肌肉记忆在任何一行都成立。
+   *
+   * ── 查询余额按钮（上次改造从余额列挪来）──────────────────────
    * 文案**恒定**是「余额」，展开态表达在 `title` 与 `.open` 类上 ——
    * 这不是随手取的，而是**列宽预算的要求**（见下）。
    * 它原先在余额列里就是同一套做法（标签恒为「积分」，只有 title 变化）。
    *
    * 为什么不改成「余额 / 收起余额」两态文案（看起来更直白）：操作列是这张表里
-   * 最挤的一格（五颗按钮并排），而最坏组合是「设为首选 + 余额 + 设置 + 已签到 + ⋯」
-   * ——「收起余额」比「余额」宽出两个字（约 23px），那 23px 只能从账号列挤。
+   * 最挤的一格（四颗按钮并排），多两个字（约 23px）只能从账号列挤。
    * 而这一列里已经有一颗**真的**用两态文案的按钮（签到 / 已签到），那是有理由的：
    * 「已签到」是**不可点**的状态（带 disabled），用户必须一眼看出「今天没得签了」，
    * 藏进 title 就失去意义。余额按钮则两态都可点、且展开态本身有更强的信号
@@ -535,12 +584,6 @@
    */
   function actionsCell(account, ctx) {
     const enabled = isEnabled(account);
-    const settings = `<button data-action="settings" data-id="${esc(account.id)}" title="备注名 / 启用 / 代理">设置</button>`;
-    const open = ctx.usageOpen === true;
-    const usage = supportsUsage(account)
-      ? `<button class="usage-btn${open ? ' open' : ''}" data-action="usage" data-id="${esc(account.id)}"`
-        + ` title="${esc(open ? '收起余额明细' : '查询该账号剩余余额')}">余额</button>`
-      : '';
     const checkedIn = checkedInToday(account);
     const checkin = !enabled || !supportsCheckin(account)
       ? ''
@@ -548,10 +591,13 @@
         ? `<button data-action="checkin" data-id="${esc(account.id)}" disabled`
           + ` title="${esc(checkinDoneTitle(account))}">已签到</button>`
         : `<button data-action="checkin" data-id="${esc(account.id)}" title="为该账号签到">签到</button>`;
-    const atFront = ctx.seat?.position === 1;
-    const promote = `<button data-action="switch" data-id="${esc(account.id)}"`
-      + ` title="${atFront ? '已在全局队列第一位' : '仅将优先级调整到全局第一位，不改变启用状态'}"${atFront ? ' disabled' : ''}>设为首选</button>`;
-    return `<td class="cell-actions"><div class="acct-actions">${promote}${usage}${settings}${checkin}`
+    const open = ctx.usageOpen === true;
+    const usage = supportsUsage(account)
+      ? `<button class="usage-btn${open ? ' open' : ''}" data-action="usage" data-id="${esc(account.id)}"`
+        + ` title="${esc(open ? '收起余额明细' : '查询该账号剩余余额')}">余额</button>`
+      : '';
+    const settings = `<button data-action="settings" data-id="${esc(account.id)}" title="备注名 / 启用 / 代理">设置</button>`;
+    return `<td class="cell-actions"><div class="acct-actions">${checkin}${usage}${settings}`
       + `<button data-action="more" data-id="${esc(account.id)}" title="更多操作">⋯</button></div></td>`;
   }
 

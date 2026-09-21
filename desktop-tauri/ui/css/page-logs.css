@@ -30,11 +30,6 @@
    挤不下就整组换行，压扁会让「本月」和「30 天」看着像同一个按钮。 */
 .log-filters .seg { flex: 0 0 auto; }
 
-/* 「不看脱敏」是筛选行里唯一的开关，放在关键词输入框之后。
-   输入框 flex-grow:1 已经把剩余宽度吃干净，所以它自然落到行尾，
-   不需要 margin-left:auto（那样在输入框被换成更短控件时会把它甩到很远）。 */
-.log-filters .switch { flex: 0 0 auto; }
-
 /* 筛选行右侧的读数（当前档位 + 状态口径；请求日志页的 #req-summary 同用） */
 .log-filters .panel-sub {
   color: var(--text-3);

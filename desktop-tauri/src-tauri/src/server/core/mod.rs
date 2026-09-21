@@ -14,7 +14,7 @@
 //!   egress.rs            出网点（按出口缓存 Client）+ 连通性（workbuddy-proxy.mjs 的 dispatch 部分）
 //!   billing/             积分 / 签到 / 运营活动         （workbuddy-billing.mjs）
 //!   models/              workbuddy 模型目录（内置 + /v3/config 刷新）（workbuddy-models.mjs）
-//!   desensitize/         内容脱敏（词表/编译/改写/统计）（workbuddy-desensitize.mjs）
+//!   sanitize.rs          出站请求体指纹脱敏（硬编码规则集，照搬 workbuddy2api）
 //!   routing.rs           账号选路（优先级 + 限额冷却）  （workbuddy-routing.mjs）
 //!   upstream/            对话转发（选路/轮换/SSE/聚合） （workbuddy-upstream-client.mjs）
 //!   auto_checkin.rs      定时签到调度（轮询 + 补签）    （workbuddy-auto-checkin.mjs）
@@ -49,7 +49,6 @@ pub mod billing;
 pub mod clash;
 pub mod credential_maintenance;
 pub mod debug_traffic;
-pub mod desensitize;
 pub mod egress;
 pub mod endpoints;
 pub mod key_scope;
@@ -60,6 +59,7 @@ pub mod protocol;
 pub mod providers;
 pub mod proxies;
 pub mod routing;
+pub mod sanitize;
 pub mod scheduled_tasks;
 pub mod update;
 pub mod upstream;

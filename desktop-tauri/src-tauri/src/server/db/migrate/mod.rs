@@ -1,19 +1,24 @@
 //! 旧文件 → 数据库的**一次性迁移框架**（注册表 + 公共备份工具）。
 //!
 //! ── 本文件为什么先于具体迁移存在 ─────────────────────────────
-//! 改造要迁移的旧文件有八个：`config.json`、`accounts.json`、`logs.jsonl`、
+//! 改造要迁移的旧文件有七个：`config.json`、`accounts.json`、`logs.jsonl`、
 //! `requests.jsonl`、`request-daily.jsonl`、`debug-traffic.jsonl`、
-//! `desensitize.json`、`desktop-settings.json`。它们由**不同的切片**逐个
+//! `desktop-settings.json`。它们由**不同的切片**逐个
 //! 接入，但「怎么判断已经迁过」「失败怎么办」「旧文件留不留」这三件事必须
 //! 一开始就统一 —— 各切片各写一套的话，迁移策略会随切片顺序漂移，而且
 //! 「重跑会不会重复导入」这个最要命的问题会变成八个不同的答案。
 //! 所以先把骨架、幂等原则与备份工具定下来，后续切片只填「读文件 → 插库」。
 //!
+//! （第八个 `desensitize.json` 曾在这份清单里：敏感词脱敏的旧词表文件。
+//! 那个功能已随规则集换成硬编码指纹脱敏而整体删除，对应的迁移项与模块
+//! 一并移除 —— 旧文件留在原处不再导入，库里的 `desensitize` 键也只是
+//! 留着的遗留数据，见 `db::schema` 的保留键清单。）
+//!
 //! ── 幂等原则（后续每个迁移项都必须遵守）──────────────────────
 //! 迁移**只在目标数据单元为空时执行**：每个迁移项进来的第一件事是判「本项的
 //! 数据在库里有没有」——**独占一张表的项**判 `SELECT COUNT(*) FROM 目标表`，
 //! **写 `kv` 的项**判「自己那个键在不在」（`kv` 是共享表，表非空与它迁过没有
-//! 毫无关系，见 `desensitize.rs` 的模块头）。非 0 / 已存在就直接返回 `None`。
+//! 毫无关系，见 `settings.rs` 的模块头）。非 0 / 已存在就直接返回 `None`。
 //! 于是：
 //!   1. 重复启动不会重复导入 —— 第一次导入完数据就在那里了；
 //!   2. 即使旧文件没被改名（改名失败、用户在迁移后手工把文件放回来），
@@ -23,9 +28,9 @@
 //! 为什么用「目标数据有没有」而不是在 `kv` 里记一个 `migratedXxx: true` 标记：
 //! 标记与数据可能不一致（标记写了但导入只写了一半就被中断 —— 那时必须重跑，
 //! 而标记会阻止重跑；反之标记没写但数据进去了，重跑就插重复行）。
-//! 「数据自己有没有」是数据自己的事实，不会说谎。注意本项自己那个数据单元
-//! （`kv.desensitize` 键）**本身就是**这个原则的实例：它要么完整地在那里、
-//! 要么不在，不存在「迁了一半」的中间态。
+//! 「数据自己有没有」是数据自己的事实，不会说谎。注意写 `kv` 的项自己那个
+//! 数据单元（如 `kv.desktopSettings` 键）**本身就是**这个原则的实例：
+//! 它要么完整地在那里、要么不在，不存在「迁了一半」的中间态。
 //!
 //! ── 失败为什么不阻断启动 ────────────────────────────────────
 //! 迁移是**旧数据的一次性搬运**，它的失败不该让网关起不来：迁移前的老版本
@@ -49,7 +54,6 @@
 //!     logs.rs     logs.jsonl    → logs 表
 //!     requests.rs requests.jsonl + request-daily.jsonl → requests / request_daily 表
 //!     debug.rs    debug-traffic.jsonl → debug_traffic 表
-//!     desensitize.rs desensitize.json → kv 表的 `desensitize` 键
 //!     config.rs   config.json → kv 表（**每个顶层键一行**）
 //!     settings.rs desktop-settings.json → kv 表的 `desktopSettings` 键
 //! ```
@@ -62,8 +66,8 @@
 //! ── 三种幂等判据（看注册表时先分清自己在看哪一类）─────────────
 //!   - **独占一张表**（账号 / 事件日志 / 请求明细 / 请求聚合 / 调试报文）：
 //!     判「表空不空」；
-//!   - **独占 `kv` 的一个键**（桌面设置 / 脱敏词表）：判「自己那个键在不在」
-//!     —— 不能判表空不空，`kv` 是共享表（见 `desensitize.rs` 模块头）；
+//!   - **独占 `kv` 的一个键**（桌面设置）：判「自己那个键在不在」
+//!     —— 不能判表空不空，`kv` 是共享表（见 `settings.rs` 模块头）；
 //!   - **写 `kv` 的开放集合**（网关配置）：用**标记键** —— 配置项没有哪个键能
 //!     代表整份配置（见 `config.rs` 模块头那一整段论证，它同时也回应了
 //!     「T6 为什么反对标记键」这个看起来矛盾的地方：反对的是非原子的标记）。
@@ -109,7 +113,6 @@ mod accounts;
 mod backup;
 mod config;
 mod debug;
-mod desensitize;
 mod logs;
 mod requests;
 mod settings;
@@ -197,12 +200,11 @@ pub struct LegacyMigration {
 /// 排在末尾只是按「数据量从大到小」的习惯：报文单条可达数 MB，放最后不会让
 /// 前面几项的日志被大文件的读取拖在后面。
 ///
-/// `import_desensitize` / `import_settings` 同理无依赖（各自只写 `kv` 里自己的
-/// 键，与账号、日志、统计都不相干）—— 它们的**判据与独占一张表的项不同**
-/// （判「自己那个键在不在」而不是「表空不空」，因为 `kv` 是共享表）；
-/// 两者挨着放，让「同类判据的项放在一起」在读注册表时可见。
-/// `import_config` 的判据是**第三种**（标记键，因为配置项是开放集合）——
-/// 三种判据的完整论证分别见 `desensitize.rs` / `config.rs` 的模块头。
+/// `import_settings` 同理无依赖（只写 `kv` 里自己的键，与账号、日志、统计都
+/// 不相干）—— 它的**判据与独占一张表的项不同**（判「自己那个键在不在」而不是
+/// 「表空不空」，因为 `kv` 是共享表）；`import_config` 的判据是**第三种**
+/// （标记键，因为配置项是开放集合）—— 两种判据的完整论证分别见
+/// `settings.rs` / `config.rs` 的模块头。
 pub const LEGACY_MIGRATIONS: &[LegacyMigration] = &[
     LegacyMigration { label: config::LABEL, locate: config::legacy_file, import: config::import_config },
     LegacyMigration { label: settings::LABEL, locate: settings::legacy_file, import: settings::import_settings },
@@ -211,7 +213,6 @@ pub const LEGACY_MIGRATIONS: &[LegacyMigration] = &[
     LegacyMigration { label: requests::LABEL, locate: requests::requests_file, import: requests::import_requests },
     LegacyMigration { label: requests::DAILY_LABEL, locate: requests::daily_file, import: requests::import_daily },
     LegacyMigration { label: debug::LABEL, locate: debug::legacy_file, import: debug::import_debug },
-    LegacyMigration { label: desensitize::LABEL, locate: desensitize::legacy_file, import: desensitize::import_desensitize },
 ];
 
 /// 还在原处的旧文件对应的迁移项名（**界面列「待迁移数据」用**）。

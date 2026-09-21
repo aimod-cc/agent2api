@@ -276,10 +276,10 @@ impl UpstreamService {
         if let Some(object) = upstream_body.as_object_mut() {
             object.insert("stream".to_string(), Value::Bool(true));
         }
-        // 内容处理的作用范围**按请求取一次快照**：同一次请求里各 provider 的判定
-        // 用同一份范围（请求进行中改设置不会让语义漂移），且这里的 body 始终是
-        // 客户端原始请求体 —— 处理只发生在「某一家即将发送之前」，见 payload.rs。
-        let desensitize_scope = crate::server::core::desensitize::global().provider_scope();
+        // 指纹脱敏开关**按请求取一次快照**：同一次请求里各 provider 的判定用同一
+        // 份值（请求进行中改设置不会让语义漂移），且这里的 body 始终是客户端原始
+        // 请求体 —— 处理只发生在「某一家即将发送之前」，见 payload.rs。
+        let sanitize_fingerprints = crate::server::config::current().sanitize_fingerprints();
         // Key 的提供商白名单随请求带进转发上下文：它要活过整条转发链
         //（含流式 —— 但流本身不需要它，只在选路与重试时读）。
         // 这里把 request 的字段**移出来**再借给 context：`request` 的其它部分
@@ -292,7 +292,7 @@ impl UpstreamService {
             stream: request.stream,
             client_headers: &request.client_headers,
             telemetry: &request.telemetry,
-            desensitize_scope: &desensitize_scope,
+            sanitize_fingerprints,
             key_scope: key_scope.as_ref(),
         };
         provider_loop::forward_with_providers(self, context, &mut slot, &mut connections).await

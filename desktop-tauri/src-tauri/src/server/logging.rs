@@ -40,6 +40,9 @@ const TAG_CATEGORY: &[(&str, &str)] = &[
     ("[Models]", "model"),
     ("[Model]", "model"),
     ("[Upstream]", "upstream"),
+    // 遗留映射：`[Desensitize]` 已无生产者（那个模块随规则集换成硬编码指纹脱敏
+    // 而删除），留着是为了让**历史日志条目**重放分类时仍落到「脱敏」而不是
+    // 默认的 server —— 与 `logs_store::CATEGORIES` 保留该项同理。
     ("[Desensitize]", "desensitize"),
     ("[Logs]", "server"),
     ("[Billing]", "upstream"),

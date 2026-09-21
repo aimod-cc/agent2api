@@ -56,6 +56,16 @@ pub const KEY_DEBUG_DIR: &str = "debugDir";
 /// 迅速膨胀；关闭时采集路径完全不执行（零开销，见各采集点的 `if enabled`）。
 pub const KEY_DEBUG_MODE: &str = "debugMode";
 
+/// 出站请求体黑名单指纹脱敏开关（config.json 键，对应 workbuddy2api 的
+/// `features.sanitize_blacklist_fingerprints`）。
+///
+/// 开启后转发层在每次出站前剥离上游内容审核的黑名单指纹（见
+/// `core::sanitize`）：表头键值整段删除、承载语义的模板句最小改写。
+/// **默认开启**（与参考项目同默认）：关掉它等于把客户端 system 模板原样发给
+/// 上游，那正是模板句被误拦（400 code=11128）的原因。
+/// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
+pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
+
 /// 三档保留天数的默认值（缺失时用它们）
 pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
 pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 30;
@@ -137,8 +147,6 @@ pub const KEY_REPORT_AUTO_REFRESH: &str = "reportAutoRefresh";
 pub const KEY_UPDATE_CHECK: &str = "updateCheck";
 /// 定时查询积分在 `scheduledTasks` 下的子键（后端定时查全部账号的余额 / 积分）
 pub const KEY_USAGE_QUERY: &str = "usageQuery";
-/// 敏感词库更新在 `scheduledTasks` 下的子键（后端定时拉仓库里的 `sensitive-words.json`）
-pub const KEY_SENSITIVE_SYNC: &str = "sensitiveSync";
 
 /// 凭证维护默认间隔（分钟）：与改造前的硬编码 600 秒一致
 pub const DEFAULT_CREDENTIAL_MAINTENANCE_MINUTES: i64 = 10;
@@ -168,13 +176,6 @@ pub const DEFAULT_UPDATE_CHECK_MINUTES: i64 = 5;
 /// 10 分钟一次（每小时 6 轮）对这个「看一眼还剩多少」的需求足够，
 /// 也不会因为间隔过密给上游添负担、触发风控。
 pub const DEFAULT_USAGE_QUERY_MINUTES: i64 = 10;
-/// 敏感词库更新的默认间隔（分钟）：每 10 分钟拉一次仓库里的 `sensitive-words.json`。
-///
-/// 取值理由与软件版本检查（5 分钟）同源，但更宽松：走 `raw.githubusercontent.com`
-/// **不计入** GitHub API 的匿名限额（60 次/小时/IP），所以密集些也不会连累别的
-/// 任务；而 10 分钟一轮（144 次/天）已经足够跟上「上游改了拦截规则 → 我们补词」
-/// 这个节奏 —— 真正紧急时用户还有「立即执行」按钮。
-pub const DEFAULT_SENSITIVE_SYNC_MINUTES: i64 = 10;
 
 /// 间隔型任务的取值范围。上下限分两套（分钟 / 秒），因为两类任务的合理区间
 /// 差着量级：后端维护任务按分钟（1 分钟～1 天），前端刷新按秒（1 秒～10 分钟）。
@@ -211,7 +212,6 @@ pub struct ScheduledSettings {
     pub report_auto_refresh: IntervalTask,
     pub update_check: IntervalTask,
     pub usage_query: IntervalTask,
-    pub sensitive_sync: IntervalTask,
 }
 
 impl Default for ScheduledSettings {
@@ -244,10 +244,6 @@ impl Default for ScheduledSettings {
             usage_query: IntervalTask {
                 enabled: true,
                 interval: DEFAULT_USAGE_QUERY_MINUTES,
-            },
-            sensitive_sync: IntervalTask {
-                enabled: true,
-                interval: DEFAULT_SENSITIVE_SYNC_MINUTES,
             },
         }
     }

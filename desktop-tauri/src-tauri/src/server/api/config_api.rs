@@ -4,7 +4,7 @@
 //!
 //! GET 返回：
 //!   `{apiKey: 掩码或null, apiKeySet, locale, defaultModel,
-//!     desensitize:{enabled,termCount,roles}}`
+//!     sanitizeBlacklistFingerprints}`
 //!   掩码格式沿用 Node 版第 920 行：`前6字符...后4字符`。
 //!
 //! POST / PUT 接受 `{apiKey?, locale?}`（两者行为完全一致，PUT 是别名，
@@ -20,8 +20,9 @@
 //! 「运行中立即生效」：Node 版改的是内存里的 opts 对象；这里改的是
 //! `server::config` 的 RwLock 快照，鉴权中间件每请求读它 —— 不用重启。
 //!
-//! `desensitize` 子对象是**精简摘要**（`{enabled, termCount, roles}`，对照
-//! server.mjs 924 行）—— 完整词表与命中统计在 GET /api/desensitize。
+//! 曾经的 `desensitize` 子对象（`{enabled, termCount, roles}` 摘要）随词表方案
+//! 一起删除；现在这里透出的是**指纹脱敏开关**（`sanitizeBlacklistFingerprints`），
+//! 与 `GET /api/sanitize` 的键同名同值。
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -40,15 +41,15 @@ const MIN_API_KEY_LENGTH: usize = 8;
 const API_KEY_TOO_SHORT: &str = "API Key 至少需要 8 个字符";
 
 /// GET /api/config
-pub async fn get_config(State(state): State<ServerState>) -> Response {
+pub async fn get_config(State(_state): State<ServerState>) -> Response {
     let snapshot = config::current();
     ok_json(json!({
         "apiKey": snapshot.masked_api_key(),
         "apiKeySet": snapshot.api_key_set(),
         "locale": snapshot.locale(),
         "defaultModel": snapshot.default_model(),
-        // 脱敏摘要（形状与 /api/session 的 desensitize 一致）
-        "desensitize": state.desensitize().summary(),
+        // 指纹脱敏开关（与 GET /api/sanitize 同一个键、同一个值）
+        config::KEY_SANITIZE_FINGERPRINTS: snapshot.sanitize_fingerprints(),
     }))
 }
 

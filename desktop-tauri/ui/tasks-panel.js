@@ -554,9 +554,6 @@
       // 否则用户点完「立即执行」切到账号页，看到的还是上一次的旧余额
       // （要等 20 秒那一轮轮询才跟上，那正是「点了像没反应」）
       if (id === 'usageQuery') await window.wbAccountsView?.syncBalancesSnapshot?.();
-      // 词库同步会往词表里补词，脱敏页的版本号与词表列表当场就旧了 ——
-      // 不刷新的话，用户点完「立即执行」切到脱敏页会看到补词前的状态
-      if (id === 'sensitiveSync') await window.wbDesensitizePanel?.load?.();
     } catch (error) {
       toast(`执行失败：${error.message}`, 'err');
       await load();

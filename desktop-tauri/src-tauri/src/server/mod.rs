@@ -52,7 +52,7 @@
 //!     proxies.rs    /api/proxies*（Clash 实时读取 + 出口连通性测试）
 //!     billing.rs    /api/usage、/api/checkin*、/api/activity/*（对照 server.mjs 871-911）
 //!     chat.rs       POST /v1/chat/completions、GET /v1/models（对话主链路）
-//!     desensitize.rs /api/desensitize*（词表维护 / 开关 / 角色 / 命中统计）
+//!     sanitize.rs   /api/sanitize（出站指纹脱敏开关）
 //!     auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
 //!     scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务：开关 / 间隔 / 立即执行）
 //!     update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
@@ -84,10 +84,7 @@
 //!       mod.rs       管理器句柄 / 下载状态机 / 进度与取消
 //!       version.rs   版本比较、域名白名单、资产挑选、文件名安全化（纯函数）
 //!       client.rs    出网候选（直连 → Clash）与 GitHub 请求头
-//!     desensitize/ 内容脱敏：
-//!       mod.rs       词表读写 / 默认词表迁移 / 命中统计（句柄）
-//!       engine.rs    纯函数：词表编译、文本改写、content/messages/body 遍历
-//!       sql.rs       `kv` 表 `desensitize` 键的行级读写
+//!     sanitize.rs  出站请求体指纹脱敏（硬编码规则集，纯函数）
 //!     upstream/    对话转发：
 //!       mod.rs       转发主链路（选路循环 / 429 轮换 / 去重排队 / SSE 流）
 //!       request.rs   请求构造（头集合、URL、system 注入、错误解析）
@@ -102,9 +99,8 @@
 //!     管理 API 已全部就位（切片 1-6），切片 7 只剩打包收尾。
 //!   - 账号与鉴权：`ServerState::store()` / `auth()` / `login()` 三个克隆句柄。
 //!   - 模型目录与转发：`ServerState::models()` / `upstream()`。
-//!   - 脱敏：`ServerState::desensitize()`（路由用）；对话链路里是转发层的
-//!     `process_body_for_provider`，它取 `core::desensitize::global()`。
-//!     词表与开关现在落在统一库的 `kv` 表（`desensitize` 键）。
+//!   - 指纹脱敏：无句柄，转发层每次出站前读 `config::current().sanitize_fingerprints()`
+//!     决定要不要调 `core::sanitize::sanitize_body`（纯函数，无状态）。
 //!   - 定时签到：`ServerState::auto_checkin()`；停机清理走
 //!     `core::auto_checkin::stop_global()`（backend::shutdown 里调用）。
 //!   - 间隔型定时任务：`core::scheduled_tasks`（注册表 + 调度循环，循环在
@@ -157,7 +153,6 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::AuthService;
 use crate::server::core::auto_checkin::AutoCheckin;
 use crate::server::core::billing::BillingService;
-use crate::server::core::desensitize::Desensitizer;
 use crate::server::core::login::LoginService;
 use crate::server::core::models::ModelCatalog;
 use crate::server::core::update::UpdateManager;
@@ -189,8 +184,6 @@ pub struct ServerState {
     models: ModelCatalog,
     /// 对话转发器句柄（选路 / 429 轮换 / SSE 透传 / 去重排队）
     upstream: UpstreamService,
-    /// 内容脱敏句柄（词表 / 开关 / 角色 / 命中统计；内部 RwLock）
-    desensitize: Desensitizer,
     /// 定时签到句柄（轮询调度 + 启动补签；内部 Mutex + 后台任务）
     auto_checkin: AutoCheckin,
     /// 软件更新句柄（GitHub Release 检测 / 安装包下载；内部 Mutex）
@@ -379,32 +372,14 @@ impl ServerState {
         let billing = BillingService::new(auth.clone());
         // 模型目录：**进程级单例**（Agent2API 改造 W2a-T2）。聚合模型目录
         // （core::providers::catalog）只收 &AccountStore，不该让调用方层层传目录，
-        // 因此目录自身也做成进程级句柄（与 config / desensitize / auto_checkin
+        // 因此目录自身也做成进程级句柄（与 config / auto_checkin
         // 同一模式）：`core::models::global_catalog()` 与这里的 `models` 是
         // **同一实例**（共享同一把 RwLock），刷新对两边同时可见。
         let models = core::models::global_catalog();
         let upstream = UpstreamService::new(store.clone(), auth.clone());
-        // 内容脱敏：默认开启，词表与开关现在落在统一库的 `kv` 表
-        // （`desensitize` 键；旧 `{config_dir}/desensitize.json` 由
-        // `migrate::import_desensitize` 一次性搬入）。所以传的是**同一个 `Db`**
-        // —— `Option<Db>`：打不开时脱敏器照常用默认词表与默认开关工作，
-        // 只是改配置落不了库（内存里仍生效）。
-        // WORKBUDDY_DESENSITIZE=1/0 只覆盖**本次运行**，不落库（persist:false）
-        // —— 避免启动脚本顺带改掉用户在前端的设置
-        let desensitize = core::desensitize::init(db.clone());
-        match std::env::var("WORKBUDDY_DESENSITIZE").as_deref() {
-            Ok("0") => {
-                desensitize.set_enabled(false, false);
-            }
-            Ok("1") => {
-                desensitize.set_enabled(true, false);
-            }
-            // 未设置（或其它值）→ 沿用库里的开关
-            _ => {}
-        }
 
         // ── 定时签到与软件更新（切片 6）──────────────────────────
-        // 两者都是进程级句柄（同 config / logging / desensitize 的模式）：
+        // 两者都是进程级句柄（同 config / logging 的模式）：
         // 定时签到的 stop() 要从**停机路径**（backend::shutdown，只有 Tauri 的
         // AppState）调到，所以必须能从全局拿到；这里装入后 ServerState 里那份
         // 与全局那份是同一实例。
@@ -456,7 +431,6 @@ impl ServerState {
             billing,
             models,
             upstream,
-            desensitize,
             auto_checkin,
             update,
             request_stats,
@@ -475,33 +449,17 @@ impl ServerState {
         );
         logging::log("[Config]", &format!("默认模型: {}", snapshot.default_model()));
         logging::log("[Config]", &format!("计费语言: {}", snapshot.locale()));
-        // 对照 workbuddy-cli.mjs 的 logStartupConfig：脱敏状态一行（含词表路径），
-        // 由环境变量强制覆盖时补一句说明（Node 同样如此）
-        let d = state.desensitize.state();
-        let enabled_flag = d.get("enabled").and_then(serde_json::Value::as_bool).unwrap_or(false);
-        let term_count = d.get("termCount").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        let roles = d
-            .get("roles")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("、")
-            })
-            .unwrap_or_default();
-        let forced = matches!(
-            std::env::var("WORKBUDDY_DESENSITIZE").as_deref(),
-            Ok("0") | Ok("1")
-        );
+        // 出站指纹脱敏一行：开着时说明「出站会剥离审核指纹」，关着时点明后果
+        // （客户端 system 模板会原样发上游，可能被 400 code=11128 误拦）
         logging::log(
             "[Config]",
             &format!(
-                "内容脱敏: {}（{term_count} 个词，作用角色 {roles}，词表 {}）{}",
-                if enabled_flag { "✅ 已启用" } else { "❌ 已关闭" },
-                state.desensitize.file().display(),
-                if forced { "（本次运行由环境变量覆盖）" } else { "" },
+                "出站指纹脱敏: {}",
+                if snapshot.sanitize_fingerprints() {
+                    "✅ 已启用（剥离上游审核黑名单指纹）"
+                } else {
+                    "❌ 已关闭（客户端 system 模板原样发送，可能被上游误拦）"
+                },
             ),
         );
         logging::log("[Config]", &format!("配置目录: {}", state.config_dir.display()));
@@ -651,11 +609,6 @@ impl ServerState {
     /// 对话转发器句柄
     pub fn upstream(&self) -> &UpstreamService {
         &self.upstream
-    }
-
-    /// 内容脱敏句柄（词表路由、/api/config 与 /api/session 的摘要共用）
-    pub fn desensitize(&self) -> &Desensitizer {
-        &self.desensitize
     }
 
     /// 定时签到句柄（/api/auto-checkin* 三条路由 + 启动调度）

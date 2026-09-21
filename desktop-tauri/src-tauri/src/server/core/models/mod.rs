@@ -35,7 +35,7 @@
 //!
 //! ── 进程级句柄 ──────────────────────────────────────────────
 //! `global_catalog()` 是聚合层的读取口（`OnceLock` 单例，与
-//! `core::desensitize::global()` 同一模式）：`ServerState::bootstrap` 与聚合层
+//! `config::init` 同一模式）：`ServerState::bootstrap` 与聚合层
 //! 拿到的是同一实例，刷新对两边同时可见。
 
 mod shape;
@@ -643,7 +643,7 @@ pub fn builtin_models_snapshot() -> Value {
 /// （`core::providers::catalog`）的公开 API 只收 `&AccountStore`（handler 手边
 /// 就有），不该再要求调用方层层传一个 ModelCatalog —— 那会把 `list_models` 与
 /// 将来 chat_completions 的签名都改一遍。全局句柄与 `config::current()` /
-/// `core::desensitize::global()` 是同一模式：启动时装一次，之后所有模块共用。
+/// `config::current()` 是同一模式：启动时装一次，之后所有模块共用。
 ///
 /// 取用方式是 `get_or_init`：`ServerState::bootstrap` 与聚合层拿到的是**同一个
 /// 实例**（共享同一把 RwLock），即使 bootstrap 被调用多次（重启路径）也不会

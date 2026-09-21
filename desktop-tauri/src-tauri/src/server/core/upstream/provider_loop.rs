@@ -63,7 +63,6 @@
 //! 模型目录刷新、定时任务、账号被标记限额）。判断一条日志该去哪边，就看
 //! **它的条数会不会跟着用户发请求一起涨**。
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -78,7 +77,7 @@ use crate::server::core::providers::{kind_from_id, kind_id, meta, ProviderKind};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
-use super::payload::{send_body, ProviderContext};
+use super::payload::{send_body, ProviderContext, SendBody};
 use super::request::{read_upstream_error, send_chat_request, TransportRequest};
 use super::{
     account_display, account_label, connections::ConnectionGuard, describe_proxy, reset_hint,
@@ -175,6 +174,44 @@ fn transport_retry_advice(remaining: usize) -> Option<RetryAdvice> {
         delay_ms: config::retry_settings().delay_ms(),
         reason: "上游连接失败".to_string(),
     })
+}
+
+/// 兜底退避建议：**非限额**的上游错误，在换账号之前先在同一账号上重发。
+///
+/// ── 为什么需要这一档 ────────────────────────────────────────
+/// 前两档都有明确的适用面：适配器专属判定只覆盖它认识的那几个码
+/// （workbuddy 只认 11128 敏感词），瞬时状态码只收 408/5xx。两者都不命中时，
+/// 请求会直接跳到「换账号」—— 而设置页那个「同一账号重试次数」**一次都没用上**。
+/// 用户实测：填了 3，一次 400 却看到 6 个账号各试一次、重试链里
+/// `retries` 全空（2026-09）。
+///
+/// 语义上这就是该设置项的字面承诺：**先在这个账号上多试几次，不行再换人**。
+/// 判据放在「分类之后」而不是「按状态码硬编码」，是因为 400 这类码的含义
+/// 完全由上游决定（同一个 400 可能是报文非法、也可能是上游自己状态不一致），
+/// 网关无从分辨 —— 而重发的代价只是一个间隔，换号的代价是消耗另一个账号的
+/// 额度与一次可能的限额标记。先重发更划算。
+///
+/// ── 排除项（各自有更合适的动作）─────────────────────────────
+///   - `QuotaLimited`（429 / 限额码）：那是账号级限额，走「标记冷却 + 换号」，
+///     在原地重发只会白等一个间隔（与 [`TRANSIENT_RETRY_STATUSES`] 不收 429
+///     同一条理由）；
+///   - `TokenExpired`（401）：有专属动作（刷新凭证后同账号重试一次），
+///     走到这里说明已经刷过一轮仍失败，重发没有新变量。
+fn fallback_retry_advice(
+    class: &UpstreamErrorClass,
+    remaining: usize,
+    status: u16,
+) -> Option<RetryAdvice> {
+    if remaining == 0 {
+        return None;
+    }
+    match class {
+        UpstreamErrorClass::QuotaLimited { .. } | UpstreamErrorClass::TokenExpired { .. } => None,
+        UpstreamErrorClass::Fatal { .. } => Some(RetryAdvice {
+            delay_ms: config::retry_settings().delay_ms(),
+            reason: format!("上游错误（HTTP {status}），换账号前先原地重发"),
+        }),
+    }
 }
 
 /// 退避重试的运行日志行：`⚠️ {原因}；{n} 秒后重试（第 {i}/{N} 次）`。
@@ -318,6 +355,10 @@ async fn attempt_queue(
 ) -> Result<ForwardOutcome, GatewayError> {
     let model = model_of(ctx.body);
     let model_label = if model.is_empty() { "(默认)".to_string() } else { model.clone() };
+    // 限额冷却键的解析器：把请求名解析成**各家上游真名**（见 `routing::CooldownKeys`）。
+    // 建一次、整条请求共用 —— 选路、429 记账、成功清理三处读的必须是同一个键，
+    // 否则冷却会写在一个名字上、查在另一个名字上。
+    let cooldown_keys = rotate::CooldownKeys::new(&model);
     let mut tried_ids: Vec<String> = Vec::new();
     // ── 两份独立的预算（见 config::RetrySettings）─────────────────────
     //   - `budget`：同一个账号上还能**原地重发**几次。整份请求共用一份，
@@ -342,13 +383,18 @@ async fn attempt_queue(
     // 记录有 `free`/`pass`）：发送名跟着实际承载的账号所在池走
     // （`wire_target_for_provider`），跨池账号的发送名不同，各算一份。
     // 勾选的家用处理副本，未勾选的用原始 body。
-    let mut send_cache: HashMap<(&'static str, String), Cow<'_, Value>> = HashMap::new();
+    //
+    // 值里同时带着**该家实际收到的上游模型名**（`SendBody::wire_model`）——
+    // 它是限额冷却的键，与发出去的字节同源（见 `payload::SendBody`）。
+    // 缓存因此不只省一次脱敏：429 记账与成功清理都从这里取真名，不必再解析一遍。
+    let mut send_cache: HashMap<(&'static str, String), SendBody<'_>> = HashMap::new();
 
     // 标签是必需的：下面「429 降级到下一个账号」发生在**内层发送循环**里，
     // 裸 `continue` 会回到内层（用同一个账号再发一次，正好是要避免的事）。
     // `continue 'accounts` 才表达「换队列里的下一个账号」。
     'accounts: for _ in 0..=MAX_ROUTE_ATTEMPTS {
-        let target = rotate::select_target_account(service, provider_ids, &model, &tried_ids).await?;
+        let target =
+            rotate::select_target_account(service, provider_ids, &cooldown_keys, &tried_ids).await?;
         // 连接计数改绑到这一轮选中的账号：失败重试换账号时计数跟着走，
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
         // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
@@ -377,7 +423,12 @@ async fn attempt_queue(
                             tried_ids.push(account_id);
                         }
                     }
-                    match rotate::pick_next_account(service, provider_ids, &model, &tried_ids) {
+                    match rotate::pick_next_account(
+                        service,
+                        provider_ids,
+                        &cooldown_keys,
+                        &tried_ids,
+                    ) {
                         Some(next) => {
                             // 换号额度用尽 → 队列里即使还有人也不再顺延
                             // （`take_switch` 已写过那行终端日志），本次错误原样
@@ -512,9 +563,15 @@ async fn attempt_queue(
             .unwrap_or("")
             .trim()
             .to_string();
-        let body = send_cache
+        let send = send_cache
             .entry((provider_id, account_pool))
             .or_insert_with(|| send_body(ctx, provider_id, target.account.as_ref()));
+        let body = &send.body;
+        // 这一家实际收到的上游模型名 = 它的限额冷却键（与字节同源，见 `SendBody`）。
+        // 必须在**借用 body 之后**取一份 owned 副本：`send_cache` 的项在本轮
+        // 结束时才释放，而下面 429 分支要 `continue 'accounts`（重新可变借用
+        // `send_cache`），持有 `send` 的借用活不到那里。
+        let wire_model = send.wire_model.clone();
 
         // ── 一次账号内的发送链：最多两次（首次 + 401 刷新后重试一次）────
         // 为什么把刷新重试并进同一个循环：重试**自己也可能是** 429
@@ -695,23 +752,29 @@ async fn attempt_queue(
                     {
                         if !tried_ids.contains(&account_id) {
                             tried_ids.push(account_id.clone());
+                            // 冷却键 = **上游真名**（不是请求名）：上游按它记额度，
+                            // 判定侧（`cooldown_keys`）也按它查，两处同源见
+                            // `routing::CooldownKeys`。
                             let reset_text = rotate::mark_account_limited(
                                 service,
                                 &account_id,
-                                &model,
+                                &wire_model,
                                 *status as i32,
                                 *upstream_code,
                                 *reset_at,
                                 &failure.error.message,
                             );
                             let limit_at =
-                                rotate::account_limit_reset_at(service, &account_id, &model);
+                                rotate::account_limit_reset_at(service, &account_id, &wire_model);
+                            // 日志文案与账号页的「限流」列同口径：以真名为主，
+                            // 映射生效时补 `请求名 →` 前缀（见 `limit_model_label`）
+                            let limit_label = limit_model_label(&model, &wire_model);
                             let from_label =
                                 account_label(target.account.as_ref(), &account_id, &session);
                             match rotate::pick_next_account(
                                 service,
                                 provider_ids,
-                                &model,
+                                &cooldown_keys,
                                 &tried_ids,
                             ) {
                                 Some(next) => {
@@ -736,7 +799,7 @@ async fn attempt_queue(
                                     logging::console_line(
                                         "[Upstream]",
                                         &format!(
-                                            "⚠️ 账号 {from_label} 对模型 {model} 已限额{reset_hint}，\
+                                            "⚠️ 账号 {from_label} 对模型 {limit_label} 已限额{reset_hint}，\
                                              按优先级降级 → {next_label}（优先级 {}{next_home}）",
                                             next_priority
                                                 .map(|value| value.to_string())
@@ -750,12 +813,12 @@ async fn attempt_queue(
                                     rotate::report_limit_event(
                                         "warn",
                                         &format!(
-                                            "账号「{from_label}」对模型 {model_label} 已限额{reset_hint}，\
+                                            "账号「{from_label}」对模型 {limit_label} 已限额{reset_hint}，\
                                              按优先级降级 → 「{next_label}」",
                                         ),
                                         Some(&from_label),
                                         Some(&next_label),
-                                        &model,
+                                        &wire_model,
                                         *upstream_code,
                                         *status as i32,
                                         limit_at,
@@ -773,13 +836,13 @@ async fn attempt_queue(
                                     rotate::report_limit_event(
                                         "error",
                                         &format!(
-                                            "模型 {model_label} 在所有候选账号均已限额或禁用，\
+                                            "模型 {limit_label} 在所有候选账号均已限额或禁用，\
                                              无法继续转发（尝试过 {} 个账号）",
                                             tried_ids.len(),
                                         ),
                                         Some(&from_label),
                                         None,
-                                        &model,
+                                        &wire_model,
                                         *upstream_code,
                                         *status as i32,
                                         limit_at,
@@ -809,7 +872,12 @@ async fn attempt_queue(
                             tried_ids.push(account_id);
                         }
                     }
-                    match rotate::pick_next_account(service, provider_ids, &model, &tried_ids) {
+                    match rotate::pick_next_account(
+                        service,
+                        provider_ids,
+                        &cooldown_keys,
+                        &tried_ids,
+                    ) {
                         Some(next) => {
                             if !take_switch(&mut switches_left, switch_total) {
                                 return Err(failure.error);
@@ -851,8 +919,16 @@ async fn attempt_queue(
             }
         };
 
-        // 请求成功：该账号对该模型的限额标记（如有）已失效，清除
-        cap_cleared(service, &target, &model, &model_label, &session, provider_id);
+        // 请求成功：该账号对该模型的限额标记（如有）已失效，清除。
+        // 键是**上游真名**（与写入侧、判定侧同一个键，见 `routing::CooldownKeys`）。
+        cap_cleared(
+            service,
+            &target,
+            &wire_model,
+            &limit_model_label(&model, &wire_model),
+            &session,
+            provider_id,
+        );
         logging::verbose(
             "[Upstream]",
             &format!(
@@ -953,7 +1029,6 @@ async fn attempt_stateful(
 ) -> Result<ForwardOutcome, GatewayError> {
     let provider_id = kind_id(kind);
     let model = model_of(ctx.body);
-    let model_label = if model.is_empty() { "(默认)".to_string() } else { model.clone() };
     // 没有账号记录（走默认登录态）时，只有声明了环境变量旁路的 provider 能继续
     // —— 与无状态路径同一判据与文案（`allows_anonymous_default_session`）
     if target.account_id.is_none() && !adapter.allows_anonymous_default_session() {
@@ -983,7 +1058,10 @@ async fn attempt_stateful(
     // ── 内容处理：凭证已就绪、这一家**即将发送**，此刻才决定发送体 ────────
     // 与无状态路径同一时机与同一判据：选路失败（503/401）的请求走不到这里，
     // 不会产生一次「已转发的处理」；未勾选的家拿到的是客户端原始请求体。
-    let body = send_body(ctx, provider_id, target.account.as_ref());
+    let send = send_body(ctx, provider_id, target.account.as_ref());
+    let body = &send.body;
+    // 这一家实际收到的上游模型名 = 限额冷却键（与字节同源，见 `SendBody`）
+    let wire_model = &send.wire_model;
     // 旁路记账：本 provider + 本账号是这一轮的实际承载者（attempts +1）。
     // 账号展示名的兜底链与无状态路径同（账号名 → 会话昵称 → 账号 id）；
     // 这里没有会话对象可传（会话还没建），用公开形态的名字。
@@ -1008,7 +1086,7 @@ async fn attempt_stateful(
         "[Upstream]",
         &format!(
             "会话式转发 model={} stream={} account={} priority={} 出口={} provider={provider_id}",
-            model_label,
+            limit_model_label(&model, wire_model),
             ctx.stream,
             target.account_id.as_deref().unwrap_or("-"),
             target
@@ -1022,7 +1100,7 @@ async fn attempt_stateful(
         .forward_conversation(
             &service.store,
             target.account_id.as_deref().unwrap_or(""),
-            &body,
+            body,
             ctx.client_headers,
             target.proxy.clone(),
             ctx.stream,
@@ -1033,7 +1111,14 @@ async fn attempt_stateful(
         Ok(outcome) => {
             // 成功：该账号对该模型的限额标记（如有）已失效，清除。对本路径是
             // 空操作（不写标记），共用它是为了「将来某家产生标记」时自动获得清理
-            cap_cleared(service, &target, &model, &model_label, &Value::Null, provider_id);
+            cap_cleared(
+                service,
+                &target,
+                wire_model,
+                &limit_model_label(&model, wire_model),
+                &Value::Null,
+                provider_id,
+            );
             logging::verbose(
                 "[Upstream]",
                 &format!("会话式转发完成（{}ms）", logging::now_ms() - started_at),
@@ -1160,6 +1245,25 @@ fn model_of(body: &Value) -> String {
         .to_string()
 }
 
+/// 限额事件的模型文案：以**上游真名**为主读数。
+///
+/// 冷却键是上游真名，账号页的「限流」列读的也是它 —— 日志若打印请求名，
+/// 就会出现「日志说 `gpt-5.6-luna`、账号页说 `deepseek-v4.1-flash`」这种
+/// 看起来像记错账号的分歧。所以两者都用真名，仅在请求名不同（映射生效）时
+/// 补一段 `请求名 →` 前缀，用户仍能对上「我刚发的那个名字」。
+fn limit_model_label(requested: &str, wire: &str) -> String {
+    let requested = requested.trim();
+    let wire = wire.trim();
+    if wire.is_empty() {
+        // 没有真名（请求体没带 model）：退回请求名，与改造前逐字一致
+        return if requested.is_empty() { "(默认)".to_string() } else { requested.to_string() };
+    }
+    if requested.is_empty() || requested.eq_ignore_ascii_case(wire) {
+        return wire.to_string();
+    }
+    format!("{requested} → {wire}")
+}
+
 /// SSE/聚合响应的 model 名回写参数：要不要改写由适配器回答
 /// （小浣熊上游会回自己的内部名，见 `providers::raccoon` 与 `sse.rs` 的模块头）。
 /// 未声明回写的 provider 得 None，下发帧逐字节不变（workbuddy 的硬要求）。
@@ -1239,10 +1343,12 @@ async fn send_with_retry(
         let status = response.status().as_u16();
         let detail = read_upstream_error(response, capture).await;
         let body = detail.to_value();
+        let class = adapter.classify_error(status, &body);
         // 退避重试：provider 专属判定优先，没声明时对瞬时状态码统一兜底
         let advice = adapter
             .retry_advice(&body, budget.used(), budget.total)
-            .or_else(|| transient_retry_advice(status, budget.remaining));
+            .or_else(|| transient_retry_advice(status, budget.remaining))
+            .or_else(|| fallback_retry_advice(&class, budget.remaining, status));
         if let Some(advice) = advice {
             budget.remaining = budget.remaining.saturating_sub(1);
             let used = budget.used();
@@ -1260,7 +1366,6 @@ async fn send_with_retry(
             "[Upstream]",
             &format!("上游错误 HTTP {status}: {}", detail.message),
         );
-        let class = adapter.classify_error(status, &body);
         // 文案由适配器给出（含 provider 提示），编排层原样组装成网关错误
         let error = match &class {
             UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. } => {

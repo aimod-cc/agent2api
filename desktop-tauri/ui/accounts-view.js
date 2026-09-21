@@ -461,7 +461,8 @@
    * 打开「⋯」菜单：点击时才把菜单项插入 DOM，收起时移除。
    * 之所以不是常驻隐藏（display:none），是因为布局探针会把「常驻但隐藏」的
    * 按钮算进行内按钮集合，导致测量结果与实际可见操作不一致。
-   * 菜单项本身由 accounts-model.js 生成（启用/禁用、刷新 Token、删除账号）。
+   * 菜单项本身由 accounts-model.js 生成（启用/禁用、设为首选、刷新 Token、
+   * 删除账号）。
    *
    * 宿主是操作单元格 `.cell-actions`（它设了 `position: relative`）：
    * 菜单贴着按钮组弹出、随列表滚动一起移动。
@@ -474,7 +475,11 @@
     const menu = document.createElement('div');
     menu.className = 'more-menu';
     menu.dataset.for = account.id;
-    menu.innerHTML = moreMenuHtml(account);
+    // 「设为首选」在菜单里要按「是否已在第一位」置灰，判据用位置表现算 ——
+    // 与行上序号、↑ 按钮的边界同一个 positionMap（见 accounts-groups），
+    // 不另存一份「谁是队首」。菜单是点击时才生成的，这一次计算很便宜。
+    const seat = positionMap(accounts()).get(account.id);
+    menu.innerHTML = moreMenuHtml(account, { atFront: seat?.position === 1 });
 
     const host = button.closest('.cell-actions') || button.closest('tr.acct-row');
     host.appendChild(menu);

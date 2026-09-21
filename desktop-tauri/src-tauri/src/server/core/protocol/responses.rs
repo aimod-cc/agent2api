@@ -175,22 +175,235 @@ fn messages_from_input(
     let Some(items) = input.as_array() else {
         // 单个对象（非数组）也接受：客户端偶尔直接给一个 message 项
         if input.is_object() {
-            push_input_item(&mut messages, input)?;
+            let mut pending = PendingReasoning::default();
+            push_input_item(&mut messages, input, &mut pending)?;
+            merge_successive_assistants(&mut messages);
         }
         return Ok(messages);
     };
+    // 跨项状态：reasoning 项的正文要挂到**它旁边那条** assistant 消息上，
+    // 而两者在 `input[]` 里是平级的两个项（见 `PendingReasoning` 的说明）
+    let mut pending = PendingReasoning::default();
     for item in items {
         if let Some(text) = item.as_str() {
             messages.push(json!({ "role": "user", "content": text }));
             continue;
         }
-        push_input_item(&mut messages, item)?;
+        push_input_item(&mut messages, item, &mut pending)?;
     }
+    merge_successive_assistants(&mut messages);
     Ok(messages)
 }
 
+/// 把**连续的多条 assistant 消息合并成一条**。
+///
+/// ── 为什么必须合并（这是 400 的真正原因）────────────────────
+/// DeepSeek 明确拒绝连续的 assistant 消息，报错原文：
+/// `does not support successive user or assistant messages … You should
+/// interleave the user/assistant messages in the message sequence.`
+///
+/// 而 Codex 走 Responses 时**每一轮都可能产生连续的 assistant 项**：它把
+/// 「先说一句话」和「发起工具调用」拆成两个平级项
+/// （`reasoning → message → custom_tool_call`），转换后就是两条紧挨着的
+/// assistant 消息。真实数据：43 条抓包请求里，唯一出现连续 assistant 的那条
+/// 就是唯一一次 400；同一批里连续 **user** 消息有 1~7 对却全部成功 ——
+/// 可见被拒的确实是「连续 assistant」这个形状，与 reasoning 无关。
+///
+/// ── 合并规则 ────────────────────────────────────────────────
+/// 后一条并入前一条，字段按语义合并：
+///   - `content`：两段文本**换行拼接**（前一条是引言、后一条是动作说明，
+///     都是模型的话，拼起来语义不变）；
+///   - `tool_calls`：**数组相加**（并行/连续调用，上游按数组逐条执行）；
+///   - `reasoning_content`：保留先到的（同一轮的思考本来就该一致，
+///     真有出入时以先到的为准，与 [`PendingReasoning`] 同一口径）。
+///
+/// 合并结果正是 DeepSeek 接受的形状 —— 也是 Codex 自己发出来的合法形状
+/// （`content` 与 `tool_calls` 同在一条 assistant 上）。
+fn merge_successive_assistants(messages: &mut Vec<Value>) {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    for message in messages.drain(..) {
+        let can_merge = message.get("role").and_then(Value::as_str) == Some("assistant")
+            && out
+                .last()
+                .and_then(|last| last.get("role"))
+                .and_then(Value::as_str)
+                == Some("assistant");
+        if !can_merge {
+            out.push(message);
+            continue;
+        }
+        let Some(previous) = out.last_mut().and_then(Value::as_object_mut) else {
+            out.push(message);
+            continue;
+        };
+        let Some(incoming) = message.as_object() else {
+            continue;
+        };
+        merge_assistant_fields(previous, incoming);
+    }
+    *messages = out;
+}
+
+/// 把 `incoming` 的字段并进 `previous`（见 [`merge_successive_assistants`]）
+fn merge_assistant_fields(previous: &mut Map<String, Value>, incoming: &Map<String, Value>) {
+    // content：两段文本换行拼接。空串/Null 视为「没有这段」
+    let merged_text = {
+        let a = text_of(previous.get("content"));
+        let b = text_of(incoming.get("content"));
+        match (a.is_empty(), b.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(a),
+            (true, false) => Some(b),
+            (false, false) => Some(format!("{a}\n{b}")),
+        }
+    };
+    match merged_text {
+        Some(text) => {
+            previous.insert("content".to_string(), Value::String(text));
+        }
+        None => {
+            // 两条都没有正文：保持 Null（带 tool_calls 的 assistant 常是这种）
+            if !previous.contains_key("content") {
+                previous.insert("content".to_string(), Value::Null);
+            }
+        }
+    }
+    // tool_calls：数组相加
+    let incoming_calls = incoming.get("tool_calls").and_then(Value::as_array);
+    if let Some(calls) = incoming_calls.filter(|calls| !calls.is_empty()) {
+        match previous.get_mut("tool_calls").and_then(Value::as_array_mut) {
+            Some(existing) => existing.extend(calls.iter().cloned()),
+            None => {
+                previous.insert("tool_calls".to_string(), Value::Array(calls.clone()));
+            }
+        }
+    }
+    // reasoning_content：保留先到的（`entry` 语义：已有就不覆盖）
+    if let Some(reasoning) = incoming.get("reasoning_content").cloned() {
+        previous
+            .entry("reasoning_content".to_string())
+            .or_insert(reasoning);
+    }
+}
+
+/// 取消息 `content` 的纯文本形态（字符串直接用；其余交给 `content_text`）
+fn text_of(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(other) => content_text(other),
+        None => String::new(),
+    }
+}
+
+/// 等待归位的 reasoning 正文（跨 input 项的暂存）。
+///
+/// ── 为什么需要跨项状态 ──────────────────────────────────────
+/// Responses 的 reasoning 是**独立于** function_call 的兄弟项，两者平级：
+///
+/// ```text
+/// input: [ … , {type:"reasoning", summary:[…]}, {type:"function_call", …} , … ]
+/// ```
+///
+/// 而 Chat 侧没有「独立的思考项」这个概念 —— 思考只能作为 `reasoning_content`
+/// 挂在某条 assistant 消息上。于是转换必须把这两项**合并**成一条消息。
+///
+/// ── 为什么必须合并（不合并就是 400）────────────────────────
+/// DeepSeek 等 thinking 模型要求：请求带 `tools` 时，历史里每个
+/// assistant 轮次的 `reasoning_content` 都要完整回传，漏掉就返回
+/// `400 the reasoning content from the previous turn must be passed back in
+/// thinking mode`。原实现把 reasoning 项整个丢掉，于是每一条带工具调用的
+/// 历史都缺 reasoning —— Codex 走 Responses 时必然踩中（它每轮都带工具）。
+///
+/// ── 同一轮的**每条** assistant 都要带它（不只是带工具调用的那条）──────
+/// 一个轮次在 `input[]` 里可能是**多项**，Codex 实测的形状：
+///
+/// ```text
+/// [1] reasoning            ← 这一轮的思考（只有一个）
+/// [2] message  assistant   '我来扫描一下常见的开发工具。'   ← 同轮正文
+/// [3] custom_tool_call     ← 同轮工具调用
+/// ```
+///
+/// 这里的关键：**`[2]` 与 `[3]` 都要带同一份 reasoning**。上游把「连续的
+/// assistant 消息」当同一个轮次核对，只给 `[3]` 挂、让 `[2]` 空着会被判
+/// `reasoning_content_missing`（真实事故：43 条请求里唯一出现「连续 assistant」
+/// 结构的那条就是唯一一次 400）。
+///
+/// 所以 `take()` 在**每条** assistant 类消息上都会调用，且**取走后不清空** ——
+/// 本轮内后续的 assistant 消息还要接着用同一份思考。清空时机是「轮次结束」，
+/// 由 [`PendingReasoning::end_turn`] 负责，而轮次边界就是**下一条 user 消息**。
+///
+/// ── 为什么只做「向后挂」 ────────────────────────────────────
+/// Responses 的输出顺序固定是 reasoning 在前、它对应的 message /
+/// function_call 在后（`response.output[]` 的顺序，客户端原样回传），
+/// 所以只需要「暂存 → 本轮后续的 assistant 项取走」这一个方向。
+///
+/// 反方向（assistant 先到、reasoning 后到）**故意不做回填**：回填只能挂到
+/// 「最后一条」assistant 上，而那一条很可能是**上一轮**的（例如
+/// `… function_call → function_call_output → reasoning(属于下一轮) → …`），
+/// 挂错轮次比丢掉更糟 —— 上游会认为这一轮带了别轮的思考。
+///
+/// 一直没有 assistant 可挂时**丢弃**（轮次结束时清空）：挂到 user / tool
+/// 消息上会污染对话。
+#[derive(Default)]
+struct PendingReasoning {
+    /// 本轮（或本轮尚未消费的那一段）的 reasoning 正文
+    text: Option<String>,
+    /// 这段正文是否已经挂到过消息上。
+    ///
+    /// 用来区分「同一轮的第二个 reasoning 项」与「下一轮的第一个 reasoning 项」：
+    /// 前者该与已有正文**拼接**，后者该**替换**掉它。
+    /// 判据是「中间有没有 assistant 消息消费过」—— 消费过就说明上一段属于
+    /// 上一轮（`reasoning → tool_call → reasoning` 这种形状里，两段 reasoning
+    /// 分属两轮，拼在一起会把上一轮的思考带到这一轮，与挂错轮次同一类错误）。
+    attached: bool,
+}
+
+impl PendingReasoning {
+    /// 记下一段 reasoning。
+    ///
+    /// 上一段**已经被消费**时替换（新的一轮开始了）；否则拼接（同一轮里
+    /// 模型拆成了多个 reasoning 项）。
+    fn stash(&mut self, text: String) {
+        if self.attached {
+            self.text = Some(text);
+            self.attached = false;
+            return;
+        }
+        match self.text.as_mut() {
+            Some(existing) => {
+                existing.push('\n');
+                existing.push_str(&text);
+            }
+            None => self.text = Some(text),
+        }
+    }
+
+    /// 本轮要挂到 assistant 消息上的 reasoning（**不清空** —— 同一轮的每条
+    /// assistant 消息都要带同一份，见结构体文档），同时记下「已被消费」
+    fn attach(&mut self) -> Option<String> {
+        let text = self.text.clone();
+        if text.is_some() {
+            self.attached = true;
+        }
+        text
+    }
+
+    /// 轮次结束（遇到新的 user / system 消息）：清掉本轮的 reasoning
+    fn end_turn(&mut self) {
+        self.text = None;
+        self.attached = false;
+    }
+}
+
 /// 单个 input 项 → 零到一条 Chat 消息（追加进 `messages`）
-fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), ConvertError> {
+///
+/// `pending` 是跨项的 reasoning 暂存（见 [`PendingReasoning`]）：reasoning 项
+/// 自己不产生消息，只把正文交给相邻的 assistant 项。
+fn push_input_item(
+    messages: &mut Vec<Value>,
+    item: &Value,
+    pending: &mut PendingReasoning,
+) -> Result<(), ConvertError> {
     let kind = string_field(item, "type").to_lowercase();
     match kind.as_str() {
         // 函数调用与其结果：合成 assistant(tool_calls) + tool 两条消息。
@@ -204,15 +417,12 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
                 let raw = json_text(item.get("arguments").unwrap_or(&Value::Null));
                 if raw.is_empty() { "{}".to_string() } else { raw }
             };
-            messages.push(json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": { "name": name, "arguments": arguments },
-                }],
-            }));
+            messages.push(tool_call_message(
+                &call_id,
+                &name,
+                arguments,
+                pending.attach(),
+            ));
         }
         "function_call_output" => {
             messages.push(json!({
@@ -238,19 +448,13 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
                     input
                 }
             };
-            messages.push(json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": [{
-                    "id": call_id_of(item),
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        // 按降级时的约定包成 `{"input": "…"}`，与出站声明一致
-                        "arguments": freeform::wrap_freeform_input(&raw),
-                    },
-                }],
-            }));
+            messages.push(tool_call_message(
+                &call_id_of(item),
+                &name,
+                // 按降级时的约定包成 `{"input": "…"}`，与出站声明一致
+                freeform::wrap_freeform_input(&raw),
+                pending.attach(),
+            ));
         }
         "custom_tool_call_output" => {
             messages.push(json!({
@@ -259,14 +463,22 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
                 "content": tool_output_text(item.get("output")),
             }));
         }
-        // reasoning 项：它的正文不属于任何一轮对话，跳过（Chat 侧没有对应位置）
-        "reasoning" => {}
+        // reasoning 项：正文不属于任何一轮对话，但**不能丢** —— 它要挂到本轮的
+        // assistant 消息上（见 [`PendingReasoning`]）。这里只暂存，
+        // 由本轮后续的 message / function_call / custom_tool_call 消费
+        "reasoning" => {
+            if let Some(text) = reasoning_text_of(item) {
+                pending.stash(text);
+            }
+        }
         "input_text" | "text" => {
             messages.push(json!({ "role": "user", "content": string_field(item, "text") }));
+            pending.end_turn();
         }
         "input_image" | "input_file" | "image_url" => {
             // 裸内容块（不在 message 里）：包成一条 user 消息
             messages.push(json!({ "role": "user", "content": [item.clone()] }));
+            pending.end_turn();
         }
         // 工具声明项：不是对话内容，已经在 `tool_plan::plan_tools` 里
         // 提升成请求级工具声明。这里静默跳过 —— 落到下面的兜底分支会报一条
@@ -306,11 +518,30 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
             let mut message = Map::new();
             message.insert("role".to_string(), Value::String(role.clone()));
             message.insert("content".to_string(), content.clone());
-            // Responses 的 assistant 项可能带 reasoning：折回 reasoning_content
+            // assistant 项的 reasoning 有两个来源，**先看项内的、再拿本轮的**：
+            //   - 项内的 `summary`：客户端把思考塞在同一条消息里时用这个；
+            //   - 本轮暂存（`PendingReasoning`）：Codex 把 reasoning 作为**独立
+            //     兄弟项**发来，转换时挂到本轮每条 assistant 消息上。
+            //
+            // 这里**只读 `summary`、绝不读 `content`** —— message 项的 `content`
+            // 是**正文**（`{type:"output_text", text:…}`），把它当思考会让
+            // `reasoning_content` 变成正文的副本。那是修过的真实 bug。
+            //
+            // 纯文本 assistant 消息**也要**带 reasoning（不是只给带工具调用的
+            // 那条）：Codex 一轮里可能先发正文、再发工具调用，两条是**连续的
+            // assistant 消息**，上游按轮次核对，缺任何一条都判
+            // `reasoning_content_missing`（真实事故，见 [`PendingReasoning`]）。
             if role == "assistant" {
-                if let Some(reasoning) = reasoning_text_of(item) {
+                let reasoning = summary_text_of(item).or_else(|| pending.attach());
+                if let Some(reasoning) = reasoning {
                     message.insert("reasoning_content".to_string(), Value::String(reasoning));
                 }
+            } else if role != "tool" {
+                // 非 assistant、非 tool 的消息 = 上一轮结束：清掉本轮的 reasoning，
+                // 免得它被挂到下一轮的 assistant 消息上（挂错轮次会 400）。
+                // `tool` 结果**不算**轮次边界 —— 同一轮里工具结果之后还有
+                // assistant 消息（那正是 Codex 的常规形状），reasoning 要接着用。
+                pending.end_turn();
             }
             messages.push(Value::Object(message));
         }
@@ -326,12 +557,64 @@ fn content_is_structured(content: &Value) -> bool {
     })
 }
 
-/// 一个 reasoning 项的正文（summary 或 content 里的 text 拼接）
+/// 工具调用项 → Chat 的 assistant(tool_calls) 消息。
+///
+/// `reasoning` 是同轮次 reasoning 项的正文（见 [`PendingReasoning`]）：挂上它
+/// 才能满足 thinking 模型「带 tools 时 reasoning_content 必须回传」的要求。
+/// 为 None 时不写这个字段 —— 写空串与不写是两回事，上游对空串的判定各家不一。
+fn tool_call_message(
+    call_id: &str,
+    name: &str,
+    arguments: String,
+    reasoning: Option<String>,
+) -> Value {
+    let mut message = Map::new();
+    message.insert("role".to_string(), Value::String("assistant".to_string()));
+    message.insert("content".to_string(), Value::Null);
+    message.insert(
+        "tool_calls".to_string(),
+        json!([{
+            "id": call_id,
+            "type": "function",
+            "function": { "name": name, "arguments": arguments },
+        }]),
+    );
+    if let Some(reasoning) = reasoning {
+        message.insert("reasoning_content".to_string(), Value::String(reasoning));
+    }
+    Value::Object(message)
+}
+
+/// **一个 `reasoning` 项**的正文（`summary` 优先，退到 `content`）。
+///
+/// 只给 `reasoning` 项用 —— 那个类型的 `content` 确实是思考正文。
+/// **绝不能拿它读普通 `message` 项**：message 的 `content` 是对话正文，
+/// 读出来会让 `reasoning_content` 变成正文的副本（见 [`summary_text_of`]）。
 fn reasoning_text_of(item: &Value) -> Option<String> {
-    let parts = item
-        .get("summary")
-        .and_then(Value::as_array)
-        .or_else(|| item.get("content").and_then(Value::as_array))?;
+    summary_text_of(item).or_else(|| text_blocks_of(item.get("content")))
+}
+
+/// **`message` 项**的思考正文：只认 `summary`，绝不回退到 `content`。
+///
+/// ── 为什么这个区分是必需的（真实事故）────────────────────────
+/// 两条协议里「正文」与「思考」的字段位置不同：
+///   - `message` 项：`content: [{type:"output_text", text:"正文"}]`，无 `summary`；
+///   - `reasoning` 项：`summary: [{type:"summary_text", text:"思考"}]`。
+///
+/// 早先这里共用了一个「summary 优先、退到 content」的读法，于是**纯文本
+/// assistant 轮次**（message 项）把正文读成了思考，转换结果里
+/// `reasoning_content` 与 `content` 一模一样。后果不是「多带了一份无害的
+/// 数据」：DeepSeek 的 thinking 校验按轮次核对 reasoning，这一轮的思考被
+/// 认成错的，紧接着那条真正需要 reasoning 的工具调用轮次反而拿不到它
+/// （reasoning 项在文本项之前到达，被文本项先消费掉了），上游照样回
+/// `400 reasoning_content_missing`。
+fn summary_text_of(item: &Value) -> Option<String> {
+    text_blocks_of(item.get("summary"))
+}
+
+/// 一个块数组里的 `text` 拼接（空数组 / 非数组 / 全空文本都给 None）
+fn text_blocks_of(blocks: Option<&Value>) -> Option<String> {
+    let parts = blocks.and_then(Value::as_array)?;
     let text: String = parts
         .iter()
         .map(|part| string_field(part, "text"))

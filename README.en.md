@@ -32,7 +32,7 @@ OpenAI client / any SDK
 - [Quick Start](#quick-start)
 - [Screenshots](#screenshots)
 - [Data Storage](#data-storage)
-- [Default Sensitive Word List](#default-sensitive-word-list)
+- [Outbound Fingerprint Sanitization](#outbound-fingerprint-sanitization)
 - [Project Layout](#project-layout)
 - [Development & Build](#development--build)
 - [Usage Notice](#usage-notice)
@@ -116,35 +116,35 @@ Everything lives in **a single SQLite database**: `~/.agent2api/agent2api.db` (t
 
 The database runs in WAL mode, so while the app is running you will also see `agent2api.db-wal` and `agent2api.db-shm` next to it. Include them when backing up (or quit the app first — it checkpoints the WAL back into the main file on exit).
 
-> **Upgrading from an older version**: earlier versions scattered data across 8 JSON / JSONL files (`accounts.json`, `config.json`, `logs.jsonl`, `requests.jsonl`, `request-daily.jsonl`, `debug-traffic.jsonl`, `desensitize.json`, `desktop-settings.json`). On first launch the new version **detects** them and shows a dialog explaining that storage has moved to SQLite; the import only starts after you press "Upgrade" in that dialog. Choosing "Later" skips the import for this run (accounts and history stay unavailable, and the dialog appears again on the next launch).
+> **Upgrading from an older version**: earlier versions scattered data across JSON / JSONL files (`accounts.json`, `config.json`, `logs.jsonl`, `requests.jsonl`, `request-daily.jsonl`, `debug-traffic.jsonl`, `desktop-settings.json`). On first launch the new version **detects** them and shows a dialog explaining that storage has moved to SQLite; the import only starts after you press "Upgrade" in that dialog. Choosing "Later" skips the import for this run (accounts and history stay unavailable, and the dialog appears again on the next launch).
 >
 > After a successful import the old files are **renamed** to `name.migrated` (for example `accounts.json.migrated`) and kept in place as backups — they are **never deleted**. You can open them at any time to roll back or cross-check your data; rename one back and restart to be prompted to upgrade again.
 
 ---
 
-## Default Sensitive Word List
+## Outbound Fingerprint Sanitization
 
-The default word list used by the **Desensitize** page comes from two places, and together they decide what gets a zero-width space inserted:
+Upstream moderation matches **literal strings**, not meaning: the fixed template sentences that clients (Claude Code / Codex-style CLIs) inject into the system prompt, the billing-header field name, and certain bare error codes will get the whole request rejected with HTTP 400. Such a rejection has nothing to do with whether the content is actually harmful — those exact strings just have to be present.
 
-- **Built-in list** (compiled into the binary, `DEFAULT_TERMS` in `engine.rs`): the offline fallback, and the starting list for brand-new users.
-- **Remote list** (the repository's [`sensitive-words.json`](./sensitive-words.json)): fetched once at startup, then **every 10 minutes** by the **"Sensitive word list update"** task on the Scheduled Tasks page. Upstream moderation rules change constantly; this path lets the list keep up without waiting for a client release.
+With **fingerprint sanitization** enabled (Settings → General → Fingerprint sanitization, on by default), the gateway rewrites those fingerprints before every forward:
 
-Both share one version number (`version` in the file / `defaultsVersion` locally). When the remote version is newer than what has been merged locally, terms you do not have yet are **appended** to your list.
+- **Header key/value pairs are stripped entirely**: `x-anthropic-billing-header: ...` and trailing `cc_*=` pairs are removed; a leftover bare key name is abbreviated to `x-anthropic-billing-hdr` (breaks the literal match, meaning preserved).
+- **Semantic template sentences get a minimal rewrite** (one word changed, meaning intact):
 
-> **Sync only adds, never removes**: it will not overwrite or delete terms you maintain yourself, and it will not touch the desensitize switch, roles, or providers. The flip side: **a built-in term you deleted will come back on the next sync** — the remote file is a full snapshot, so it cannot tell "you deleted this" from "this is new". To disable a term for good, remove that provider from the desensitize scope instead, or turn the "Sensitive word list update" task off.
+  | Original | Rewritten |
+  | --- | --- |
+  | `You are Claude Code, Anthropic's official CLI for Claude` | `...official CLI **tool** for Claude` |
+  | `Main branch (you will usually use this for PRs)` | `**Default** branch (you will usually use this for PRs)` |
+  | `You are a coding agent running in the Codex CLI, a terminal-based coding assistant.` | `...running in the Codex CLI **tool**, a terminal-based...` |
+  | `To give feedback, users should report...` | `To **provide** feedback, users should report...` |
 
-Fetching uses `raw.githubusercontent.com` (which does not count against GitHub's anonymous API rate limit). A failed fetch **does not affect forwarding** — the list simply stays as it is until the next successful sync. Override the default URL with the `AGENT2API_SENSITIVE_WORDS_URL` environment variable (useful for forks pointing at their own repository). The "Default word list" block on the Desensitize page shows the current version, last sync time and result, and offers a manual "Sync now".
+- **The bare error code `11128` becomes `11-128`**: that number is the trigger for an upstream anti-probing check — if it appears anywhere in the request body the whole request is rejected (`code=11128`, a bare `11128`, `错误码 11128` all match, regardless of context). The cost is that **a `11128` in your own conversation is rewritten too** — but its mere presence in a request is the rejection condition, so leaving it alone always fails. A hyphen is used rather than a zero-width space because the upstream was measured to normalize zero-width characters away.
 
-File format:
+The rule set is **hard-coded** (ported from `internal/upstream/sanitize.go` in [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)). There is no maintainable word list and nothing to update over the network. Turning the switch off sends client templates upstream verbatim, and template sentences may be rejected again.
 
-```json
-{
-  "version": 4,
-  "terms": ["DoS", "exploit", "x-anthropic-billing-header"]
-}
-```
+Matches are recorded in the request log's "敏" tag (hover to see which rules matched); a `11128` rejection itself goes through the forwarding layer's backoff retry.
 
-Fields like `$comment` are ignored, and a bare array also works (treated as version 0). **Terms must not contain zero-width characters themselves** — the zero-width space is inserted at runtime. Bump `version` whenever you append terms.
+> This only rewrites the **copy sent upstream**. What the client receives is unchanged.
 
 ---
 
@@ -193,7 +193,7 @@ agent2api/
 │  │  │  │  │                    loopback callback, Qoder's device authorization)
 │  │  │  │  ├─ routing.rs / billing/   Account routing (global priority + rate-limit cooldown) / points check-in ops
 │  │  │  │  ├─ proxies.rs / clash.rs / egress.rs   Egress proxies and a per-exit cached Client
-│  │  │  │  ├─ desensitize/     Redaction engine and word lists (applied per provider + role)
+│  │  │  │  ├─ sanitize.rs      Outbound fingerprint sanitization (header stripping + minimal rewrites)
 │  │  │  │  ├─ credential_maintenance.rs  Batch refresh of expired / soon-to-expire credentials
 │  │  │  │  ├─ usage_query.rs     Balance / points queries (concurrent across accounts + the snapshot taken by the scheduled run)
 │  │  │  │  ├─ scheduled_tasks.rs  Interval-based scheduled task registry and dispatch loop (toggle / interval /
@@ -202,7 +202,7 @@ agent2api/
 │  │  │  │                       Import/export (with identity normalization) / scheduled check-in / software updates
 │  │  │  └─ api/                 Per-route handlers (health/session/accounts/accounts_usage/
 │  │  │                          chat/models/keys/model_manage/stats/logs/billing/
-│  │  │                          desensitize/auto-checkin/scheduled-tasks/update/…)
+│  │  │                          sanitize/auto-checkin/scheduled-tasks/update/…)
 │  │  ├─ lib.rs                  App entry point (config directory migration → settings → tray → main window → start backend)
 │  │  ├─ backend.rs              In-process server lifecycle
 │  │  ├─ legacy_install.rs       Cleanup of the old "current user" install (directory / shortcuts / uninstall entry / autostart; release only)

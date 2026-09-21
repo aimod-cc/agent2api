@@ -77,7 +77,7 @@ function applyTheme(mode) {
 // ─── 页面导航 ────────────────────────────────
 
 const PAGE_KEY = 'workbuddy-desktop-page';
-const PAGES = ['overview', 'accounts', 'gateway', 'keys', 'desensitize', 'docs', 'logs', 'tasks', 'requests', 'settings'];
+const PAGES = ['overview', 'accounts', 'gateway', 'keys', 'docs', 'logs', 'tasks', 'requests', 'settings'];
 /** 页签中文名：顶栏面包屑用。overview 的用户可见名是「报表」、gateway 的是「模型管理」
  *  （内部标识保持不变：localStorage 记忆、showPage 与 CSS 的 [data-page] 选择器都依赖它） */
 const PAGE_LABELS = {
@@ -85,7 +85,6 @@ const PAGE_LABELS = {
   accounts: '账号',
   gateway: '模型管理',
   keys: '网关 Key',
-  desensitize: '脱敏',
   docs: '文档',
   logs: '日志',
   tasks: '定时任务',
@@ -190,7 +189,6 @@ function renderTopbarStatus() {
       + (limited ? chip(`${limited} 个已限流`, 'warn') : ''),
     gateway: () => (gatewayUp ? chip('监听 127.0.0.1', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
     keys: () => mirror('keys-status'),
-    desensitize: () => mirror('desensitize-badge'),
     // 文档页没有自己的徽标（它只有一组复制的地址），跟着网关的运行状态走 ——
     // 地址在页面上的意义就是「现在能不能连」，网关没起来时那个状态最要紧
     docs: () => (gatewayUp ? chip('网关运行中', 'ok') : chip('未就绪', 'bad')) + chip(port, '', true),
@@ -605,8 +603,6 @@ async function refresh() {
     state = next;
     // 拿到状态即清掉上一次的失败说明（见下面 catch 的注释）
     stateError = '';
-    // 词表通过独立接口加载，避免阻塞状态
-    await loadDesensitize();
     // 清掉已删除账号的本地缓存；代理可选项也可能在 Clash 侧改过，下次打开弹窗重读
     const validIds = new Set((state.accounts?.accounts || []).map(a => a.id));
     window.wbAccountsView?.refreshCaches(validIds);
@@ -624,11 +620,6 @@ async function refresh() {
   } finally {
     releaseBusy();
   }
-}
-
-/** 词表面板自带状态，这里只做转发，避免再往主 state 里塞一份 */
-function loadDesensitize() {
-  return window.wbDesensitizePanel?.load();
 }
 
 // ─── 账号操作（列表按钮统一入口；积分/签到由 accounts-view 自行消化） ───
@@ -688,13 +679,9 @@ applyTheme(localStorage.getItem('workbuddy-desktop-theme') || 'system');
 
 api.onStateChanged(next => {
   if (!next?.accounts && !next?.session && !next?.health) return;
-  // 合并：旧 state + 新字段。脱敏状态由词表面板自持，这里直接丢掉，避免
-  // /api/session 的精简摘要（无 terms）覆盖掉完整词表。
-  const { desensitize: _ignored, ...rest } = next;
-  state = { ...(state || {}), ...rest };
+  // 合并：旧 state + 新字段
+  state = { ...(state || {}), ...next };
   render();
-  // 状态变更后顺带刷新一次词表，命中统计跟着更新
-  void loadDesensitize();
 });
 
 // ─── 共享给子模块（账号视图 / 词表面板 / 日志面板 / 账号设置面板）───

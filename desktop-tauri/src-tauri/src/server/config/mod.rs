@@ -113,6 +113,12 @@ pub struct RuntimeConfig {
     /// 就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存下来
     /// 最省事 —— 这条判定在转发热路径上。
     debug_mode: bool,
+    /// 出站请求体黑名单指纹脱敏开关（设置页「通用 → 指纹脱敏」）。
+    ///
+    /// 与 `debug_mode` 同一理由：转发层**每次发送前**都要判一次（改完开关下一个
+    /// 请求就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存
+    /// 下来最省事 —— 这条判定在转发热路径上。
+    sanitize_fingerprints: bool,
     /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
     raw: Map<String, Value>,
 }
@@ -147,6 +153,11 @@ impl RuntimeConfig {
     /// 调试模式是否开启（转发层每次发送前判一次，见字段说明）
     pub fn debug_mode(&self) -> bool {
         self.debug_mode
+    }
+
+    /// 出站指纹脱敏是否开启（转发层每次发送前判一次，见字段说明）
+    pub fn sanitize_fingerprints(&self) -> bool {
+        self.sanitize_fingerprints
     }
 
     /// 掩码后的 API Key，格式照抄 server.mjs 920 行：前 6 后 4。
@@ -323,6 +334,13 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         // 只有字面 `true` 算开启（手改文件写 "1" / "yes" 一律当关）：与
         // 「写坏回落」同一取向 —— 这个开关控制是否把凭据落盘，宁可少采
         debug_mode: raw.get(KEY_DEBUG_MODE).and_then(Value::as_bool).unwrap_or(false),
+        // 只有字面 `false` 算关闭：**默认开**（缺失 → true）。这个开关是「要不要
+        // 剥离会被上游误拦的模板句」，默认关会让新用户一上来就撞 400 code=11128
+        // ——与 debug_mode 的「默认关」取向相反，因为两者的默认值代价不同。
+        sanitize_fingerprints: raw
+            .get(KEY_SANITIZE_FINGERPRINTS)
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
         raw,
     }
 }
@@ -335,7 +353,7 @@ static CONFIG: RwLock<Option<RuntimeConfig>> = RwLock::new(None);
 /// ── 签名为什么从 `init()` 改成接 `Db` ───────────────────────
 /// 配置的真相来源从 `config.json` 变成了统一库的 `kv` 表，路径这件事由 `Db`
 /// 唯一持有（`Db::file()`）。与 `LogStore::with_db` / `RequestStats::with_db`
-/// / `AccountStore::with_db` / `desensitize::init` 同一形态，五个 store 的构造
+/// / `AccountStore::with_db` 同一形态，各 store 的构造
 /// 方式保持一致；`Option<Db>` 也一致（库打不开时仍能构造，只是降级）。
 ///
 /// 装入时机是 `bootstrap` 里的第一件事（`Db::open` 之后、迁移之前）——
@@ -487,7 +505,7 @@ where
 /// `Db::with` 持的是**全局唯一那把连接锁**，而 `logging::log` 的入库那一路
 /// 要往同一个库写 `logs` 表 —— `std::sync::Mutex` 不可重入，在闭包里打日志
 /// 等于当场死锁。所以 `write_all` 只把 `Result` 交出来，这里在锁外记
-/// （与 `desensitize::save_locked` 同一处置）。
+/// （与日志库的处置相同）。
 ///
 /// 注意本函数**在日志库初始化之前就可能被调用**（`bootstrap` 里
 /// `config::init` 早于 `logging::init_store`）：那时 `logging::log` 的入库
@@ -711,6 +729,22 @@ pub fn set_debug_mode(enabled: bool) -> bool {
             .raw
             .insert(KEY_DEBUG_MODE.to_string(), Value::Bool(enabled));
         config.debug_mode = enabled;
+    })
+}
+
+// ─── 出站指纹脱敏（sanitizeBlacklistFingerprints）─────────────
+
+/// 写入出站指纹脱敏开关。
+///
+/// 与 `set_debug_mode` 同一模式：内存快照与 raw 底稿一起改 —— 前者让下一个请求
+/// 立刻用新值（转发层逐请求读快照），后者保证写盘时不吃掉 config.json 里的
+/// 其它字段。返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_sanitize_fingerprints(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_SANITIZE_FINGERPRINTS.to_string(), Value::Bool(enabled));
+        config.sanitize_fingerprints = enabled;
     })
 }
 

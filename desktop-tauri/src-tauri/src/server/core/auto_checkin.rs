@@ -317,7 +317,7 @@ struct Inner {
     stopped: Arc<AtomicBool>,
 }
 
-/// 定时签到服务句柄：内部一把锁 + Clone，与 desensitize / models 同构。
+/// 定时签到服务句柄：内部一把锁 + Clone，与 update / models 同构。
 ///
 /// 锁只用来读写 running 与任务句柄这类微秒级操作；签到执行全程在锁外
 /// （硬约束：持锁不做网络请求、不 await）。`running` 用 CAS 抢锁的方式表达
@@ -698,7 +698,7 @@ impl AutoCheckin {
 /// 为什么不用 ServerState 就够了：停机入口是 `backend::shutdown(&AppState)`，
 /// 那里只有 Tauri 的应用状态，拿不到 ServerState；而 Node 版退出时明确会
 /// `autoCheckin.stop()`（server.mjs 1047-1049 的 closeAll）。用进程级句柄
-/// （与 config / logging / desensitize 同一个模式）让停机路径能直接拿到它。
+/// （与 config / logging 同一个模式）让停机路径能直接拿到它。
 /// ServerState 里那份与全局这份是**同一实例**（bootstrap 时装入）。
 static GLOBAL: OnceLock<AutoCheckin> = OnceLock::new();
 

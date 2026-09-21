@@ -193,6 +193,164 @@ impl AccountStore {
         count
     }
 
+    /// 一次性迁移：清掉**按请求名（映射别名）记下的限额键**（幂等，可重复调用）。
+    ///
+    /// ── 修的是什么（2026-09 的事故）─────────────────────────────
+    /// 映射（`modelRules.mappings`）会在发送前把请求名改写成上游真名，而上游按
+    /// **真名**记额度。旧实现在记账与判定两侧都用了请求名，于是：
+    ///
+    /// - 别名请求撞限额后，冷却写在别名键上（如 `gpt-5.6-luna`）；
+    /// - 之后用真名（`deepseek-v4.1-flash`）请求时读的是真名键 —— 读不到那条
+    ///   冷却，于是照样选中这个已经限额的账号，白撞一次 429；
+    /// - 账号页如实展示那堆别名键，看起来像「这个账号对三个模型都限流了」，
+    ///   其实只有一个额度（实测三个键的 `resetAt` 完全相同）。
+    ///
+    /// 修好读写两侧（`routing::CooldownKeys` / `payload::SendBody::wire_model`）
+    /// 之后，这些**存量别名键**会变成永不命中的孤儿记录：判定侧不再读它们，
+    /// 但它们仍会出现在账号页的「限流」列里（前端如实渲染后端给的键），
+    /// 用户看到的就是一条点不掉的假限流。所以升级时必须清一次。
+    ///
+    /// ── 为什么是「删除」而不是「改写成真名」──────────────────────
+    /// 看起来把别名键改名成真名更「保信息」，但那会**把冷却时间平白延长**：
+    /// 别名键上的 `resetAt` 来自「用别名请求时」上游返回的那次 429，它与真名键
+    /// 上那条记录本就是同一份额度的两种写法（实测 `resetAt` 完全一致）。改名会
+    /// 在真名键已存在时二选一（丢一条或覆盖另一条），两种结果都不比删除更准。
+    /// 而冷却只是「先别用这个账号」的短期建议 —— 删掉后最坏情况是**多试一次**
+    /// 上游、再撞一次 429 重新落一条正确的冷却；比留一条永远错位的假记录好。
+    ///
+    /// ── 判据为什么必须**按账号所属的家**逐条算（这里最容易写错）──────
+    /// 直觉写法是「键名出现在映射的 alias 表里 → 清掉」，但那会**误删合法的
+    /// 冷却**：`alias` 允许与上游 id 同名（同名映射是主备的正式用法，见
+    /// `model_rules` 模块头），所以 `deepseek-v4.1-flash` 既是 raccoon / cline
+    /// 那边的映射别名，**同时**也是 WorkBuddy 的原生模型名。对着 WorkBuddy 的
+    /// 账号看到这个键就删，会把一条真实的额度冷却抹掉 —— 那个账号之后会被反复
+    /// 选中、反复撞 429，正是本次要修的那类症状反过来再犯一遍。
+    ///
+    /// 正确的判据是**转发侧那个函数本身**：把键名当成请求名，问
+    /// `wire_target_for_provider(键, 该账号的家)` 会发出什么名字 ——
+    ///
+    /// - 发出的是**键名自己**（该家原生承载它，或存在同名映射）→ 它是真名，
+    ///   这条冷却是合法的，留着；
+    /// - 发出的是**别的名字**（键名被映射改写掉了）→ 键名不是上游真名，
+    ///   这条冷却错位，清掉。
+    ///
+    /// 与判定 / 写入两侧同一套口径（都走 `wire_target_for_provider`），
+    /// 不存在第三份「什么算真名」的实现。
+    ///
+    /// 不碰 `resetAt` 已过期的条目 —— 那些本来就不显示、也不参与判定，
+    /// 让它们自然留着（与 `rate_limit_reset_at` 的「过期即未限额」同一口径，
+    /// 不值得为它们多写一次库）。
+    ///
+    /// 返回被清理的 `(账号名, 键)` 摘要（供日志），没有可清理的返回空表。
+    ///
+    /// ── 为什么分两段（先快照判定、再持锁落盘）而不是全程持锁 ─────────
+    /// 判定要调 `wire_target_for_provider`，它会扫各家的模型清单。虽然那些清单
+    /// 当前都是**纯内存**的（`global_catalog` / 各家的 `models::list`），持着
+    /// 账号锁去调它们眼下不会死锁 —— 但那是一条**隐式约定**：将来谁让某家的
+    /// `list_models` 读一次账号库，这里就会变成「自己等自己」的硬死锁（`std`
+    /// 的 Mutex 不可重入，且 release 是 panic=abort）。所以判定一律在锁外做完，
+    /// 落盘只做「按 id 删几个键」这一件确定的事。
+    pub fn migrate_rate_limit_keys(&self) -> Vec<String> {
+        // ① 快照（内部自取自放锁）：公开形态里就有判定要的全部字段
+        let snapshot = self.list_accounts();
+        let accounts = crate::server::core::routing::accounts_of(&snapshot);
+        if accounts.is_empty() {
+            return Vec::new();
+        }
+        let now = logging::now_ms();
+        // ② 锁外判定：这个键在该家是不是真名（判据见函数头）
+        let mut plan: Vec<(String, String, Vec<String>)> = Vec::new();
+        for account in &accounts {
+            let Some(id) = account.get("id").and_then(Value::as_str).filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            let Some(Value::Object(limits)) = account.get("rateLimits") else {
+                continue;
+            };
+            let provider = crate::server::core::routing::provider_of(account).to_string();
+            let stale: Vec<String> = limits
+                .iter()
+                .filter(|(key, entry)| {
+                    let future = entry
+                        .get("resetAt")
+                        .and_then(Value::as_f64)
+                        .map(|value| value > now as f64)
+                        .unwrap_or(false);
+                    if !future || key.is_empty() {
+                        return false;
+                    }
+                    // 键名当请求名问一次：发出去的不是它自己 → 它不是真名
+                    let wire = crate::server::core::providers::catalog::wire_target_for_provider(
+                        key,
+                        &provider,
+                        None,
+                    )
+                    .model;
+                    !wire.eq_ignore_ascii_case(key)
+                })
+                .map(|(key, _)| key.clone())
+                .collect();
+            if !stale.is_empty() {
+                let who = account
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(id)
+                    .to_string();
+                plan.push((id.to_string(), who, stale));
+            }
+        }
+        if plan.is_empty() {
+            return Vec::new();
+        }
+        // ③ 持锁落盘：只按计划删键，不再做任何解析
+        let _guard = self.guard();
+        let mut state = self.load(&_guard);
+        let mut cleaned: Vec<String> = Vec::new();
+        for record in state.accounts.iter_mut() {
+            let Some((_, who, stale)) = plan.iter().find(|(id, _, _)| id == record.id()) else {
+                continue;
+            };
+            // 克隆一份再改：`record.get` 是共享借用，后面 `record.remove` /
+            // `record.set` 要可变借用，两者不能同时活着（与 `clear_rate_limit`
+            // 同一处理：那里也是先 clone 出 limits 再写回）
+            let Some(Value::Object(current)) = record.get("rateLimits") else {
+                continue;
+            };
+            let mut limits = current.clone();
+            let mut hit = false;
+            for key in stale {
+                // 只删计划里那几个；键可能已被别的路径清掉（快照与落盘之间有
+                // 时间差），`remove` 的返回值正好用来确认真的删掉了
+                if limits.remove(key).is_some() {
+                    hit = true;
+                    cleaned.push(format!("{who}: {key}"));
+                }
+            }
+            if !hit {
+                continue;
+            }
+            if limits.is_empty() {
+                record.remove("rateLimits");
+            } else {
+                record.set("rateLimits", Value::Object(limits));
+            }
+            record.set_updated_at(now);
+        }
+        if cleaned.is_empty() {
+            return cleaned;
+        }
+        if let Err(error) = self.save(&state, &_guard) {
+            logging::log(
+                "[Accounts]",
+                &format!("❌ 限流键迁移落库失败（下次启动会重试）: {error}"),
+            );
+            return Vec::new();
+        }
+        cleaned
+    }
+
     /// 记录账号**今天已签到**（登录页那枚按钮据此置灰）。
     ///
     /// `at` 是这次签到成功的毫秒时间戳。判定「今天签过没」由**读侧**按自然日比

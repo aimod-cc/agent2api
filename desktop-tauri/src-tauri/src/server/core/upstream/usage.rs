@@ -129,18 +129,17 @@ pub struct TelemetrySnapshot {
     pub first_response_at: Option<i64>,
     /// 中断 / 异常原因（成功为 None）
     pub error: Option<String>,
-    /// **本次请求命中的敏感词**（词 + 次数；空表 = 一个都没命中）。
+    /// **本次请求命中的脱敏规则**（规则标签 + 次数；空表 = 一个都没命中）。
     ///
     /// ── 数据从哪来 ──────────────────────────────────────────────
-    /// `core::desensitize` 的 `process_body` 早就算出了 `term_counts`
-    /// （按次数降序的每词命中数），但那份结果此前只喂给两个消费者：
-    /// 进程级的聚合统计（设置页「脱敏」那一块显示的累计值）与一行
-    /// `[Desensitize] 已脱敏命中 N 处：词×次数` 日志。**逐条请求**的命中
-    /// 明细当场就丢了，于是请求日志那边只能说「这次命中了敏感词」，
-    /// 说不出命中了什么。
+    /// `core::sanitize` 的 `sanitize_body` 在剥离指纹时顺手算出命中明细
+    /// （按次数降序的每条规则命中数）。字段名与形状**未随规则集更换而改动**
+    /// —— 列名 `sensitive_hits`、元素 `{word, count}`、前端的「敏」标签与
+    /// 悬停面板都照常工作，只是 `word` 里装的从「命中的敏感词」变成
+    /// 「命中的规则标签」（如 `11128` / `cc_*=` / 模板句原文）。
     ///
-    /// 采集点在 `payload::send_body`（某一家即将发送、拿到 `ProcessOutcome`
-    /// 的那一刻），由 [`Self::note_sensitive_hits`] 合并进来。
+    /// 采集点在 `payload::send_body`（某一家即将发送、拿到脱敏结果的那一刻），
+    /// 由 [`Self::note_sensitive_hits`] 合并进来。
     ///
     /// ── 为什么是并集累加（与 attempts 的覆盖式相对）───────────────
     /// 见 `payload::send_body` 的说明：跨家降级时每个在范围内的家各处理一次，
@@ -589,10 +588,10 @@ impl RequestTelemetry {
     /// 追加第二条：一份 `[{word, count}]` 里同一个词出现两次，没有任何读侧
     /// 会把它当成两件事，只会让「命中 3 次」这种读数变成「两条各 2 次」。
     ///
-    /// 词数上界：词表本身有 `MAX_TERMS`（见 `desensitize::engine`），
-    /// 但那是**整个词表**的上限，一条请求理论上可以把它们全命中一遍。
-    /// 这里不设额外的截断闸 —— 命中表落库是 JSON 文本，而词表上限本身
-    /// 已经是合理量级（前端展示时按次数降序截断，见 requests-panel 的弹层）。
+    /// 条数上界：规则集是硬编码的（7 条特征串 + 3 条正则 + 5 条改写，见
+    /// `core::sanitize`），远小于改造前那份可维护词表，因此命中标签的条数
+    /// 天然有界。这里不设额外的截断闸 —— 命中表落库是 JSON 文本，
+    /// 前端展示时还会按次数降序截断（见 requests-panel 的弹层）。
     pub fn note_sensitive_hits(&self, term_counts: &[(String, usize)]) {
         if term_counts.is_empty() {
             return;

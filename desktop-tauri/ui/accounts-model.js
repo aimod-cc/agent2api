@@ -212,9 +212,23 @@
   /**
    * ⋯ 菜单项（点击时才插入 DOM，这里只生成 HTML）。
    *
-   * 菜单按「影响面」从大到小排：启用/禁用会改变这个账号是否参与转发，
-   * 是最重的一项，故放在最前；删除账号同理，排在最后并由 <hr> 隔开。
-   * 两项都标 danger：它们会立刻改变转发可用性。
+   * 菜单按「对转发的影响面」从大到小排：启用/禁用会改变这个账号是否参与转发，
+   * 是最重的一项，故放在最前；「设为首选」只改队列顺序（不改启用状态），
+   * 排在它之后；删除账号同样是最重的改动，排在最后并由 <hr> 隔开。
+   * 首尾两项都标 danger：它们会立刻改变转发可用性。
+   *
+   * ── 「设为首选」本次从行上搬进来 ──────────────────────────────
+   * 它原先在操作列里占一颗 62px 的按钮（四颗里最宽的一颗），而它回答的
+   * 「这个账号排第几」隔壁的优先级列已经写着。搬进来之后行上只剩四颗按钮，
+   * 操作列得以从 250px 收到 200px，省下的宽度归账号列（见 accounts-table.js
+   * 的 actionsCell）。可达性不变 —— 它现在是菜单的第二项，紧跟在启用/禁用之后。
+   *
+   * `ctx.atFront`（账号是否已在全局队列第一位）由调用方给：菜单项要按它
+   * **置灰**。判据必须来自视图侧的位置表（accounts-groups 的 positionMap，
+   * 与行上的序号、↑ 按钮的边界同源），本文件是纯逻辑、手里没有账号全集。
+   * 缺省 false（= 可点）是刻意的降级方向：后端对「已经在第一位」返回
+   * `changed: false`，调用方会把那句「账号已在全局队列第一位」透出来 ——
+   * 漏传只是少一次置灰，不会变成一个点了没反应的按钮。
    *
    * 「桌面端实时登录态」账号**也可以删除**了（曾经置灰不可删，现已放开）：
    * 它是「导入桌面端登录态」建出来的一条账号记录，删除只作用于这条记录 ——
@@ -228,18 +242,27 @@
    * 所以这一项对它不出现 —— 手动刷新走的是「不过期就原样返回」的路径，
    * 点了只会得到一句「已刷新」而实际什么都没做，不如不给这个入口。
    */
-  function moreMenuHtml(account) {
+  function moreMenuHtml(account, ctx = {}) {
+    const atFront = ctx.atFront === true;
     const items = [];
     items.push(isEnabled(account)
       ? { action: 'disable', label: '禁用', danger: true }
       : { action: 'enable', label: '启用', danger: true });
+    // 队首时置灰：与它还在行上时的处理逐字一致（那时是 disabled 属性）
+    items.push({
+      action: 'switch',
+      label: '设为首选',
+      disabled: atFront,
+      title: atFront ? '已在全局队列第一位' : '仅将优先级调整到全局第一位，不改变启用状态',
+    });
     if (account.hasRefreshToken) {
       items.push({ action: 'refresh', label: '刷新 Token' });
     }
     items.push(isDesktopAccount(account)
       ? { action: 'remove', label: '删除账号', danger: true, title: '删除这条账号记录（不会影响客户端自己的登录态；之后可再点「导入桌面端登录态」加回来）' }
       : { action: 'remove', label: '删除账号', danger: true });
-    // 菜单内不再重复行内已有的操作（设置/积分/设为首选都留在行上）
+    // 菜单内不重复行上已有的操作（签到 / 余额 / 设置都留在行上）；
+    // 「设为首选」是反向的那一条 —— 它从行上搬进了菜单，见上面的说明。
     return items.map((item, index) => {
       const hr = item.danger && index > 0 ? '<hr>' : '';
       const attrs = [

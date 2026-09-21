@@ -305,30 +305,11 @@ const BRIDGE_JS: &str = r#"
       invoke('run_installer', { path: String(path || ''), restart: restart !== false }),
     openReleasePage: url => invoke('open_release_page', { url: String(url || '') }),
 
-    // ── 敏感词脱敏 ──
-    getDesensitize: () => call('GET', '/api/desensitize'),
-    setDesensitizeEnabled: enabled =>
-      call('POST', '/api/desensitize/enabled', { enabled: enabled === true }),
-    setDesensitizeRoles: roles =>
-      call('POST', '/api/desensitize/roles', {
-        roles: Array.isArray(roles) ? roles.filter(role => typeof role === 'string') : [],
-      }),
-    // 作用提供商（Agent2API 改造新增，`PUT` 全量替换语义）：
-    // 与 roles 一样只保留字符串项 —— 界面给的是勾选出来的 provider id 列表，
-    // 非字符串混进来只可能是调用方写错，交给后端校验不如在这里干净地滤掉。
-    setDesensitizeProviders: providers =>
-      call('PUT', '/api/desensitize/providers', {
-        providers: Array.isArray(providers) ? providers.filter(id => typeof id === 'string') : [],
-      }),
-    saveDesensitizeTerms: terms => call('PUT', '/api/desensitize/terms', { terms }),
-    addDesensitizeTerms: terms => call('POST', '/api/desensitize/terms', { terms }),
-    removeDesensitizeTerm: term => call('DELETE', '/api/desensitize/terms', { terms: [term] }),
-    resetDesensitizeTerms: () => call('POST', '/api/desensitize/reset', {}),
-    resetDesensitizeStats: () => call('POST', '/api/desensitize/stats/reset', {}),
-    // 立即同步远程词库（force：忽略版本号比对，把远端词条全量补一遍）。
-    // 会真打一次 GitHub raw，因此可能慢（几秒）—— 按钮的 loading 态由
-    // desensitize-panel 的 guard() 负责，这里不另做超时。
-    syncDesensitizeTerms: () => call('POST', '/api/desensitize/remote-sync', {}),
+    // ── 出站指纹脱敏开关 ──
+    // 与 getDebug / saveDebug 同形：GET 读、PUT 写，响应体就是新状态。
+    getSanitize: () => call('GET', '/api/sanitize'),
+    saveSanitize: enabled =>
+      call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true }),
 
     // ── 运行日志 ──
     getLogs: query => call('GET', '/api/logs' + toQuery(query)),

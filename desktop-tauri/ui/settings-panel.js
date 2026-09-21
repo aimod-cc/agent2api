@@ -5,7 +5,7 @@
  * 独立于 app.js 的面板模块：自持「应用设置」状态，
  * 通过 window.wbSettingsPanel 暴露 load 给 app.js（切到设置页时加载）。
  *
- * 与 desensitize-panel.js / logs-panel.js 同构，依赖 window.wbApp 的 esc / toast / refresh。
+ * 与 logs-panel.js 同构，依赖 window.wbApp 的 esc / toast / refresh。
  *
  * 主进程契约（本文件只按此调用，不另造方法名）：
  *   getAppSettings()        → { closeToTray, autostart }
@@ -169,6 +169,7 @@
       loadRetention(),
       loadRetry(),
       loadDebug(),
+      loadSanitize(),
       loadStorage(),
       window.wbUpdatePanel?.load?.(),
     ]);
@@ -917,12 +918,80 @@
   $('settings-debug-mode')?.addEventListener('change', event => saveDebug(event.target));
   $('btn-debug-refresh')?.addEventListener('click', () => loadDebug().then(() => toast('调试模式设置已刷新')));
 
+  // ─── 指纹脱敏（出站请求体的指纹剥离开关）────────────────────
+
+  /**
+   * 与调试模式**完全同构**（读 / 写 / 回滚三处一一对应），因此不再逐行重复
+   * 那套论证：两者都是「转发层逐请求读快照的全局布尔开关」，都有 GET/PUT 两条
+   * 接口、都会在读到后端值之前锁住控件。差异只有默认值（本项默认**开**）
+   * 与文案。
+   */
+  let sanitize = null;
+
+  function renderSanitize(data) {
+    if (data !== undefined) sanitize = data;
+    const badge = $('sanitize-badge');
+    const toggle = $('settings-sanitize');
+    if (!badge || !toggle) return;
+
+    if (!sanitize || typeof sanitize !== 'object') {
+      badge.className = 'badge bad';
+      badge.textContent = '不可用';
+      toggle.disabled = true;
+      $('sanitize-state').textContent = '未能读取指纹脱敏设置，请稍后重试';
+      return;
+    }
+
+    const on = sanitize.sanitizeBlacklistFingerprints === true;
+    toggle.disabled = false;
+    toggle.checked = on;
+    badge.className = 'badge ok';
+    badge.textContent = '已生效';
+    $('sanitize-state').textContent = on
+      ? '正在剥离出站请求里的审核指纹：表头键值整段删除，模板句最小改写。'
+      : '未开启，客户端 system 模板会原样发往上游，可能被内容审核误拦（400）。';
+  }
+
+  async function loadSanitize() {
+    try {
+      renderSanitize(await api.getSanitize());
+    } catch (error) {
+      console.warn('读取出站指纹脱敏设置失败:', error.message);
+      renderSanitize(null);
+    }
+  }
+
+  async function saveSanitize(toggle) {
+    if (panelBusy) {
+      toggle.checked = sanitize && typeof sanitize === 'object'
+        ? sanitize.sanitizeBlacklistFingerprints === true
+        : !toggle.checked;
+      return;
+    }
+    const wanted = toggle.checked;
+    panelBusy = true;
+    toggle.disabled = true;
+    try {
+      const saved = await api.saveSanitize(wanted);
+      renderSanitize(saved);
+      toast(wanted ? '✅ 出站指纹脱敏已开启' : '已关闭出站指纹脱敏');
+    } catch (error) {
+      toast(`保存失败: ${error.message}`, 'err');
+      await loadSanitize(); // 回滚到后端的真实值
+    } finally {
+      panelBusy = false;
+    }
+  }
+
+  $('settings-sanitize')?.addEventListener('change', event => saveSanitize(event.target));
+  $('btn-sanitize-refresh')?.addEventListener('click', () => loadSanitize().then(() => toast('指纹脱敏设置已刷新')));
+
   // 保存位置是**只读展示**，没有按钮要绑事件（三个「更改…」入口随单库语义
   // 一起删除，理由见上面那一节的注释）。这里只留一个「刷新」出口：用户手工
   // 改过配置目录后能立刻重读一次，不必重开程序。
   $('btn-storage-refresh')?.addEventListener('click', () => loadStorage().then(() => toast('存储概况已刷新')));
 
-  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderStorage };
+  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderSanitize, renderStorage };
 
   // 重试设置同样在首次读到后端值之前保持禁用：空输入框既能被误改，
   // 也会让「值与后端是否一致」的判断失真。读成功后由 renderRetry 解禁，
@@ -933,6 +1002,9 @@
   {
     const debugToggle = $('settings-debug-mode');
     if (debugToggle) debugToggle.disabled = true;
+    // 指纹脱敏开关同理
+    const sanitizeToggle = $('settings-sanitize');
+    if (sanitizeToggle) sanitizeToggle.disabled = true;
   }
 
   // 保留天数在首次读到后端值之前保持禁用：空输入框既能被误改，也没法参与

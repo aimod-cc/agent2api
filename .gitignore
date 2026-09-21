@@ -13,6 +13,8 @@ desktop-tauri/src-tauri/gen/schemas/
 .zcode/
 .verify/
 prototype/
+# ZCode 的忽略配置文件本身（本机工具配置，不入库）
+.zcodeignore
 
 # 第三方参考项目（仅本地分析用）
 Acankao/

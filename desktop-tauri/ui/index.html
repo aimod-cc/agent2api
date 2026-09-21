@@ -64,7 +64,6 @@
         <div class="nav-group-label">转发能力</div>
         <button class="nav-item" data-page="gateway" data-icon="gateway"><span class="ico"></span><span class="label">模型管理</span></button>
         <button class="nav-item" data-page="keys" data-icon="key"><span class="ico"></span><span class="label">网关 Key</span></button>
-        <button class="nav-item" data-page="desensitize" data-icon="desensitize"><span class="ico"></span><span class="label">脱敏</span></button>
         <!-- 文档：接口地址（Base URL / 三种对话协议 / 模型列表）与将来的使用说明。
              它原先在「网关 Key」页里，R8 按需求搬成独立一级菜单 —— 接口地址是
              「接客户端」这件事本身要查的东西，与「管理 Key」不是同一类操作，
@@ -419,124 +418,6 @@
             </div>
             <div class="panel-foot">
               <span>客户端请求需带 <code>Authorization: Bearer &lt;key&gt;</code> 或 <code>x-api-key: &lt;key&gt;</code>；修改后立即生效，本程序自身会自动使用第一把启用的 Key。每把 Key 可单独限制<b>可用提供商</b>与<b>可用模型</b>（行内「可用范围」）：留空 = 不限制，两个都设时按交集生效 —— 被限制的模型对这把 Key 表现为「不存在」（拉 /v1/models 也看不到它），提供它的家不在可用列表里时请求同样被拒。</span>
-            </div>
-          </section>
-        </section>
-
-        <!-- ─── 脱敏 ─── -->
-        <section class="page" data-page="desensitize">
-          <div class="page-head">
-            <h2>敏感词脱敏</h2>
-            <p class="intro">命中词会在词内插入零宽空格，人眼与模型读到的不变，但上游后端的关键词匹配会失效。</p>
-          </div>
-
-          <section class="panel">
-            <div class="panel-head">
-              <h2>脱敏设置</h2>
-              <span id="desensitize-badge" class="badge">检测中…</span>
-              <div class="head-actions">
-                <button id="btn-reset-terms">恢复默认词表</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div class="switch-card">
-                <label class="switch">
-                  <input type="checkbox" id="desensitize-enabled">
-                  <span class="track"></span>
-                  <span>启用脱敏</span>
-                </label>
-                <span class="desc" id="desensitize-state">—</span>
-              </div>
-
-              <div class="role-picks" id="desensitize-roles">
-                <span class="lead">作用角色：</span>
-                <label class="check"><input type="checkbox" value="system"><span>system（客户端合规模板）</span></label>
-                <label class="check"><input type="checkbox" value="user"><span>user（用户输入）</span></label>
-                <label class="check"><input type="checkbox" value="assistant"><span>assistant</span></label>
-                <label class="check"><input type="checkbox" value="tool"><span>tool</span></label>
-              </div>
-
-              <!-- 作用提供商：哪些上游的请求要过脱敏。
-                   用自研下拉（select.js 增强出的触发器 + 浮层）呈现多选 —— 选项是
-                   运行时从提供商摘要拿的（新增 provider 自动出现在这里），
-                   与「作用角色」那组写死的复选框不同，不能烤进 HTML。
-                   data-placeholder 是「一项都没勾」时触发器上的文案（写这句的是
-                   select.js 的 selectedText），比留给它一个空框更能说明后果。 -->
-              <div class="provider-pick">
-                <span class="lead">作用提供商：</span>
-                <select id="desensitize-providers" multiple data-placeholder="未选择（不会处理任何请求）"
-                        aria-label="脱敏作用的提供商"></select>
-                <span class="tip-q" data-tip="只对勾选这里的提供商所承载的请求做脱敏，未勾选的上游原样转发。判定在转发之前：同一模型多家都能提供时，只要候选链里有一家需要脱敏，这次请求就会先脱敏再发（保守策略）—— 免得降级换到另一家时把敏感内容发给了不该收到的上游。至少选一家；想整体停用请用上面的「启用脱敏」开关。"></span>
-                <span class="desc" id="desensitize-providers-state">—</span>
-              </div>
-
-              <div class="term-add">
-                <input type="text" id="term-input" placeholder="输入要添加的词，回车或点「添加」（支持逗号/换行批量粘贴）" autocomplete="off">
-                <button id="btn-add-term" class="primary">添加</button>
-              </div>
-
-              <div class="terms" id="term-list"><div class="empty" style="padding:14px 0">正在加载词表…</div></div>
-            </div>
-          </section>
-
-          <!-- 默认词库（远程同步）：词表从「升级才更新」改成「从仓库定时拉取」之后，
-               用户需要能看到「当前合并到哪一版、上次同步成没成」—— 没有这一块时，
-               拉取失败（网络不通、仓库改名）在界面上是完全不可见的静默降级。
-               「立即同步」走 POST /api/desensitize/remote-sync（force 语义）。 -->
-          <section class="panel">
-            <div class="panel-head">
-              <h2>默认词库</h2>
-              <span id="sensitive-sync-badge" class="badge">—</span>
-              <div class="head-actions">
-                <button id="btn-sync-terms">立即同步</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div class="retention-list storage-counts">
-                <div class="storage-count"><span class="k">词库版本</span><span class="v" id="sensitive-merged-version">—</span></div>
-                <div class="storage-count"><span class="k">上次同步</span><span class="v" id="sensitive-last-sync">—</span></div>
-              </div>
-              <!-- 同步结果是一整句话（「远端 v4 补入 2 个词条」/「拉取失败：…」），
-                   塞进上面那种大字号格子里会溢出，所以单独一行用 .detail 呈现 -->
-              <div class="detail" id="sensitive-sync-message">—</div>
-              <p class="hint">
-                默认词库随本项目的 GitHub 仓库发布（<code id="sensitive-source-url">—</code>），
-                「定时任务」页的「敏感词库更新」每 10 分钟自动拉取一次，这里可以手动立即拉一次。
-                同步只补不删：不会覆盖或删除你自己维护的词条，也不会改动脱敏开关与作用范围。
-              </p>
-            </div>
-          </section>
-
-          <section class="panel">
-            <div class="panel-head">
-              <h2>命中统计</h2>
-              <div class="head-actions">
-                <button id="btn-reset-stats">清空统计</button>
-              </div>
-            </div>
-            <div class="panel-body">
-              <div class="stat-strip">
-                <div class="stat-cell">
-                  <span class="n" id="stat-requests">—</span>
-                  <span class="l">已处理请求</span>
-                </div>
-                <div class="stat-cell accent">
-                  <span class="n" id="stat-changed">—</span>
-                  <span class="l">命中请求</span>
-                </div>
-                <div class="stat-cell warn">
-                  <span class="n" id="stat-hits">—</span>
-                  <span class="l">命中次数</span>
-                </div>
-              </div>
-
-              <div class="stat-terms" id="stat-terms"></div>
-
-              <p class="hint">
-                命中词会在词内插入零宽空格（如 <code>DoS</code> → <code>Do&#8203;S</code>），人眼和模型读到的不变，
-                但上游后端的关键词匹配会失效，从而避免合规模板被内容审核误拦。
-                词表保存在 <code id="desensitize-file">~/.agent2api/desensitize.json</code>。
-              </p>
             </div>
           </section>
         </section>
@@ -927,6 +808,34 @@
                     </div>
                     <div class="settings-state" id="debug-state">—</div>
                     <div class="hint retention-note">开启后新发生的请求才会被记录（已经过去的请求补不回来）。报文单独存放，位置可在左侧「数据 → 保存位置」里更改。</div>
+                  </div>
+                </section>
+
+                <!-- ── 通用：指纹脱敏 ──
+                     开关读写配置（经 /api/sanitize，HTTP 桥）。
+                     开启后转发层在每次出站前剥离上游内容审核的黑名单指纹：
+                     表头键值整段删除、客户端 system 模板句最小改写（每句只换一个词，
+                     语义不变）。关掉它等于把这些模板原样发上游，可能被误拦
+                     （HTTP 400 code=11128）。规则集是硬编码的，没有可维护的词表。 -->
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>指纹脱敏</h2>
+                    <span class="tip-q" data-tip="上游用「逐字精确匹配」的方式审核请求体（不是语义审核）：客户端注入的固定模板句、计费头字段名、以及某些裸错误码出现在报文里就会整单拦截，返回 400。开启本项后，网关在每次转发前改写这些指纹 —— 表头键值整段删除，承载语义的模板句只换一个词（如 official CLI for Claude → official CLI tool for Claude），对话内容与语义都不受影响。规则集是内置的，不需要也无法维护词表。关掉本项后客户端模板会原样发往上游，可能重新出现模板句被误拦的报错。"></span>
+                    <span id="sanitize-badge" class="badge">检测中…</span>
+                    <div class="head-actions">
+                      <button id="btn-sanitize-refresh">刷新</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="settings-switches">
+                      <label class="switch">
+                        <input type="checkbox" id="settings-sanitize">
+                        <span class="track"></span>
+                        <span>剥离上游审核黑名单指纹（改写请求体里的模板句与表头）</span>
+                      </label>
+                    </div>
+                    <div class="settings-state" id="sanitize-state">—</div>
+                    <div class="hint retention-note">默认开启。命中明细会记进请求日志的「敏」标签（悬停可看命中了哪几条规则）。本项只改发给上游的副本，客户端看到的响应内容不变。</div>
                   </div>
                 </section>
               </div>
@@ -1520,7 +1429,7 @@
           </div>
 
           <!-- ── 可用提供商 / 可用模型（R9，参考 OmniProxy 的 Key 限制）──
-               两个多选都是自研下拉（select.js 增强出来的触发器 + 浮层，与脱敏页
+               两个多选都是自研下拉（select.js 增强出来的触发器 + 浮层，与模型管理页
                「作用提供商」同一控件），选项在打开弹窗时由 keys-panel.js 灌入：
                  · 可用提供商 = 后端下发的**注册表**摘要（不硬编码 id 清单 ——
                    项目禁止维护第二份 provider 清单，见 account_store 模块头）
@@ -1610,7 +1519,7 @@
   <script src="sms-login.js"></script>
   <script src="add-account.js"></script>
   <!-- 提供商目录：provider 摘要与「作用提供商」写入的唯一前端入口。
-       必须排在所有消费者（desensitize-panel / accounts-groups / logs-panel）之前 -->
+       必须排在所有消费者（accounts-groups / logs-panel）之前 -->
   <script src="providers.js"></script>
   <!-- accounts-groups 必须在 accounts-model 之前：后者按名解构它的判定与分组函数
        （被依赖者先加载）。再往前必须在 providers.js 之后 —— providerSummaries 会问
@@ -1643,7 +1552,6 @@
        排在所有可能调它的面板之前 —— 它只暴露 wbConfirm.ask，点击时才用，
        但先加载让依赖关系一眼可见。 -->
   <script src="confirm-dialog.js"></script>
-  <script src="desensitize-panel.js"></script>
   <script src="logs-panel.js"></script>
   <!-- 请求日志的两块「独立小件」，都必须排在 requests-panel.js 之前：
        · request-hover    列表里重试 / 敏感词两枚标签的悬停面板。requests-panel 在

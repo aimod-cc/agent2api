@@ -12,7 +12,7 @@
 //!               （Node 版这三条确实都没调 checkApiKey）
 //!   `protected` 需鉴权：/api/config、/api/logs*、/api/stats*、/api/retention、
 //!               /api/accounts*、/api/proxies*、
-//!               /api/usage、/api/checkin*、/api/activity/*、/api/desensitize*、
+//!               /api/usage、/api/checkin*、/api/activity/*、/api/sanitize、
 //!               /api/auto-checkin*、/api/update/*、
 //!               /api/session/login/*、/api/session/refresh|logout、/auth/*
 //!
@@ -238,15 +238,15 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/models/custom/remove", post(api::model_manage::remove_custom))
         .route("/api/keys", get(api::keys_api::list_keys).post(api::keys_api::create_key))
         .route("/api/keys/{id}", patch(api::keys_api::update_key).delete(api::keys_api::delete_key))
-        // ── 内容脱敏（对照 workbuddy-desensitize-routes.mjs）──
-        // 八条端点全部走 checkApiKey，所以整组挂 protected。
-        // 用 any(...) 注册三条入口（无尾段 + 尾斜杠 + 通配尾段），方法/路径判定
-        // 交给 api::desensitize::entry —— 与账号路由同一个理由：Node 是
-        // 「前缀命中 → 按 action 逐条判」的结构，拆成独立 axum 路由会让
-        // `/api/desensitize/` 与未知子路径的 404 形状跟 Node 分叉。
-        .route("/api/desensitize", any(api::desensitize::entry))
-        .route("/api/desensitize/", any(api::desensitize::entry))
-        .route("/api/desensitize/{*rest}", any(api::desensitize::entry))
+        // ── 出站指纹脱敏开关 ──
+        // 与 /api/debug 同形的单开关端点（GET 读 / PUT 写），挂 protected：
+        // 它决定出站请求体要不要剥离审核指纹，敏感度与调试模式同级。
+        // 改造前的 /api/desensitize* 八条端点（词表增删改 / 作用角色 / 作用提供商 /
+        // 命中统计 / 远程同步）随词表方案整体删除，只剩这一个开关。
+        .route(
+            "/api/sanitize",
+            get(api::sanitize::get_sanitize).put(api::sanitize::put_sanitize),
+        )
         // ── 定时签到（对照 server.mjs 726-746 行）──
         // 三条都在 Node 的最外层大 try 里，失败走 OpenAI 风格 body（含 run 的
         // 「签到正在执行中，请稍候」）—— 形状由 api::auto_checkin 自己保证。
@@ -263,7 +263,7 @@ pub fn router(state: ServerState) -> Router {
         // 打上游），并触发真打上游的刷新，敏感度与 /api/retention 同级。
         //
         // 三条入口都是 any(...)、方法判定交给 `api::scheduled_tasks::entry` ——
-        // 与 /api/accounts、/api/desensitize 同一取舍：拆成独立 axum 路由会让
+        // 与 /api/accounts 同一取舍：拆成独立 axum 路由会让
         // 「已注册路径 + 未注册方法」变成 405 兜底，而这个前缀下希望统一给 404。
         // 单独登记尾斜杠形态：`/api/scheduled-tasks/` 在 `{*rest}` 里匹配不上
         // （通配要求至少一个非空段），不登记就会落到全局 404。
@@ -283,7 +283,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/update/{*rest}", any(api::update::entry))
         // ── 切片 7 收尾时要知道的事 ─────────────────────────────
         // 管理 API 到此**全部就位**（切片 1-6 覆盖了 health/session/config/logs/
-        // accounts/proxies/billing/chat/desensitize/auto-checkin/update），
+        // accounts/proxies/billing/chat/sanitize/auto-checkin/update），
         // 路由表不再有缺口。切片 7 只需处理打包收尾：
         //   ① 从 package.json / resources 里摘掉旧的 node 后端产物
         //      （server.cjs + node.exe 的随包分发），确认 tauri.conf.json 的
@@ -543,10 +543,9 @@ pub fn parse_body(bytes: &[u8]) -> Result<Value, errors::GatewayError> {
 /// 都得到 `Some("")`）—— 调用方若要按空值走另一条分支，自己 `filter` 一下，
 /// 这也正是 `accounts_usage` 取 `id` 时的写法。
 ///
-/// 为什么提到 HTTP 层：`/api/update` 的 `current`、`/api/desensitize` 的 `term`
-/// 与本条各有一份私有实现，三者口径必须一致（都对应 JS 的 `URLSearchParams`），
-/// 各写一份迟早会漂。既有的两份私有实现保持原样未动（避免顺手改动已交付路径），
-/// 新代码请用这个。
+/// 为什么提到 HTTP 层：`/api/update` 的 `current` 与本条各有一份私有实现，
+/// 两者口径必须一致（都对应 JS 的 `URLSearchParams`），各写一份迟早会漂。
+/// 既有的那份私有实现保持原样未动（避免顺手改动已交付路径），新代码请用这个。
 pub fn query_param(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         let (name, value) = match pair.split_once('=') {

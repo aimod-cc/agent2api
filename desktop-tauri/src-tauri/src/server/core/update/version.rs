@@ -217,9 +217,8 @@ pub fn pick_installer(assets: Option<&Value>) -> Option<Value> {
 
 /// JS `String.prototype.trim` 的空白集合 = White_Space ∪ {U+FEFF}。
 ///
-/// 与 `core::desensitize` 里那份实现规则相同，但那个函数是模块内可见
-/// （`pub(super)`），跨模块拿不到；这里为 safe_file_name 的 `.trim()` 复制一份。
-/// 规则只有一行，重复的代价小于把它提升成全局公共设施。
+/// 这里为 safe_file_name 的 `.trim()` 复制一份：规则只有一行，重复的代价
+/// 小于把它提升成全局公共设施（项目里另有几处同款实现，各自模块内可见）。
 fn js_trim(value: &str) -> &str {
     value.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
 }

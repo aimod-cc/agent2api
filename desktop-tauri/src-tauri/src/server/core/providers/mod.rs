@@ -237,7 +237,7 @@ pub const DEFAULT_PROVIDER_ID: &str = "workbuddy";
 ///      match 会先报编译错，提醒把这张表与这里一起更新。
 ///
 /// 调用方对 `None` 的处理（W4a 已逐个核查，见各文件的注释）：
-///   - **校验路径**（`api::desensitize::validate_providers`、
+///   - **校验路径**（网关 Key 的可用提供商校验、
 ///     `api::config_api::parse_provider_route`）→ 400「未知的提供商」，本就如此；
 ///   - **容错路径**（`config.rs` 的优先级表解析、`catalog.rs` 的 `all_kinds`）
 ///     → `filter_map` 跳过该项（回落注册表默认值 / 不进候选链），不 panic；

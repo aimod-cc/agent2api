@@ -47,8 +47,8 @@
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  /* 表格化：横向也允许滚动。表格有最小宽度（760px，见 page-accounts-table.css），
-     更窄时按列宽原样横滚，而不是把列压窄 —— 压缩会把「设为首选」折成两行。
+  /* 表格化：横向也允许滚动。表格有最小宽度（900px，见 page-accounts-table.css），
+     更窄时按列宽原样横滚，而不是把列压窄 —— 压缩会把操作列里的按钮折成两行。
      卡片时代这里是 overflow-x: hidden（卡片网格自己会换行，不需要横滚）。 */
   overflow-x: auto;
   /* 常驻预留滚动条槽：有无滚动条时列表区宽度一致，列数不会跳变 */
