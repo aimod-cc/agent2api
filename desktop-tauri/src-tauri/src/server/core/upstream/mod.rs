@@ -214,6 +214,14 @@ pub(super) struct RouteTarget {
     pub account: Option<Value>,
     pub proxy: Option<ResolvedProxy>,
     pub priority: Option<i64>,
+    /// 选路阶段的提示（目前只有「账号代理不可用、本次回退直连」）。
+    ///
+    /// ── 为什么由选路层带到转发层，而不是当场打一行日志 ──────────
+    /// 它是**逐请求**的事实（代理配错的账号上，每一条请求都会发生一次），
+    /// 改造前按请求往运行日志里灌一行 —— 用户看到的是刷屏，而请求日志那边
+    /// 又看不到「这条请求其实是直连出去的」。带到这里之后，转发层把它记进
+    /// **本轮尝试明细**的 `notice`，请求日志一次悬停就能看到，运行日志不再写。
+    pub proxy_notice: Option<String>,
 }
 
 impl UpstreamService {
@@ -313,7 +321,11 @@ impl UpstreamService {
         let Some(signal) = signal else {
             return;
         };
-        logging::log("[Upstream]", "⏳ 检测到相同请求正在处理，排队等待（防重试风暴）");
+        // 只在终端：这是**网关内部的排队协调**（相同 body 的请求撞在一起），
+        // 不是转发结果 —— 请求日志那边没有它的落点（等待发生在选路之前，
+        // 那时还没有任何尝试明细可挂），所以它既不进请求日志、也不再进运行
+        // 日志页，只在终端留一行供排障时确认「这条请求为什么慢」。
+        logging::console_line("[Upstream]", "⏳ 检测到相同请求正在处理，排队等待（防重试风暴）");
         // 先注册等待、再检查完成标志：notify_waiters 只唤醒「当时已登记」的
         // 等待者，这个顺序保证「置位在前」与「置位在后」两种情况都不会漏
         let mut notified = std::pin::pin!(signal.signal.notified());
@@ -453,7 +465,10 @@ impl Stream for ForwardStream {
                     }
                     let detail = crate::server::core::egress::describe_error_detail(&error);
                     let message = format!("上游流中断: {detail}");
-                    logging::log("[Model]", &format!("❌ {message}"));
+                    // 只在终端：这条原因由下面的 `note_error` 进请求日志
+                    // （客户端此时已收到部分内容，HTTP 状态早就是 200，
+                    // 只有请求日志的「错误」列能解释「为什么这条是失败的」）。
+                    logging::console_line("[Model]", &format!("❌ {message}"));
                     // 旁路记账：断流原因要进请求日志（客户端此时已收到部分内容，
                     // HTTP 状态早就是 200，只有这里能解释「为什么这条是失败的」）
                     self.telemetry.note_error(&message);

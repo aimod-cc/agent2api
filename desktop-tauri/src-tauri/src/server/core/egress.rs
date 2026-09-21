@@ -250,6 +250,10 @@ pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
     }
     // ② 未命中才构造（锁外，可能阻塞）
     let client = Arc::new(build_client(proxy).unwrap_or_else(|error| {
+        // 这条**保留在运行日志**（不像同类的「账号代理不可用」那样进请求日志）：
+        // 它每个出口缓存条目最多触发一次 —— 构造失败的兜底 Client 也会被缓存
+        // （见下面 ③），后续请求直接命中缓存、不再走到这里，所以条数**不随
+        // 请求量增长**。判据与其它日志一致：看它的条数会不会跟着请求一起涨。
         logging::log("[Upstream]", &format!("⚠️ {error}，本次回退直连"));
         // 构造失败的兜底客户端：TLS 后端初始化都失败时没有别的退路，
         // 只能返回一个「请求时才报错」的客户端。Client::new() 几乎不会失败。

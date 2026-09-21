@@ -4,13 +4,26 @@
 /**
  * 「请求日志」页里那两枚标签的**悬停面板**：重试链与敏感词命中。
  *
+ * ── 这一块为什么是「逐请求日志的唯一去处」（本次改造）────────────
+ * 改造前，一次转发的过程事实散在两个页面：换号顺延、退避重试、401 刷新、
+ * 限额降级、上游报错、代理回退各自往**运行日志**写一行（有的按请求刷屏），
+ * 而请求日志这边只能看到「换了几次号」与最后一次的结果。现在这些事实全部
+ * 收进尝试明细（`attemptDetails` 的 `account` / `retries` / `notice`），
+ * 本模块负责把它们渲染出来 —— 于是排障时**只看这一处**就够：
+ *   · 谁承载了每一轮（提供商 + 账号）
+ *   · 每一轮成没成、失败原因
+ *   · 每一轮内部退避重试了几次、每次为什么、等了多久
+ *   · 出口有没有降级（代理不可用 → 直连）
+ *   · 配合「详情」列的调试报文，敏感词场景下能看到完整的请求与响应原文
+ *     （这正是「有敏感词时在运行日志里看不全」的解法：报文归请求日志）
+ *
  * ── 为什么单独成文件 ──────────────────────────────────────────
  * 与 tooltip.js / select.js 同一类东西：一块自洽的浮层交互（定位、翻转、
  * 事件、生命周期）。但**不复用 tooltip.js**，因为它的契约是纯文本 ——
  * `bubble.textContent = text`，内容来自 `data-tip` 属性。这里要弹的是一份
- * 结构化的富文本（切换路径一串箭头、每次尝试一行、故障行红字、成功行绿字、
- * 敏感词是「词 × 次数」的列表），塞进属性会被 HTML 转义成一堆源码，
- * 用户看到的是标签而不是面板。
+ * 结构化的富文本（切换路径一串箭头、每次尝试一行、重试子行、故障行红字、
+ * 成功行绿字、敏感词是「词 × 次数」的列表），塞进属性会被 HTML 转义成
+ * 一堆源码，用户看到的是标签而不是面板。
  *
  * 另一条路是给 tooltip.js 加一个「HTML 内容」开关，但那会让一个被全站几十处
  * `data-tip` 依赖的公共组件多出一条**安全上更敏感**的路径（`innerHTML`）——
@@ -18,7 +31,9 @@
  * 浮层，与 OmniProxy 的 `FailoverTip` / `SensitiveMaskedTag` 一一对应。
  *
  * ── 与 requests-panel.js 的分工 ────────────────────────────────
- *   · 本文件      内容 HTML 的构造（`chainHtml` / `sensitiveHtml`）+ 浮层机制
+ *   · 本文件      内容 HTML 的构造（`chainHtml` / `retryRowsHtml` /
+ *                 `sensitiveHtml`）+ 浮层机制 + 「标签该不该出现」的判据
+ *                 （`hasProcessFacts`，因为那要读明细内部的字段）
  *   · 请求日志页  只负责渲染那两枚标签，并把「怎么从标签反查数据」告诉本模块
  *                 （`bind({ host, entryOf })`）
  * 反查而不是把数据塞进 `data-*`：一次尝试明细可达 24 条、错误摘要 200 字符，
@@ -82,12 +97,34 @@
   /** 一次尝试的明细数组（后端字段是 attemptDetails；旧行没有该键 → 空表） */
   const detailsOf = entry => (Array.isArray(entry?.attemptDetails) ? entry.attemptDetails : []);
 
+  /** 一次尝试内部的退避重试数组（旧明细没有该键 → 空表） */
+  const retriesOf = item => (Array.isArray(item?.retries) ? item.retries : []);
+
+  /**
+   * 这条请求是否有**值得展示的过程事实**（决定「重试」那枚标签显不显示）。
+   *
+   * ── 判据为什么不是 `attempts > 1`（本次改造）─────────────────
+   * `attempts` 只数**账号轮换**（口径见后端 `TelemetrySnapshot::attempts`），
+   * 而同账号内的退避重试（11128 敏感词拦截、瞬时 5xx、传输层失败、401 刷新）
+   * 不计入它 —— 一次被 11128 拦下、重试 3 次后成功的请求，`attempts` 仍是 1。
+   * 改造前这类请求在列表里**连标签都不出现**（而运行日志那边刷了 3 行），
+   * 用户只能去「日志」页看。现在重试链进了明细，判据要跟着扩成「换过号
+   * **或**重试过**或**有过提示」，否则新采集到的重试信息永远显示不出来。
+   *
+   * 敏感词命中不在这里判：它是同一列里另一枚标签（`sensitiveHits`）的事，
+   * 两者各自独立出现（见 requests-panel.js 的 retryCell）。
+   */
+  function hasProcessFacts(entry) {
+    if ((Number(entry?.attempts) || 1) > 1) return true;
+    return detailsOf(entry).some(item => retriesOf(item).length > 0 || item?.notice);
+  }
+
   /**
    * 切换路径行：`A → B → C`。
    *
    * **只在真实发生过 ≥2 次尝试时显示**（与 OmniProxy 同判据）：只有一次尝试时
    * 那串箭头就是「A → 成功」，没有信息量；而这一列的标签本来就只在
-   * `attempts > 1` 时出现，所以这条判据主要是防「明细比 attempts 短」的边界
+   * 有过程事实时出现，所以这条判据主要是防「明细比 attempts 短」的边界
    * （截断、或部分尝试没采到）。
    */
   function chainHtml(details) {
@@ -98,7 +135,43 @@
   }
 
   /**
-   * 单次尝试的一行：`尝试 N · 提供商 → 成功(200) / 失败(500)：错误摘要`。
+   * 一次尝试内部的退避重试子行：`↻ 重试 N 次` + 逐条原因。
+   *
+   * 挂在它所属的那一行尝试下面（缩进），而不是作为并列的尝试行 —— 它们是
+   * **同一轮账号内**的重发（换的是时间不是账号），并列会让「切换路径」那串
+   * 箭头里混进一串同名项，把真正的换号链埋掉（口径见后端 `AttemptDetail::retries`）。
+   *
+   * 逐条文案：`第 n 次 · 原因（HTTP 状态码，无则省略） · 等 Xs`。
+   */
+  function retryRowsHtml(item) {
+    const retries = retriesOf(item);
+    if (!retries.length) return '';
+    const head = `<div class="rh-retry-head">↻ 重试 ${retries.length} 次</div>`;
+    const rows = retries.map((retry, index) => {
+      const reason = String(retry?.reason ?? '').trim();
+      const status = Number(retry?.status);
+      const hasStatus = retry?.status !== null && retry?.status !== undefined
+        && Number.isFinite(status);
+      const delayMs = Number(retry?.delayMs);
+      const delay = Number.isFinite(delayMs) && delayMs > 0
+        ? `，等 ${esc(formatDelay(delayMs))}`
+        : '';
+      return `<div class="rh-retry-row"><span class="rh-no">第 ${index + 1} 次 ·</span>`
+        + `<span class="rh-retry-why">${esc(reason || '未知原因')}</span>`
+        + (hasStatus ? `<span class="rh-retry-status">HTTP ${esc(String(status))}</span>` : '')
+        + (delay ? `<span class="rh-dim">${delay}</span>` : '')
+        + '</div>';
+    }).join('');
+    return `<div class="rh-retry">${head}${rows}</div>`;
+  }
+
+  /** 退避时长的可读形态（秒；不足 1 秒给毫秒） */
+  function formatDelay(ms) {
+    return ms >= 1000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms)}ms`;
+  }
+
+  /**
+   * 单次尝试的一行：`尝试 N · 提供商（账号）→ 成功(200) / 失败(500)：错误摘要`。
    *
    * 三种结局的判据与颜色：
    *   · `error` 非空         → 失败（红），带状态码（可能没有：传输层失败）
@@ -106,25 +179,35 @@
    *   · 两者都无             → 未定论（淡灰）。只在「这一轮还在飞」时出现，
    *     而列表里看到的行都是已收尾的，所以它几乎只会来自被手工改过的库；
    *     给一个中性文案而不是猜成功/失败。
+   *
+   * 账号名（`item.account`）挂在提供商名后面：一家可以有多个账号，
+   * 「WorkBuddy / aibjchat001@gmail.com」比只有家名更能定位到那一轮
+   * （改造前这个信息只在运行日志的「按队列顺延」那行里，请求日志看不到）。
+   *
+   * 下面还跟着这一轮的重试子行与提示行（有才显示）。
    */
   function attemptRowHtml(item, index) {
     const name = providerLabel(item?.provider);
+    const account = String(item?.account ?? '').trim();
     const status = Number(item?.status);
     const hasStatus = item?.status !== null && item?.status !== undefined && Number.isFinite(status);
     const error = item?.error ? String(item.error) : '';
     // 序号从 1 起（后端明细数组本身就是发生顺序，不需要另存 attempt_no）
     const head = `<span class="rh-no">尝试 ${index + 1} ·</span>`
       + `<span class="rh-who">${esc(name || '未知')}</span>`
+      + (account ? `<span class="rh-account">${esc(account)}</span>` : '')
       + '<span class="rh-arrow">→</span>';
-    if (error) {
-      return `<div class="rh-row">${head}<span class="rh-bad">失败${
-        hasStatus ? `（${esc(String(status))}）` : ''}：${esc(error)}</span></div>`;
-    }
-    if (hasStatus) {
-      return `<div class="rh-row">${head}<span class="rh-ok">成功（${esc(String(status))}）</span></div>`;
-    }
-    // 有状态码之外的最后一种：状态码缺失且没有错误摘要（见上面「未定论」）
-    return `<div class="rh-row">${head}<span class="rh-dim">无结果记录</span></div>`;
+    const notice = String(item?.notice ?? '').trim();
+    const extras = (notice ? `<div class="rh-notice">⚠️ ${esc(notice)}</div>` : '')
+      + retryRowsHtml(item);
+    const body = error
+      ? `<span class="rh-bad">失败${
+        hasStatus ? `（${esc(String(status))}）` : ''}：${esc(error)}</span>`
+      : hasStatus
+        ? `<span class="rh-ok">成功（${esc(String(status))}）</span>`
+        // 有状态码之外的最后一种：状态码缺失且没有错误摘要（见上面「未定论」）
+        : '<span class="rh-dim">无结果记录</span>';
+    return `<div class="rh-row">${head}${body}</div>${extras}`;
   }
 
   /**
@@ -335,9 +418,14 @@
   bindGlobal();
 
   window.wbRequestHover = {
-    // 只导出宿主需要的那两个入口；内容构造函数保持私有（宿主要显示什么，
-    // 由标签上的 data-req-hover 决定，不必也不该由它拼 HTML）
+    // 只导出宿主需要的入口；内容构造函数保持私有（宿主要显示什么，
+    // 由标签上的 data-req-hover 决定，不必也不该由它拼 HTML）。
+    //
+    // `hasProcessFacts` 是唯一一个**给宿主用的判断**：那枚「重试」标签显不显示
+    // 由它回答 —— 判据（换过号 **或** 重试过 **或** 有提示）需要读明细内部
+    // 的字段，让宿主自己拼一遍就会有两份判据（见它的说明）。
     bind,
     close,
+    hasProcessFacts,
   };
 })();

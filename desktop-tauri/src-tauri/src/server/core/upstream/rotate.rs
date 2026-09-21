@@ -97,6 +97,7 @@ pub(super) async fn select_target_account(
             account: None,
             proxy: None,
             priority: None,
+            proxy_notice: None,
         });
     }
 
@@ -159,6 +160,7 @@ pub(super) async fn select_target_account(
         account: None,
         proxy: None,
         priority: None,
+        proxy_notice: None,
     })
 }
 
@@ -180,31 +182,35 @@ pub(super) fn accounts_in_providers(service: &UpstreamService, providers: &[&str
         .collect()
 }
 
-/// 组装选路结果；代理解析失败时记一条日志（本次回退直连）
+/// 组装选路结果；代理解析失败时把提示**带进选路结果**（本次回退直连）。
+///
+/// ── 提示为什么是返回值的一部分而不是当场打日志 ────────────────
+/// 改造前这里直接 `logging::log` 一行运行日志。那是**逐请求**的事实：代理配错
+/// 的账号上每条请求都会刷一行，而请求日志那边看不到「这次其实是直连的」。
+/// 现在把文案挂在 `RouteTarget::proxy_notice` 上，由转发层记进本轮尝试明细
+/// （见那个字段的说明），运行日志不再写。
+///
+/// 两个来源合并成一条文案：账号存储里记的 `proxyError`（上次解析失败的原因）
+/// 与本次现场解析失败的原因。**后者优先** —— 它说明的是「这次为什么直连」，
+/// 而 `proxyError` 可能是更早的旧状态。
 pub(super) fn with_proxy_notice(
     account: Value,
     proxy: Value,
     proxy_error: Option<String>,
     account_id: String,
 ) -> RouteTarget {
-    if let Some(proxy_error) = proxy_error.as_deref() {
-        logging::log(
-            "[Upstream]",
-            &format!(
-                "⚠️ 账号「{}」代理不可用，本次直连: {proxy_error}",
-                account_display(&account)
-            ),
-        );
-    }
+    let mut notice = proxy_error.map(|error| {
+        format!(
+            "账号「{}」代理不可用，本次直连: {error}",
+            account_display(&account)
+        )
+    });
     let resolved = match ResolvedProxy::from_json(&proxy) {
         Ok(proxy) => proxy,
         Err(reason) => {
             // 会话里的 proxy 由账号存储解析过（成功才会带过来），
-            // 这里失败说明数据在两次读盘之间变了：按直连兜底并记一条
-            logging::log(
-                "[Upstream]",
-                &format!("⚠️ 账号代理不可用（{reason}），本次回退直连"),
-            );
+            // 这里失败说明数据在两次读盘之间变了：按直连兜底
+            notice = Some(format!("账号代理不可用（{reason}），本次回退直连"));
             None
         }
     };
@@ -214,6 +220,7 @@ pub(super) fn with_proxy_notice(
         priority: priority_of(&account),
         account: Some(account),
         proxy: resolved,
+        proxy_notice: notice,
     }
 }
 

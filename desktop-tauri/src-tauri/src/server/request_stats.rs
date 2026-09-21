@@ -85,7 +85,7 @@ use report::{
 };
 
 pub use record::{
-    AttemptDetail, NewRequestEntry, RequestEntry, RequestQuery, Retention, SensitiveHit,
+    AttemptDetail, NewRequestEntry, RequestEntry, RequestQuery, Retention, RetryEvent, SensitiveHit,
     DEFAULT_LIMIT, MAX_LIMIT,
 };
 

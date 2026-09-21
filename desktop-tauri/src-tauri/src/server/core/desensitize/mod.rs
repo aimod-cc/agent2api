@@ -526,7 +526,11 @@ impl Desensitizer {
         let mut processed = body.clone();
         let outcome = self.process_body(&mut processed);
         if outcome.changed {
-            logging::log("[Desensitize]", &hit_log_line(&outcome));
+            // 只在**终端**留痕：命中明细已经跟着这条请求进了请求日志
+            // （`sensitiveHits` → 「重试」列里的「敏」标签，悬停逐词看次数），
+            // 运行日志页因此不再为每一次命中写一行（改造前那一行是
+            // 「日志」页唯一的命中视图，现在有了更直接的去处）。
+            logging::console_line("[Desensitize]", &hit_log_line(&outcome));
         }
         Some(ProcessedBody {
             body: processed,

@@ -34,7 +34,9 @@ use crate::server::core::providers::catalog::{
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::errors::GatewayError;
 use crate::server::logging;
-use crate::server::request_stats::{AttemptDetail, NewRequestEntry, RequestStats, SensitiveHit};
+use crate::server::request_stats::{
+    AttemptDetail, NewRequestEntry, RequestStats, RetryEvent, SensitiveHit,
+};
 use crate::server::ServerState;
 
 /// 调试落盘的目录名与文件名（Node 版 `join(CONFIG_DIR, 'debug', ...)`）
@@ -350,8 +352,9 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     entry.upstream_model = snapshot.upstream_model;
     // 两个明细字段（本次改造）：都是「有采集才有值」的旁路数据，采集点在
     // 转发链路上（`core::upstream::usage` 槽），这里只负责搬运。
-    //   · attemptDetails：每次上游尝试的（provider / 状态码 / 错误摘要），
-    //     请求日志「重试」列的弹层显示它；转发前就失败的请求没有它（空表）。
+    //   · attemptDetails：每次上游尝试的（provider / 账号 / 状态码 / 错误摘要
+    //     / 本轮内部的退避重试 / 提示），请求日志「重试」列的弹层显示它；
+    //     转发前就失败的请求没有它（空表）。
     //   · sensitiveHits：本次命中的敏感词与次数，同一列的紫色标签显示它。
     // 存储层的两个类型与采集侧**各自定义、当前同形**（见 `RequestEntry` 的
     // 注释），所以这里逐字段转一次 —— 不做 `From` impl 是为了让两处结构能
@@ -362,8 +365,19 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
         .into_iter()
         .map(|item| AttemptDetail {
             provider: item.provider,
+            account: item.account,
             status: item.status,
             error: item.error,
+            retries: item
+                .retries
+                .into_iter()
+                .map(|retry| RetryEvent {
+                    reason: retry.reason,
+                    status: retry.status,
+                    delay_ms: retry.delay_ms,
+                })
+                .collect(),
+            notice: item.notice,
         })
         .collect();
     entry.sensitive_hits = snapshot

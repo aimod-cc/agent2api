@@ -191,9 +191,14 @@ pub struct RequestEntry {
     /// 展示位置：请求日志「重试」列里的紫色标签（悬停看命中词），与 OmniProxy
     /// 的 `SensitiveMaskedTag` 同形。命中**不再**在「日志」页展示 —— 改造前那
     /// 边靠 `[Desensitize] 已脱敏命中…` 那行应用日志间接呈现（见 logs-panel
-    /// 的模块头），现在逐条请求有了直接落点，日志页那层间接展示整体移除；
-    /// 应用日志那一行本身**仍然保留**，它是排障时的实时记录，与请求日志的
-    /// 用途不同（一个回答「刚才发生了什么」，一个回答「这条请求命中了什么」）。
+    /// 的模块头），现在逐条请求有了直接落点，日志页那层间接展示整体移除。
+    ///
+    /// ── 那行应用日志本身也一起降级了（逐请求日志收敛）────────────
+    /// 上一版保留它当「排障时的实时记录」，本次改造把它也改成只写**终端**
+    /// （`console_line`）：它的条数跟着请求量涨，而内容（命中词 × 次数）
+    /// 这里一字不少地存着 —— 两个通道说同一件事时，逐请求的那个不该再进
+    /// 运行日志页。要排查「上游因为敏感词拒绝了这条请求」，看本字段 + 调试
+    /// 模式的原始报文（请求日志的「详情」列）比看那行日志更完整。
     #[serde(rename = "sensitiveHits", default)]
     pub sensitive_hits: Vec<SensitiveHit>,
 }
@@ -218,17 +223,46 @@ pub struct SensitiveHit {
 /// `provider` 空串表示「这一轮没记下承载者」—— 采集侧保证它非空
 /// （`note_attempt_started` 的入参就是 provider_id），所以空串只可能来自
 /// 手工改过的库，展示层照常给占位文案。
+///
+/// ── `account` / `retries` / `notice` 是 schema v3 之前就有的吗 ──────
+/// 不是：它们与 `account` 一起在「逐请求日志收敛」这次改造里加入，仍走
+/// `attemptDetails` 那个 **JSON 文本列**，所以**不需要动数据库 schema**
+/// （列本身早就存在，加的是 JSON 内部的键）。旧行的 JSON 里没有这三个键，
+/// `default` 读成空串 / 空表 / None，展示层一视同仁地不渲染那几行。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttemptDetail {
     /// 这一轮实际发送的 provider id
     #[serde(default)]
     pub provider: String,
+    /// 这一轮承载的账号展示名（空串 = 该轮没有账号记录）
+    #[serde(default)]
+    pub account: String,
     /// 这一轮的 HTTP 状态码（None = 未定论或传输层失败，见采集侧的说明）
     #[serde(default)]
     pub status: Option<i64>,
     /// 这一轮的失败摘要（成功时为 None）
     #[serde(default)]
     pub error: Option<String>,
+    /// 这一轮**内部**的退避重试（空表 = 没重试过，见采集侧的说明）
+    #[serde(default)]
+    pub retries: Vec<RetryEvent>,
+    /// 这一轮的提示（目前只有代理回退直连）
+    #[serde(default)]
+    pub notice: Option<String>,
+}
+
+/// 一次尝试内部的退避重试（存储契约，与采集侧同形各自定义）。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RetryEvent {
+    /// 重试原因
+    #[serde(default)]
+    pub reason: String,
+    /// 触发重试的 HTTP 状态码（None = 传输层失败）
+    #[serde(default)]
+    pub status: Option<i64>,
+    /// 退避时长（毫秒）
+    #[serde(rename = "delayMs", default)]
+    pub delay_ms: u64,
 }
 
 /// `attempts` 的 serde 默认值（载入缺该字段的旧行时按 1 次算）
@@ -414,8 +448,26 @@ impl NewRequestEntry {
                 .into_iter()
                 .map(|item| AttemptDetail {
                     provider: item.provider.trim().to_string(),
+                    // 账号名 trim 的理由与 provider 相同（空白不该造出一个
+                    // 「看起来不同的名字」）；空串语义 = 该轮没有账号记录
+                    account: item.account.trim().to_string(),
                     status: item.status,
                     error: item.error.filter(|text| !text.is_empty()),
+                    // 重试链：reason 为空的项丢弃（同敏感词的 word 空项 ——
+                    // 「重试了但不知道为什么」对读侧没有价值，只会多一行噪音），
+                    // delay_ms 的负数（手改的库）夹成 0
+                    retries: item
+                        .retries
+                        .into_iter()
+                        .filter(|retry| !retry.reason.trim().is_empty())
+                        .map(|retry| RetryEvent {
+                            reason: retry.reason.trim().to_string(),
+                            status: retry.status,
+                            delay_ms: retry.delay_ms,
+                        })
+                        .collect(),
+                    // notice 空串收敛成 None，理由同 error
+                    notice: item.notice.filter(|text| !text.is_empty()),
                 })
                 .collect(),
             sensitive_hits: self

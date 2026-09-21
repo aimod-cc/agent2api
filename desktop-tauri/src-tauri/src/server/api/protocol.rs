@@ -206,7 +206,9 @@ pub async fn responses_endpoint(
         }
         Err(error) => {
             let message = error.message.clone();
-            logging::log("[Model]", &format!("❌ {message}"));
+            // 只在终端：`error_response` 会把同一条 message 记进请求日志
+            // （见 `api::chat` 同名分支的说明）。
+            logging::console_line("[Model]", &format!("❌ {message}"));
             error_response(context, &error, |status, error| {
                 let code = anthropic::responses_error_code(status);
                 GatewayError::with_status(i32::from(status), error.message.clone())
@@ -306,7 +308,9 @@ pub async fn messages_endpoint(
         }
         Err(error) => {
             let message = error.message.clone();
-            logging::log("[Model]", &format!("❌ {message}"));
+            // 只在终端：`error_response` 会把同一条 message 记进请求日志
+            // （见 `api::chat` 同名分支的说明）。
+            logging::console_line("[Model]", &format!("❌ {message}"));
             error_response(context, &error, |status, error| {
                 anthropic_error_response_with_status(status, &error.message)
             })

@@ -190,17 +190,24 @@
   }
 
   /**
-   * 重试列：上游尝试链（`attempts`）+ 敏感词命中（`sensitiveHits`）。
+   * 重试列：上游尝试链 + 过程事实（`attemptDetails`）+ 敏感词命中（`sensitiveHits`）。
    *
    * ── 这一列现在承载两件事（本次改造）──────────────────────────
    * 改造前这里只是一个「重试」标记（`attempts > 1` 时出现），敏感词命中在
    * 「日志」页由 `[Desensitize]` 那类应用日志间接呈现 —— 两处都只说「发生过」，
    * 不说「发生了什么」。现在两者都收敛到这一列，并各自带一个悬停面板：
-   *   · 橙标签 → 切换路径 + 每次尝试的（提供商 → 成功/失败 · 状态码 · 错误）
+   *   · 橙标签 → 切换路径 + 每次尝试的（提供商 · 账号 → 成功/失败 · 状态码 ·
+   *     错误）+ 每轮内部的退避重试 + 提示（代理回退等）
    *   · 紫标签 → 命中的词 × 次数
    * 形态照 OmniProxy 的 `FailoverTip` / `SensitiveMaskedTag`（同一列里两枚
    * 标签，各自挂自己的弹层 —— 那边特意**不**把整格包一层 Tooltip，
    * 否则两枚标签的弹层会互相嵌套、悬停时同时弹出）。
+   *
+   * ── 橙标签的判据是 `hasProcessFacts`，不是 `attempts > 1`（本次改造）──
+   * `attempts` 只数账号轮换，同账号内的退避重试不计入它 —— 一次被 11128
+   * 敏感词拦截、重试 3 次后成功的请求 `attempts` 仍是 1，改造前这类请求
+   * **连标签都不出现**（而运行日志那边刷了 3 行，这正是要收敛掉的东西）。
+   * 判据与文案的完整说明见 request-hover.js 的 `hasProcessFacts`。
    *
    * ── 敏感词标签为什么只写一个「敏」字（本次改造）──────────────
    * 表头已经收窄成「重试」（见 REQ_HEAD 的说明），这一列只有 52px 宽：
@@ -223,10 +230,18 @@
     const attempts = Number(entry.attempts) || 1;
     const key = rowKey(entry);
     const tags = [];
-    if (attempts > 1) {
+    // 判据交给 request-hover（它要读明细内部的字段）。兜底成 `attempts > 1`：
+    // 万一那个模块没就绪，至少换过号的请求仍能显示标签（旧行为），
+    // 而不是整列静默变空。
+    const showChain = window.wbRequestHover?.hasProcessFacts?.(entry) ?? attempts > 1;
+    if (showChain) {
+      // 标签文案带次数：换过号时 `attempts` 就是轮数；没换号只有重试时，
+      // 那个数字来自重试链（两者都读不到时退回不带次数）。
+      const count = attempts > 1 ? attempts : countRetries(entry);
       tags.push(`<button type="button" class="badge tag warn req-hover-tag"`
         + ` data-req-hover="chain" data-req-id="${esc(key)}"`
-        + ` title="查看每次尝试的提供商与结果">重试 ${attempts}</button>`);
+        + ` title="查看每次尝试的提供商、账号与重试原因">`
+        + `重试${count > 1 ? ` ${count}` : ''}</button>`);
     }
     // 敏感词命中：判据是「命中表非空」（后端 sensitiveHits 字段）。
     // 不用 attempts 那类计数 —— 命中是这条请求的属性，与重试次数无关
@@ -238,6 +253,20 @@
     }
     if (!tags.length) return '<span class="req-none">-</span>';
     return `<span class="req-retry">${tags.join('')}</span>`;
+  }
+
+  /**
+   * 这条请求里所有尝试明细的内部重试总次数（没有明细时为 0）。
+   *
+   * 只用于标签上的那个数字：`attempts > 1` 时优先用 `attempts`（那是换号轮数，
+   * 与「切换路径」那串箭头长度一致），否则用本函数 —— 一次 11128 拦截重试
+   * 3 次而没换号的请求，标签显示「重试 3」而不是光秃秃一个「重试」。
+   */
+  function countRetries(entry) {
+    const details = Array.isArray(entry?.attemptDetails) ? entry.attemptDetails : [];
+    return details.reduce((sum, item) => (
+      sum + (Array.isArray(item?.retries) ? item.retries.length : 0)
+    ), 0);
   }
 
   /**

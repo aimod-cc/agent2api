@@ -187,14 +187,33 @@ pub struct SensitiveHit {
 
 /// 单次上游尝试的明细（`TelemetrySnapshot::attempts_detail` 的元素）。
 ///
-/// 字段刻意取窄：前端弹层要显示的就这三样（谁 → 成没成 → 为什么）。
+/// 字段刻意取窄：前端弹层要显示的就这几样（谁 → 成没成 → 为什么）。
 /// 不记时间戳与耗时：那是「每次尝试各花了多久」的另一个问题，转发链路上
 /// 没有现成的分段计时，为它加钩子要动 `send_with_retry` 的每一层 ——
 /// 收益不抵改动面（总耗时与首响已经在明细里给出）。
+///
+/// ── `account` / `retries` / `notice` 为什么在这里（逐请求日志收敛）──
+/// 改造前这三样各自在**运行日志**里打一行：「账号 X 转发失败按队列顺延」
+/// 带账号名、「5 秒后重试（第 n/N 次）」带退避次数、「账号代理不可用，本次
+/// 直连」带出口回退。它们全是**逐请求**的事实，却只能去「日志」页看，
+/// 而请求日志页的同一行请求那里恰好缺这几样（弹层里只有 provider）。
+/// 收进明细后，请求日志的一行 + 一次悬停就能回答「换了谁、每轮重试了几次、
+/// 为什么重试、出口有没有降级」，运行日志不再需要为每一次转发写行。
+///
+/// 三者都是**有采集才有值**：旧行没有这些键，`default` 读成空/None，
+/// 展示层对空值与旧数据一视同仁（不显示那一行），不给旧数据猜值。
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AttemptDetail {
     /// 这一轮实际发送的 provider id
     pub provider: String,
+    /// 这一轮承载的**账号展示名**（账号名 → 会话昵称 → 账号 id 的兜底链，
+    /// 与 `note_attempt` 给 `account_name` 的口径完全一致）。
+    ///
+    /// 与 `provider` 并列而不是替代它：一家可以有多个账号，弹层里
+    /// 「WorkBuddy / aibjchat001@gmail.com」比只有家名更能定位到那一轮。
+    /// 空串 = 该轮没有账号记录（用默认登录态转发），展示层给占位文案。
+    #[serde(default)]
+    pub account: String,
     /// 这一轮的 HTTP 状态码。
     ///
     /// `None` = 还在飞（请求尚未收尾，例如正在流式下发）或传输层失败
@@ -208,6 +227,45 @@ pub struct AttemptDetail {
     /// 显示完整的一串（A → B → C），最后那个成功的 C 正是读者要找的答案。
     #[serde(default)]
     pub error: Option<String>,
+    /// 这一轮**内部**的退避重试（`[{reason, status, delayMs}]`，按发生顺序）。
+    ///
+    /// ── 为什么挂在明细里而不是追加新的明细 ────────────────────
+    /// 同账号内的退避重发**不算一次新尝试**（口径见 `TelemetrySnapshot::attempts`
+    /// 的说明：`attempts` 回答「换了几个账号」，不是「打了几次上游」）。
+    /// 若为它追加明细，弹层里的「切换路径」就会多出一串同名同账号的项，
+    /// 把真正的换号链埋掉。所以它作为**那一轮的下级事件**存在这里。
+    ///
+    /// 空表 = 这一轮没有重试（绝大多数请求）。
+    #[serde(default)]
+    pub retries: Vec<RetryEvent>,
+    /// 这一轮的**提示**（非失败、但值得记一笔的过程事实）。
+    ///
+    /// 目前只有一种来源：账号代理不可用、本次回退直连（改造前是
+    /// `[Upstream] ⚠️ 账号代理不可用…` 那行运行日志）。它是**每一条**用该
+    /// 账号的请求都会发生的事，正因如此更不该按请求往运行日志里灌。
+    #[serde(default)]
+    pub notice: Option<String>,
+}
+
+/// 一次**尝试内部**的退避重试（`AttemptDetail::retries` 的元素）。
+///
+/// 三个字段回答三个问题：为什么重试（`reason`）、上游当时怎么回的
+/// （`status`）、等了多久（`delay_ms`）。不记重试序号：数组顺序就是发生顺序，
+/// 前端按下标 +1 即可（与 `attempts_detail` 的序号同一手法）。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RetryEvent {
+    /// 重试原因（适配器给的 provider 专属措辞，或编排层的通用兜底措辞）
+    pub reason: String,
+    /// 触发重试的 HTTP 状态码；`None` = 传输层失败（压根没有响应头）
+    #[serde(default)]
+    pub status: Option<i64>,
+    /// 本次退避时长（毫秒）
+    ///
+    /// 键名 camelCase：这个结构整体序列化进 `attemptDetails` 那个 JSON 列，
+    /// 前端直接读它 —— 与本项目其余跨端字段（`attemptDetails` / `sensitiveHits`
+    /// / `firstResponseMs`）同一写法。
+    #[serde(rename = "delayMs", default)]
+    pub delay_ms: u64,
 }
 
 /// `attempts_detail` 的长度上限。
@@ -233,6 +291,22 @@ pub const MAX_ATTEMPT_DETAILS: usize = 24;
 /// —— 本模块在 `core` 下，不能反向依赖 `api`（见 `core/mod.rs` 的约定），
 /// 修改其中一处时**必须**同步另一处，这条注释就是那个提醒。
 pub const MAX_ATTEMPT_ERROR_CHARS: usize = 200;
+
+/// 明细里账号展示名的字符上限。
+///
+/// 账号名是用户自己填的自由文本（导入的账号名可能是邮箱、昵称、一长串备注），
+/// 而弹层里它与 provider 名同处一行。60 个字符足够放一个邮箱加中文昵称，
+/// 再长就让它省略 —— 明细是「一眼看清谁承载了这一轮」的读数，不是账号名片。
+pub const MAX_ATTEMPT_ACCOUNT_CHARS: usize = 60;
+
+/// 单条重试原因的字符上限。
+///
+/// 比错误摘要短：重试原因是一句「为什么再试一次」（如「上游敏感词拦截（11128）」），
+/// 不是完整的上游报文 —— 后者在 `error` 与调试模式的原始报文里都有。
+pub const MAX_ATTEMPT_RETRY_REASON_CHARS: usize = 120;
+
+/// 单条明细里提示文案的字符上限。
+pub const MAX_ATTEMPT_NOTICE_CHARS: usize = 200;
 
 /// 按字符截断（超出部分用 `…` 收尾）。
 ///
@@ -361,18 +435,64 @@ impl RequestTelemetry {
     /// 与 [`Self::note_attempt`] 配对调用（同一次发送前），所以两者条数一致；
     /// 调用顺序必须是 `note_attempt` → `note_attempt_started`。
     ///
+    /// `account` 与 `note_attempt` 的 `account_name` 传**同一个值**（调用方算
+    /// 一次、两处用），于是弹层里「这一轮是谁在承载」与报表的账号列不可能对不上。
+    ///
     /// 超过 [`MAX_ATTEMPT_DETAILS`] 时**丢弃**新条目（保头，理由见那个常量的说明）。
     /// 调用方不要靠本方法表达「截断了」——那是 `snapshot()` 的职责。
-    pub fn note_attempt_started(&self, provider: &str) {
+    pub fn note_attempt_started(&self, provider: &str, account: &str) {
         let mut guard = self.lock();
         if guard.attempts_detail.len() >= MAX_ATTEMPT_DETAILS {
             return;
         }
         guard.attempts_detail.push(AttemptDetail {
             provider: provider.to_string(),
+            account: truncate_chars(account, MAX_ATTEMPT_ACCOUNT_CHARS),
             status: None,
             error: None,
+            retries: Vec::new(),
+            notice: None,
         });
+    }
+
+    /// 给**最后一条**尝试明细追加一次内部退避重试（`send_with_retry` 每退避
+    /// 一次调一次）。
+    ///
+    /// 空 `reason` 直接丢弃：明细里出现一条「重试了，但不知道为什么」，
+    /// 对排障没有任何价值，还会让弹层多一行噪音。
+    pub fn note_attempt_retry(&self, reason: &str, status: Option<i64>, delay_ms: u64) {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return;
+        }
+        let mut guard = self.lock();
+        let Some(last) = guard.attempts_detail.last_mut() else {
+            return;
+        };
+        last.retries.push(RetryEvent {
+            reason: truncate_chars(reason, MAX_ATTEMPT_RETRY_REASON_CHARS),
+            status,
+            delay_ms,
+        });
+    }
+
+    /// 给**最后一条**尝试明细记一条提示（目前只有代理回退直连）。
+    ///
+    /// **首次为准**（与 `note_error` 同一取向）：同一轮里代理提示只会有一条，
+    /// 后来的（例如重试时又算了一次）不该覆盖先到的那条根因。
+    /// 空串不写，理由同 [`Self::note_attempt_retry`]。
+    pub fn note_attempt_notice(&self, notice: &str) {
+        let notice = notice.trim();
+        if notice.is_empty() {
+            return;
+        }
+        let mut guard = self.lock();
+        let Some(last) = guard.attempts_detail.last_mut() else {
+            return;
+        };
+        if last.notice.is_none() {
+            last.notice = Some(truncate_chars(notice, MAX_ATTEMPT_NOTICE_CHARS));
+        }
     }
 
     /// 给**最后一条**尝试明细补上结果（成功也要调，此时 `status` 有值、

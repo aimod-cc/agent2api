@@ -180,8 +180,12 @@ pub async fn chat_completions(
             json_response(body)
         }
         Err(error) => {
-            // headers 还没发出（流式还没开始）→ 直接给 OpenAI 风格错误
-            logging::log("[Model]", &format!("❌ {}", error.message));
+            // headers 还没发出（流式还没开始）→ 直接给 OpenAI 风格错误。
+            // 这行只在终端：同一条 message 紧接着由 `record_entry` 的
+            // fallback_error 记进请求日志的「错误」列（含被 Key 白名单拒绝、
+            // 模型不可用这类网关自己的判定）—— 运行日志页不再为每一次失败的
+            // 请求写一行。
+            logging::console_line("[Model]", &format!("❌ {}", error.message));
             let status = i64::from(error.http_status().as_u16());
             let message = error.message.clone();
             record_entry(

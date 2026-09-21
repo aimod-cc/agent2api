@@ -319,12 +319,15 @@ impl ProviderAdapter for WorkBuddyAdapter {
     /// 次数与间隔改由设置页的「请求重试」统一提供）。
     ///
     /// **循环**留在编排层（架构文档 §4.3「11128 退避逻辑保持在转发层」），
-    /// 这里只回答「这个错误要不要退避、退多久、日志怎么写」——
+    /// 这里只回答「这个错误要不要退避、退多久、为什么」——
     /// 「哪个码是敏感词拦截」是 workbuddy 的知识，不该漏进 `upstream/`。
     ///
     /// `budget` 是编排层按「这一轮是不是已经换过家」算出的预算
     /// （见 `ProviderAdapter::retry_advice` 的说明）—— 本函数只比 `attempt`
     /// 与它，不去读全局设置里的哪一档。
+    ///
+    /// 返回的 `reason` 不含「第 n/N 次」：那是编排层才知道的读数
+    /// （见 `RetryAdvice` 的说明）。
     fn retry_advice(&self, error_body: &Value, attempt: usize, budget: usize) -> Option<RetryAdvice> {
         let code = error_body.get("code").and_then(Value::as_i64);
         if code != Some(RATE_LIMIT_CODE) {
@@ -336,13 +339,8 @@ impl ProviderAdapter for WorkBuddyAdapter {
         let retry = crate::server::config::retry_settings();
         Some(RetryAdvice {
             delay_ms: retry.delay_ms(),
-            log_message: format!(
-                "⚠️ 上游敏感词拦截（11128），请检查提示词中的敏感词（可在「脱敏」页维护词表）；\
-                 {} 秒后重试（第 {}/{} 次）",
-                retry.interval_seconds,
-                attempt + 1,
-                budget,
-            ),
+            reason: "上游敏感词拦截（11128），请检查提示词中的敏感词（可在「脱敏」页维护词表）"
+                .to_string(),
         })
     }
 

@@ -47,13 +47,21 @@
 //! 每一轮账号尝试都 `telemetry.note_attempt(...)`，并带上 provider id ——
 //! 报表按「实际承载这次请求的家」记账，而不是按客户端请求的模型名猜。
 //!
-//! 同一处还要配一次 `note_attempt_started(provider_id)`，并在本轮定局时
+//! 同一处还要配一次 `note_attempt_started(provider_id, account)`，并在本轮定局时
 //! `finish_last_attempt(status, error)` —— 那一对写的是**尝试明细链**
 //! （请求日志「重试」列的弹层要显示「A → B → C」），与 `note_attempt` 的
 //! 「最后一次为准」不同，它是追加式历史。两个出口（成功 `break response`、
 //! 失败 `Err(failure)`）各记一次，所以明细条数恒等于 `attempts`。
 //! **改这里的任何一条出口路径时都要一并检查那两处**：漏一处就会让明细
 //! 比 attempts 少一条（前端会显示一条「无状态码、无错误」的悬空项）。
+//!
+//! ── 逐请求的日志一律不进运行日志页（本次改造）───────────────────
+//! 本文件里凡是「每转发一次就会发生」的事件（换号顺延、退避重试、401 刷新、
+//! 限额降级、上游报错、代理回退）都只写**终端**（`console_line`）或**请求
+//! 日志**（明细的 `error` / `retries` / `notice`）—— 运行日志页只留「不随
+//! 请求量增长的网关自身状态事件」（启动、登录、账号增删改、凭证维护、
+//! 模型目录刷新、定时任务、账号被标记限额）。判断一条日志该去哪边，就看
+//! **它的条数会不会跟着用户发请求一起涨**。
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -127,37 +135,35 @@ const TRANSIENT_RETRY_STATUSES: &[u16] = &[408, 500, 502, 503, 504];
 ///
 /// `remaining` 是本阶段**还剩几次**退避可用（见 `send_with_retry` 的说明）；
 /// 用尽即返回 None，由调用方收敛成终态错误。
-fn transient_retry_advice(status: u16, remaining: usize, total: usize) -> Option<RetryAdvice> {
-    let retry = config::retry_settings();
+fn transient_retry_advice(status: u16, remaining: usize) -> Option<RetryAdvice> {
     if remaining == 0 || !TRANSIENT_RETRY_STATUSES.contains(&status) {
         return None;
     }
     Some(RetryAdvice {
-        delay_ms: retry.delay_ms(),
-        log_message: format!(
-            "⚠️ 上游瞬时错误（HTTP {status}），{} 秒后重试（第 {}/{} 次）",
-            retry.interval_seconds,
-            total - remaining + 1,
-            total,
-        ),
+        delay_ms: config::retry_settings().delay_ms(),
+        reason: format!("上游瞬时错误（HTTP {status}）"),
     })
 }
 
 /// 传输层失败（DNS / 代理 / 连接）的统一退避建议：与瞬时 HTTP 错误同一套设置。
-fn transport_retry_advice(remaining: usize, total: usize) -> Option<RetryAdvice> {
-    let retry = config::retry_settings();
+fn transport_retry_advice(remaining: usize) -> Option<RetryAdvice> {
     if remaining == 0 {
         return None;
     }
     Some(RetryAdvice {
-        delay_ms: retry.delay_ms(),
-        log_message: format!(
-            "⚠️ 上游连接失败，{} 秒后重试（第 {}/{} 次）",
-            retry.interval_seconds,
-            total - remaining + 1,
-            total,
-        ),
+        delay_ms: config::retry_settings().delay_ms(),
+        reason: "上游连接失败".to_string(),
     })
+}
+
+/// 退避重试的运行日志行：`⚠️ {原因}；{n} 秒后重试（第 {i}/{N} 次）`。
+///
+/// 原因来自 `RetryAdvice::reason`（provider 专属措辞），进度由这里补 ——
+/// 「第几次 / 共几次」只有编排层知道（预算按提供商阶段走，见 `RetryBudget`）。
+/// 改造前这句整句由适配器与两个兜底函数各自拼好，措辞与现在一致，只是
+/// 分隔符统一成「；」（原先瞬时错误与连接失败那两句用「，」）。
+fn retry_log_line(reason: &str, delay_ms: u64, used: usize, total: usize) -> String {
+    format!("⚠️ {reason}；{} 秒后重试（第 {used}/{total} 次）", delay_ms / 1000)
 }
 
 /// 转发入口：在候选家的全部账号里按全局优先级逐个尝试。
@@ -256,7 +262,10 @@ fn filter_by_key_scope(
     if !kept.is_empty() {
         return Ok(kept);
     }
-    logging::log(
+    // 只在**终端**留痕：这条拒绝会作为 GatewayError 一路抛回入口，
+    // 由 `api::chat` / `api::protocol` 记进请求日志的「错误」列（同一个原因、
+    // 更完整的措辞），运行日志页因此不再为每一次被拒的请求写一行。
+    logging::console_line(
         "[Security]",
         &format!(
             "🚫 请求被网关 Key 的可用提供商拒绝: 模型 {model}（{}）",
@@ -351,7 +360,9 @@ async fn attempt_queue(
                     }
                     match rotate::pick_next_account(service, provider_ids, &model, &tried_ids) {
                         Some(next) => {
-                            logging::log(
+                            // 顺延这件事本身由请求日志的尝试链回答（本轮明细已经
+                            // 定稿为失败、下一轮会追加新明细），这里只留终端一行
+                            logging::console_line(
                                 "[Upstream]",
                                 &format!(
                                     "⚠️ 会话式转发失败，按队列顺延 → {}（优先级 {}）",
@@ -438,13 +449,17 @@ async fn attempt_queue(
             }
         }
         // ── 旁路记账：本 provider + 本账号是这一轮的实际承载者 ──────────
+        // 账号展示名算一次、两处用（`note_attempt` 的 account_name 与
+        // `note_attempt_started` 的 account）：弹层里「这一轮谁在承载」与
+        // 报表的账号列因此不可能对不上。
+        let attempt_account = account_label(
+            target.account.as_ref(),
+            target.account_id.as_deref().unwrap_or(""),
+            &session,
+        );
         ctx.telemetry.note_attempt(
             target.account_id.as_deref(),
-            &account_label(
-                target.account.as_ref(),
-                target.account_id.as_deref().unwrap_or(""),
-                &session,
-            ),
+            &attempt_account,
             provider_id,
         );
         // 尝试明细的「起头」：本轮的承载者定了，结果稍后由下面两个出口补上
@@ -453,7 +468,12 @@ async fn attempt_queue(
         // 放在这里而不是 send_with_retry 里：函数内那层退避重试（同账号重发）
         // **不算一次新尝试**（口径见 TelemetrySnapshot::attempts 的说明），
         // 若在循环里起头就会多出几条「同名同账号」的重复项。
-        ctx.telemetry.note_attempt_started(provider_id);
+        ctx.telemetry.note_attempt_started(provider_id, &attempt_account);
+        // 代理回退提示：选路时记下的「代理不可用、本次直连」跟着这一轮走
+        // （改造前它是一行运行日志，见 `with_proxy_notice`）
+        if let Some(notice) = target.proxy_notice.as_deref() {
+            ctx.telemetry.note_attempt_notice(notice);
+        }
 
         // ── 内容处理：凭证已就绪、这一家**即将发送**，此刻才决定发送体 ────
         // 位置在选路/凭证之后：没有可用账号（上面的 503/401 提前返回）的请求
@@ -548,7 +568,9 @@ async fn attempt_queue(
             if let Some(capture) = capture.as_deref() {
                 capture.reset_request(&transport.url, provider_id, &transport.headers, &plan.body);
             }
-            match send_with_retry(adapter, &transport, &mut budget, capture.as_deref()).await {
+            match send_with_retry(adapter, &transport, &mut budget, capture.as_deref(), ctx.telemetry)
+                .await
+            {
                 Ok(response) => {
                     // 成功出口：这一轮的结果是「成功 + 状态码」，明细在这里定稿。
                     // 失败出口在下面（`Err(failure)` 那一支的开头）—— 两个出口
@@ -578,7 +600,15 @@ async fn attempt_queue(
                     {
                         refreshed = true;
                         let account_id = target.account_id.clone().unwrap_or_default();
-                        logging::log(
+                        // 401 刷新重试也是「本轮内部的一次重试」（换凭证不换账号），
+                        // 与退避重试同一落点 —— 请求日志的重试链因此能回答
+                        // 「这一轮重试过没有、为什么」，运行日志不再写这一行。
+                        ctx.telemetry.note_attempt_retry(
+                            &format!("token 被上游拒绝（401），刷新后重试一次（账号 {account_id}）"),
+                            Some(i64::from(failure.error.status_code)),
+                            0,
+                        );
+                        logging::console_line(
                             "[Upstream]",
                             &format!(
                                 "token 被上游拒绝（401），尝试刷新后重试一次（账号 {account_id}）"
@@ -661,7 +691,10 @@ async fn attempt_queue(
                                         )
                                     };
                                     let reset_hint = reset_hint(&reset_text);
-                                    logging::log(
+                                    // 这一行只在终端：请求日志那边由「本轮明细的
+                                    // error + 下一轮的账号」表达同一条事实
+                                    // （换号链就是降级过程本身）。
+                                    logging::console_line(
                                         "[Upstream]",
                                         &format!(
                                             "⚠️ 账号 {from_label} 对模型 {model} 已限额{reset_hint}，\
@@ -671,6 +704,10 @@ async fn attempt_queue(
                                                 .unwrap_or_else(|| "-".to_string()),
                                         ),
                                     );
+                                    // 账号被标记限额是**状态变更**（账号页的「限额」
+                                    // 列会跟着变、用户可操作），不是逐请求的过程
+                                    // 事实 —— 所以它是保留在运行日志里的那一条，
+                                    // 与上面那行终端日志的区别就在这里。
                                     rotate::report_limit_event(
                                         "warn",
                                         &format!(
@@ -744,10 +781,14 @@ async fn attempt_queue(
                                     )
                                 }
                             };
-                            logging::log(
+                            // 只在终端：请求日志那侧由「本轮明细（账号 + 错误）
+                            // + 下一轮的明细」完整表达这条顺延链 —— 这条日志
+                            // 里除了这两者之外没有第三个信息。
+                            logging::console_line(
                                 "[Upstream]",
                                 &format!(
-                                    "⚠️ 账号 {} 对模型 {model} 转发失败（HTTP {}），                                     按队列顺延 → {}（优先级 {}{next_home}）",
+                                    "⚠️ 账号 {} 对模型 {model} 转发失败（HTTP {}），\
+                                     按队列顺延 → {}（优先级 {}{next_home}）",
                                     account_label(target.account.as_ref(), &target.account_id.clone().unwrap_or_default(), &session),
                                     failure.error.status_code,
                                     account_display(&next),
@@ -900,20 +941,22 @@ async fn attempt_stateful(
     // 旁路记账：本 provider + 本账号是这一轮的实际承载者（attempts +1）。
     // 账号展示名的兜底链与无状态路径同（账号名 → 会话昵称 → 账号 id）；
     // 这里没有会话对象可传（会话还没建），用公开形态的名字。
-    ctx.telemetry.note_attempt(
-        target.account_id.as_deref(),
-        &account_label(
-            target.account.as_ref(),
-            target.account_id.as_deref().unwrap_or(""),
-            &Value::Null,
-        ),
-        provider_id,
+    // 算一次、两处用，理由同无状态路径。
+    let attempt_account = account_label(
+        target.account.as_ref(),
+        target.account_id.as_deref().unwrap_or(""),
+        &Value::Null,
     );
+    ctx.telemetry
+        .note_attempt(target.account_id.as_deref(), &attempt_account, provider_id);
     // 尝试明细的起头：与 note_attempt 配对（同上一条注释的说明）。
     // 本路径的定稿在下面 match 的两个分支里 —— 有状态 provider 没有账号轮换，
     // 所以一轮就是一条明细，链路至多一项（`provider_loop` 的 `'accounts` 循环
     // 仍可能在外层顺延到下一个账号，那会走本函数第二次调用）。
-    ctx.telemetry.note_attempt_started(provider_id);
+    ctx.telemetry.note_attempt_started(provider_id, &attempt_account);
+    if let Some(notice) = target.proxy_notice.as_deref() {
+        ctx.telemetry.note_attempt_notice(notice);
+    }
     let started_at = logging::now_ms();
     logging::verbose(
         "[Upstream]",
@@ -957,7 +1000,9 @@ async fn attempt_stateful(
         }
         // 一律透传（Fatal 语义，核对结论见函数头）：不换账号、不冷却、不重试
         Err(error) => {
-            logging::log("[Upstream]", &format!("❌ {}", error.message));
+            // 只在终端：这条错误会作为 GatewayError 抛回入口，由 `api::chat` /
+            // `api::protocol` 记进请求日志（明细的 error 也是同一条文案）。
+            logging::console_line("[Upstream]", &format!("❌ {}", error.message));
             // 明细定稿：状态码取网关错误的（有状态路径的错误由适配器定档，
             // 502/500/上游码都可能），错误摘要用同一条文案 —— 与列表里
             // 「错误」列显示的是同一个根因。
@@ -1086,10 +1131,18 @@ fn model_rewrite_of(adapter: &dyn ProviderAdapter, model: &str) -> Option<super:
 ///
 /// 重试判定分两档：
 ///   - **适配器声明**（`retry_advice`）：provider 专属知识（workbuddy 的 11128），
-///     要不要退避、文案，全由适配器回答（见模块头）；
+///     要不要退避、原因，全由适配器回答（见模块头）；
 ///   - **统一兜底**（[`transient_retry_advice`] / [`transport_retry_advice`]）：
 ///     瞬时 HTTP 状态码与传输层失败按同一套设置原样重发 —— 这是「重试设置
 ///     对全部提供商生效」的入口，适配器没声明的家也能吃到同一份配置。
+///
+/// ── 每次退避为什么只写请求日志、不写运行日志 ─────────────────
+/// 退避重试是**逐请求**的过程事实（一次 11128 拦截会连打 3 行），而它此前
+/// 只能去「日志」页看 —— 请求日志那一行请求上恰好什么都看不出来
+/// （同账号重试不计入 `attempts`，也不追加尝试明细）。现在每次退避由
+/// `note_attempt_retry` 记进**本轮那条明细**的下级重试链，请求日志一次悬停
+/// 就能看到「为什么重试了几次」；控制台仍留一行（`console_line`），
+/// 方便用终端排障时实时看到。
 ///
 /// ── `budget` 为什么要 `&mut`（两档设置怎么落地）──────────────
 /// 退避重试的次数是**每个「提供商阶段」各一份**的：在最初那一家上用
@@ -1107,6 +1160,7 @@ async fn send_with_retry(
     transport: &TransportRequest,
     budget: &mut RetryBudget,
     capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
+    telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
 ) -> Result<reqwest::Response, OutboundFailure> {
     loop {
         let response = match send_chat_request(transport).await {
@@ -1114,9 +1168,14 @@ async fn send_with_retry(
             Err(error) => {
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
                 // 次数用完才收敛成 502，与改造前的兜底一致
-                if let Some(advice) = transport_retry_advice(budget.remaining, budget.total) {
+                if let Some(advice) = transport_retry_advice(budget.remaining) {
                     budget.remaining -= 1;
-                    logging::log("[Upstream]", &advice.log_message);
+                    let used = budget.used();
+                    telemetry.note_attempt_retry(&advice.reason, None, advice.delay_ms);
+                    logging::console_line(
+                        "[Upstream]",
+                        &retry_log_line(&advice.reason, advice.delay_ms, used, budget.total),
+                    );
                     tokio::time::sleep(Duration::from_millis(advice.delay_ms)).await;
                     continue;
                 }
@@ -1140,14 +1199,21 @@ async fn send_with_retry(
         // 退避重试：provider 专属判定优先，没声明时对瞬时状态码统一兜底
         let advice = adapter
             .retry_advice(&body, budget.used(), budget.total)
-            .or_else(|| transient_retry_advice(status, budget.remaining, budget.total));
+            .or_else(|| transient_retry_advice(status, budget.remaining));
         if let Some(advice) = advice {
             budget.remaining = budget.remaining.saturating_sub(1);
-            logging::log("[Upstream]", &advice.log_message);
+            let used = budget.used();
+            telemetry.note_attempt_retry(&advice.reason, Some(i64::from(status)), advice.delay_ms);
+            logging::console_line(
+                "[Upstream]",
+                &retry_log_line(&advice.reason, advice.delay_ms, used, budget.total),
+            );
             tokio::time::sleep(Duration::from_millis(advice.delay_ms)).await;
             continue;
         }
-        logging::log(
+        // 定论的上游错误：这一行只在**终端**留痕。请求日志那侧由本轮明细的
+        // `error`（同一个 message）回答，两处不再各写一份。
+        logging::console_line(
             "[Upstream]",
             &format!("上游错误 HTTP {status}: {}", detail.message),
         );
