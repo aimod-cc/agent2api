@@ -75,21 +75,26 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
             }
         }
     }
-    // 工具：Responses 的形态是 `{type:"function", name, parameters}`（扁平的），
-    // Chat 要的是 `{type:"function", function:{name, parameters}}`（嵌套一层）
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+    // 工具声明有两个来源，都要收：
+    //   1) 顶层 `tools`（标准 Responses 形态）
+    //   2) `input[]` 里 `type:"additional_tools"` 的项（Codex 的 Responses Lite
+    //      路径：工具塞在 input 里，顶层 `tools` 为 null）
+    // 第 2 条是 2026-09 那次「Codex 调不动工具」的根因 —— 只认顶层字段时，
+    // Lite 路径的声明会被整个跳过，模型看不到任何工具，于是把调用当正文吐出来
+    let tool_decls = collect_tool_declarations(body);
+    if !tool_decls.is_empty() {
         let mut converted: Vec<Value> = Vec::new();
         let mut downgraded: Vec<String> = Vec::new();
         let mut ignored: Vec<String> = Vec::new();
-        for tool in tools {
+        for tool in &tool_decls {
             if let Some(function) = tool_to_chat(tool) {
                 converted.push(function);
                 continue;
             }
             // 没转出来的分两类。custom（freeform）是**要**降级的 —— 漏了就是
-            // 静默失效（2026-09 起 Codex 的 exec / apply_patch 全部失效即由此
-            // 而来）；其余（web_search / local_shell 等 Responses 原生工具）
-            // 上游确实没有对应物，只能丢，但要留痕，否则同样是静默失效
+            // 静默失效（Codex 的 exec / apply_patch 全部失效即由此而来）；
+            // 其余（web_search / local_shell 等 Responses 原生工具）上游确实
+            // 没有对应物，只能丢，但要留痕，否则同样是静默失效
             if freeform::is_custom_tool(tool) {
                 if let Some(function) = freeform::downgrade_custom_tool(tool) {
                     downgraded.push(string_field(tool, "name"));
@@ -137,6 +142,49 @@ pub fn chat_from_responses(body: &Value) -> Result<Value, ConvertError> {
 
 fn has_effort(value: &Value) -> bool {
     !string_value(value).trim().is_empty()
+}
+
+/// `additional_tools` 输入项的 type 字面量。
+///
+/// Codex 的 Responses Lite 路径用它承载工具声明：顶层 `tools` 置 null，工具
+/// 改放在 `input[]` 的这一个项里（见 OpenAI 文档「Add tools at a specific point
+/// in the input」）。本网关的上游是 Chat 接口，没有「对话中途追加工具」的概念，
+/// 所以统一提升成请求级工具声明。
+const ADDITIONAL_TOOLS_ITEM: &str = "additional_tools";
+
+/// 收集请求里的全部工具声明（顶层 `tools` + `input[]` 里的 `additional_tools`）。
+///
+/// 两个来源合并成一份扁平数组交给调用方转换，调用方不必关心它们原先放在哪。
+/// 顶层排在前面：它是请求级声明，语义上先于中途追加。
+fn collect_tool_declarations(body: &Value) -> Vec<Value> {
+    let mut decls: Vec<Value> = Vec::new();
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        decls.extend(tools.iter().cloned());
+    }
+    let Some(items) = body.get("input").and_then(Value::as_array) else {
+        return decls;
+    };
+    for item in items {
+        if !string_field(item, "type").eq_ignore_ascii_case(ADDITIONAL_TOOLS_ITEM) {
+            continue;
+        }
+        // 规范形态是 `tools: [完整工具定义]`。但 Lite 路径在不同 Codex 版本里
+        // 出现过只给名字（`tool_names: [...]`）的变体 —— 那种形态没有可转换的
+        // 定义，只能留痕跳过，硬编一份假 schema 会让模型按错误参数调用
+        if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+            decls.extend(tools.iter().cloned());
+        } else if let Some(names) = item.get("tool_names").and_then(Value::as_array) {
+            let listed: Vec<String> = names.iter().map(string_value).collect();
+            logging::log(
+                "[Responses]",
+                &format!(
+                    "⚠️ additional_tools 只给了工具名、没有定义，无法转发：{}",
+                    listed.join(", ")
+                ),
+            );
+        }
+    }
+    decls
 }
 
 /// `instructions` + `input` → Chat 的 `messages` 数组。
@@ -255,6 +303,10 @@ fn push_input_item(messages: &mut Vec<Value>, item: &Value) -> Result<(), Conver
             // 裸内容块（不在 message 里）：包成一条 user 消息
             messages.push(json!({ "role": "user", "content": [item.clone()] }));
         }
+        // 工具声明项：不是对话内容，已经在 `collect_tool_declarations` 里
+        // 提升成请求级工具声明。这里静默跳过 —— 落到下面的兜底分支会报一条
+        // 误导性的「内容会缺一段」（它本来就不该出现在对话里）
+        ADDITIONAL_TOOLS_ITEM => {}
         // 消息项（含 type 缺失/为 "message" 的常规形态）
         _ => {
             let role = {
@@ -554,7 +606,7 @@ fn format_to_chat(format: &Value) -> Value {
 /// （instructions / temperature / tools / …）如实回显，客户端据此确认
 /// 「我发的参数被接受了」。
 pub fn responses_from_chat(chat: &Value, model: &str, request: &Value) -> Value {
-    let custom_names = freeform::custom_tool_names(request.get("tools"));
+    let custom_names = freeform::custom_tool_names_from_request(request);
     let choice = chat.pointer("/choices/0");
     let message = choice.and_then(|choice| choice.get("message")).cloned().unwrap_or(Value::Null);
     let finish = choice
@@ -837,7 +889,7 @@ impl ResponsesStream {
             created: logging::now_ms() / 1000,
             model: model.to_string(),
             request: request.clone(),
-            custom_names: freeform::custom_tool_names(request.get("tools")),
+            custom_names: freeform::custom_tool_names_from_request(request),
             sequence: 0,
             created_sent: false,
             finished: false,
@@ -1540,7 +1592,7 @@ impl ResponsesCollector {
 
     /// 收成一个 Responses 响应对象
     pub fn into_response(self, model: &str, request: &Value) -> Value {
-        let custom_names = freeform::custom_tool_names(request.get("tools"));
+        let custom_names = freeform::custom_tool_names_from_request(request);
         let mut output: Vec<Value> = Vec::new();
         if !self.reasoning.is_empty() {
             output.push(json!({

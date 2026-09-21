@@ -49,19 +49,38 @@ pub fn is_custom_tool(tool: &Value) -> bool {
     string_field(tool, "type").eq_ignore_ascii_case("custom")
 }
 
-/// 请求里所有 custom 工具的名字（回程据此决定 item 类型）
-pub fn custom_tool_names(tools: Option<&Value>) -> std::collections::BTreeSet<String> {
+/// 请求里所有 custom 工具的名字（回程据此决定 item 类型）。
+///
+/// 收的是**整个请求体**而不是 `tools` 数组：工具声明有两个来源（顶层 `tools`
+/// 与 `input[]` 里的 `additional_tools` 项），只读顶层会在 Codex 的
+/// Responses Lite 路径下拿到空集合，回程就会把 `exec` 输出成 `function_call`
+/// —— 客户端按 JSON 参数解析自由文本，工具照样跑不起来。
+pub fn custom_tool_names_from_request(request: &Value) -> std::collections::BTreeSet<String> {
     let mut names = std::collections::BTreeSet::new();
-    let Some(items) = tools.and_then(Value::as_array) else {
-        return names;
-    };
-    for tool in items {
-        if !is_custom_tool(tool) {
-            continue;
+    let mut collect = |tools: &Value| {
+        let Some(items) = tools.as_array() else {
+            return;
+        };
+        for tool in items {
+            if !is_custom_tool(tool) {
+                continue;
+            }
+            let name = string_field(tool, "name");
+            if !name.is_empty() {
+                names.insert(name);
+            }
         }
-        let name = string_field(tool, "name");
-        if !name.is_empty() {
-            names.insert(name);
+    };
+    if let Some(tools) = request.get("tools") {
+        collect(tools);
+    }
+    if let Some(items) = request.get("input").and_then(Value::as_array) {
+        for item in items {
+            if string_field(item, "type").eq_ignore_ascii_case("additional_tools") {
+                if let Some(tools) = item.get("tools") {
+                    collect(tools);
+                }
+            }
         }
     }
     names
