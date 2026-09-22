@@ -457,7 +457,7 @@ impl ProviderAdapter for QoderAdapter {
                 // 上游流必须被**拉到底**（源实现同样读完整条流再 cancel）：
                 // 客户端断开时 tokio 的 channel 发送端会失败，循环随即退出，
                 // drop 掉 response 就等价于断开上游连接。
-                tauri::async_runtime::spawn(async move {
+                crate::spawn_task(async move {
                     drive_stream(response, translator, telemetry, limit_ctx, sender).await;
                 });
                 return Ok(crate::server::core::upstream::ForwardOutcome::Stream {

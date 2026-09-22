@@ -117,17 +117,3 @@ pub(super) fn write(path: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 连接级写入（迁移项用：它拿到的就是 `&Connection`，且已在框架的事务里）。
-///
-/// 与 [`write`] 的区别有两点，都是「谁的连接」带来的：
-///   - **不建表**：迁移跑在 `Db::open` 里，schema 已经建好（`CREATE TABLE`
-///     那一步是给运行期在 `Db::open` 之前调用准备的，见 [`write`]）；
-///   - **不吞错误**：错误原样上抛，由调用方（迁移项）决定记日志与返回值。
-pub(super) fn write_conn(conn: &Connection, text: &str) -> rusqlite::Result<()> {
-    conn.execute(
-        "INSERT INTO kv (key, value) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![KEY, text],
-    )?;
-    Ok(())
-}

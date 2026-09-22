@@ -46,7 +46,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::gateway;
+use crate::paths;
 
 /// 暂存目录名后缀（正式目录名 + 后缀 + 本次唯一标识，见模块头）
 const STAGING_SUFFIX: &str = ".migrating";
@@ -78,7 +78,7 @@ pub fn migrate_config_dir() -> Result<MigrationOutcome, String> {
         return Ok(MigrationOutcome::SkippedEnvOverride);
     }
 
-    let target = gateway::config_dir();
+    let target = paths::config_dir();
     // 新目录存在（哪怕是链接）→ 以它为准：不合并、不覆盖、不猜测来源
     if std::fs::symlink_metadata(&target).is_ok() {
         return Ok(MigrationOutcome::NothingToDo);
@@ -161,7 +161,7 @@ pub fn pending_reason() -> Option<String> {
     if env_dir_override_set() {
         return None;
     }
-    let target = gateway::config_dir();
+    let target = paths::config_dir();
     if std::fs::symlink_metadata(&target).is_ok() {
         return None;
     }
@@ -395,7 +395,7 @@ fn is_link_like(metadata: &std::fs::Metadata) -> bool {
 /// 是否设置了配置目录的环境变量覆盖（`AGENT2API_PROXY_HOME` 或旧名）。
 ///
 /// 只判断「有没有设」，不重复解析路径 —— 解析口径的唯一事实来源是
-/// `gateway::config_dir()`；覆盖生效时迁移整体不适用。
+/// `paths::config_dir()`；覆盖生效时迁移整体不适用。
 fn env_dir_override_set() -> bool {
     ["AGENT2API_PROXY_HOME", "WORKBUDDY_PROXY_HOME"]
         .iter()

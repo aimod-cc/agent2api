@@ -122,7 +122,7 @@ impl LoginService {
         let service = self.clone();
         let poll_handle = handle.clone();
         let poll_sid = sid.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn_task(async move {
             service.run_catpaw_poll(poll_handle, poll_sid).await;
         });
         logging::log("[Login]", "发起 CatPaw 网页登录（等待浏览器回调…）");

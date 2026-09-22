@@ -54,11 +54,17 @@ use super::{finish_task_error, LoginService, LoginTaskHandle, LOGIN_TIMEOUT_MS};
 /// 这里**没有** state 字段：表的键就是 state，再存一份等于同一个事实有两处，
 /// 而两处一旦不一致（改了一处忘了另一处）就会让「回调是不是我们这一轮」的
 /// 判断开始说谎。要比对 state 直接比表的键即可。
+///
+/// `created_at`：回调关联用。`navigate_uri` 是客户端同款形态、**不带**
+/// state（见 `providers::autoclaw::oauth::CALLBACK_PATH_PREFIX`），回调进来时
+/// 靠「变体匹配 + 最近发起」找到它属于哪一轮 —— 同一变体同时挂着两轮登录时
+/// 取最近发起的那个（用户几乎不会这么做；真发生了，早的那轮等超时收尾）。
 pub(super) struct PendingOauth {
     region: Region,
     vendor: Vendor,
     navigate_uri: String,
     device_id: String,
+    created_at: i64,
 }
 
 impl LoginService {
@@ -78,7 +84,7 @@ impl LoginService {
     ) -> Result<LoginTaskHandle, String> {
         let state = random_hex()?;
         let device_id = oauth::new_oauth_device_id();
-        let navigate = oauth::navigate_uri(callback_base, vendor, &state);
+        let navigate = oauth::navigate_uri(callback_base, vendor);
         // 这一步要过风控，失败原因（630014 / 631002）由 oauth 模块翻成人话
         let auth_url = oauth::request_oauth_url(
             region,
@@ -104,6 +110,7 @@ impl LoginService {
                 vendor,
                 navigate_uri: navigate,
                 device_id,
+                created_at: logging::now_ms(),
             },
         );
         // 超时兜底：这条链没有后台轮询（回调是唯一入口），因此必须有人负责
@@ -133,13 +140,40 @@ impl LoginService {
         table.remove(state)
     }
 
-    /// 看一眼待办状态但**不移除**它（校验用，见 `finish_autoclaw_oauth_callback`）。
+    /// 回调关联：按变体找那一轮登录的 `(state, handle)`。
     ///
-    /// 只回变体：它是这次校验唯一需要的事实（state 本身就是表的键，
-    /// 而地区在下面 `take` 出来的那份里现成就有）。
-    fn peek_pending_vendor(&self, state: &str) -> Option<Vendor> {
-        let table = self.autoclaw_oauth.lock().unwrap_or_else(|error| error.into_inner());
-        table.get(state).map(|pending| pending.vendor)
+    /// `navigate_uri` 是客户端同款形态、**不带**任何任务标识（见
+    /// `providers::autoclaw::oauth::CALLBACK_PATH_PREFIX`），回调 URL 里只有
+    /// 路径末段的变体与上游拼回的 code/state —— 任务关联靠这里：在待办表里
+    /// 筛出变体匹配的候选，按发起时间**取最近的**一个。
+    ///
+    /// 同一变体并发两轮的场景没有完美答案（上游的授权码只对应其中一轮），
+    /// 「最近发起」是实际使用下最可能的意图；早的那轮由超时兜底收尾。
+    /// 已取消的任务直接跳过（回调迟到时不应复活它）。
+    ///
+    /// 锁序：先在待办表的锁内收集候选（state + 发起时间），**释放后再**查任务
+    /// 表 —— 两张表各是独立锁，不在一张锁的临界区里去碰另一张，避免与
+    /// `start`（先任务后待办）形成反向嵌套。
+    fn find_pending_for_vendor(&self, vendor: Vendor) -> Option<(String, LoginTaskHandle)> {
+        let mut candidates: Vec<(String, i64)> = {
+            let table = self.autoclaw_oauth.lock().unwrap_or_else(|error| error.into_inner());
+            table
+                .iter()
+                .filter(|(_, pending)| pending.vendor == vendor)
+                .map(|(state, pending)| (state.clone(), pending.created_at))
+                .collect()
+        };
+        candidates.sort_by(|left, right| right.1.cmp(&left.1));
+        for (state, _) in candidates {
+            let Some(handle) = self.tasks.get(&state) else {
+                continue;
+            };
+            if handle.snapshot().canceled {
+                continue;
+            }
+            return Some((state, handle));
+        }
+        None
     }
 
     /// 超时收尾：到点任务还没结束就置失败（并清掉待办状态）。
@@ -148,7 +182,7 @@ impl LoginService {
     /// 这条没有循环，所以单独起一个只睡一次的定时任务。
     fn spawn_autoclaw_oauth_timeout(&self, handle: LoginTaskHandle, state: String) {
         let service = self.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn_task(async move {
             tokio::time::sleep(Duration::from_millis(LOGIN_TIMEOUT_MS)).await;
             if handle.snapshot().finished_at.is_some() || handle.snapshot().canceled {
                 return;
@@ -160,47 +194,41 @@ impl LoginService {
         });
     }
 
-    /// 浏览器回调：校验 state → 用授权码换凭证 → 落账号 → 标记任务完成。
+    /// 浏览器回调：校验 → 用授权码换凭证 → 落账号 → 标记任务完成。
     ///
-    /// ── 两个 state 是**两个不同的值**（别合并，这是实测踩到的坑）──────
-    ///   - `task_state`：**我们**生成的一次性随机串，放在 `navigate_uri` 的
-    ///     **路径**里。它只用于「这次回调属于哪一轮登录」的查找与 CSRF 校验；
-    ///   - `upstream_state`：**上游**在 302 时拼在查询串里的 `state`。换码
-    ///     （`oauth-login`）要求回传的是**这一个** —— 官方客户端也是这么做的
-    ///     （`overseaOAuthLogin(vendor, searchParams.get("code"),
-    ///     searchParams.get("state"), callbackUri)`，读的就是查询串）。
-    ///
-    /// 把 `task_state` 当 `upstream_state` 传过去，换码会稳定失败
-    /// （上游认不出这个 state 与它发出去的授权码配对）—— 而症状是
-    /// 「用户明明登录成功、网关却说授权码无效」，极难从现象反推。
+    /// ── 回调 URL 里只有上游的 state（没有我们的 task_state）────────
+    /// `navigate_uri` 是客户端同款形态、不带任何任务标识（见
+    /// `oauth::CALLBACK_PATH_PREFIX`），上游 302 拼回的 `?code=…&state=…` 里的
+    /// `state` 是**上游自己生成的**那个（`upstream_state`）—— 换码
+    /// （`oauth-login`）要求回传的正是它（官方客户端也是
+    /// `searchParams.get("state")`）。我们自己的任务 state 只存在于待办表的
+    /// 键里，回调靠 [`Self::find_pending_for_vendor`]（变体匹配 + 最近发起）
+    /// 关联，URL 里既放不下也不能放（放查询串会与上游的 state 撞参数名，
+    /// 放子路径会偏离客户端已验证的形态）。
     ///
     /// 返回成功时的账号 id（浏览器停在成功页上，这个值只进日志）。
     ///
-    /// ── 校验口径（与 CatPaw 同）─────────────────────────────────
+    /// ── 校验口径 ────────────────────────────────────────────────
     /// 回调落在本机 HTTP 端口上，任何本机进程都能伪造一次 GET，因此：
-    ///   1. task_state 必须对应一个**进行中**的登录任务（否则 404 / 已结束）；
-    ///   2. 任务记录的 provider 必须是 AutoClaw 系（防止把别家的 state 送进来）；
-    ///   3. 待办表里必须有这个 state，且记录的变体与 URL 里的**一致** ——
-    ///      待办表只在我们发起那一轮写入，因此它存在就等于「这个 state 是我们
-    ///      发给上游的那个」（表的键就是 state 本身，没有第二份可比）；
-    ///   4. 授权码一次性：重复回调直接返回成功，不再换一次码
-    ///      （第二次必然得到 631001「授权码无效」，把一次成功变成一次失败）。
+    ///   1. 关联到的任务必须**进行中且属于 AutoClaw 系**；
+    ///   2. 授权码一次性：同一个任务被回调两次（用户刷新页面 / 浏览器预取）
+    ///      直接返回成功，不再换一次码（第二次必然得到 631001
+    ///      「授权码无效」，把一次成功变成一次失败）。
+    ///
+    /// 与旧形态（state 进回调 URL 逐字比对）的取舍：伪造回调不再被秘密 state
+    /// 挡住 —— 本机进程可以毁掉一场进行中的登录（换码失败 → 任务失败）。
+    /// 这是 loopback 回调威胁模型下的可接受代价：换不到任何凭证，重试即可。
     pub async fn finish_autoclaw_oauth_callback(
         &self,
         vendor: Vendor,
-        task_state: &str,
         upstream_state: &str,
         code: &str,
     ) -> Result<String, GatewayError> {
-        let state = task_state.trim();
         let code = code.trim();
         if code.is_empty() {
             return Err(GatewayError::with_status(400, "回调没有携带授权码"));
         }
-        if state.is_empty() {
-            return Err(GatewayError::with_status(400, "回调没有携带 state"));
-        }
-        let Some(handle) = self.tasks.get(state) else {
+        let Some((state, handle)) = self.find_pending_for_vendor(vendor) else {
             return Err(GatewayError::with_status(
                 404,
                 "这次登录已取消或已过期，请重新发起",
@@ -210,35 +238,11 @@ impl LoginService {
         if Region::from_provider_id(&snapshot.provider).is_none() {
             return Err(GatewayError::with_status(400, "这次登录不属于 AutoClaw"));
         }
-        if snapshot.done || snapshot.canceled {
+        if snapshot.done {
             // 幂等：同一个回调被送来两次（用户刷新页面 / 浏览器预取）不是错误
             return Ok(String::new());
         }
-        // ── 先校验、后取走（顺序不能反）─────────────────────────
-        // `peek` 而不是 `take`：变体不匹配的那次回调**不能**把待办状态吃掉 ——
-        // 吃掉了的话，紧接着到达的、真正匹配的那次回调会看到「上下文已丢失」，
-        // 一次正常登录就被一个伪造（或陈旧）的回调毁掉了。只有确认这一轮
-        // 确实是我们的（变体一致），才在下面 take 走它。
-        let Some(pending_vendor) = self.peek_pending_vendor(state) else {
-            // 待办状态不在（进程重启 / 已被超时任务清掉）：任务表里还有它，
-            // 但我们拼不出那次 `navigate_uri`，换码必然失败 —— 说清原因
-            finish_task_error(&handle, "登录上下文已丢失，请重新发起");
-            return Err(GatewayError::with_status(410, "登录上下文已丢失，请重新发起"));
-        };
-        if pending_vendor != vendor {
-            // ── 不碰任务、也不吃掉待办状态（有意的）─────────────────
-            // 走到这里说明 URL 里的变体与发起时那个不符。可能是伪造的请求，
-            // 也可能是我们自己拼错了 —— 两种情况下**都不该动这次登录**：
-            //   · 若是伪造：把任务标记失败等于让一个本机进程能掐断用户正在
-            //     进行的登录（DoS）；而它本来什么都换不到（state 校验在后面）；
-            //   · 若是我们自己的 bug：更不该顺手把用户那次登录也毁了。
-            // 因此只回一条错误，任务照旧等着真正的那次回调。
-            return Err(GatewayError::with_status(
-                400,
-                "登录回调与本次登录不匹配，请重新发起",
-            ));
-        }
-        let Some(pending) = self.take_pending_oauth(state) else {
+        let Some(pending) = self.take_pending_oauth(&state) else {
             finish_task_error(&handle, "登录上下文已丢失，请重新发起");
             return Err(GatewayError::with_status(410, "登录上下文已丢失，请重新发起"));
         };

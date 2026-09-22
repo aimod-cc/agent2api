@@ -701,9 +701,12 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
         .get("captchaVerifyParam")
         .and_then(Value::as_str)
         .unwrap_or("");
-    // 回调挂在本网关自己的 loopback 端口上（理由见 `autoclaw::oauth` 模块头：
-    // 上游不校验 navigate_uri 的形态与主机，实测）
-    let callback_base = format!("http://127.0.0.1:{}", state.port);
+    // 回调挂在本网关自己的 loopback 端口上。host 必须是 `localhost`：
+    // Zai 的 OAuth 服务在 authorize 阶段校验 redirect_uri 白名单，`127.0.0.1`
+    // 会被拒（`Redirect URI not registered for this client`，2026-09-22 实测；
+    // Google 同形态却能过 —— 两家规则不同）。形态必须与客户端逐字同款，
+    // 理由与回调路由见 `providers::autoclaw::oauth::CALLBACK_PATH_PREFIX`。
+    let callback_base = format!("http://localhost:{}", state.port);
     let handle = match state
         .login()
         .start_autoclaw_oauth_login(region, vendor, captcha, &callback_base)
@@ -721,24 +724,25 @@ pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) ->
     }))
 }
 
-/// `GET /api/session/login/autoclaw-oauth-callback/{vendor}/{state}` —— 浏览器回调。
+/// `GET /auth/callback-{vendor}` —— 浏览器回调（客户端同款形态，见
+/// `providers::autoclaw::oauth::CALLBACK_PATH_PREFIX`；Zai 的 OAuth 白名单按
+/// host 校验，navigate_uri 必须与官方客户端逐字同款才能通过）。
 ///
 /// ── 为什么这条免鉴权（挂 public 组）──────────────────────────
 /// 调用方是**用户的浏览器**（授权页 302 到这里），它当然没有我们的 API Key。
-/// 安全性由一次性 state 承担：它在网关进程内生成、与登录任务一一对应、
-/// 回调时逐字比对（见 `finish_autoclaw_oauth_callback`）。与 CatPaw 那条
-/// loopback 回调同一取舍。
+/// 与 CatPaw 那条 loopback 回调同一取舍。
 ///
-/// ── 为什么是 GET 且 state 在路径里 ──────────────────────────
-/// 上游在 `navigate_uri` 后面拼 `?code=…&state=…`，是**顶层导航**（浏览器
-/// 直接跳过来）。把变体与 state 放进路径段，就不必猜上游是追加 `?` 还是
-/// `&`（`navigate_uri` 里已经带了查询串时会变成 `&`）—— 我们给上游的
-/// `navigate_uri` 里不带查询串，但让回调的解析不依赖这一点更稳。
+/// ── 任务怎么关联（这里没有我们的 state）─────────────────────
+/// 上游在 `navigate_uri` 后拼 `?code=…&state=…`，查询串里的 `state` 是**上游
+/// 生成的**那个（换码要回传它）。我们自己的任务标识不在回调 URL 里（放查询串
+/// 会与它撞参数名、放子路径会偏离客户端形态）—— 任务关联在登录服务里按
+/// 「变体匹配的进行中任务」完成（见 `core::login::autoclaw` 的
+/// `find_pending_for_vendor`）。
 ///
 /// 响应是给人看的 HTML（浏览器停在这一页），因此不走 `ok_json` 那套信封。
 pub async fn login_autoclaw_oauth_callback(
     State(state): State<ServerState>,
-    axum::extract::Path((vendor_id, task_state)): axum::extract::Path<(String, String)>,
+    axum::extract::Path(vendor_id): axum::extract::Path<String>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Response {
     use crate::server::core::providers::autoclaw::oauth::Vendor;
@@ -746,8 +750,7 @@ pub async fn login_autoclaw_oauth_callback(
         return oauth_callback_page(400, "登录失败：无法识别的登录方式");
     };
     let code = params.get("code").cloned().unwrap_or_default();
-    // 上游在查询串里回的 state —— 换码要用的**是这一个**（不是路径里的 task_state，
-    // 两者是不同的值，见 `finish_autoclaw_oauth_callback` 的说明）
+    // 上游在查询串里回的 state —— 换码要用的就是这一个（官方客户端读的也是它）
     let upstream_state = params.get("state").cloned().unwrap_or_default();
     // 上游把 error 也回在这个查询串里（用户拒绝授权时）
     if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
@@ -755,7 +758,7 @@ pub async fn login_autoclaw_oauth_callback(
     }
     match state
         .login()
-        .finish_autoclaw_oauth_callback(vendor, &task_state, &upstream_state, &code)
+        .finish_autoclaw_oauth_callback(vendor, &upstream_state, &code)
         .await
     {
         Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),

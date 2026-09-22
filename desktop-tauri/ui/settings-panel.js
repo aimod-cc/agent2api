@@ -172,6 +172,7 @@
       loadSanitize(),
       loadPrompt(),
       loadStorage(),
+      loadCaptcha(),
       window.wbUpdatePanel?.load?.(),
     ]);
   }
@@ -791,6 +792,53 @@
   $('settings-chinese-units')?.addEventListener('change', event => applyUnits(event.target.checked));
   $('btn-settings-export').addEventListener('click', exportAccounts);
   $('btn-settings-import').addEventListener('click', importAccounts);
+
+  // ── 机器人校验（ALTCHA）：读写走 HTTP 桥（/api/captcha），与桌面壳的
+  // getAppSettings 不同源 —— 照 retention 的模式：读失败降级禁用开关。
+  // 注意 call() 返回的是**已解包的 data**（同 getRetention），不要再剥一层。
+  async function loadCaptcha() {
+    const toggle = $('settings-captcha');
+    if (!toggle) return;
+    try {
+      const state = await api.getCaptchaSetting();
+      toggle.checked = state?.captchaEnabled === true;
+      toggle.disabled = false;
+    } catch (error) {
+      toggle.disabled = true;
+      console.warn('读取机器人校验设置失败:', error.message);
+    }
+  }
+
+  async function saveCaptcha(on) {
+    const toggle = $('settings-captcha');
+    try {
+      const state = await api.saveCaptchaSetting(on);
+      toggle.checked = state?.captchaEnabled === true;
+      toast(on ? '✅ 机器人校验已开启' : '⚠️ 机器人校验已关闭');
+    } catch (error) {
+      toast(`保存失败：${error.message}`, 'err');
+      loadCaptcha();
+    }
+  }
+  $('settings-captcha')?.addEventListener('change', event => saveCaptcha(event.target.checked));
+
+  // ── 面板登录（仅网页端显示）：「退出登录」撤销本设备的整条会话链
+  //（30 天自动续期一并失效），其他已登录设备不受影响；成功后整页跳回登录页。
+  if (window.workbuddyDesktop?.platform === 'web') {
+    const section = $('panel-login-section');
+    const button = $('btn-panel-logout');
+    if (section) section.style.display = '';
+    button?.addEventListener('click', async () => {
+      button.disabled = true;
+      try {
+        await api.panelLogout();
+        window.location.href = '/login';
+      } catch (error) {
+        button.disabled = false;
+        toast(`退出失败：${error.message}`, 'err');
+      }
+    });
+  }
 
   // 分类切换同样是纯本地偏好：绑定挂在导航容器上（事件委托），
   // 这样以后新增分类不必再补一行绑定

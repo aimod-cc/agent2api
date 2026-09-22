@@ -45,25 +45,34 @@
 //! 因此整条链是「**前端过一次验证码 → 网关拿 URL → 浏览器登录 → 网关换码**」，
 //! 网关侧没有浏览器依赖。
 //!
-//! ── navigate_uri 为什么可以用本网关的 loopback 地址 ─────────────
-//! 实测上游对 `navigate_uri` **只做非空校验、不校验形态也不校验主机**：
-//! 传 `not-a-url` / `ftp://x/y` / `http://127.0.0.1:1/a` /
-//! `https://evil.example.com/...` 得到的都是同一个 630014（缺验证码），
-//! 没有一个被更早地拒掉。官方客户端的端口也是**运行时挑的**
-//! （`ALL_PORTS` 里第一个能 listen 的，实测就是随机量级），所以「端口必须
-//! 是某个固定值」这条约束并不存在。
+//! ── navigate_uri 为什么必须长成客户端那样（本节两处实测，别混）─
+//! 上游对 `navigate_uri` 的校验发生在**两个阶段**，口径完全不同：
 //!
-//! 于是回调可以直接挂在本网关自己的监听端口上（与 CatPaw 同一手法，见
+//!   - **第 ② 步（`oauth-url` 接口）**：只做非空校验，不校验形态也不校验主机。
+//!     传 `not-a-url` / `ftp://x/y` / `http://127.0.0.1:1/a` 得到的都是同一个
+//!     630014（缺验证码），没有一个被更早地拒掉 —— 客户端的端口也是运行时挑的，
+//!     「端口必须是某个固定值」这条约束并不存在。
+//!   - **登录完成后的 authorize 跳转**：Zai 的 OAuth 服务校验 `redirect_uri`
+//!     白名单。host 用 `127.0.0.1` 时窗口里直接渲染
+//!     `{"detail":"Redirect URI not registered for this client"}`（2026-09-22
+//!     实测，Google 同形态却能过 —— 两家的白名单规则不同）；`localhost` 正常。
+//!     因此 `navigate_uri` 必须与客户端逐字同款：
+//!     `http://localhost:<port>/auth/callback-{vendor}`（见 [`CALLBACK_PATH_PREFIX`]）。
+//!
+//! 于是回调直接挂在本网关自己的监听端口上（与 CatPaw 同一手法，见
 //! `core::login::catpaw` 的模块头）：省掉一个临时监听器，也省掉「临时端口
-//! 被占用 / 忘了关」这类故障面。回调地址把 state 放在**路径**里而不是查询串：
-//! 上游会在 `navigate_uri` 后面拼 `?code=…&state=…`，路径里带 state 就不必
-//! 猜上游是追加 `?` 还是 `&`。
+//! 被占用 / 忘了关」这类故障面。回调地址里**不带** state（理由见
+//! `CALLBACK_PATH_PREFIX` 的说明）；任务关联由登录服务按变体匹配进行中的
+//! 任务完成。
 //!
 //! ── 安全 ────────────────────────────────────────────────────
 //! 回调落在本机 HTTP 端口上，任何本机进程都能伪造一次 GET。安全由**一次性
-//! state** 承担：它只在本进程内生成、与登录任务一一对应、回调时逐字比对
-//! （`core::login` 的 `finish_autoclaw_oauth_callback`）。与 CatPaw 的
-//! loopback 回调同一威胁模型、同一处置。token 只进账号库，不进日志。
+//! 授权码**与登录任务的校验链承担：code 一次性（重复回调幂等）、任务必须
+//! 进行中、换码失败任务即失败 —— 与 CatPaw 的 loopback 回调同一威胁模型。
+//! 与旧形态（state 进回调 URL 逐字比对）的差异：伪造回调不再被 state 挡住，
+//! 代价是本机进程可以毁掉一场进行中的登录（DoS，重试即可），换不来任何凭证。
+//! state 仍照常生成 —— 它是登录任务的内部关联键与去重键，只是不再外露。
+//! token 只进账号库，不进日志。
 
 use serde_json::{json, Value};
 
@@ -135,27 +144,37 @@ impl Vendor {
 
 /// 回调路径的前缀（**本网关自己的**路由，不是上游的）。
 ///
-/// 形如 `/api/session/login/autoclaw-oauth-callback/{vendor}/{state}`：
-/// 变体与 state 都放在路径里，回调处理函数因此不需要再查任何映射表 ——
-/// 「这次回调属于哪个变体」这个事实由 URL 自己带着（它是我们当初交给上游的
-/// 那个 `navigate_uri` 的一部分，绕一圈回来必须原样）。
+/// 形如 `/auth/callback-{vendor}`（`zai` / `google`）—— **与官方客户端逐字同款**
+/// （客户端 `getZaiCallbackUri()` / `getGoogleCallbackUri()` 给的就是
+/// `http://localhost:<port>/auth/callback-zai|google`）。变体放在路径末段，
+/// 回调处理函数据此认出这次回调属于哪个变体。
 ///
-/// 与 `catpaw::CALLBACK_PATH` 同一手法，但多两段路径参数：CatPaw 的 state
-/// 在**表单 body** 里（上游主动 POST），这条是**浏览器 302**（查询串里只有
-/// code/state，而 state 已用于任务比对，变体只能另找地方放）。
-pub const CALLBACK_PATH_PREFIX: &str = "/api/session/login/autoclaw-oauth-callback";
+/// ── 为什么形态一个字都不能改（2026-09-22 实测）───────────────
+/// 上游在第 ② 步（`oauth-url` 接口）对 `navigate_uri` 只做非空校验，但登录
+/// 完成、Zai 的 OAuth 服务生成 302 之前会校验 `redirect_uri` 白名单：host 用
+/// `127.0.0.1` 得到 `{"detail":"Redirect URI not registered for this client"}`
+/// （Google 链路同形态却能过 —— 两家的白名单规则不同），`localhost` 正常。
+/// 客户端的端口是运行时挑的，所以白名单不可能精确到端口；能不能精确到路径
+/// 也未实测 —— 因此**连路径都照抄客户端**，把未知规则的风险降到零。
+///
+/// 与 CatPaw 的 loopback 回调同一手法，但这里没有把 state 拼进 URL：
+/// 放查询串会与上游 302 带回的 `state`（上游自己生成的另一个值，见
+/// `core::login::autoclaw::finish_autoclaw_oauth_callback`）撞参数名，放子路径
+/// 又偏离了客户端形态 —— 任务关联改由登录服务按「变体匹配的进行中任务」
+/// 完成（见 `CALLBACK` 安全说明）。
+pub const CALLBACK_PATH_PREFIX: &str = "/auth/callback-";
 
 /// 拼这次登录的回调地址（同时也是交给上游的 `navigate_uri`）。
 ///
-/// `callback_base` 是本网关自己的 loopback 基址（`http://127.0.0.1:<port>`），
-/// 由调用方给出 —— 本模块拿不到监听端口（它在 `ServerState` 上）。
-pub fn navigate_uri(callback_base: &str, vendor: Vendor, state: &str) -> String {
+/// `callback_base` 是本网关自己的 loopback 基址（`http://localhost:<port>`），
+/// 由调用方给出 —— 本模块拿不到监听端口（它在 `ServerState` 上）。host 必须
+/// 是 `localhost`（理由见 [`CALLBACK_PATH_PREFIX`] 的说明）。
+pub fn navigate_uri(callback_base: &str, vendor: Vendor) -> String {
     format!(
-        "{}{}/{}/{}",
+        "{}{}/{}",
         callback_base.trim_end_matches('/'),
         CALLBACK_PATH_PREFIX,
-        vendor.id(),
-        state
+        vendor.id()
     )
 }
 

@@ -943,6 +943,35 @@
                     <div class="io-result" id="settings-io-result" style="display:none"></div>
                   </div>
                 </section>
+
+                <!-- 机器人校验开关（ALTCHA）：护的是面板登录 / 注册（公开的认证
+                     边界），读写走 HTTP 桥（/api/captcha），与桌面壳开关不同源。
+                     桌面形态没有登录页场景，开关同样可见 —— 文案说明作用面。 -->
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>机器人校验</h2>
+                  </div>
+                  <div class="panel-body">
+                    <label class="switch">
+                      <input type="checkbox" id="settings-captcha">
+                      <span class="track"></span>
+                      <span>登录 / 注册需要通过 ALTCHA 人机验证（工作量证明）</span>
+                    </label>
+                    <div class="hint">开启后，登录页在浏览器后台自动完成验证（对真人无感），而脚本每次尝试都要先算一道题 —— 暴力破解与抢注的成本显著上升。仅影响面板的登录 / 注册，与 API 客户端的 API Key 无关。</div>
+                  </div>
+                </section>
+
+                <!-- 面板登录（仅网页端显示，settings-panel.js 按平台开关）：桌面壳的
+                     面板跟着应用走，没有「登录面板」的概念。 -->
+                <section class="panel" id="panel-login-section" style="display:none">
+                  <div class="panel-head">
+                    <h2>面板登录</h2>
+                  </div>
+                  <div class="panel-body">
+                    <div class="hint">当前浏览器以管理员身份登录着本面板。「退出登录」会撤销这台设备的登录会话（30 天内的自动续期一并失效），需要重新输入账号密码；其他已登录的设备不受影响。</div>
+                    <div style="margin-top:10px"><button id="btn-panel-logout">退出登录</button></div>
+                  </div>
+                </section>
               </div>
 
               <!-- ── 数据：保留天数 ──

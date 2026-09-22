@@ -136,6 +136,8 @@
 
 pub mod api;
 mod account_bootstrap;
+pub mod access;
+pub mod altcha;
 pub mod config;
 pub mod config_migration;
 pub mod core;
@@ -145,8 +147,9 @@ pub mod http;
 pub mod logging;
 pub mod logs_store;
 pub mod request_stats;
+mod static_files;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -175,8 +178,20 @@ use crate::server::request_stats::{RequestStats, Retention};
 pub struct ServerState {
     /// 监听端口（默认 3065，可用 AGENT2API_PROXY_PORT 覆盖；旧名 WORKBUDDY_PROXY_PORT 仍可读）
     pub port: u16,
+    /// 管理面板的独立监听端口（headless 设 `AGENT2API_PANEL_PORT` 开启）。
+    /// `None` = 面板与网关同端口（默认形态与桌面壳）；`Some(p)` = 主端口只挂
+    /// `/v1/*` 网关，静态界面与 `/api/*` 挂到 `p` —— 面板端口可以不暴露公网，
+    /// 管理面整体留在内网。桌面壳不设置它。
+    pub panel_port: Option<u16>,
+    /// 监听地址。桌面壳固定 127.0.0.1（单机安全边界）；headless 二进制按
+    /// `AGENT2API_HOST` 解析（默认 0.0.0.0，供容器端口映射）。
+    pub host: IpAddr,
     /// 配置目录（`~/.agent2api`），与壳侧 gateway::config_dir() 同源
     pub config_dir: PathBuf,
+    /// headless 下托管管理界面（`ui/` 静态目录）的根；`None` = 不托管
+    /// （桌面形态由 Tauri 壳的 custom-protocol 出界面，网关只出 API）。
+    /// 桌面壳不设置它；headless 二进制经 [`ServerState::set_ui_dir`] 打开。
+    ui_dir: Option<PathBuf>,
     /// 账号存储句柄（内部一把 Mutex，绝不在持锁时做网络请求）
     store: AccountStore,
     /// 鉴权服务句柄（会话读取 / token 刷新）
@@ -264,7 +279,7 @@ impl ServerState {
     /// → 建目录）就会把新目录建出来，让迁移永远失去重试机会。失败以 `Err`
     /// 往上传（`ensure_ready` 原样透给 UI 的 `backend:error`），不 panic、
     /// 也不静默降级。
-    pub fn bootstrap(port: u16) -> Result<Self, String> {
+    pub fn bootstrap(port: u16, host: IpAddr) -> Result<Self, String> {
         if let Some(reason) = config_migration::pending_reason() {
             return Err(reason);
         }
@@ -425,11 +440,19 @@ impl ServerState {
         // 值得一个能被直接找到的位置，所以整组搬到了那个文件。
         if !upgrade_pending {
             account_bootstrap::run(&store);
+            // 统计侧的一次性口径订正：模型维度从「请求名（映射别名）」重算成
+            // 「上游真名」（见 `RequestStats::remap_model_dimension_once`）。
+            // 与 account_bootstrap 同一模式：待迁移旧数据没导入时跳过 ——
+            // 跑了会把幂等标记打早，升级完成后由 `api::upgrade_api` 补调。
+            request_stats.remap_model_dimension_once();
         }
 
         let state = Self {
             port,
+            panel_port: None,
+            host,
             config_dir,
+            ui_dir: None,
             store,
             auth,
             login,
@@ -444,7 +467,7 @@ impl ServerState {
         };
         logging::log("[Server]", "Agent2API 多提供商本地网关（Rust 进程内服务）启动中…");
         logging::log("[Config]", &format!("API 端口: {}", port));
-        logging::log("[Config]", "API 监听地址: 127.0.0.1");
+        logging::log("[Config]", &format!("API 监听地址: {}", host));
         logging::log(
             "[Config]",
             &format!(
@@ -593,7 +616,7 @@ impl ServerState {
         // 无害的请求，换来的是「这一页的开关说了算」这条一致性。
         //
         // ── 为什么循环里不处理停机信号 ────────────────────────────
-        // 服务器停机时进程会结束，任务随之消失。用 tauri 的 spawn
+        // 服务器停机时进程会结束，任务随之消失。用 crate::spawn_task
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
 
@@ -686,6 +709,17 @@ impl ServerState {
         }
         db::migrate::pending_items(&self.config_dir)
     }
+
+    /// 打开 headless 形态的管理界面托管：`ui_dir` 指向 `ui/` 静态目录，
+    /// 网关随 API 一并出面板（桌面形态不调用 —— 界面由 Tauri 壳出）。
+    pub fn set_ui_dir(&mut self, dir: PathBuf) {
+        self.ui_dir = Some(dir);
+    }
+
+    /// headless 是否托管管理界面（`http::router` 据此挂静态 fallback）。
+    pub fn ui_dir(&self) -> Option<&PathBuf> {
+        self.ui_dir.as_ref()
+    }
 }
 
 /// 读布尔型环境变量开关：**按候选名依次取第一个被设置的**（前一个是新名）。
@@ -702,7 +736,6 @@ fn env_flag(names: &[&str]) -> bool {
     false
 }
 
-
 /// 启动进程内服务器：同步 bind（失败立刻返回可读错误）+ 异步 serve。
 ///
 /// 返回停机信号发送端：调用方（state::BackendHandle）持有它，
@@ -716,7 +749,7 @@ fn env_flag(names: &[&str]) -> bool {
 /// commands 在异步上下文），所以：
 ///   1. 同步段只做 `std::net::TcpListener::bind` —— 这一步不需要运行时，
 ///      且端口占用这个最常见的失败能立刻拿到 OS 错误码返回给调用方；
-///   2. 需要运行时的 from_std 与 serve 都放进 `tauri::async_runtime::spawn`，
+///   2. 需要运行时的 from_std 与 serve 都放进 `crate::spawn_task`，
 ///      任务体一定跑在运行时的工作线程上，reactor 必然可用。
 ///
 /// ── 失败为什么返回 PortConflict 而不是裸字符串 ──
@@ -724,9 +757,23 @@ fn env_flag(names: &[&str]) -> bool {
 /// 落在系统保留段里则只能「更换端口」。分类判据（`std::io::ErrorKind`）
 /// 只有在这里才拿得到，所以在这里分好类往上带，别让界面去猜错误文案。
 pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
-    let router = http::router(state.clone());
-    let addr = SocketAddr::from(([127, 0, 0, 1], state.port));
+    // ── 路由按形态拆分 ─────────────────────────────────────────
+    // 默认（panel_port = None，桌面壳 / 未设 PANEL_PORT 的 headless）：单端口
+    // 挂完整路由（面板 + 网关合并），行为与拆分前逐字一致。分端口形态
+    // （headless 设 AGENT2API_PANEL_PORT）：主端口只挂网关（/v1/* + /health），
+    // 面板（静态界面 + /api/*）单独监听 panel_port —— 把面板端口留在内网，
+    // 公网只暴露网关端口。（panel_port == port 视为没配，兜底走合并。）
+    let panel_port = match state.panel_port {
+        Some(port) if port != state.port => Some(port),
+        _ => None,
+    };
+    let main_router = match panel_port {
+        Some(_) => http::gateway_router(state.clone()),
+        None => http::router(state.clone()),
+    };
+    let panel_router = panel_port.map(|_| http::panel_router(state.clone()));
 
+    let addr = SocketAddr::new(state.host, state.port);
     let listener = std::net::TcpListener::bind(addr)
         .map_err(|error| PortConflict::from_bind_error(state.port, &error, None))?;
     // 立刻转成非阻塞：从这一刻起到 serve 接手之间，若有连接进来，
@@ -739,12 +786,43 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
             &format!("设置监听为非阻塞失败: {error}"),
         )
     })?;
+    // 面板监听（分端口形态）：也在同步段 bind —— 两个端口都拿到手才起
+    // serve，任一失败直接返回冲突（已 bind 的主监听随 drop 自动释放，
+    // 不会留下半启动状态）。
+    let panel_listener = match panel_port {
+        Some(port) => {
+            let addr = SocketAddr::new(state.host, port);
+            let listener = std::net::TcpListener::bind(addr)
+                .map_err(|error| PortConflict::from_bind_error(port, &error, None))?;
+            listener.set_nonblocking(true).map_err(|error| {
+                PortConflict::new(
+                    ConflictKind::Other,
+                    port,
+                    None,
+                    &format!("设置监听为非阻塞失败: {error}"),
+                )
+            })?;
+            Some(listener)
+        }
+        None => None,
+    };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    // 停机广播：oneshot 只有一个 receiver，而分端口形态有两个 serve 都要
+    // 收到停机信号。协调任务把 oneshot 信号（send 或发送端被 drop）转成
+    // watch 置位，两个 serve 各拿一份 receiver；watch 发送端 drop 也会让
+    // `wait_for` 返回，停机语义与单 oneshot 一致。
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    crate::spawn_task(async move {
+        let _ = shutdown_rx.await;
+        let _ = stop_tx.send(true);
+    });
+
     // 停机收尾要用的统计句柄：先克隆出来再移进任务（`state` 是借用，不能
     // 随 async move 一起走）
     let request_stats = state.request_stats();
-    tauri::async_runtime::spawn(async move {
+    let stop_main = stop_rx.clone();
+    crate::spawn_task(async move {
         // 运行时上下文在这里必然成立，from_std 不会 panic
         let listener = match tokio::net::TcpListener::from_std(listener) {
             Ok(listener) => listener,
@@ -753,10 +831,18 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
                 return;
             }
         };
-        let server = axum::serve(listener, router).with_graceful_shutdown(async move {
-            // 收到停机信号（或发送端被丢弃）即结束 accept 循环，
+        // into_make_service_with_connect_info：把客户端地址带进 handler
+        // （面板登录的失败锁定按来源 IP 计；无 ConnectInfo 的提取会 panic，
+        //  所以 serve 的形态必须与之一致）
+        let mut stop = stop_main;
+        let server = axum::serve(
+            listener,
+            main_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            // 收到停机广播（或广播端被丢弃）即结束 accept 循环，
             // 已在处理中的请求会跑完再退出
-            let _ = shutdown_rx.await;
+            let _ = stop.wait_for(|stop| *stop).await;
         });
         match server.await {
             Ok(()) => logging::log("[Server]", "服务已停止"),
@@ -770,6 +856,32 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
         // 让用户备份时只面对一个文件（见 `RequestStats::flush` 的说明）。
         request_stats.flush();
     });
+
+    // 面板 serve（分端口形态才有）：独立监听、同一份停机广播。
+    // 统计收尾只归主 serve（上面那个任务），这里只管转发请求。
+    if let Some(listener) = panel_listener {
+        let router = panel_router.expect("panel_port 与 panel_router 必须成对");
+        crate::spawn_task(async move {
+            let listener = match tokio::net::TcpListener::from_std(listener) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    logging::log("[Server]", &format!("❌ 面板监听创建失败: {error}"));
+                    return;
+                }
+            };
+            let server = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let mut stop = stop_rx;
+                let _ = stop.wait_for(|stop| *stop).await;
+            });
+            if let Err(error) = server.await {
+                logging::log("[Server]", &format!("❌ 面板服务异常退出: {error}"));
+            }
+        });
+    }
 
     Ok(shutdown_tx)
 }

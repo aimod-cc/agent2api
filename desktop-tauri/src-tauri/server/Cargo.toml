@@ -1,0 +1,82 @@
+[package]
+name = "agent2api-server"
+version = "2.7.0"
+description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
+authors = ["aimod-cc"]
+edition = "2021"
+# MSRV 与桌面 crate 保持一致（rusqlite 0.40 → libsqlite3-sys 0.38 声明 1.88）
+rust-version = "1.88"
+license-file = "../../../LICENSE"
+repository = "https://github.com/aimod-cc/agent2api"
+homepage = "https://github.com/aimod-cc/agent2api"
+
+# ── 为什么拆成独立 crate ──────────────────────────────────────
+# 网关本体（原桌面 crate 的 src/server 模块）要同时服务两种形态：
+#   · Tauri 桌面端（进程内 HTTP 服务器）；
+#   · Docker / 服务器上的 headless 二进制（agent2api-server，无 GUI）。
+# 单 crate 形态下 headless 也链接整个 tauri 依赖树 —— Linux 容器里编译
+# 需要 webkit2gtk / gtk3 一整套系统库，运行时也要背着这些 .so，而
+# headless 一个都不用。拆出来后桌面与 headless 各自链接同一个 lib，
+# 各带各的最小依赖。
+#
+# 模块结构刻意保持「薄壳」：lib.rs 只挂 `mod server` / `mod port_conflict`
+# 两层原样目录，模块内部所有 `crate::server::…` / `crate::port_conflict::…`
+# 路径与拆分前完全一致 —— 拆分不需要动几百处路径，桌面侧重导出后
+# `crate::server::…` 也原样可用。
+
+[lib]
+name = "agent2api_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent2api-server"
+path = "src/bin/agent2api-server.rs"
+
+# ── 依赖清单 ─────────────────────────────────────────────────
+# 从桌面 crate 的依赖里摘出网关本体真正用到的部分（逐条理由见桌面
+# Cargo.toml 对应条目的注释，此处不重复）。刻意**没有**的：tauri 及
+# 其插件、windows-sys（端口管理是壳侧的事）。
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rt-multi-thread/macros 起运行时，net 监听端口，sync 传停机信号，
+# fs/io-util 读写配置与日志文件；signal 供 headless 二进制接 SIGTERM
+# （容器 stop 的优雅停机路径）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "fs", "signal"] }
+url = "2"
+axum = "0.8"
+# 出站请求：rustls（纯 Rust，不依赖系统 openssl）+ socks5 出网代理
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+# ALTCHA 机器人校验的 challenge 签名（HMAC-SHA256，见 server/altcha.rs）
+hmac = "0.12"
+chrono = "0.4"
+futures = "0.3"
+tokio-stream = "0.1"
+bytes = "1"
+# CatPaw 适配器的内联图片压缩（providers/catpaw/image_compress.rs）
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+base64 = "0.22"
+# Qoder 网页登录的 PKCE verifier / nonce
+getrandom = "0.2"
+# 出站请求体的指纹脱敏（core/sanitize.rs）
+regex = "1"
+# AutoClaw 适配器 encryption 侧（providers/autoclaw/crypto.rs）
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+# Qoder COSY 签名的 AES-128-CBC
+aes = "0.9"
+# AutoClaw 鉴权接口的请求签名（MD5 复刻客户端指纹，不是安全边界）
+md-5 = "0.10"
+# Qoder COSY 签名的 RSA-PKCS#1 v1.5 加密（手写模幂，见 cosy.rs）
+num-bigint = "0.4"
+# 本地存储唯一真相：单文件 SQLite（bundled 静态链接，运行时零系统依赖）
+rusqlite = { version = "0.40", features = ["bundled"] }
+# 管理面板登录的密码哈希（AGENT2API_ADMIN_PASSWORD_HASH）：
+# bcrypt 与 htpasswd -nBC 的输出格式互通，生成命令无需额外工具
+bcrypt = "0.15"
+
+# AutoClaw 凭证解密的 DPAPI（providers/autoclaw/crypto.rs）。仅 Windows
+# 目标生效；其它平台该适配器的「导入桌面端登录态」是桩实现。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Security_Cryptography"] }

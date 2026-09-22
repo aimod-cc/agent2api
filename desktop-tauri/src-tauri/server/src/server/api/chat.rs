@@ -352,13 +352,13 @@ pub async fn count_tokens(State(state): State<ServerState>, body: Bytes) -> Resp
 /// 每个已实现的 provider 自己决定去哪儿拉清单（workbuddy 是 /v3/config），
 /// 本函数不认识任何一家。W3 加上小浣熊适配器后这里一行都不用改。
 ///
-/// 必须用 `tauri::async_runtime::spawn` 而不是 `tokio::spawn`：
+/// 必须用 `crate::spawn_task` 而不是 `tokio::spawn`：
 /// 本函数在 axum handler 里调用（运行时上下文已成立），但显式选择项目里
 /// 统一的 spawn 入口，避免以后有人把它挪到非 Tokio 上下文时 panic
-/// （release 是 panic=abort，那会带走整个桌面应用）。
+/// （release 是 panic=abort，那会带走整个进程）。
 pub fn spawn_catalog_refresh(state: &ServerState) {
     let store = state.store().clone();
-    tauri::async_runtime::spawn(async move {
+    crate::spawn_task(async move {
         crate::server::core::providers::adapter::refresh_implemented(&store).await;
     });
 }

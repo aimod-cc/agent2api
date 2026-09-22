@@ -59,21 +59,13 @@
 //! 绝不因为一个设置让应用起不来。**唯一的例外是「保存」**：那必须报错，
 //! 因为用户点了保存却没存上是他需要知道的事（与 `load` 的取向相反）。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::gateway;
 
 pub(crate) mod sql;
-
-/// 旧设置文件名（`{config_dir}/desktop-settings.json`）。
-///
-/// 字面量在本文件里写一次而不是引别的常量：这个文件随本次改造已经**不再是
-/// 真相来源**（设置进了数据库），而迁移项与下面的回落读路径处理的正是它 ——
-/// 名字是历史事实，不会随代码演进变化（与 `db::migrate::debug` 的
-/// `DEBUG_FILE_NAME` 同一处理）。
-pub(crate) const LEGACY_FILE_NAME: &str = "desktop-settings.json";
 
 /// 设置数据所在的文件（**就是库文件**；界面展示与排障用）。
 ///
@@ -86,7 +78,7 @@ pub fn file_path() -> PathBuf {
 
 /// 旧设置文件的路径（迁移项与回落读路径共用）。
 pub(crate) fn legacy_file_path() -> PathBuf {
-    gateway::config_dir().join(LEGACY_FILE_NAME)
+    agent2api_server::paths::legacy_desktop_settings_file()
 }
 
 /// 应用设置。
@@ -164,36 +156,7 @@ pub fn save(settings: &AppSettings) -> Result<(), String> {
     sql::write(&file_path(), &text)
 }
 
-/// 迁移项用：读旧文件的原文（**不解析**，保持原样交给迁移）。
-///
-/// 与 [`load`] 的区别：`load` 要的是「能用的设置」（解析失败就回落），
-/// 迁移要的是「文件里到底写了什么」—— 解析与归一归运行期，迁移只负责搬运。
-/// 整份文本搬过去还有个额外好处：用户手写的未知字段一并保留
-/// （与配置项「全量保留未知字段」的不变量一致）。
-pub(crate) fn read_legacy_text(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path).ok()
-}
-
-/// 迁移项用：把一份旧设置文本写进库（**用迁移框架给的连接**）。
-///
-/// 为什么不让迁移项直接调 [`save`]：那会自己开一条新连接（`sql::write`），
-/// 于是迁移的这次写入**跑在框架那批之外** —— 它自己的原子性没问题（单行
-/// UPSERT），但「写不进去时旧文件要不要保留」这个判断就无法与写入处在同一个
-/// 事务里。用框架给的连接则与其余七项一致（都在 `Db::open` 的锁内）。
-///
-/// 返回的 `rusqlite::Result` 由迁移项转成一行 ❌ 日志并返回 `None`
-/// （不备份旧文件 —— 那份文件是运行期回落链的最后保障）。
-pub(crate) fn write_migrated(conn: &rusqlite::Connection, text: &str) -> rusqlite::Result<()> {
-    sql::write_conn(conn, text)
-}
-
-/// 迁移项用：这份旧设置文本能不能解析成设置。
-///
-/// 为什么要先判一次：把一份读不懂的内容写进库，会让**运行期的回落链断掉**
-/// —— 库里有了值（虽然读不懂），`load` 就不会再回落（`sql::load` 命中即返回，
-/// 解析失败取默认），于是用户看到的是「设置全变回默认」，而旧文件又被改名成了
-/// 备份。判一次则宁可让文件留在原处、库里不写（迁移项跳过 + 保留旧文件，
-/// 与其它项遇到坏 JSON 时同一处理）。
-pub(crate) fn legacy_parses(text: &str) -> bool {
-    serde_json::from_str::<AppSettings>(text).is_ok()
-}
+// 注：旧文件迁移用的三个辅助（读原文 / 解析校验 / 写库）已随网关本体迁到
+// 独立 crate（`agent2api_server::server::db::migrate::settings` 本地实现），
+// 其中解析校验用的 `LegacyAppSettings` 是 `AppSettings` 的镜像 —— **本结构
+// 增删字段时必须同步那边**，两边注释互相指向。

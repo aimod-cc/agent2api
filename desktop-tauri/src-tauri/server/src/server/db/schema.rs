@@ -95,6 +95,18 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // `sqlite3` 看），而不是因为改一次 API Key 就静默消失。真要清理时手工
     // 删这一行即可。
     "desensitize",
+    // 面板管理员（server::access）：{username, hash} 整份 JSON 一个键 ——
+    // 首次部署在面板上注册产生（环境变量预置时优先于它），属于「其它零散
+    // 状态」一类：不是配置项，配置写入绝不能动它。
+    "panelAdmin",
+    // 面板刷新令牌（server::access）：整份记录数组一个键（条目是个位数：
+    // 每设备一条活链），轮换/撤销都是整键重写。刷新令牌在库里只存 sha256，
+    // 重启后 access 短效令牌虽在内存丢失，浏览器用它静默换新。
+    "panelTokens",
+    // ALTCHA 机器人校验的 HMAC 密钥（server::altcha）：首次签发 challenge
+    // 时生成并落库，只经 HMAC 使用、从不外发。属于「其它零散状态」，
+    // 配置写入绝不能动它。
+    "panelAltchaSecret",
     // config.json 迁移的完成标记（db::migrate::config）。为什么配置这一项
     // **需要**标记键而其余项不需要：配置项是开放集合，没法问「配置迁过了
     // 没有」（理由与完整论证见 db::migrate::config 的模块头）。

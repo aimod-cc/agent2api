@@ -133,6 +133,7 @@ pub async fn run_upgrade(State(state): State<ServerState>) -> Response {
     // 处置一致）。
     let config_dir = state.config_dir.clone();
     let store = state.store().clone();
+    let request_stats = state.request_stats();
     let result = tokio::task::spawn_blocking(move || {
         let outcomes =
             db.with(|conn| crate::server::db::migrate::run_legacy_migrations(conn, &config_dir));
@@ -151,6 +152,11 @@ pub async fn run_upgrade(State(state): State<ServerState>) -> Response {
             // `migrate_cline_split` 读 `modelRules`，而那个配置项正是这次迁移
             // 刚从旧 `config.json` 搬进来的，快照没重装就读不到它。
             crate::server::account_bootstrap::run(&store);
+            // 统计侧的口径订正同理补调（启动时被 upgrade_pending 跳过，
+            // 见 `RequestStats::remap_model_dimension_once` 的调用时机说明）：
+            // 旧聚合行刚导进来，模型维度还按请求名累计，不重算的话本次运行
+            // 的报表会一直把映射别名当成独立模型。
+            request_stats.remap_model_dimension_once();
         }
         outcomes
     })

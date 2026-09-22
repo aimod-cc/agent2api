@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agent2API · 登录</title>
+  <style>
+    /* 与面板同一套视觉基调（tokens.css 的深色变量取值），独立成页不依赖面板样式 */
+    :root {
+      --bg: #141517;
+      --card: #1e1f22;
+      --border: #33343a;
+      --text: #e8e8e8;
+      --text-dim: #9a9ca3;
+      --accent: #007aff;
+      --accent-hover: #2b8bff;
+      --error: #ff8080;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: radial-gradient(1200px 600px at 50% -10%, #1d2b45 0%, var(--bg) 55%);
+      font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+      color: var(--text);
+      padding: 24px;
+    }
+    .card {
+      width: min(400px, 100%);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 36px 34px 30px;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+    }
+    .brand {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 26px;
+      text-align: center;
+    }
+    .brand svg { width: 52px; height: 52px; border-radius: 12px; box-shadow: 0 6px 18px rgba(0, 122, 255, 0.35); }
+    .brand h1 { font-size: 21px; font-weight: 700; letter-spacing: 0.2px; }
+    .brand .sub { font-size: 12.5px; color: var(--text-dim); }
+    .mode-tip { font-size: 13px; color: var(--text-dim); text-align: center; margin-bottom: 18px; }
+    label { display: block; font-size: 12.5px; color: var(--text-dim); margin: 14px 0 5px; }
+    input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #26272b;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus { border-color: var(--accent); }
+    .error {
+      color: var(--error);
+      font-size: 13px;
+      min-height: 20px;
+      margin-top: 12px;
+      white-space: pre-wrap;
+      text-align: center;
+    }
+    button {
+      width: 100%;
+      margin-top: 10px;
+      padding: 11px 0;
+      border: 0;
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 14.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    .footer { margin-top: 22px; text-align: center; font-size: 12px; color: var(--text-dim); }
+    /* 官方 widget 微调：
+       ① 行铺满表单宽度（官方默认按内容收窄，在表单里会显得靠左）；
+       ② label 覆盖登录页的全局表单标签样式（那个 margin: 14px 0 5px 与
+          灰色会把「我不是机器人」压下去、变灰）—— 用 altcha-widget 前缀
+          提高特异性盖过全局规则；
+       ③ 隐藏品牌 footer（altcha.org 外链，与 OmniProxy 的取用方式一致）。 */
+    altcha-widget { display: block; margin: 20px 0; }
+    /* 官方脚本注入的全局 button 样式带 margin-top: 10px，会破坏下方间距对称 */
+    #submit { margin-top: 0; }
+    altcha-widget .altcha { width: fit-content; max-width: 100%; margin: 0 auto; box-sizing: border-box; }
+    altcha-widget .altcha-label label { margin: 0; font-size: 13px; color: inherit; }
+    altcha-widget div:has(> .altcha-logo) { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <!-- 品牌标与桌面端 / 面板侧栏同一造型（icons.js 的 brand 项），独立成页内嵌一份 -->
+      <svg viewBox="0 0 24 24" role="img" aria-label="Agent2API">
+        <rect width="24" height="24" rx="5.4" fill="#007AFF" />
+        <g fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5.23 9.24h10.71" />
+          <path d="M15.94 6.72 18.77 9.24 15.94 11.76" />
+          <path d="M18.77 14.76H8.06" />
+          <path d="M8.06 12.24 5.23 14.76 8.06 17.28" />
+        </g>
+      </svg>
+      <div>
+        <h1>Agent2API</h1>
+        <div class="sub">OpenAI 兼容网关 · 管理面板</div>
+      </div>
+    </div>
+
+    <div class="mode-tip" id="mode-tip"></div>
+
+    <form id="form" autocomplete="on">
+      <label for="username">账号</label>
+      <input id="username" autocomplete="username" placeholder="管理员账号" />
+      <label for="password">密码</label>
+      <input id="password" type="password" autocomplete="new-password" placeholder="至少 8 位" />
+      <!-- ALTCHA 官方 widget：勾一下「我不是机器人」→ 后台算题 → 绿勾已验证 -->
+      <altcha-widget id="altcha" challengeurl="/api/panel/captcha" name="altcha" hidefooter
+        strings='{"aria":"我不是机器人","label":"我不是机器人","verified":"验证成功","verifying":"验证中…","wait":"请稍候…","error":"验证失败，请重试","expired":"验证已过期，请重试","footer":"由 ALTCHA 保护"}'></altcha-widget>
+      <button id="submit" type="submit">继续</button>
+      <div class="error" id="error"></div>
+    </form>
+
+    <div class="footer">登录后可在「网关 Key」页为 API 客户端创建密钥</div>
+  </div>
+
+  <script type="module" src="/altcha.min.js"></script>
+  <script>
+    (function () {
+      'use strict';
+      var $ = function (id) { return document.getElementById(id); };
+      var tip = $('mode-tip');
+      var errorEl = $('error');
+      var button = $('submit');
+      var isSetup = false;
+
+      // 已登录（access 会话有效）→ 直接进面板；401 → 留在本页
+      fetch('/api/session').then(function (resp) {
+        if (resp.ok) window.location.href = '/';
+      }).catch(function () { /* 未登录，留在本页 */ });
+
+      // ── ALTCHA 官方 widget（proof-of-work，协议见 server::altcha）──
+      // 点一下「我不是机器人」→ widget 领题并在后台算 → 绿勾「验证成功」，
+      // verified 事件给出随提交的 payload。payload 一次性（服务器用后即焚）：
+      // 提交失败要 widget.reset() 重新验证。网关关闭了校验时领题回 400，
+      // 整个 widget 隐藏，提交不带 payload。
+      var captchaPayload = null;
+      var widget = document.getElementById('altcha');
+
+      widget.addEventListener('verified', function (event) {
+        captchaPayload = (event.detail && event.detail.payload) || null;
+      });
+      widget.addEventListener('expired', function () {
+        captchaPayload = null;
+      });
+
+      // 探测开关：未启用时领题回 400，隐藏验证行（提交自然不带 payload）
+      fetch('/api/panel/captcha').then(function (resp) {
+        if (!resp.ok) widget.style.display = 'none';
+      }).catch(function () { /* 网关不可达：widget 自会显示错误 */ });
+
+      // 决定模式：没有任何管理员 → 注册；否则登录
+      fetch('/api/panel/status').then(function (resp) { return resp.json(); }).then(function (data) {
+        var registered = data && data.data && data.data.registered;
+        isSetup = !registered;
+        tip.textContent = isSetup
+          ? '首次使用：创建一个管理员账号，用于登录此面板'
+          : '请输入管理员账号与密码';
+        $('submit').textContent = isSetup ? '创建账号并进入面板' : '登录';
+        if (isSetup) $('password').placeholder = '设置密码（至少 8 位）';
+      }).catch(function () {
+        tip.textContent = '无法连接网关，请确认服务已启动';
+      });
+
+      function doSubmit(username, password) {
+        button.disabled = true;
+        errorEl.textContent = '';
+        var body = { username: username, password: password };
+        if (captchaPayload) body.captcha = captchaPayload;
+        fetch(isSetup ? '/api/panel/setup' : '/api/panel/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        }).then(function (resp) {
+          return resp.json().then(function (payload) { return { ok: resp.ok, payload: payload }; });
+        }).then(function (result) {
+          if (result.ok) {
+            window.location.href = '/';
+            return;
+          }
+          var detail = result.payload && (result.payload.error || result.payload);
+          errorEl.textContent = (detail && detail.message) || '请求失败，请重试';
+          button.disabled = false;
+          captchaPayload = null; // payload 是一次性的：失败后重新验证
+          widget.reset();
+        }).catch(function () {
+          errorEl.textContent = '无法连接网关';
+          button.disabled = false;
+          captchaPayload = null;
+          widget.reset();
+        });
+      }
+
+      // capture：先于官方 widget 的 form 集成逻辑跑，未验证时给出明确提示
+      $('form').addEventListener('submit', function (event) {
+        event.preventDefault();
+        var username = $('username').value.trim();
+        var password = $('password').value;
+        if (!username || !password) {
+          errorEl.textContent = '请填写账号与密码';
+          return;
+        }
+        if (widget.style.display !== 'none' && !captchaPayload) {
+          errorEl.textContent = '请先勾选「我不是机器人」完成验证';
+          return;
+        }
+        doSubmit(username, password);
+      }, true);
+    })();
+  </script>
+</body>
+</html>

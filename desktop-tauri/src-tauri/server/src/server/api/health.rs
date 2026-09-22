@@ -36,6 +36,13 @@ pub const UNCONFIGURED_REASON: &str = crate::server::core::auth::UNCONFIGURED_RE
 
 /// 处理 GET /health
 pub async fn handle(State(state): State<ServerState>) -> Response {
+    // headless 的安全形态（未注册闸门 / /v1 fail-closed）下只回答「进程活着」：
+    // 完整摘要会把上游地址、登录状态、模型数量递给公网上的探测者。
+    // 探活方（Docker HEALTHCHECK / 反代）只看状态码与 status 字段，不受影响；
+    // 桌面壳与面板首屏不受影响 —— 那两种形态下闸门与 fail-closed 都不会开启。
+    if crate::server::access::panel_gate() || crate::server::access::v1_fail_closed() {
+        return raw_json(json!({ "status": "ok" }));
+    }
     let snapshot = config::current();
     let summary = state.auth().get_config_summary();
     let status = state.auth().get_status().await;

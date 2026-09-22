@@ -315,7 +315,7 @@ struct Inner {
     /// 是否已有一次签到在执行（对应 Node 的闭包变量 running）
     running: bool,
     /// 调度循环任务句柄（对应 Node 的 timer）
-    task: Option<tauri::async_runtime::JoinHandle<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
     /// 停机标志：stop() 置位后循环退出（幂等；再次 start 会重置）
     stopped: Arc<AtomicBool>,
 }
@@ -541,17 +541,17 @@ impl AutoCheckin {
         {
             let mut inner = self.lock();
             if let Some(task) = &inner.task {
-                if !task.inner().is_finished() {
+                if !task.is_finished() {
                     return;
                 }
             }
             inner.stopped = Arc::new(AtomicBool::new(false));
             let stopped = inner.stopped.clone();
             let service = self.clone();
-            // 用 tauri 的 spawn：本函数可能从 setup 钩子（主线程）或 axum handler
-            // 调用，`tauri::async_runtime::spawn` 会自己进入全局运行时，
+            // 用 crate::spawn_task：本函数可能从 setup 钩子（主线程）或 axum handler
+            // 调用，`crate::spawn_task` 兜底进全局运行时，
             // 不会像裸 `tokio::spawn` 那样在非运行时上下文 panic（release 是 panic=abort）
-            inner.task = Some(tauri::async_runtime::spawn(async move {
+            inner.task = Some(crate::spawn_task(async move {
                 loop {
                     // 先睡再 tick：与 setInterval 的「间隔后首次触发」一致，
                     // 也避开 start() 里那次补签刚发起的窗口
@@ -577,7 +577,7 @@ impl AutoCheckin {
         self.schedule();
         if state.last_fired_date.as_deref() != Some(local_date_key(Local::now()).as_str()) {
             let service = self.clone();
-            tauri::async_runtime::spawn(async move {
+            crate::spawn_task(async move {
                 service.fire("启动补签").await;
             });
         } else {

@@ -615,7 +615,7 @@ impl LoginService {
     /// 后台起一个登录任务，并把「失败/完成」写回任务句柄。
     fn spawn_login(&self, handle: LoginTaskHandle, edition: String) {
         let this = self.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn_task(async move {
             let handle_for_callback = handle.clone();
             let result = this
                 .login_interactive(Some(edition.as_str()), &handle, move |url, state| {

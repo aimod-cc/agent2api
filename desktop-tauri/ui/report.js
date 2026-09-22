@@ -230,7 +230,7 @@
   // ─── 板块二：Top 提供商 / Top 账号排行 ──────
   //
   // 两张卡片（并排）共用同一套渲染：都是「一行一个主体 + 用量条 + Token 用量」，
-  // 差别只在数据来源、名字怎么取、以及「其它」那一行怎么称呼。抽成一个函数传配置，
+  // 差别只在数据来源、名字怎么取。抽成一个函数传配置，
   // 而不是写两份 —— 两份的列宽、tooltip 格式、排序口径迟早会漂，而这类漂移
   // 不会报错，只会让两张并排的卡片看起来像两套设计。
   //
@@ -256,10 +256,10 @@
    * 一条明细都没记下这一维」（例如全部请求都没走到转发），此时给一句空态即可。
    * 两者混在一起会让「版本落后」看起来像「今天没用量」。
    *
-   * 展示上只取前 5 项（超过就并进「其它」）：这块是概览不是明细表，项数一多
-   * 每行的条就细到看不出差别；完整数据本来也能在模型请求里按列核对。
+   * 展示上不再截断：全部账号 / 提供商都逐行列出（此前只取前 5 项、其余并成
+   * 「其它」一行 —— 但「其它」里具体是谁只能去猜），行数多时由卡片自身的
+   * 限高滚动兜住（见 page-report.css 的 .rank-shares），卡片高度不再随行数增长。
    */
-  const RANK_TOP = 5;
 
   /** 两张卡片的配置（渲染逻辑共用，差异全在这里） */
   const RANK_CARDS = {
@@ -267,8 +267,6 @@
       panelId: 'report-providers-panel',
       listId: 'report-providers',
       labelId: 'report-providers-label',
-      // 「其它 N 家」：provider 的量词是「家」
-      restLabel: count => `其它 ${count} 家`,
       emptyText: '所选范围内还没有请求记录',
       // provider 的 id 是注册表里的短标识（workbuddy / qoder），tooltip 里值得带上
       tipName: item => (item.id ? `${item.label}（${item.id}）` : item.label),
@@ -277,8 +275,6 @@
       panelId: 'report-accounts-panel',
       listId: 'report-accounts',
       labelId: 'report-accounts-label',
-      // 「其它 N 个」：账号的量词是「个」，与账号页的称呼一致
-      restLabel: count => `其它 ${count} 个`,
       emptyText: '所选范围内还没有账号用量',
       // 账号名可能重复（两家都能叫「默认」），id 才是身份 —— tooltip 里带上它
       tipName: item => (item.id ? `${item.label}（${item.id}）` : item.label),
@@ -315,21 +311,11 @@
     // 保留这条兜底与概览里的口径一致
     const share = count => (total ? (count / total) * 100 : 0);
 
-    // 按 Token 用量降序排序后截断，溢出的合并成「其它」一行 —— 合并后的条仍然
-    // 按真实总量画，所以所有条加起来始终是 100%，不会因为截断而看起来缺一截
+    // 按 Token 用量降序排序后全量渲染：不再把溢出行并进「其它」，占比的分母
+    // 仍是对该维度全量求和，每行的百分比加起来始终是 100%
     const sorted = [...rows].sort((left, right) => right.tokens - left.tokens);
-    const head = sorted.slice(0, RANK_TOP);
-    const rest = sorted.slice(RANK_TOP);
-    if (rest.length) {
-      head.push({
-        id: '',
-        label: config.restLabel(rest.length),
-        // 合并行的 tokens 累加：排序基准换成 tokens 之后它自然就对了
-        tokens: rest.reduce((sum, item) => sum + item.tokens, 0),
-      });
-    }
 
-    return head.map(item => {
+    return sorted.map(item => {
       const percent = share(item.tokens);
       const text = formatTokens(item.tokens);
       const name = item.label || item.id || '未知';
@@ -356,7 +342,7 @@
    * 不是「这一维没数据」。面板与页头的小标题一起藏，避免页面上留一个空卡片。
    *
    * 小标题读数是 **Token 总量**（不再是「N 次请求」）：它与行内读数同一口径，
-   * 于是「5 行之和小标题」这条对账关系在界面上随时看得出来 —— 请求数总量写在
+   * 于是「各行之和小标题」这条对账关系在界面上随时看得出来 —— 请求数总量写在
    * 概览卡片里，两处各管一个量纲，不会互相打架。
    */
   function paintRank(key, list) {

@@ -1,0 +1,27 @@
+# 构建上下文只需要：src-tauri（网关源码）与 desktop-tauri/ui（面板静态文件）。
+# 其余一概不进镜像 —— 尤其 Acankao/（参考项目源码）与各构建产物目录。
+
+.git
+.github
+Acankao
+assets
+prototype
+logs
+data
+.tmp-release
+.verify
+target
+**/target
+**/node_modules
+node_modules
+*.md
+.env
+
+# 桌面壳的 Rust 工程不进镜像（tauri 全家桶），但网关 crate（server/）
+# 与 workspace 清单（Cargo.toml / Cargo.lock）必须进
+desktop-tauri/src-tauri/*
+!desktop-tauri/src-tauri/Cargo.toml
+!desktop-tauri/src-tauri/Cargo.lock
+!desktop-tauri/src-tauri/server
+desktop-tauri/package.json
+desktop-tauri/package-lock.json

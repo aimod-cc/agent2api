@@ -28,7 +28,7 @@ impl LoginService {
         self.tasks.register(&flow.state, handle.clone());
         let service = self.clone();
         let task = handle.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn_task(async move {
             service.run_qoder_login(task, flow).await;
         });
         logging::log("[Login]", &format!("发起 Qoder {}网页登录（等待授权…）", region.label()));

@@ -28,12 +28,22 @@ use serde_json::{Map, Value};
 
 use super::types::*;
 
-/// 环境变量里的 API Key（去空白，空串当未配置）
+/// 环境变量里的 API Key（新名优先，旧名兼容读；去空白，空串当未配置）
 pub(super) fn env_api_key() -> Option<String> {
-    std::env::var("WORKBUDDY_PROXY_API_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    env_api_key_value()
+}
+
+/// 两个候选名按序取第一个有效值（`AGENT2API_PROXY_API_KEY` > 旧名）
+pub(crate) fn env_api_key_value() -> Option<String> {
+    for name in ["AGENT2API_PROXY_API_KEY", "WORKBUDDY_PROXY_API_KEY"] {
+        if let Ok(value) = std::env::var(name) {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
 }
 
 /// 环境变量里的非空字符串

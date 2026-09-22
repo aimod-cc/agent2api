@@ -98,7 +98,14 @@ pub async fn ensure_ready(app: &AppHandle) -> Result<(), StartupFailure> {
     // 失败一律原样返回：`bootstrap` 只在「本该执行的目录迁移没有执行」时返回
     // Err（防御性校验，见那边的注释）—— 继续下去会把新配置目录建出来，
     // 让迁移永远无法重试，所以这里必须中断而不是带着错误往下走。
-    let state = server::ServerState::bootstrap(port).map_err(StartupFailure::other)?;
+    // 桌面形态永远只听本机回环：管理 API 不出 127.0.0.1（headless 形态
+    // 由 agent2api-server 二进制按 AGENT2API_HOST 自行决定监听地址）。
+    let state = server::ServerState::bootstrap(port, std::net::IpAddr::from([127, 0, 0, 1]))
+        .map_err(StartupFailure::other)?;
+
+    // 面板访问控制的库句柄注入（桌面不注册管理员 → 该体系不启用，行为不变；
+    // 与容器共用数据目录且注册过时，桌面管理 API 需要 Key —— 壳自动携带）
+    server::access::attach_db(state.db().cloned());
 
     // 端口已被占用：唯一合法的占用者是「本产品的旧版 node 网关」（升级场景），
     // 先尝试自动接管；接管不了（别的程序 / 用户手工起的服务）才走报错。

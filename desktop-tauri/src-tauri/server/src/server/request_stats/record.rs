@@ -143,8 +143,9 @@ pub struct RequestEntry {
     /// 空串 = 客户端没点名，或该行来自还没有此字段的旧版本）。
     ///
     /// 请求日志用它与 `upstreamModel` 分两行展示「⬆️ 转发的什么 / ⬇️ 请求的
-    /// 什么」。**不要**把它与 `model` 混用：`model` 是解析后的名字（默认回落
-    /// 与映射都已生效），报表按模型聚合的历史口径跟着 `model` 走。
+    /// 什么」。**不要**把它与 `model` 混用：`model` 是请求侧的解析名（默认回落
+    /// 已生效；映射不改写它 —— 映射语义重做后改写下沉到发送侧按家进行，见
+    /// `pipeline::resolve_model` 的说明），客户端点名映射别名时它就是别名本身。
     #[serde(rename = "clientModel", default)]
     pub client_model: String,
     /// 实际发给上游的模型名（映射 + 备援按家改写后的最终值；空串 =
@@ -153,6 +154,11 @@ pub struct RequestEntry {
     /// 与 `model` 的差别只在「改写发生过」时出现：下游请求 `gpt-4o` 映射到
     /// `deepseek-v4-pro`、或请求名经备援落到别家时，`model` 记请求侧解析名，
     /// 这里记上游真正收到、也真正认识的名字。
+    ///
+    /// **报表按模型聚合以本字段为统计键**（空串回落 `model`，见
+    /// `fold_into_daily` 的 `model_stat_key`）：映射只是代名，实际请求的仍是
+    /// 上游那一个模型，用量要记在真名名下 —— 否则同一个上游模型会在
+    /// 「模型用量」里拆成「真名 + 各家别名」好几行。
     #[serde(rename = "upstreamModel", default)]
     pub upstream_model: String,
     /// **每一次上游尝试的明细**（`[{provider, status, error}]`，按发生顺序）。

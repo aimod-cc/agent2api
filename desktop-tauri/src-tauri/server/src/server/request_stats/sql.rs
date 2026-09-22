@@ -175,9 +175,16 @@ impl FilterPlan {
         let mut fragments: Vec<String> = Vec::new();
         let mut binds: Vec<SqlValue> = Vec::new();
 
-        // ① 模型名精确匹配；空串（输入框清空）当没筛
+        // ① 模型名精确匹配；空串（输入框清空）当没筛。
+        //    匹配**两个**名字列：`model`（请求侧解析名）与 `upstream_model`
+        //    （实际发给上游的名字）。报表的模型维度按上游真名聚合（见
+        //    `fold_into_daily` 的 `model_stat_key`），而明细的 `model` 列存的是
+        //    请求侧解析名 —— 只匹配一列时，映射请求在报表里显示的真名
+        //    （只落在 upstream_model 列）会筛出 0 条。两个名字都该能筛到，
+        //    条件因此取并集；与下拉候选（`select_model_options`）同一口径。
         if let Some(want) = filter.model.as_deref().filter(|text| !text.is_empty()) {
-            fragments.push("model = ?".to_string());
+            fragments.push("(model = ? OR upstream_model = ?)".to_string());
+            binds.push(SqlValue::Text(want.to_string()));
             binds.push(SqlValue::Text(want.to_string()));
         }
 
@@ -276,9 +283,34 @@ pub(super) fn select_filter_options(
     max: usize,
 ) -> rusqlite::Result<(Vec<String>, Vec<String>)> {
     Ok((
-        select_distinct_ordered(conn, "model", max)?,
+        select_model_options(conn, max)?,
         select_distinct_ordered(conn, "provider", max)?,
     ))
+}
+
+/// 模型筛选候选：`model` 与 `upstream_model` 两列非空值的并集。
+///
+/// 与 [`FilterPlan`] 的模型条件同一口径（两个名字都该能筛到，理由见那边的
+/// 注释）：候选清单若只取 `model` 列，报表按上游真名聚合后，用户拿着真名
+/// 来明细里筛时下拉里没有那个选项 —— 正是「列表里有这一行、下拉里却没有
+/// 这个选项」的不一致（见 `stats_request_filters` 的说明）。非映射请求两个
+/// 名字相同，在并集里自然合成一项，计数按两列出现次数合计。
+///
+/// 不复用 [`select_distinct_ordered`]：那个函数按单列分组，这里是两列
+/// `UNION ALL` 后再分组，硬套会让列名参数变成两段 SQL 拼接，可读性反而差。
+fn select_model_options(conn: &Connection, max: usize) -> rusqlite::Result<Vec<String>> {
+    let sql = "SELECT name FROM (
+         SELECT model AS name FROM requests WHERE model <> ''
+         UNION ALL
+         SELECT upstream_model AS name FROM requests WHERE upstream_model <> ''
+       ) GROUP BY name ORDER BY COUNT(*) DESC, name ASC LIMIT ?1";
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params![max as i64])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
 }
 
 /// 取某一列的非空值，按出现次数降序、同次数按值升序（最多 `max` 个）。

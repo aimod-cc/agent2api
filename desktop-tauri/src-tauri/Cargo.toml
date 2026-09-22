@@ -1,6 +1,6 @@
 [package]
 name = "workbuddy-proxy-desktop"
-version = "2.6.0"
+version = "2.7.0"
 description = "Agent2API 桌面端 — 多提供商本地网关与会话管理"
 authors = ["aimod-cc"]
 edition = "2021"
@@ -16,6 +16,14 @@ license-file = "../../LICENSE"
 repository = "https://github.com/aimod-cc/agent2api"
 homepage = "https://github.com/aimod-cc/agent2api"
 
+# ── workspace ───────────────────────────────────────────────
+# 网关本体拆成了独立 crate（`server/`，桌面与 headless 二进制共用）。
+# workspace 让两个 crate 共享一个 target/ 与 Cargo.lock，公共依赖
+# （tokio / reqwest / rusqlite…）只编译一次。[profile.release] 由
+# workspace root（本文件）统一提供。
+[workspace]
+members = ["server"]
+
 [lib]
 name = "workbuddy_proxy_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -24,6 +32,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+# 网关本体（独立 crate）：桌面壳进程内跑它的 HTTP 服务器，
+# headless 二进制（agent2api-server）也链接同一个 lib
+agent2api-server = { path = "server" }
 # tray-icon 提供系统托盘，image-png 用于解析 bundle 图标（托盘图标直接复用它，不新增图片资源）
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-dialog = "2"

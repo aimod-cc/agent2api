@@ -66,6 +66,14 @@ pub const KEY_DEBUG_MODE: &str = "debugMode";
 /// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
 pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
 
+/// 机器人校验开关的键（config.json 键，ALTCHA proof-of-work，见 `server::altcha`）。
+///
+/// **默认开启**：登录 / 注册是公开的认证边界，脚本可以无限打（暴破密码、
+/// 抢注管理员）；ALTCHA 让每个请求先花一次算力，配合失败锁定把批量攻击
+/// 打得没性价比。对真人无感 —— 登录页在后台把题算完才允许提交。
+/// 只影响面板的 login / setup 两个端点，与 `/v1/*` 的 API Key 鉴权无关。
+pub const KEY_CAPTCHA_ENABLED: &str = "captchaEnabled";
+
 /// 系统提示词模式的键（config.json 键，对应 workbuddy2api 的 `prompt.mode`）。
 ///
 /// 取值 `passthrough` / `custom` / `append`（见 `core::prompt::PromptMode`）；

@@ -128,37 +128,14 @@ fn describe_error(value: &Value) -> String {
 
 /// 配置目录：与后端共用 `~/.agent2api`（可用环境变量覆盖）。
 ///
-/// **这是配置目录的唯一事实来源**：`server::config::config_dir()` 直接转发到
-/// 这里，所以「壳读 key」与「服务端读写数据」永远指向同一个目录。改名时
-/// 只需改本函数与下面 `default_config_dir` 的后缀，别处不要再写目录名字面量
-/// —— 唯一的例外是 `server::config` 里的 `LEGACY_DIR_NAME`，它要引用 1.x 的
-/// 旧目录名做一次性拷贝（迁移实现在 `server::config_migration`）。
+/// 实现已随网关本体迁到独立 crate（`agent2api_server::paths::config_dir`，
+/// 唯一实现），本函数保留为转发 —— 壳侧调用点不必感知 crate 边界，
+/// 「壳读 key」与「服务端读写数据」仍永远指向同一个目录。
 ///
 /// 环境变量：`AGENT2API_PROXY_HOME` 优先，旧名 `WORKBUDDY_PROXY_HOME` 兼容读
 /// （1.x 的启动脚本/快捷方式里可能还留着旧名）。
 pub fn config_dir() -> PathBuf {
-    env_path("AGENT2API_PROXY_HOME")
-        .or_else(|| env_path("WORKBUDDY_PROXY_HOME")) // 旧名兼容读
-        .unwrap_or_else(default_config_dir)
-}
-
-/// 读环境变量里的目录覆盖：未设置 / 全空白一律当未设置
-fn env_path(name: &str) -> Option<PathBuf> {
-    let custom = std::env::var(name).ok()?;
-    let trimmed = custom.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
-    }
-}
-
-/// 默认配置目录：`{用户主目录}/.agent2api`
-fn default_config_dir() -> PathBuf {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agent2api")
+    agent2api_server::paths::config_dir()
 }
 
 /// 读取本地 API Key。仅在本机内存里取；未配置时返回 None。

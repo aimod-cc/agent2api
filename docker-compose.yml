@@ -1,0 +1,37 @@
+# Agent2API 部署（单容器：默认一个 3065 端口，既是管理面板也是 OpenAI 兼容网关）。
+#
+#   docker compose up -d --build
+#
+#   面板     http://<主机>:3065    （首次打开注册管理员账号，之后账号密码登录）
+#   网关     http://<主机>:3065/v1 （API Key 在面板「网关 Key」页创建；OpenAI 兼容）
+#
+# 可选：面板分端口（AGENT2API_PANEL_PORT）——设置后管理面（界面 + /api/*）
+# 单独监听该端口，主端口只保留 /v1/* 网关。想把面板留在内网时：在 .env 里
+# 设置 AGENT2API_PANEL_PORT=3066，然后只映射网关端口：
+#
+#   ports:
+#     - "3065:3065"    # 网关（/v1/*），公网可暴露
+#     - "127.0.0.1:3066:3066"   # 面板：只绑本机回环，不暴露公网
+#
+# 数据全部落在 ./data 一个卷里。
+
+services:
+  agent2api:
+    build: .
+    image: agent2api:local
+    container_name: agent2api
+    restart: unless-stopped
+    ports:
+      - "3065:3065"
+    environment:
+      # 面板管理员：可选。不设时走登录页注册（首次打开面板即提示）；
+      # 无人值守 / IaC 部署才需要在这里预置（密码明文填，启动时自动
+      # 转 bcrypt 哈希，库里只存哈希）。
+      AGENT2API_ADMIN_USER: ${AGENT2API_ADMIN_USER:-}
+      AGENT2API_ADMIN_PASSWORD: ${AGENT2API_ADMIN_PASSWORD:-}
+      # 可选：面板分端口（见文件头说明）。不设则面板与网关同在 3065。
+      AGENT2API_PANEL_PORT: ${AGENT2API_PANEL_PORT:-}
+      # 可选：AGENT2API_VERBOSE / AGENT2API_ALLOW_NO_KEY / AGENT2API_PROXY_PORT
+    volumes:
+      # 全部状态（SQLite 库、配置、日志）都在这一个卷里
+      - ./data:/data

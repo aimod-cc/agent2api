@@ -75,6 +75,7 @@ use chrono::{Duration as ChronoDuration, NaiveDate};
 use serde_json::{json, Value};
 
 use crate::server::db::Db;
+use crate::server::logging;
 
 use clock::{date_key, day_of, local_midnight_ms, today};
 use record::{DailyEntry, MAX_DAILY_DAYS, MAX_ENTRIES};
@@ -599,6 +600,56 @@ impl RequestStats {
             Ok(())
         });
     }
+
+    /// 模型维度的一次性口径订正：把「按请求名（映射别名）累计」的历史聚合行，
+    /// 用现存明细按新口径（上游真名，见 `model_stat_key`）重算。
+    ///
+    /// ── 为什么需要它 ──────────────────────────────────────────
+    /// 改口径前写出的聚合行，模型维度记的是请求侧解析名 —— 客户端点名映射
+    /// 别名时，用量被记在别名名下（同一个上游模型在环形图里拆成好几行）。
+    /// 明细里一直有 `upstreamModel`（schema v2 起就有列），所以明细覆盖到的
+    /// 天数可以真正重算，不是猜。
+    ///
+    /// ── 为什么是 kv 标记 + 启动期一次 ──────────────────────────
+    /// 与 `backfill::rebuild_legacy_days`（缺账号维度回填）不同：那次的候选
+    /// 「聚合行缺 accountStats」可以从聚合行本身检测（缺列即候选），幂等免费；
+    /// 这次的错行（模型键是别名）与对行（模型键是真名）在聚合行里**长得一样**，
+    /// 没有可检测的特征，幂等必须靠显式标记（`kv` 表，与 `legacy::MARKER_*`
+    /// 同一机制）。
+    ///
+    /// ── 拿不准就不动 ──────────────────────────────────────────
+    /// 沿用 `backfill` 的安全边界：明细会被保留期（天数 + 容量闸）裁掉，
+    /// 当天「明细条数 ≥ 聚合行 requests」才说明明细足以代表当天，才重算；
+    /// 不够的天原样保留 —— 用残缺明细重算会让当天数字凭空缩水，比留着别名
+    /// 分组更糟。超出明细保留期的历史天因此**不修**：那些天没有重算依据。
+    ///
+    /// ── 调用时机（与 `account_bootstrap` 同一模式）──────────────
+    /// 启动时一次（`server/mod.rs`）；待迁移旧文件还没导入时（`upgrade_pending`）
+    /// 跳过 —— 跑了会把幂等标记打早，导入完成的旧聚合行就永远轮不到订正；
+    /// 升级完成后由 `api::upgrade_api` 补调一次。两处都调不会做两遍活
+    /// （标记 + 条数判据，见上）。
+    pub fn remap_model_dimension_once(&self) {
+        // 日志不能在持 `inner` 锁期间打（会写同一个库，`Mutex` 不可重入，
+        // 见 `guard` 的说明），先把结果拿出来，锁释放后再记
+        let outcome = {
+            let guard = self.guard();
+            self.with_conn_mut(&guard, remap_model_days)
+        };
+        match outcome {
+            Some(changed) if !changed.is_empty() => logging::log(
+                "[Stats]",
+                &format!(
+                    "🔁 已按上游真名重算 {} 天的模型用量（此前按请求名 / 映射别名累计）：{}",
+                    changed.len(),
+                    changed.join("、")
+                ),
+            ),
+            Some(_) => {}
+            // Err（已由 with_conn_mut 打控制台日志）与库不可用都在这一支：
+            // 标记没写，下次启动自然再试，订正不会因此丢
+            None => {}
+        }
+    }
 }
 
 /// 保留期的两条边界（明细用毫秒下界，聚合用日期键下界）。
@@ -627,13 +678,79 @@ impl RetentionBounds {
     }
 }
 
+/// 模型用量口径订正的完成标记键（`kv` 表）。
+///
+/// 与 `legacy::MARKER_*` 同一机制与写法：存在即视为已订正，值恒为 `'true'`。
+/// 为什么需要显式标记（而不是像账号维度回填那样从数据本身检测），见
+/// [`RequestStats::remap_model_dimension_once`] 的说明。
+const MODEL_UPSTREAM_MARKER: &str = "modelUsageUpstreamRemapped";
+
+/// [`RequestStats::remap_model_dimension_once`] 的库操作体：单事务完成
+/// 「读标记 → 找候选日 → 逐日重算 → 写标记」。
+///
+/// 重算走 [`rebuild_day`]（与记账 / `clear_where` 重算同一段累加代码，
+/// 口径天然一致）；返回真正重算的日期（升序，供日志列出）。
+fn remap_model_days(conn: &mut rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
+    if legacy::marker_present(conn, MODEL_UPSTREAM_MARKER)? {
+        return Ok(Vec::new());
+    }
+    let tx = conn.unchecked_transaction()?;
+    // 明细覆盖到的本地日期（去重升序）。DISTINCT ts 走 ts 索引，
+    // 明细有 2 万行的容量闸，全扫代价可忽略。
+    let mut days: BTreeSet<NaiveDate> = BTreeSet::new();
+    {
+        let mut stmt = tx.prepare("SELECT DISTINCT ts FROM requests")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let ts: i64 = row.get(0)?;
+            days.insert(day_of(ts));
+        }
+    }
+    let mut changed = Vec::new();
+    for day in days {
+        let key = date_key(day);
+        let start = local_midnight_ms(day);
+        // 开区间上界减 1 毫秒：与 rebuild_day 的取法一致（见那里的边界说明）
+        let end = local_midnight_ms(day + ChronoDuration::days(1)).saturating_sub(1);
+        let detail_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM requests WHERE ts >= ?1 AND ts <= ?2",
+            rusqlite::params![start, end],
+            |row| row.get(0),
+        )?;
+        // 聚合行的当天请求数。读不出（行不存在或读失败）当 0 处理：
+        // 重算是按明细整行重写的安全动作，聚合行缺失时重算顺带把它建全。
+        let aggregate_requests: i64 = tx
+            .query_row(
+                "SELECT requests FROM request_daily WHERE date = ?1",
+                rusqlite::params![key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        // backfill 同一条判据：明细条数 ≥ 聚合行请求数才说明明细足以代表
+        // 当天（没被保留期/容量裁过），才重算 —— 拿残缺明细重算会让当天
+        // 数字凭空缩水（见 `backfill` 模块头的「拿不准就不动」）
+        if detail_count >= aggregate_requests {
+            rebuild_day(&tx, day)?;
+            changed.push(key);
+        }
+    }
+    // 标记与数据同事务提交：中断（断电 / 崩溃）后标记必然没写，下次启动
+    // 整批重跑 —— 重算本身幂等，代价只是再扫一遍
+    tx.execute(
+        "INSERT INTO kv (key, value) VALUES (?1, 'true')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![MODEL_UPSTREAM_MARKER],
+    )?;
+    tx.commit()?;
+    Ok(changed)
+}
+
 /// 重算某一天的聚合行：从**剩余明细**整行重算；一条不剩就删掉那一行。
 ///
 /// `day` 是本地自然日，区间按 `[当天零点, 次日零点)` 取 —— 与 `date_key(day_of(ts))`
 /// 的归档口径同源（都用 `clock` 的本地时区工具），所以「某条明细属于哪一天」
 /// 与「重算时按哪个区间取它」不可能对不上。
-fn rebuild_day(conn: &rusqlite::Connection, day: NaiveDate) -> rusqlite::Result<()> {
-    let key = date_key(day);
+fn rebuild_day(conn: &rusqlite::Connection, day: NaiveDate) -> rusqlite::Result<()> {    let key = date_key(day);
     let start = local_midnight_ms(day);
     // 开区间上界减 1 毫秒，等价于 `[start, next_start)`；用 1ms 而不是直接取
     // `next_start - 1` 是为了避开「夏令时切换当天次日零点不存在」这类边界
@@ -734,7 +851,9 @@ fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
     day.tokens += item.total_tokens;
     day.cache_hit_tokens += item.cache_read_tokens;
     day.cache_input_tokens += item.prompt_tokens;
-    push_model_accum(&mut day.model_tokens, &item.model, item.total_tokens, 1);
+    // 模型维度用「上游真名」当统计键（见 `model_stat_key`）：映射只是代名，
+    // 实际请求的仍是上游那一个模型，报表要按它归组
+    push_model_accum(&mut day.model_tokens, model_stat_key(item), item.total_tokens, 1);
     // 空 provider 也建组（见 push_provider_accum 的注释）
     push_provider_accum(
         &mut day.provider_stats,
@@ -751,4 +870,28 @@ fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
         i64::from(success),
         item.total_tokens,
     );
+}
+
+/// 报表按模型聚合用的**统计键**：上游真名优先，请求名回落。
+///
+/// ── 为什么不能直接用 `model` ────────────────────────────────
+/// 映射语义重做后（见 `pipeline::resolve_model` 的说明），请求名全程保持
+/// 客户端原值，改写下沉到发送侧按家进行（`payload::send_body` →
+/// `catalog::wire_target_for_provider`）。于是 `model`（请求侧解析名）在
+/// 客户端点名映射别名时就是**别名本身** —— 报表若按它聚合，同一个上游模型
+/// 会被拆成「真名 + 各家别名」好几行。而映射只是代名，实际请求的仍是上游
+/// 那一个模型：`upstream_model`（telemetry 在发送侧采集的最终下发名）才是
+/// 「用量花在哪个模型上」的正确答案。
+///
+/// ── 回落 ──────────────────────────────────────────────────
+/// 转发前就失败的请求一次都没发出去，`upstream_model` 为空串 —— 请求名是
+/// 此时我们所知的最好信息（token 已清零，只影响请求数维度）。还没有
+/// `upstreamModel` 键的旧明细同样走回落：这不是「给旧数据猜值」，空串回落
+/// 保留的是明细里本来就有的信息。
+fn model_stat_key(item: &RequestEntry) -> &str {
+    if item.upstream_model.is_empty() {
+        &item.model
+    } else {
+        &item.upstream_model
+    }
 }

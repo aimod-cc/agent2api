@@ -53,7 +53,7 @@
 //!   sql.rs    `kv` 表的行级读写（本模块唯一出现 SQL 的地方）
 //! ```
 //!
-//! 配置目录本身（`~/.agent2api`）的事实来源在 `crate::gateway::config_dir`，
+//! 配置目录本身（`~/.agent2api`）的事实来源在 `crate::paths::config_dir`，
 //! 本模块只做转发；从 1.x 升级上来的一次性目录迁移在 `config_migration`，
 //! 这里只保留旧目录名常量与旧目录路径访问器（`LEGACY_DIR_NAME` 仍是全仓
 //! 唯一的字面量）。
@@ -65,7 +65,7 @@ use serde_json::{Map, Value};
 
 use crate::server::db::Db;
 
-mod parse;
+pub(crate) mod parse;
 pub(crate) mod sql;
 mod types;
 
@@ -119,6 +119,11 @@ pub struct RuntimeConfig {
     /// 请求就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存
     /// 下来最省事 —— 这条判定在转发热路径上。
     sanitize_fingerprints: bool,
+    /// 面板机器人校验开关（设置页「通用 → 机器人校验」，ALTCHA proof-of-work）。
+    ///
+    /// 与 `debug_mode` 同一理由：登录 / 注册端点逐请求判一次（改完开关下一个
+    /// 请求就生效），解析一次存下来最省事。默认 `true`，见 `KEY_CAPTCHA_ENABLED`。
+    captcha_enabled: bool,
     /// 系统提示词设置（设置页「通用 → 系统提示词」）。
     ///
     /// 与 `sanitize_fingerprints` 同一理由（转发层逐请求取一次，改完下一个请求
@@ -167,6 +172,11 @@ impl RuntimeConfig {
         self.sanitize_fingerprints
     }
 
+    /// 面板机器人校验开关（登录 / 注册端点逐请求判一次）。
+    pub fn captcha_enabled(&self) -> bool {
+        self.captcha_enabled
+    }
+
     /// 系统提示词设置（界面 / 日志用；转发层要的是下面的借用视图）
     pub fn prompt_settings(&self) -> &PromptSettings {
         &self.prompt
@@ -202,10 +212,10 @@ impl RuntimeConfig {
     }
 }
 
-/// 配置目录：复用壳侧实现，保证「壳读 key」与「服务端读 key」指向同一个目录
-/// （唯一事实来源在 `crate::gateway::config_dir`，改路径只需改那一处）
+/// 配置目录：`paths::config_dir` 是唯一实现（桌面侧 `gateway::config_dir` 转发这里），
+/// 「壳读 key」与「服务端读 key」仍指向同一个目录，改路径只需改 paths 一处。
 pub fn config_dir() -> PathBuf {
-    crate::gateway::config_dir()
+    crate::paths::config_dir()
 }
 
 /// config.json 的完整路径
@@ -365,6 +375,12 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         // ——与 debug_mode 的「默认关」取向相反，因为两者的默认值代价不同。
         sanitize_fingerprints: raw
             .get(KEY_SANITIZE_FINGERPRINTS)
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        // 只有字面 `false` 算关闭：**默认开**。登录 / 注册的暴破与抢注防护
+        // 宁可多一道不可少一道（见 KEY_CAPTCHA_ENABLED 的说明）
+        captcha_enabled: raw
+            .get(KEY_CAPTCHA_ENABLED)
             .and_then(Value::as_bool)
             .unwrap_or(true),
         // 系统提示词：模式非法/缺失 → passthrough（默认），文件读不到 → 内置默认
@@ -841,6 +857,19 @@ pub fn set_sanitize_fingerprints(enabled: bool) -> bool {
             .raw
             .insert(KEY_SANITIZE_FINGERPRINTS.to_string(), Value::Bool(enabled));
         config.sanitize_fingerprints = enabled;
+    })
+}
+
+/// 写入机器人校验开关（设置页「通用 → 机器人校验」）。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式：内存立即生效（登录 / 注册端点
+/// 逐请求读快照），写盘时不吃掉 config.json 里的其它字段。
+pub fn set_captcha_enabled(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_CAPTCHA_ENABLED.to_string(), Value::Bool(enabled));
+        config.captcha_enabled = enabled;
     })
 }
 

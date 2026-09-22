@@ -37,6 +37,7 @@ OpenAI 客户端 / 任意 SDK
 ## 目录
 
 - [快速开始](#快速开始)
+- [Docker 部署](#docker-部署)
 - [界面预览](#界面预览)
 - [数据存储](#数据存储)
 - [项目结构](#项目结构)
@@ -52,8 +53,6 @@ OpenAI 客户端 / 任意 SDK
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口；若检测到旧版本的数据目录或数据文件，会弹窗提示迁移，按指引操作即可（详见[数据存储](#数据存储)）。
 2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上）。
-
-> **AutoClaw 两个地区的登录方式不同**：国内版只有手机验证码；国际版只有 Zai / Google 账号网页授权 —— 在添加账号弹窗里选「网页登录（Zai / Google）」，按提示先完成一次滑块验证（官方要求的风控步骤，由本机内置的官方验证码组件完成），随后会打开官方登录页；打开方式可选**内嵌窗口**或**系统默认浏览器**（后者会复用你浏览器里已登录的 Zai / Google 账号）。国际版不提供手机验证码登录（官方客户端也不提供这一项，多数国际版账号没有绑定手机号）；若你已在客户端登录过，用「导入桌面端登录态」最快，也可以直接粘贴凭证。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。
@@ -85,6 +84,47 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+---
+
+## Docker 部署
+
+```bash
+docker run -d --name agent2api --restart unless-stopped \
+  -p 3065:3065 -v ./data:/data \
+  aimodcc/agent2api:latest
+```
+
+浏览器打开 `http://<主机>:3065`，首次进入会引导**注册管理员账号**（后续登录用它）；登录后在「网关 Key」页创建一把 API Key 给客户端用 —— `http://<主机>:3065/v1` 即 OpenAI 兼容端点，未建 Key 前拒绝转发，建第一把后自动恢复。所有状态（SQLite 库 / 配置 / 日志）都落在 `./data` 一个卷里。
+
+compose 用户（`docker-compose.yml` 全文就这么多；amd64 / arm64 都有镜像）：
+
+```yaml
+services:
+  agent2api:
+    image: aimodcc/agent2api:latest
+    container_name: agent2api
+    restart: unless-stopped
+    ports:
+      - "3065:3065"
+    volumes:
+      - ./data:/data
+```
+
+环境变量（都可选，不需要预置任何东西）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `AGENT2API_ADMIN_USER` + `AGENT2API_ADMIN_PASSWORD` | 预置管理员账号密码（密码明文填，启动时自动转哈希）；不填走面板注册 |
+| `AGENT2API_PANEL_PORT` | 面板分端口：设后面板（界面 + `/api/*`）单独监听该端口，公网只映射主端口即可把管理面留在内网（面板端口绑回环，写 `127.0.0.1:3066:3066`） |
+| `AGENT2API_HOST` / `AGENT2API_PROXY_PORT` | 监听地址（默认 `0.0.0.0`）/ 端口（默认 `3065`） |
+| `AGENT2API_ALLOW_NO_KEY` | 置 `1` 关闭 fail-closed（未配 Key 也放行 `/v1`，仅限纯内网） |
+
+从源码构建：克隆本仓库后 `docker compose up -d --build`（镜像里只有网关与面板，不含 Rust 工具链）。
+
+**网页端功能差异**（都源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；AutoClaw / CatPaw 网页登录的回调打本机端口，远程面板请改用粘贴凭证；小浣熊网页登录与「导入本机桌面端登录态」不可用（用填写凭证）。
+
+---
 
 ---
 
@@ -137,10 +177,12 @@ print(resp.choices[0].message.content)
 ```
 agent2api/
 ├─ desktop-tauri/
-│  ├─ src-tauri/src/
-│  │  ├─ server/                 网关实现（Rust，进程内 HTTP 服务器）
+│  ├─ src-tauri/
+│  │  ├─ server/                 网关本体 crate（agent2api-server，独立编译：
+│  │  │                          桌面端与 headless 二进制共用；src/server/ 下
+│  │  │                          的实现与 bin/agent2api-server.rs 无 GUI 依赖）
 │  │  │  ├─ mod.rs               服务组装：ServerState、启动、停机、启动迁移
-│  │  │  ├─ http.rs              路由表、CORS、API Key 中间件、body 限制
+│  │  │  ├─ http.rs              路由表、CORS、API Key 中间件、body 限制、headless 静态托管
 │  │  │  ├─ config.rs / logging.rs / logs_store.rs / errors.rs
 │  │  │  ├─ config_migration.rs  1.x 配置目录迁移（~/.workbuddy-proxy → ~/.agent2api，启动第一步）
 │  │  │  ├─ request_stats.rs + request_stats/   统计的时钟窗口、写入、聚合与裁剪
@@ -205,6 +247,8 @@ agent2api/
 │  └─ src-tauri/tauri.conf.json  打包配置（NSIS）
 ├─ build/make-icon.mjs           生成应用图标源图
 ├─ assets/screenshots/           README 配图（界面截图）
+├─ Dockerfile / .dockerignore    headless 镜像（多阶段构建，只含网关与面板）
+├─ docker-compose.yml / .env.example   部署（单容器：面板 + 网关同端口）
 └─ package.json                  构建脚本入口（tauri:dev / tauri:build / build:icon）
 ```
 

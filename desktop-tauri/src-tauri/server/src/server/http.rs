@@ -8,7 +8,7 @@
 //!   - 未捕获错误统一走 errors::GatewayError → OpenAI 风格 payload + 500
 //!
 //! ── 路由分组（后续切片照这个模式扩展）────────────────────────
-//!   `public`    免鉴权：/health、/api/session、/api/endpoints
+//!   `public`    免鉴权：/health、/api/endpoints（/api/session 已挪 protected）
 //!               （Node 版这三条确实都没调 checkApiKey）
 //!   `protected` 需鉴权：/api/config、/api/logs*、/api/stats*、/api/retention、
 //!               /api/accounts*、/api/proxies*、
@@ -40,8 +40,10 @@ use crate::server::errors;
 use crate::server::logging;
 use crate::server::ServerState;
 
-/// 全局请求体上限：32MB（对应 Node 版 MAX_BODY_SIZE）。
-/// 后续 /v1/chat/completions 会带长上下文的大请求体，默认 2MB 不够用。
+/// 管理面请求体上限：32MB（对应 Node 版 MAX_BODY_SIZE）。
+/// 只约束面板路由（/api/* 管理接口）与手动 `to_bytes` 的读取；
+/// 网关面 /v1/* 不设上限 —— 长上下文 + base64 图片的大请求体不能被
+/// 网关先拒（上游会自己表达能收多大），见 `gateway_router` 里的 disable。
 pub const MAX_BODY_SIZE: usize = 32 * 1024 * 1024;
 
 /// CORS 允许的方法，逐字照抄 Node 版 sendCORS。
@@ -53,19 +55,42 @@ const CORS_METHODS: &str = "GET, POST, OPTIONS, DELETE";
 /// CORS 允许的请求头，逐字照抄 Node 版
 const CORS_HEADERS: &str = "Content-Type, Authorization, x-api-key";
 
-/// 组装完整路由。
+/// 组装完整路由（面板 + 网关**同端口**：默认形态与桌面壳）。
+///
+/// 分端口部署（headless 设了 `AGENT2API_PANEL_PORT`）时不要用本函数：
+/// 用 [`panel_router`] + [`gateway_router`] 各挂一个监听（见 `mod::start`）。
 pub fn router(state: ServerState) -> Router {
-    // 免鉴权：/health（壳侧就绪探测）、/api/session（前端首屏状态）、
-    // /api/endpoints（接口清单，排查用）
+    panel_router(state.clone()).merge(gateway_router(state))
+}
+
+/// 管理面路由：管理界面（静态文件 fallback）+ `/api/*`。
+///
+/// 分端口形态下它单独监听 `AGENT2API_PANEL_PORT` —— 面板端口可以不暴露
+/// 公网（防火墙 / compose 不映射），管理面就整体留在内网。
+pub fn panel_router(state: ServerState) -> Router {
+    // 免鉴权：/api/endpoints（接口清单，排查用）
     //
-    // /v1/models 也在这一组：Node 版这条**不查** API Key ——
-    // 它是只读探针，OpenAI 客户端常在配置 key 之前先拉模型列表
-    // （README 的接口说明里也把 /v1/models 列在免鉴权探针里）。
+    // GET /api/session 原本也在免鉴权组（「前端首屏在配置 Key 之前也要能读」，
+    // 见 session.rs），后来挪进 protected：桌面壳的管理请求由壳自动带第一把
+    // Key，不受影响；而 headless/公网形态下它暴露账号昵称、各家健康状态等
+    // 部署信息，不该在无 Key 的世界里裸奔（网页端 bridge 首次 401 会引导输入）。
     let public = Router::new()
-        .route("/health", get(api::health::handle))
-        .route("/api/session", get(api::session::get_session))
         .route("/api/endpoints", get(api::endpoints::handle))
-        .route("/v1/models", get(api::chat::list_models))
+        // 面板登录：调用方此时没有任何凭证，必须挂 public —— 安全由
+        // 失败锁定（同 IP 连续 5 次锁 5 分钟）与 bcrypt 校验成本承担
+        // （见 api::panel 与 access 的模块头）。未配置管理员的部署
+        // （桌面形态）这条返回 404，等于功能不存在。
+        .route("/api/panel/login", post(api::panel::panel_login))
+        // 注册 / 会话刷新 / 登出：同为「认证边界」端点 —— 调用方要么还没有
+        // 凭证（setup / login），要么凭证本身就是它们的主张（refresh 带
+        // refresh cookie、logout 撤自己的会话），挂 public 由端点自理。
+        .route("/api/panel/status", get(api::panel::panel_status))
+        .route("/api/panel/setup", post(api::panel::panel_setup))
+        .route("/api/panel/refresh", post(api::panel::panel_refresh))
+        .route("/api/panel/logout", post(api::panel::panel_logout))
+        // ALTCHA 领题：与 status / setup 同为「认证边界」端点 —— 领题时
+        // 用户还没有任何凭证（开关关闭时回 400，前端跳过校验）
+        .route("/api/panel/captcha", get(api::panel::captcha_challenge))
         // CatPaw 网页登录的 loopback 回调：**上游浏览器直接 POST 到这里**
         // （redirect 指向本网关自己的 loopback 端口，见 core::login::catpaw），
         // 所以它必须免鉴权 —— 调用方是美团 passport 页面，它没有我们的 API Key。
@@ -77,20 +102,27 @@ pub fn router(state: ServerState) -> Router {
             post(api::session::login_catpaw_callback),
         )
         // AutoClaw OAuth（国际版）的 loopback 回调：**浏览器 302 到这里**
-        // （授权页完成后顶层导航到我们给上游的 navigate_uri，见
+        // （授权页完成后顶层导航到我们交给上游的 navigate_uri，见
         // `providers::autoclaw::oauth`），所以同样必须免鉴权 —— 调用方是用户的
-        // 浏览器，它没有我们的 API Key。安全性由一次性 `state` 承担
-        // （路径里的第二段，回调时逐字比对）。
+        // 浏览器，它没有我们的 API Key。
         //
-        // 变体与 state 都在路径里（`{vendor}/{state}`）：上游会在 navigate_uri
-        // 后面拼 `?code=…&state=…`，把这两段放进路径就不必猜它追加 `?` 还是 `&`。
+        // 路径与官方客户端**逐字同款**（`/auth/callback-zai|google`）：Zai 的
+        // OAuth 服务在 authorize 阶段按 redirect_uri 白名单校验，host 用
+        // `127.0.0.1` 或路径不照抄都会被拒（`Redirect URI not registered for
+        // this client`，2026-09-22 实测）。回调 URL 里没有我们的任务 state
+        // （放查询串会与上游回带的 state 撞参数名），任务关联按变体匹配
+        // 进行中的登录完成（见 `core::login::autoclaw`）。
         .route(
-            "/api/session/login/autoclaw-oauth-callback/{vendor}/{state}",
+            "/auth/callback-{vendor}",
             get(api::session::login_autoclaw_oauth_callback),
         );
 
     // 需鉴权：Node 版对这些路径都调用了 checkApiKey
     let protected = Router::new()
+        // GET /api/session（首屏状态）：从 public 组挪进来 —— 它会透出账号
+        // 昵称、各家健康状态、路由中的账号等部署信息（字段清单见 session.rs），
+        // 桌面壳的请求由壳带第一把 Key（gateway::request_builder）不受影响。
+        .route("/api/session", get(api::session::get_session))
         .route(
             "/api/config",
             get(api::config_api::get_config)
@@ -240,21 +272,11 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/session/logout", post(api::session::session_logout))
         .route("/auth/login", post(api::session::auth_login))
         .route("/auth/logout", post(api::session::auth_logout))
-        // ── 对话链路（对照 server.mjs 977-981）──
-        // Node 版这条查 API Key，所以挂 protected；/v1/models 不查，
-        // 挂在上面 public 组（分组判据见各自注释）
-        .route("/v1/chat/completions", post(api::chat::chat_completions))
-        // ── 另外两条协议入口（Responses / Anthropic Messages）──
-        // 与 chat/completions 完全同构：都查 API Key（挂 protected）、
-        // 都走同一套转发链路，差异只在出入口的协议翻译（见 api::protocol 与
-        // core::protocol 的模块头）。放在同一组是因为它们**就是**对话入口，
-        // 而不是管理 API —— 客户端的 base_url 换成 /v1 即可直接用。
-        .route("/v1/responses", post(api::protocol::responses_endpoint))
-        .route("/v1/messages", post(api::protocol::messages_endpoint))
-        // Anthropic 的 token 计数端点：Claude Code 在网关模式下会探它做上下文
-        // 预算。上游没有对应能力，这里给带 `estimated: true` 的估算（见该函数
-        // 说明）—— 给 404 会让客户端按「网关不支持」处理，比一个粗略数字更糟。
-        .route("/v1/messages/count_tokens", post(api::chat::count_tokens))
+        // ── 对话链路的四条入口（chat/completions / responses / messages /
+        // messages/count_tokens）原本挂在这里，拆端口时挪进了
+        // [`gateway_router`]（都查 API Key，转发语义归网关面）；
+        // /v1/models 那条免鉴权探针同去。同端口形态经 `router()` 合并，
+        // 行为与拆分前逐字一致。
         // 手动刷新模型清单（网关页按钮）：它会**真打上游**（各家的模型目录接口），
         // 所以和 /v1/chat/completions 一样必须过 API Key；GET /v1/models 那条
         // 免鉴权的只读探针不受影响（两者是不同的东西，见 api::models 模块头）。
@@ -278,6 +300,13 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/api/sanitize",
             get(api::sanitize::get_sanitize).put(api::sanitize::put_sanitize),
+        )
+        // ── 机器人校验开关 ──
+        // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
+        // 它决定登录 / 注册是否要求 ALTCHA proof-of-work，敏感度同级。
+        .route(
+            "/api/captcha",
+            get(api::captcha::get_captcha).put(api::captcha::put_captcha),
         )
         // ── 系统提示词与内容拦截降级 ──
         // 与 /api/sanitize 同为「出站内容处理」的开关，但形状不同（枚举 + 文件
@@ -334,10 +363,21 @@ pub fn router(state: ServerState) -> Router {
         //      要与 update 的 pickInstaller 规则相符：带 setup 的 .exe 优先）。
         .layer(middleware::from_fn(require_api_key));
 
+    // 静态托管只在 headless 打开（set_ui_dir）：桌面形态的界面由 Tauri 壳出，
+    // 网关的未知路径保持纯 404。ui_dir 是启动即定值，克隆进闭包。
+    let ui_dir = state.ui_dir().cloned();
     Router::new()
         .merge(public)
         .merge(protected)
-        .fallback(not_found)
+        .fallback(move |request: Request| {
+            let ui_dir = ui_dir.clone();
+            async move {
+                match ui_dir {
+                    Some(dir) => super::static_files::serve(request, dir).await,
+                    None => not_found(request).await,
+                }
+            }
+        })
         // 方法不匹配的兜底：Node 版没有 405 概念，一律落到 404 分支，
         // 所以这里把 405 也转成同样的 Not found 文案，保持行为一致
         .method_not_allowed_fallback(method_not_allowed)
@@ -345,6 +385,42 @@ pub fn router(state: ServerState) -> Router {
         .layer(middleware::from_fn(cors))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
+}
+
+/// 网关面路由：`/v1/*`（模型探针 + 三条协议入口 + token 计数）与 `/health`。
+///
+/// 分端口形态下它单独监听主端口（`AGENT2API_PROXY_PORT`）—— 对外的
+/// OpenAI 兼容端点，没有任何管理界面与管理 API；想收敛暴露面，防火墙 /
+/// compose 只映射这个端口即可。同端口形态经 [`router`] 与管理面合并。
+pub fn gateway_router(state: ServerState) -> Router {
+    // /health（壳侧就绪探测与部署探活）与 /v1/models 免鉴权：
+    // /v1/models 是只读探针，Node 版就不查 API Key —— OpenAI 客户端常在
+    // 配置 key 之前先拉模型列表（README 也把 /v1/models 列在免鉴权探针里）。
+    let open = Router::new()
+        .route("/health", get(api::health::handle))
+        .route("/v1/models", get(api::chat::list_models))
+        .with_state(state.clone());
+    // 三条协议入口 + Anthropic 的 token 计数端点：都查 API Key。
+    // 与 chat/completions 完全同构：都走同一套转发链路，差异只在出入口的
+    // 协议翻译（见 api::protocol 与 core::protocol 的模块头）。它们**就是**
+    // 对话入口而不是管理 API —— 客户端的 base_url 换成 /v1 即可直接用。
+    // count_tokens：Claude Code 在网关模式下会探它做上下文预算，上游没有
+    // 对应能力，这里给带 `estimated: true` 的估算（见该函数说明）—— 给 404
+    // 会让客户端按「网关不支持」处理，比一个粗略数字更糟。
+    let guarded = Router::new()
+        .route("/v1/chat/completions", post(api::chat::chat_completions))
+        .route("/v1/responses", post(api::protocol::responses_endpoint))
+        .route("/v1/messages", post(api::protocol::messages_endpoint))
+        .route("/v1/messages/count_tokens", post(api::chat::count_tokens))
+        .layer(middleware::from_fn(require_api_key))
+        .with_state(state);
+    // 网关面必须显式 disable：axum 对没挂 DefaultBodyLimit 层的路由兜底
+    // 2MB（axum-core Request::with_limited_body），长上下文 + base64 图片
+    // 的大请求体会被先拒成 413，客户端重试原样请求体只会白打转。这里的
+    // disable 在合并形态下也压得过面板路由外层的 max —— 扩展是逐层 insert，
+    // 内层后写覆盖外层先写。上限交给上游自己表达。
+    open.merge(guarded)
+        .layer(axum::extract::DefaultBodyLimit::disable())
 }
 
 /// 未匹配路由：文案照抄 Node 版 `Not found: <METHOD> <path>`。
@@ -436,7 +512,57 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
     // 都要走的热路径 —— 多取几次就是为同一件事重复克隆）
     let snapshot = crate::server::config::current();
     let keys = snapshot.active_api_keys();
+    let path = request.uri().path();
+
+    // ── 面板认证（headless 配置了管理员时启用）──────────────────
+    // `/api/*` 认「会话 cookie（人，账号密码换来）」或「API Key（程序，
+    // 桌面壳/脚本自动带）」。两者都没有 → 401 并注明是面板登录 ——
+    // web_shim 据此弹账号密码框而不是 Key 框。桌面形态不开这个开关
+    // （未配置管理员环境变量），下面的原有语义原样生效。
+    let panel_auth = crate::server::access::panel_auth_enabled();
+    if panel_auth && path.starts_with("/api/") {
+        if crate::server::access::session_valid(request.headers()) {
+            return next.run(request).await;
+        }
+        if !keys.is_empty()
+            && keys
+                .iter()
+                .any(|expected| request_matches_key(&request, expected))
+        {
+            // Key 也能操作管理接口（桌面壳 / 脚本自动化的通道）
+            return next.run(request).await;
+        }
+        return errors::panel_login_required_response();
+    }
+    // ── 未注册闸门（headless 专属，桌面壳不开启）────────────────
+    // 管理员还没注册（也没用环境变量预置）：/api/* 只放行 /api/panel/
+    // 前缀的认证边界端点（status / setup / login / refresh / logout ——
+    // 登录页依赖它们），其余一律 401 panel_login_required，web_shim 收到
+    // 后会整页跳到 /login 的注册表单。没有这道闸，面板前端拿到放行的
+    // 200 会直接进主界面，「部署完先注册」就成了可绕过的一步。
+    //
+    // 两个例外必须放行，否则闸门会把既有部署形态打断：
+    //   · **兼容模式**（AGENT2API_PROXY_API_KEY 预置了 Key、无管理员）：
+    //     Key 本来就是这类部署的管理凭证（桌面壳/脚本自动带），闸门必须
+    //     先试 Key 再拒绝；
+    //   · `/api/panel/` 前缀：注册 / 状态 / 登录本身就在这个前缀里。
+    if !panel_auth && crate::server::access::panel_gate() && path.starts_with("/api/") {
+        if !path.starts_with("/api/panel/")
+            && !(keys.iter().any(|expected| request_matches_key(&request, expected)))
+        {
+            return errors::panel_login_required_response();
+        }
+        return next.run(request).await;
+    }
+
     if keys.is_empty() {
+        // 免鉴权模式。公网形态下 /v1/* fail-closed：没有 Key 可校验时，
+        // 把模型额度对全网开放是不可接受的 —— 拒绝服务并引导去面板建 Key
+        // （面板本身有账号密码登录，见 access 模块头）。桌面形态不进
+        // 这个分支（开关只在 headless 启动时按需打开）。
+        if crate::server::access::v1_fail_closed() && path.starts_with("/v1/") {
+            return errors::v1_fail_closed_response();
+        }
         return next.run(request).await;
     }
 
@@ -452,7 +578,6 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
         return next.run(request).await;
     }
 
-    let path = request.uri().path().to_string();
     let method = request.method().as_str().to_string();
     logging::log("[Security]", &format!("❌ 拒绝未授权的请求: {method} {path}"));
     errors::unauthorized_response()

@@ -164,7 +164,17 @@
      一个「本来放得下却被省略号切掉」的读数。 */
   grid-template-columns: minmax(0, max-content) minmax(56px, 1fr) 68px 48px;
   align-items: center;
+  /* 行少时贴顶排布：容器一旦比内容高（max-height 生效后由父级拉伸等场景），
+     默认的 stretch 会把各行摊开来填高度，行距忽大忽小看起来像排版坏了 */
+  align-content: start;
   gap: 8px 10px;
+  /* 列表全量渲染后行数随账号 / 提供商数走：限高约 7 行，超出的部分在卡内
+     滚动，两张并排的卡片高度不再随账号数一起长。scrollbar-gutter 常驻预留，
+     账号卡开始滚动时四列轨道不会突然被滚动条压窄（与 page-accounts.css 同一手
+     法），两张卡并排时列的对齐也始终一致。 */
+  max-height: 220px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
   padding: 14px;
   border: 1px solid var(--border);
   border-radius: var(--r-md);

@@ -1,0 +1,10 @@
+HTTP/1.1 200 OK
+content-type: application/json
+set-cookie: agent2api-panel=1f51e6b5b97f7c21f16fce59d7e172e962f798eb45f6e74cc0276380bd85a447; Path=/; HttpOnly; SameSite=Lax; Max-Age=7200
+set-cookie: agent2api-panel-rt=67cda4a0b4685fef177b40702f37dcdb657391b7351bf14dc1d32a206c47fb5d9ea39c2671f1fcdffb0ffe2104af2d88; Path=/api/panel; HttpOnly; SameSite=Lax; Max-Age=2592000
+access-control-allow-origin: *
+access-control-allow-methods: GET, POST, OPTIONS, DELETE
+access-control-allow-headers: Content-Type, Authorization, x-api-key
+content-length: 41
+date: Tue, 22 Sep 2026 13:36:53 GMT
+

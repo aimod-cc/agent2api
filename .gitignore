@@ -26,3 +26,7 @@ desktop-tauri/window-shot.png
 # 发布说明草稿（只用于发布 Release，不入库）
 .release-notes-*.md
 docs/
+
+# Docker 部署：密钥与运行数据不入库
+.env
+data/

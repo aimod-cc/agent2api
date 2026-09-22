@@ -315,6 +315,9 @@
    */
   const desktopImportAvailable = config => {
     if (config.desktop === false) return false;
+    // 网页端（headless 托管面板注入 platform='web'）：没有本机桌面客户端可读，
+    // 所有「导入桌面端登录态」入口整段收起
+    if (platform() === 'web') return false;
     if (config.desktopWindowsOnly && platform() === 'macos') return false;
     return true;
   };

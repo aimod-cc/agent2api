@@ -406,7 +406,7 @@ impl UpdateManager {
         };
 
         let service = self.clone();
-        tauri::async_runtime::spawn(async move {
+        crate::spawn_task(async move {
             service.run_download(target, file_path, cancel_flag).await;
         });
         Ok(snapshot)

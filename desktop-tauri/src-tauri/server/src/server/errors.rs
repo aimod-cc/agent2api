@@ -210,6 +210,40 @@ pub fn unauthorized_response() -> Response {
         .into_response()
 }
 
+/// 401：面板登录缺失（web_shim 据此弹「账号密码」框而不是 Key 框）。
+///
+/// `type` 用 `panel_login_required` 与普通 Key 鉴权失败（`invalid_api_key`）
+/// 区分 —— 两者都是 401，但浏览器面板对它们的反应不同。
+pub fn panel_login_required_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": {
+                "message": "请先登录管理面板",
+                "type": "panel_login_required",
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// 503：headless 公网形态未配置任何 API Key 时，`/v1/*` 的 fail-closed 响应。
+///
+/// 与 401 不同：这不是「Key 错了」，而是「还没有任何 Key 可校验」——
+/// 引导用户去面板创建第一把（面板本身经入口认证，不需要 Key）。
+pub fn v1_fail_closed_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "message": "网关尚未配置任何 API Key：请登录管理面板，在「网关 Key」页创建一把",
+                "type": "api_key_not_configured",
+            }
+        })),
+    )
+        .into_response()
+}
+
 /// 404 兜底响应。
 ///
 /// 注意这里**不带 type 字段** —— Node 版 404 分支发的是

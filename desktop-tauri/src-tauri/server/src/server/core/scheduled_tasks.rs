@@ -627,7 +627,7 @@ async fn run_backend(
 /// 于是「关掉任务 = 启动也不刷」这条一致性成立；开启时行为与改造前相同。
 /// 定时查询积分也走这条：启动即查一次，界面不用等满一个间隔才见到余额。
 pub fn spawn(store: AccountStore, update: crate::server::core::update::UpdateManager) {
-    tauri::async_runtime::spawn(async move {
+    crate::spawn_task(async move {
         // 首轮：给各条后端任务排上「现在就执行」的期，于是紧接着的第一次循环
         // 立刻就跑一次。这替代了改造前 bootstrap 里那两处「启动时刷新一次」
         // （凭证维护与模型目录）—— 于是「关掉任务 = 启动也不刷」这条一致性成立，

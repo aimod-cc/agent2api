@@ -218,8 +218,9 @@ const RACCOON_CALLBACK_PATH: &str = "/callback";
 /// ── AutoClaw 国际版为什么不设限（本次新增，务必读）─────────────
 /// 它的登录页与身份提供方都不在我们的名单里（Zai 的授权页、Google 的
 /// `accounts.google.com`），而**更要紧的是回调落在本机**：授权完成后浏览器会
-/// **顶层导航到 `http://127.0.0.1:<网关端口>/api/session/login/autoclaw-oauth-callback/…`**
-/// （那就是我们交给上游的 `navigate_uri`，见 `providers::autoclaw::oauth`）。
+/// **顶层导航到 `http://localhost:<网关端口>/auth/callback-zai|google`**
+/// （那是我们交给上游的 `navigate_uri`，与官方客户端逐字同款，见
+/// `providers::autoclaw::oauth`）。
 /// 那个 loopback 地址一旦被白名单拦下，症状是「用户明明登录成功、网关却永远
 /// 等不到授权码」—— 与 [`is_login_callback`] 注释里警告过的那类静默故障同形，
 /// 而这次连回调识别都救不了它：回调本身就是一次普通 HTTP 导航，

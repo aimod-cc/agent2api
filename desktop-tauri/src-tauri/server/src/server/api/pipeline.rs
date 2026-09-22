@@ -301,7 +301,11 @@ pub struct RecordContext {
     pub telemetry: Arc<RequestTelemetry>,
     /// 请求开始时刻（毫秒 Unix 时间戳）
     pub started_at: i64,
-    /// **实际使用**的模型（默认模型回落、目录兜底都已生效的那个）
+    /// **请求侧解析**的模型（默认模型回落、目录兜底都已生效；映射**不改写**
+    /// 它 —— 客户端点名映射别名时就是别名本身，见 `resolve_model` 的说明）。
+    /// 请求日志的主列显示它；报表按模型聚合**不**用它（映射别名会被当成
+    /// 独立模型），统计键是明细里的 `upstream_model`（空回落本字段，
+    /// 见 `fold_into_daily` 的 `model_stat_key`）。
     pub model: String,
     /// **下游请求的**模型名（客户端请求体里的原值，映射 / 默认注入生效前；
     /// 客户端没点名时为空串）。请求日志用它和上游名（telemetry 的

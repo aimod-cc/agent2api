@@ -196,11 +196,7 @@ pub fn active_keys_from(raw: &Map<String, Value>) -> Vec<String> {
         .filter(|entry| entry.enabled)
         .map(|entry| entry.key)
         .collect();
-    if let Some(env) = std::env::var("WORKBUDDY_PROXY_API_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(env) = crate::server::config::parse::env_api_key_value() {
         if !keys.contains(&env) {
             keys.push(env);
         }
@@ -234,10 +230,7 @@ pub fn active_keys_from(raw: &Map<String, Value>) -> Vec<String> {
 /// 顺带让「判定用的是哪一份快照」在调用点一眼可见（不会出现「查 Key 用一份、
 /// 查白名单用另一份」的窗口期）。
 pub fn entry_for_key_from(raw: &Map<String, Value>, key: &str) -> Option<ApiKeyEntry> {
-    let env = std::env::var("WORKBUDDY_PROXY_API_KEY")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let env = crate::server::config::parse::env_api_key_value();
     if env.as_deref() == Some(key) {
         return None;
     }
