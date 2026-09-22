@@ -208,7 +208,10 @@ impl AccountStore {
             self.to_raccoon_public_account(record)
         } else if record.provider() == super::CATPAW_PROVIDER_ID {
             self.to_catpaw_public_account(record)
-        } else if record.provider() == super::AUTOCLAW_PROVIDER_ID {
+        } else if super::is_autoclaw_family(&record.provider()) {
+            // 两个地区（`autoclaw` / `autoclaw-intl`）共用这一份公开形态：
+            // 账号字段、桌面端判定、deviceId 语义两地完全一致，
+            // 差别只在域名（那是转发与凭证层的事，公开形态不体现）
             self.to_autoclaw_public_account(record)
         } else if record.provider() == super::QODER_PROVIDER_ID {
             self.to_qoder_public_account(record)

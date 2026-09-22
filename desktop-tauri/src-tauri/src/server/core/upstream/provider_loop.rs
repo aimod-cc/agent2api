@@ -38,10 +38,17 @@
 //! 实现见 `attempt_stateful`（只做「凭证 → 记账 → 转发 → 错误透传」，
 //! 三个分类动作不适用：CatPaw 的原项目没有多账号轮换也没有限额码）。
 //!
-//! ── 内容处理（脱敏）在哪一步生效 ─────────────────────────────
-//! 见 `payload.rs`：处理只在某一家即将发送前按作用范围逐家决定。本文件负责
+//! ── 内容处理（系统提示词 + 脱敏）在哪一步生效 ─────────────────
+//! 见 `payload.rs`：两层处理只在某一家即将发送前落到**副本**上。本文件负责
 //! 在正确时机调 [`send_body`]（选路与凭证就绪之后、构造请求之前），同一家
-//! 的发送体在本次请求内只算一次（换到同一家的另一个账号时复用）。
+//! 同池同降级状态的发送体在本次请求内只算一次（换到同一家的另一个账号时复用）。
+//!
+//! ── 内容拦截的补救（动作 0）为什么也在本文件 ──────────────────
+//! 上游按**逐字**匹配审核，撞上就是 HTTP 400 —— 那多半是客户端 system 模板
+//! 的指纹误报（见 `core::sanitize`）。补救分两步：**换最小中性提示词立刻重发
+//! 一次**（就在下面的账号内发送循环里，与 401 刷新重试同一位置），并触发降级
+//! 状态机（`core::degrade`）让后续请求直接带中性提示词出门。两步都不换账号、
+//! 不罚账号 —— 内容问题不是账号问题（照搬参考项目的 `ErrContentBlocked`）。
 //!
 //! ── 旁路记账（usage）────────────────────────────────────────
 //! 每一轮账号尝试都 `telemetry.note_attempt(...)`，并带上 provider id ——
@@ -196,7 +203,10 @@ fn transport_retry_advice(remaining: usize) -> Option<RetryAdvice> {
 ///     在原地重发只会白等一个间隔（与 [`TRANSIENT_RETRY_STATUSES`] 不收 429
 ///     同一条理由）；
 ///   - `TokenExpired`（401）：有专属动作（刷新凭证后同账号重试一次），
-///     走到这里说明已经刷过一轮仍失败，重发没有新变量。
+///     走到这里说明已经刷过一轮仍失败，重发没有新变量；
+///   - `ContentBlocked`（内容策略拦截）：也有专属动作（换中性提示词重发一次，
+///     见 `attempt_queue` 的动作 0），走到这里说明那次补救已经用掉 ——
+///     再原地重发同一份 body 结论不变（拦的是字节，不是账号）。
 fn fallback_retry_advice(
     class: &UpstreamErrorClass,
     remaining: usize,
@@ -206,7 +216,9 @@ fn fallback_retry_advice(
         return None;
     }
     match class {
-        UpstreamErrorClass::QuotaLimited { .. } | UpstreamErrorClass::TokenExpired { .. } => None,
+        UpstreamErrorClass::QuotaLimited { .. }
+        | UpstreamErrorClass::TokenExpired { .. }
+        | UpstreamErrorClass::ContentBlocked { .. } => None,
         UpstreamErrorClass::Fatal { .. } => Some(RetryAdvice {
             delay_ms: config::retry_settings().delay_ms(),
             reason: format!("上游错误（HTTP {status}），换账号前先原地重发"),
@@ -378,16 +390,28 @@ async fn attempt_queue(
     let mut budget = RetryBudget::new(settings.resend_budget());
     let switch_total = settings.switch_budget();
     let mut switches_left = switch_total;
+    // ── 系统提示词的降级标记（对应参考项目的 `degradedApplied`）────────
+    // `true` = 本请求的出站提示词已切到**中性提示词**：进入本请求时降级期已经
+    // 生效（状态机在别的请求里被触发过），或本请求撞了内容拦截后由下面
+    // 「动作 0」置位。置位后不再重复触发 —— 一次请求最多补救一次。
+    //
+    // `custom` 模式不可降级（system 已由网关接管，内容拦截不再指向 system
+    // 指纹），这里并进判定：后面「动作 0」与发送体计算读的都是它。
+    let mut degraded = crate::server::core::degrade::active() && ctx.prompt.mode.degradable();
     // 各家的发送体：某一家即将发送前按作用范围决定一次，换到**同一家同池**的
     // 另一个账号时复用（不重复处理、不重复统计）。键带账号的池（Cline 的账号
     // 记录有 `free`/`pass`）：发送名跟着实际承载的账号所在池走
     // （`wire_target_for_provider`），跨池账号的发送名不同，各算一份。
     // 勾选的家用处理副本，未勾选的用原始 body。
     //
+    // 键的第三维是**降级标记**：内容拦截后本请求会换中性提示词（见「动作 0」），
+    // 那一份发送体是另一份副本，键不同就自然落进另一条缓存项 —— 不必手工失效
+    // 缓存，也不会把「降级前那份」错发给后面的账号。
+    //
     // 值里同时带着**该家实际收到的上游模型名**（`SendBody::wire_model`）——
     // 它是限额冷却的键，与发出去的字节同源（见 `payload::SendBody`）。
     // 缓存因此不只省一次脱敏：429 记账与成功清理都从这里取真名，不必再解析一遍。
-    let mut send_cache: HashMap<(&'static str, String), SendBody<'_>> = HashMap::new();
+    let mut send_cache: HashMap<(&'static str, String, bool), SendBody<'_>> = HashMap::new();
 
     // 标签是必需的：下面「429 降级到下一个账号」发生在**内层发送循环**里，
     // 裸 `continue` 会回到内层（用同一个账号再发一次，正好是要避免的事）。
@@ -415,7 +439,18 @@ async fn attempt_queue(
             // 它失败了就把它记入已尝试、回到循环挑下一个账号 —— 可能已经换了一家。
             // 没有下一个可用账号时，把这个错误原样透传（它的文案最贴近真实原因）。
             let stateful_account_id = target.account_id.clone();
-            match attempt_stateful(service, ctx, kind, adapter, target, slot, connections).await {
+            match attempt_stateful(
+                service,
+                ctx,
+                kind,
+                adapter,
+                target,
+                slot,
+                connections,
+                degraded,
+            )
+            .await
+            {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
                     if let Some(account_id) = stateful_account_id {
@@ -555,6 +590,10 @@ async fn attempt_queue(
         // 位置在选路/凭证之后：没有可用账号（上面的 503/401 提前返回）的请求
         // 走不到这里，不会产生一次「已转发的处理」统计。账号的池进缓存键，
         // 让发送名随实际承载的账号走（同池换账号复用，跨池各算一份）。
+        //
+        // **发送体在下面那层发送循环里取**（不是在这里取一次就固定）：内容拦截
+        // 后的补救是「换中性提示词再发一次」，那一份要靠 `degraded` 翻转后重新
+        // 计算（见「动作 0」）。池名在这里算一次，循环里只借用。
         let account_pool = target
             .account
             .as_ref()
@@ -563,24 +602,31 @@ async fn attempt_queue(
             .unwrap_or("")
             .trim()
             .to_string();
-        let send = send_cache
-            .entry((provider_id, account_pool))
-            .or_insert_with(|| send_body(ctx, provider_id, target.account.as_ref()));
-        let body = &send.body;
-        // 这一家实际收到的上游模型名 = 它的限额冷却键（与字节同源，见 `SendBody`）。
-        // 必须在**借用 body 之后**取一份 owned 副本：`send_cache` 的项在本轮
-        // 结束时才释放，而下面 429 分支要 `continue 'accounts`（重新可变借用
-        // `send_cache`），持有 `send` 的借用活不到那里。
-        let wire_model = send.wire_model.clone();
 
-        // ── 一次账号内的发送链：最多两次（首次 + 401 刷新后重试一次）────
+        // ── 一次账号内的发送链：最多三次（首次 + 内容拦截补救一次 + 401 刷新重试一次）──
         // 为什么把刷新重试并进同一个循环：重试**自己也可能是** 429
         // （额度确实用尽）。若把它当成独立分支直接返回，就会把一条限额错误
         // 当成终态发给客户端 —— 而正确的动作是「标记冷却 + 降级到下一个账号」。
         // 并进同一循环后，两次发送的错误走同一套分类处理。
+        //
+        // 同一层还承载「内容拦截 → 换中性提示词重试一次」（动作 0）：它同样是
+        // 「不换账号、就地再发一次」，只是换了 body 而不是凭证。两个 `continue`
+        // 各自有一个一次性开关（`degraded` / `refreshed`），所以迭代次数有上界
+        // ——不存在「一直重发」的路径。
         let started_at = logging::now_ms();
         let mut refreshed = false;
-        let response = loop {
+        let (response, wire_model) = loop {
+            // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
+            // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
+            // 重新取 —— 于是「换了 body 的那次重试」拿到的一定是新的一份。
+            let send = send_cache.entry((provider_id, account_pool.clone(), degraded)).or_insert_with(
+                || send_body(ctx, provider_id, target.account.as_ref(), degraded),
+            );
+            let body = &send.body;
+            // 这一家实际收到的上游模型名 = 它的限额冷却键（与字节同源，见 `SendBody`）。
+            // 随发送体一起取（发送体换了，真名也随之重算），成功时随返回值交给
+            // 循环外（`cap_cleared` 要读它）—— 所以它是 break 的第二个元素。
+            let wire_model = send.wire_model.clone();
             // 构造请求计划**可能失败**（适配器自己的校验，例如小浣熊账号缺
             // accessToken → 401）。这里显式处理而不是用 `?` 直接抛出：
             // 上面的 `note_attempt_started` 已经为这一轮起了头，直接返回会让
@@ -650,8 +696,15 @@ async fn attempt_queue(
             if let Some(capture) = capture.as_deref() {
                 capture.reset_request(&transport.url, provider_id, &transport.headers, &plan.body);
             }
-            match send_with_retry(adapter, &transport, &mut budget, capture.as_deref(), ctx.telemetry)
-                .await
+            match send_with_retry(
+                adapter,
+                &transport,
+                &mut budget,
+                capture.as_deref(),
+                ctx.telemetry,
+                degraded,
+            )
+            .await
             {
                 Ok(response) => {
                     // 成功出口：这一轮的结果是「成功 + 状态码」，明细在这里定稿。
@@ -664,9 +717,47 @@ async fn attempt_queue(
                     // 口径，见 `RequestEntry::is_success` 的说明。
                     ctx.telemetry
                         .finish_last_attempt(Some(i64::from(response.status().as_u16())), None);
-                    break response;
+                    break (response, wire_model);
                 }
                 Err(failure) => {
+                    // ── 动作 0：内容策略拦截 → 换中性提示词，同账号立即重试一次 ──
+                    // 上游按逐字精确匹配审核，命中即整单拦截；这是**误报**而不是
+                    // 账号问题（余额健康、未限流、session 未死），所以既不罚账号
+                    // 也不换账号 —— 换一份最小中性提示词再发一次才有意义
+                    // （照搬参考项目的 `ErrContentBlocked` 处理）。
+                    //
+                    // 只在「还没换过 + 这个模式可降级」时走：`custom` 模式的 system
+                    // 已由网关接管，再撞拦截多半是用户内容本身触发审核，换提示词
+                    // 解决不了（那类情况落到下面按普通错误收尾）。
+                    //
+                    // 与 401 刷新重试同一性质（同一个账号、同一条尝试明细，
+                    // 换的是 body 不是账号）：所以它也**不**在这里给明细定稿，
+                    // 重试成功时这一轮的结局就是成功。`degraded` 置位后不再重复
+                    // 触发，一次请求最多补救一次。
+                    if matches!(failure.class, UpstreamErrorClass::ContentBlocked { .. })
+                        && !degraded
+                        && ctx.prompt.mode.degradable()
+                    {
+                        degraded = true;
+                        // 触发状态机（已在降级期内则不续期，返回原来的截止时刻）
+                        crate::server::core::degrade::trigger();
+                        let until_text = crate::server::core::degrade::until_text();
+                        let reason = format!(
+                            "内容策略拦截（疑似 system 指纹误报），换中性提示词重试一次；\
+                             降级持续到 {until_text}（届时恢复「{}」）",
+                            ctx.prompt.mode.label(),
+                        );
+                        ctx.telemetry.note_attempt_retry(
+                            &reason,
+                            Some(i64::from(failure.error.status_code)),
+                            0,
+                        );
+                        // 状态变更（降级期是一段持续状态，影响后续所有请求）——
+                        // 与「账号被标记限额」同档，进运行日志页；触发它的那一条
+                        // 请求本身在请求日志的重试链里也能看到原因。
+                        logging::log("[Upstream]", &format!("⚠️ {reason}"));
+                        continue;
+                    }
                     // ── 动作 2：token 失效 → 刷新后同一账号重试一次 ──────
                     // 只在「首次失败 + 是 token 失效 + 还没刷新过」时走。
                     // 刷新失败、或重试再失败（此时 `refreshed` 已为 true）
@@ -1026,6 +1117,7 @@ async fn attempt_stateful(
     target: RouteTarget,
     slot: &mut Option<InFlightGuard>,
     connections: &mut ConnectionGuard,
+    degraded: bool,
 ) -> Result<ForwardOutcome, GatewayError> {
     let provider_id = kind_id(kind);
     let model = model_of(ctx.body);
@@ -1058,7 +1150,10 @@ async fn attempt_stateful(
     // ── 内容处理：凭证已就绪、这一家**即将发送**，此刻才决定发送体 ────────
     // 与无状态路径同一时机与同一判据：选路失败（503/401）的请求走不到这里，
     // 不会产生一次「已转发的处理」；未勾选的家拿到的是客户端原始请求体。
-    let send = send_body(ctx, provider_id, target.account.as_ref());
+    // `degraded` 由调用方（账号循环）给出：本路径**没有**就地补救（有状态
+    // provider 一次转发就是一个会话轮次，没有「换提示词重发」这一步），
+    // 但降级期内（状态机已生效）首发的提示词也要跟着换。
+    let send = send_body(ctx, provider_id, target.account.as_ref(), degraded);
     let body = &send.body;
     // 这一家实际收到的上游模型名 = 限额冷却键（与字节同源，见 `SendBody`）
     let wire_model = &send.wire_model;
@@ -1308,6 +1403,7 @@ async fn send_with_retry(
     budget: &mut RetryBudget,
     capture: Option<&crate::server::core::debug_traffic::TrafficCapture>,
     telemetry: &crate::server::core::upstream::usage::RequestTelemetry,
+    degraded: bool,
 ) -> Result<reqwest::Response, OutboundFailure> {
     loop {
         let response = match send_chat_request(transport).await {
@@ -1345,10 +1441,21 @@ async fn send_with_retry(
         let body = detail.to_value();
         let class = adapter.classify_error(status, &body);
         // 退避重试：provider 专属判定优先，没声明时对瞬时状态码统一兜底
-        let advice = adapter
-            .retry_advice(&body, budget.used(), budget.total)
-            .or_else(|| transient_retry_advice(status, budget.remaining))
-            .or_else(|| fallback_retry_advice(&class, budget.remaining, status));
+        //
+        // ── 内容拦截为什么在 `!degraded` 时跳过这一整层 ──────────────
+        // 首次撞内容拦截时，正确的补救是「换一份中性提示词立刻重发」（调用方的
+        // 动作 0）—— 睡一个间隔、把**同一份** body 再发一遍只会确定性再撞一次墙
+        // （拦截由指纹逐字匹配触发，字节没变结论就不会变），还白吃掉重试预算。
+        // 换过提示词之后（`degraded`）才回到既有口径：仍被拦就按适配器的退避建议
+        // 重试（11-128 的「拦截窗口会持续一小段时间」是实测结论），再不行才换账号。
+        let advice = if !degraded && matches!(class, UpstreamErrorClass::ContentBlocked { .. }) {
+            None
+        } else {
+            adapter
+                .retry_advice(&body, budget.used(), budget.total)
+                .or_else(|| transient_retry_advice(status, budget.remaining))
+                .or_else(|| fallback_retry_advice(&class, budget.remaining, status))
+        };
         if let Some(advice) = advice {
             budget.remaining = budget.remaining.saturating_sub(1);
             let used = budget.used();
@@ -1369,6 +1476,12 @@ async fn send_with_retry(
         // 文案由适配器给出（含 provider 提示），编排层原样组装成网关错误
         let error = match &class {
             UpstreamErrorClass::QuotaLimited { status, message, upstream_code, .. } => {
+                GatewayError::with_status(*status as i32, message.clone())
+                    .with_optional_code(*upstream_code)
+            }
+            // 内容拦截与 Fatal 的客户端形态相同（状态码 + 上游原文 + 上游码）：
+            // 区别只在**编排动作**（前者不罚账号、先换提示词补救），不在文案。
+            UpstreamErrorClass::ContentBlocked { status, message, upstream_code } => {
                 GatewayError::with_status(*status as i32, message.clone())
                     .with_optional_code(*upstream_code)
             }

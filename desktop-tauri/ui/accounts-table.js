@@ -118,6 +118,19 @@
     },
     { key: 'account', label: '账号', align: 'center', legacyAlign: 'left', render: accountCell },
     {
+      // 代理（本次新增，列形态参考 OmniProxy 的「代理」列）：这个账号出网走
+      // 哪条线路。它原先挤在账号列第二行，抽出来之后扫这一列就能回答
+      // 「哪几个账号在走代理、是不是同一个出口」。
+      // 默认位置在账号与连接数之间（列设置里可拖走）—— 紧挨着账号列，
+      // 因为它读起来是账号的**属性**，与后面的运行时读数（连接数 / 状态 /
+      // 限流）不是一类。
+      // 这一列上一版不存在，因此没有「旧默认对齐」这回事，不给 legacyAlign。
+      key: 'proxy', label: '代理',
+      title: '该账号出网走的代理（Clash 出口 / 自定义 / 直连）；点击可修改',
+      align: 'center',
+      render: proxyCell,
+    },
+    {
       // 不加 hint 小字：这一列只有 56px，「连接数」三个字加副标题会撑破表头。
       // 口径说明放在 title 里（悬停可见）。
       // 这一列上一版就是居中（CSS 里写死了 th/td 一起居中），旧默认 = 新默认，
@@ -302,7 +315,7 @@
   }
 
   /**
-   * 账号：第一行名称，第二行「桌面端 / 代理」，第三行只在异常时出现
+   * 账号：第一行名称，第二行「桌面端」标记，第三行只在异常时出现
    * （代理不可用原因 / 账号不可用）。
    *
    * 标识（UID / userId）与 Token 尾号**不再上屏**：它们对「这条账号能不能用」没有
@@ -313,6 +326,13 @@
    * 把健康说明放这一列而不是「状态」列：状态列只有几十像素，放不下必须读全的文案；
    * 账号列是唯一随窗口与列宽变化伸缩的一列，长文案在这里才读得到。
    * 限流的恢复时间不再出现在这里 —— 限额按模型记，它有自己的列（见 limitsCell）。
+   *
+   * ── 代理那一段本次搬走了 ────────────────────────────────────
+   * 它原先在这里的第二行（「桌面端 · 代理 Clash 混合端口 7890」），现在有独立的
+   * 代理列（见 proxyCell）。两处显示同一个事实只会让人怀疑它们会不会不一致，
+   * 而代理是**线路**（决定请求从哪出去、出问题先看哪），与「这条账号是不是
+   * 桌面端登录态」不是同一类信息。第二行因此只剩桌面端标记，
+   * 普通账号（非桌面端、无代理）的副标识行整个不渲染（见 sub 的判空）。
    */
   function accountCell(account) {
     const ident = identifierOf(account);
@@ -325,22 +345,61 @@
       account.source ? `来源 ${account.source === 'imported' ? '旧数据导入' : '手动添加'}` : '',
     ].filter(Boolean).join('；');
 
-    const parts = [];
-    if (account.proxy && !account.proxy.error) {
-      parts.push(`<span class="proxy" title="该账号经此代理访问上游">代理 ${esc(account.proxy.label || '已设置')}</span>`);
-    }
     const desktop = isDesktopAccount(account)
       ? '<span class="badge desktop-tag" title="桌面端实时登录态：凭证每次从客户端登录态文件读取">桌面端</span>'
       : '';
     // 明细行为空时整行不渲染：一个空的 .acct-sub 仍占一行行高（margin + line-height），
     // 在没有任何副标识的账号上会白留一道空隙，而它恰恰是「这行没什么可说的」那种账号
-    const sub = desktop + parts.join('<span class="sep">·</span>');
     const note = healthNote(account);
     return `<td class="cell-account"><div class="acct-name"${title ? ` title="${esc(title)}"` : ''}>`
       + `<span class="name">${esc(name)}</span></div>`
-      + (sub ? `<div class="acct-sub">${sub}</div>` : '')
+      + (desktop ? `<div class="acct-sub">${desktop}</div>` : '')
       + note
       + '</td>';
+  }
+
+  /**
+   * 代理：这个账号出网走哪条线路（列形态参考 OmniProxy 的「代理」列 ——
+   * 一格一件事，扫一眼就知道走的是哪个出口）。
+   *
+   * ── 三种形态 ────────────────────────────────────────────────
+   *   · 未配置 → 「直连」（中性色）。空着会被当成渲染缺失，而写「无」不像状态；
+   *     「直连」是准确的说法 —— 它就是不走代理。
+   *   · 已配置 → 后端给的展示名 `proxy.label`（Clash 是「节点名（:7890）」或
+   *     「Clash 混合端口 7890」，自定义是「http://host:port」；换算在
+   *     `core::proxies::describe_account_proxy`，前端不自己拼 —— 两处拼法迟早漂）。
+   *   · 解析失败 → 「解析失败」红字，完整原因进 title（账号列的异常说明里
+   *     还有一份更显眼的，两处都指向「去设置里改」）。
+   *
+   * ── 为什么整格是一个按钮，而不是像 OmniProxy 那样的行内下拉 ──────
+   * OmniProxy 的代理是**独立实体**（有 id / name / protocol / host / port），
+   * 所以一个下拉就能换。本项目的代理是**账号内嵌的配置**，三种形态里
+   * 「自定义」（协议 + host + port + 用户名密码）根本表达不进一个下拉，
+   * 而 Clash 出口列表还要异步读 Clash Verge 的配置（见 proxy-form.js 的
+   * `loadClashOptions`）。行内下拉只能覆盖「直连 / Clash 出口」两态，
+   * 第三种仍要开弹窗 —— 与其做一半、让用户猜「为什么这里改不了自定义」，
+   * 不如让整格都是「去改它」的入口：点开的就是那个完整的代理表单
+   * （`data-action="settings"`，与操作列那颗「设置」走同一条链，
+   * 处理在 app.js 的 runAccountAction）。
+   */
+  function proxyCell(account) {
+    const button = (label, kind, title) =>
+      `<button class="proxy-cell ${kind}" data-action="settings" data-id="${esc(account.id)}"`
+      + ` title="${esc(title)}">${esc(label)}</button>`;
+    const proxy = account.proxy;
+    if (!proxy) {
+      return `<td class="cell-proxy">${button('直连', 'none', '该账号直连上游，未配置出网代理；点击可设置')}</td>`;
+    }
+    if (proxy.error) {
+      return `<td class="cell-proxy">${button(
+        '解析失败',
+        'bad',
+        `代理不可用：${proxy.error}（转发时会回退直连）；点击可修改`,
+      )}</td>`;
+    }
+    const label = proxy.label || '已设置';
+    const from = proxy.source === 'clash' ? 'Clash Verge 出口' : '自定义代理';
+    return `<td class="cell-proxy">${button(label, 'on', `${from}：${label}；点击可修改`)}</td>`;
   }
 
   /**
@@ -576,16 +635,15 @@
    * `disabled` 是真的禁用属性（而不是只加个灰样式）：这才同时挡住点击与键盘
    * 操作，也让读屏软件念出「不可用」—— 与「设为首选」在队首时的处理一致。
    *
-   * ── 禁用账号不渲染签到按钮 ─────────────────────────────────
-   * `!enabled` 时整颗按钮不出现。这一条与后端 `checkin.rs` 单账号路径的
-   * `enabled` 检查**成对存在**（后端那处返回 400「账号已被禁用」）：
-   * 界面上不给入口 + 后端拒绝执行，两道都要有 —— 前端可能是旧版本，
-   * 后端可能是被别人直接调的，任何一道单独存在都不足以保证「禁用就不签」。
+   * ── 禁用账号也渲染签到按钮（本次改动）─────────────────────
+   * `!enabled` 不再影响签到按钮：签到与转发是两件事，一个被禁用的账号依然可以
+   * 每天签到攒积分，用户对它点「签到」本身就是明确意图。后端
+   * `core::billing::checkin` 的单账号路径同样不再看 `enabled`（只拒国际版），
+   * 两条路径口径一致 —— 不会出现「界面给了按钮、后端却 400」。
    */
   function actionsCell(account, ctx) {
-    const enabled = isEnabled(account);
     const checkedIn = checkedInToday(account);
-    const checkin = !enabled || !supportsCheckin(account)
+    const checkin = !supportsCheckin(account)
       ? ''
       : checkedIn
         ? `<button data-action="checkin" data-id="${esc(account.id)}" disabled`

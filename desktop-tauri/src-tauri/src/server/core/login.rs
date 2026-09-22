@@ -27,6 +27,7 @@
 //! 任务完成后保留 10 分钟，清理在「取任务时顺手做过期检查」里完成，
 //! 不额外起后台定时器。
 
+mod autoclaw;
 mod catpaw;
 mod qoder;
 
@@ -239,11 +240,27 @@ pub struct LoginService {
     auth: AuthService,
     store: AccountStore,
     tasks: LoginTasks,
+    /// AutoClaw OAuth 登录的额外状态（`state → PendingOauth`）。
+    ///
+    /// ── 为什么要单独一张表（不能塞进 LoginTaskState）────────────
+    /// 那个结构是所有 provider 共用的、`/wait` 直接序列化它，往里加
+    /// AutoClaw 专属字段会让每次 `/wait` 都多带一份别人用不到的负载，
+    /// 也让「哪些字段是这家独有的」从类型上看不出来。见
+    /// `login/autoclaw.rs` 的 `PendingOauth`。
+    ///
+    /// 生命周期与任务表一致（收尾时清掉）；进程重启后自然为空，那时回调
+    /// 会被 `finish_autoclaw_oauth_callback` 判成「登录上下文已丢失」。
+    autoclaw_oauth: Arc<Mutex<HashMap<String, autoclaw::PendingOauth>>>,
 }
 
 impl LoginService {
     pub fn new(auth: AuthService, store: AccountStore) -> Self {
-        Self { auth, store, tasks: LoginTasks::new() }
+        Self {
+            auth,
+            store,
+            tasks: LoginTasks::new(),
+            autoclaw_oauth: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn tasks(&self) -> &LoginTasks {

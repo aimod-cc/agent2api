@@ -59,6 +59,8 @@
 
 use serde_json::{json, Value};
 
+use super::region::Region;
+
 /// 默认路由 ID（源实现 `DEFAULT_ROUTE`）。也是 `AUTOCLAW_DEFAULT_ROUTE`
 /// 没配时的取值 —— 与源项目 `server.mjs` 第 41 行的默认值一致。
 pub const DEFAULT_ROUTE: &str = "zai_auto";
@@ -181,14 +183,13 @@ const MODELS: &[ModelEntry] = &[
     },
 ];
 
-/// 默认路由的覆盖值：`AUTOCLAW_DEFAULT_ROUTE`（源项目 `server.mjs` 的同名环境变量）。
+/// 默认路由的覆盖值：`AUTOCLAW_DEFAULT_ROUTE`（源项目 `server.mjs` 的同名环境变量；
+/// 国际版是 `AUTOCLAW_INTL_DEFAULT_ROUTE`）。
 ///
 /// 空值/缺失回落到 `zai_auto`。只在「请求没给 model」或「未知模型回退」时生效。
-pub fn default_route() -> String {
-    std::env::var("AUTOCLAW_DEFAULT_ROUTE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+pub fn default_route(region: Region) -> String {
+    region
+        .env_override("DEFAULT_ROUTE")
         .unwrap_or_else(|| DEFAULT_ROUTE.to_string())
 }
 
@@ -229,8 +230,8 @@ fn entry_by_catalog_name(name: &str) -> Option<&'static ModelEntry> {
 /// `zai_auto-fast` 这种路由还有个陷阱：它剥前缀后是 `auto-fast`，而
 /// `is_route_id("auto-fast")` 为 false（连字符不算合法路由 ID 字符），
 /// 所以「按路由 ID 形态透传」那条路也接不住它 —— 只有远程目录知道它。
-fn remote_route_by_catalog_name(name: &str) -> Option<String> {
-    super::catalog::remote_route_id(name)
+fn remote_route_by_catalog_name(region: Region, name: &str) -> Option<String> {
+    super::catalog::remote_route_id(region, name)
 }
 
 /// 把客户端传入的 model 解析成上游路由（源实现 `resolveModelRoute` 的
@@ -266,9 +267,13 @@ fn remote_route_by_catalog_name(name: &str) -> Option<String> {
 /// 全部目录内模型（也就是绝大多数请求）。
 ///
 /// `requested_model` 始终保留客户端请求里的名字（响应回写用），不被规范化。
-pub fn resolve_model_route(raw_model: &str) -> ModelRoute {
+///
+/// `region` 决定三件事：默认路由的环境变量前缀、远程目录读哪一格的缓存、
+/// 以及第 5 档「自定义模型」判据按哪一家查（`model_rules::is_custom` 认
+/// provider id，两地的自定义登记是分开的）。
+pub fn resolve_model_route(region: Region, raw_model: &str) -> ModelRoute {
     let name = raw_model.trim();
-    let fallback = default_route();
+    let fallback = default_route(region);
     if name.is_empty() {
         return ModelRoute {
             body_model_id: strip_route_prefix(&fallback).to_string(),
@@ -286,7 +291,7 @@ pub fn resolve_model_route(raw_model: &str) -> ModelRoute {
     // 远程目录命中：用它给的路由 ID（静态表里没有的模型 —— 实测多出
     // `zai_auto` / `zai_auto-fast`）。**必须放在兜底之前**，否则这些模型会
     // 静默回退默认路由：客户端要 A 却跑了 B，而且日志上只看到一次「成功」
-    if let Some(route_id) = remote_route_by_catalog_name(name) {
+    if let Some(route_id) = remote_route_by_catalog_name(region, name) {
         return ModelRoute {
             body_model_id: strip_route_prefix(&route_id).to_string(),
             requested_model: name.to_string(),
@@ -312,12 +317,8 @@ pub fn resolve_model_route(raw_model: &str) -> ModelRoute {
     // 手动登记的自定义模型：原样透传，**不要**掉进下面的默认路由回落。
     // 判据与聚合目录同源（`model_rules::is_custom`），所以「清单里认它」
     // 与「发送时也认它」是同一件事，不存在「校验放行、发送时换成别的模型」。
-    if crate::server::core::model_rules::is_custom(
-        crate::server::core::providers::kind_id(
-            crate::server::core::providers::ProviderKind::AutoClaw,
-        ),
-        name,
-    ) {
+    // 按**本地区**的 provider id 查：两地的自定义登记是各自独立的清单
+    if crate::server::core::model_rules::is_custom(region.provider_id(), name) {
         return ModelRoute {
             route_model_id: name.to_string(),
             body_model_id: strip_route_prefix(name).to_string(),
@@ -343,8 +344,12 @@ pub fn resolve_model_route(raw_model: &str) -> ModelRoute {
 /// `maxInputTokens` / `maxOutputTokens` / `supportsImages` / `supportsReasoning` /
 /// `credits`。`routeId` 不是聚合层要的键，但**转发必须用**
 /// （`X-Request-Model`），所以一并带上（聚合层会原样忽略未知键）。
-pub fn list() -> Vec<Value> {
-    let remote = super::catalog::remote_models();
+///
+/// 远程目录按**地区**取（两地的清单独立，见 `catalog::catalog` 的说明）；
+/// 静态兜底表两地共用 —— 它是「上游不可达时的最小可用集合」，不是某一地的
+/// 真实目录。
+pub fn list(region: Region) -> Vec<Value> {
+    let remote = super::catalog::remote_models(region);
     if !remote.is_empty() {
         return remote;
     }
@@ -390,6 +395,9 @@ pub fn list() -> Vec<Value> {
 /// 本函数是**能力探测口**：保留它是为了让「某个模型到底支不支持图片」有唯一
 /// 的纯函数答案（排障 / 将来的多模态处理都会问它），源侧同一个能力位（`supportImage`）
 /// 也是独立字段。`#[allow(dead_code)]`：当前无生产调用点，编译器据实报「没人用」。
+///
+/// 只看**静态兜底表**（不带 region）：远程目录的能力位由 `list()` 直出给聚合层，
+/// 这个探测口服务的是「按名字问一个纯函数答案」，而静态表的两个条目两地同形。
 #[allow(dead_code)]
 pub fn supports_image(name: &str) -> bool {
     let trimmed = name.trim();

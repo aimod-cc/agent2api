@@ -615,8 +615,14 @@ pub struct RequestQuery {
     pub offset: usize,
     /// 默认 `DEFAULT_LIMIT`，夹在 `[1, MAX_LIMIT]`
     pub limit: Option<usize>,
-    /// 精确匹配模型名；None 不过滤
+    /// 精确匹配模型名（`model` 列 = 解析后的名字，报表按它聚合的历史口径）；
+    /// None 不过滤
     pub model: Option<String>,
+    /// 精确匹配 provider id（`provider` 列）；None 不过滤。
+    ///
+    /// 空 id 的行（一次都没发出去就失败的请求）**筛不到** —— 那不是某一家的问题，
+    /// 用 `status=error` 看它们更直接。界面的下拉也只列出现过的非空 id。
+    pub provider: Option<String>,
     /// `"ok"` = 2xx / `"error"` = 非 2xx / None 不过滤
     pub status: Option<String>,
     /// 起始毫秒时间戳（闭区间下界）

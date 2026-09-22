@@ -63,7 +63,12 @@
     workbuddy: { usage: true, checkin: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
     raccoon: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
     catpaw: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
+    // AutoClaw 两个地区（国内版 / 国际版）能力完全一致：同一套接口、同一套
+    // 字段（userId 标识、tokenExpiresAt 过期时间），差别只在域名。
+    // 两项都必须登记 —— 漏了哪一项，那一家就会掉进 GENERIC_FEATURES，
+    // 症状是余额按钮消失、标识列显示成空。
     autoclaw: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
+    'autoclaw-intl': { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
     qoder: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt' },
     'cline-free': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
     'cline-pass': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
@@ -246,9 +251,16 @@
     return accountEdition(account) !== 'intl';
   }
 
-  /** 可参与签到的账号（一键签到只用这批：所属家有签到活动 + 启用 + 非国际版） */
+  /**
+   * 可参与签到的账号（一键签到只用这批：所属家有签到活动 + 非国际版）。
+   *
+   * **不看 `enabled`**：禁用只表示「别用它转发」，签到是另一件事 ——
+   * 一个被禁用的账号依然可以每天签到攒积分。此处与后端
+   * `core::billing::checkin` 的批量路径过滤链（`supports_checkin` +
+   * 提供商范围）口径一致，否则界面上的「将签到 N 个账号」会与实际执行数对不上。
+   */
   function checkinableAccounts(list) {
-    return (list || []).filter(account => isEnabled(account) && supportsCheckin(account));
+    return (list || []).filter(account => supportsCheckin(account));
   }
 
   // ─── 筛选维度 ───────────────────────────────

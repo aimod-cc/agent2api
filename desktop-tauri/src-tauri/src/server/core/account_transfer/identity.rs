@@ -26,10 +26,16 @@ use crate::server::core::providers::{
 ///
 /// **全局保留**：任何 provider 的导入记录用了这些 id 都跳过 —— 既避免把引用
 /// 变成普通账号，也避免占住 id 让后续 importDesktop 无法创建/刷新。
-pub(super) const RESERVED_DESKTOP_IDS: [&str; 3] = [
+///
+/// AutoClaw 占两项（国内版 / 国际版各一个 id）：两地的桌面端账号是两条独立
+/// 记录（读的是同一个 `auth.json`，但归不同的 provider），因此两个 id 都要
+/// 保留 —— 漏了国际版那个，它的桌面端记录就能被当成普通账号导入，然后因为
+/// 「不落 token」而永远 `available: false`。
+pub(super) const RESERVED_DESKTOP_IDS: [&str; 4] = [
     crate::server::core::providers::raccoon::credentials::DESKTOP_ACCOUNT_ID,
     crate::server::core::providers::catpaw::credentials::DESKTOP_ACCOUNT_ID,
     crate::server::core::account_store::autoclaw_accounts::DESKTOP_ACCOUNT_ID,
+    crate::server::core::account_store::autoclaw_accounts::INTL_DESKTOP_ACCOUNT_ID,
 ];
 
 pub(super) fn is_reserved_desktop_id(id: &str) -> bool {

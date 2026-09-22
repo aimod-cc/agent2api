@@ -52,7 +52,7 @@ use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
 use crate::server::core::account_store::{
-    is_cline_family, CredentialWrite, CLINE_FREE_PROVIDER_ID, CLINE_PASS_PROVIDER_ID, MAX_ACCOUNTS,
+    is_cline_family, CredentialWrite, CLINE_FREE_PROVIDER_ID, CLINE_PASS_PROVIDER_ID,
     MAX_TOKEN_LENGTH,
 };
 use crate::server::core::providers::cline::credentials;
@@ -252,12 +252,6 @@ impl AccountStore {
         let _guard = self.guard();
         // 只读这一行（不再读全量）：既有记录决定「更新还是新建」与多处沿用值
         let existing = self.record_by_id(&_guard, &id);
-        if existing.is_none() && self.with_conn(&_guard, |conn| sql::count_all(conn))? as usize >= MAX_ACCOUNTS {
-            return Err(AccountStoreError::new(
-                format!("最多保存 {MAX_ACCOUNTS} 个账号"),
-                400,
-            ));
-        }
         if let Some(existing) = existing.as_ref() {
             if existing.provider() != provider {
                 return Err(AccountStoreError::new(
@@ -426,12 +420,6 @@ impl AccountStore {
                     409,
                 ));
             }
-        }
-        if existing.is_none() && self.with_conn(&_guard, |conn| sql::count_all(conn))? as usize >= MAX_ACCOUNTS {
-            return Err(AccountStoreError::new(
-                format!("最多保存 {MAX_ACCOUNTS} 个账号"),
-                400,
-            ));
         }
         let now = logging::now_ms();
         // 备注名兜底链：调用方给的 → 记录里原有的 → **姓名**（`credentials.name`

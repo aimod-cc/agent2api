@@ -75,6 +75,18 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/api/session/login/catpaw-callback",
             post(api::session::login_catpaw_callback),
+        )
+        // AutoClaw OAuth（国际版）的 loopback 回调：**浏览器 302 到这里**
+        // （授权页完成后顶层导航到我们给上游的 navigate_uri，见
+        // `providers::autoclaw::oauth`），所以同样必须免鉴权 —— 调用方是用户的
+        // 浏览器，它没有我们的 API Key。安全性由一次性 `state` 承担
+        // （路径里的第二段，回调时逐字比对）。
+        //
+        // 变体与 state 都在路径里（`{vendor}/{state}`）：上游会在 navigate_uri
+        // 后面拼 `?code=…&state=…`，把这两段放进路径就不必猜它追加 `?` 还是 `&`。
+        .route(
+            "/api/session/login/autoclaw-oauth-callback/{vendor}/{state}",
+            get(api::session::login_autoclaw_oauth_callback),
         );
 
     // 需鉴权：Node 版对这些路径都调用了 checkApiKey
@@ -100,7 +112,7 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/logs/", any(api::logs_api::not_found))
         .route("/api/logs/{*rest}", any(api::logs_api::not_found))
         // ── 统计报表与数据保留（切片 7 之后的扩展，非 Node 版对齐项）──
-        // 三条 /api/stats/* 与两条 /api/retention 都挂 protected：
+        // /api/stats/* 与 /api/retention 都挂 protected：
         // 它们能读到全部请求日志（含模型、账号、token 用量）并能删数据 / 改保留期，
         // 与 /api/logs 同级敏感，必须和日志接口一样走 API Key 检查。
         // 未知 /api/stats/* 子路径返回管理信封 404（照 logs_api::not_found 的做法，
@@ -109,6 +121,13 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/api/stats/requests",
             get(api::stats_api::stats_requests).delete(api::stats_api::clear_stats_requests),
+        )
+        // 筛选下拉的候选清单（出现过的模型 / 提供商）。登记在 `/api/stats/requests`
+        // 之后、`/api/stats/{*rest}` **之前**：通配兜底是 404，顺序反了会让这个
+        // 端点永远拿到 404（形状还是管理信封，看起来就像路径拼错了）
+        .route(
+            "/api/stats/requests/filters",
+            get(api::stats_api::stats_request_filters),
         )
         // 无尾段的 `/api/stats` 也登记成管理信封 404：这个前缀下没有「列表」端点
         // （报表有三条子路径），但同一前缀下的 404 形状必须一致 ——
@@ -204,6 +223,19 @@ pub fn router(state: ServerState) -> Router {
             "/api/session/login/sms/verify",
             post(api::session::login_sms_verify),
         )
+        // AutoClaw OAuth 网页登录（**国际版**的官方主方式）。三段里只有前两段
+        // 在这里：第三段（loopback 回调）在 public 组（调用方是用户的浏览器，
+        // 见那边的注释）。这两段都挂 protected —— 它们要带验证码参数去打上游、
+        // 并往任务表里登记一次登录，与 sms/* 同级敏感。
+        .route(
+            "/api/session/login/oauth/captcha-config",
+            get(api::session::login_oauth_captcha_config)
+                .post(api::session::login_oauth_captcha_config),
+        )
+        .route(
+            "/api/session/login/oauth/start",
+            post(api::session::login_oauth_start),
+        )
         .route("/api/session/refresh", post(api::session::session_refresh))
         .route("/api/session/logout", post(api::session::session_logout))
         .route("/auth/login", post(api::session::auth_login))
@@ -246,6 +278,14 @@ pub fn router(state: ServerState) -> Router {
         .route(
             "/api/sanitize",
             get(api::sanitize::get_sanitize).put(api::sanitize::put_sanitize),
+        )
+        // ── 系统提示词与内容拦截降级 ──
+        // 与 /api/sanitize 同为「出站内容处理」的开关，但形状不同（枚举 + 文件
+        // 路径 + 一个运行期状态要一起返回），所以单独一条端点，见 api::prompt
+        // 的模块头。挂 protected：它能改出站的 system 提示词，敏感度同级。
+        .route(
+            "/api/prompt",
+            get(api::prompt::get_prompt).put(api::prompt::put_prompt),
         )
         // ── 定时签到（对照 server.mjs 726-746 行）──
         // 三条都在 Node 的最外层大 try 里，失败走 OpenAI 风格 body（含 run 的

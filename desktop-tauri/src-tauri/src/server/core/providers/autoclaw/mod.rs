@@ -18,9 +18,15 @@
 //!   adapter.rs      **ProviderAdapter 实现**（T-c2）：请求构造（双模型标识头 +
 //!                   X-Authorization）/ 错误分类 / 凭证 / SSE model 回写声明，
 //!                   移植来源：`autoclaw-upstream-client.mjs` 的转发链
+//!   prompt.rs       出站 **system 提示规范化**：前置 OpenClaw 身份前缀 + 改写
+//!                   外来 harness 身份句（上游 2026-09-22 起的 system 白名单，
+//!                   实测表在该文件头）
 //!   balance.rs      积分钱包 + 订阅信息查询（移植来源 `account-balance.mjs`）
 //!   checkin.rs      每日签到（**逆向**：老项目没有这条链路，接口从 AutoClaw
 //!                   桌面端的 app.asar 里读出并实测确认）
+//!   oauth.rs        **国际版**的 OAuth 网页登录（Zai / Google）：服务端那两跳
+//!                   （取授权地址 / 用码换凭证）。浏览器那一半 —— 强制风控
+//!                   验证码 —— 在 `ui/autoclaw-oauth.js`（主窗口里跑阿里云 SDK）
 //!
 //! ── 接线现状（T-c2 已落地）──────────────────────────────────
 //! `adapter_for(AutoClaw)` 返回 [`adapter::AUTOCLAW_ADAPTER`]，`implemented_kinds()`
@@ -62,6 +68,8 @@
 //! crypto::decode_jwt_claims(&str) -> Option<Value>
 //! crypto::strip_bearer(&str) -> String
 //! adapter::AUTOCLAW_ADAPTER           静态适配器实例（`adapter_for` 返回它）
+//! prompt::normalize(&mut Value)       出站前规范化 system 提示（就地改 body）
+//! prompt::IDENTITY_LINE               上游要求的身份句（幂等判定用）
 //! balance::query_usage(&AccountStore, &str) -> Result<Value, GatewayError>
 //! checkin::claim_daily_signin(&AccountStore, &str) -> Result<Value, GatewayError>
 //! ```
@@ -86,4 +94,10 @@ pub mod crypto;
 pub mod credentials;
 pub mod login;
 pub mod models;
+pub mod oauth;
+pub mod prompt;
 pub mod refresh;
+pub mod region;
+
+pub use adapter::{AUTOCLAW_ADAPTER, AUTOCLAW_INTL_ADAPTER};
+pub use region::Region;

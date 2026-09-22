@@ -13,7 +13,7 @@
 //!                                       `?id=` 指定单个账号（**不看启用状态**，见 usage_query）
 //!   GET    /api/accounts/usage/snapshot 最近一次**定时查询**的结果快照（形状同 usage）
 //!   GET    /api/accounts/connections     逐账号活跃连接数（账号页「连接数」列，2 秒轮询）
-//!   POST   /api/accounts/checkin        签到（串行，跳过已禁用与国际版账号）{ id? }
+//!   POST   /api/accounts/checkin        签到（串行，跳过国际版与范围外的提供商）{ id? }
 //!   PATCH  /api/accounts/{id}           修改账号属性 { name?, priority?, enabled?, proxy? }
 //!   POST   /api/accounts/{id}/move      与相邻账号交换优先级 { direction: 'up' | 'down' }
 //!   DELETE /api/accounts/{id}           删除账号
@@ -24,7 +24,8 @@
 //!   - `POST /api/accounts` 按 payload 的 provider **穷举分派**（见 `add_account`）；
 //!   - `usage` 从「只服务 workbuddy」扩到**四家混查**（余额查询移植）：目标集合
 //!     不再按 provider 过滤，逐账号分流到 `ProviderAdapter::query_usage`。
-//!     `checkin` 仍然只服务 workbuddy；其余 CRUD 语义保持不变。
+//!     `checkin` 同样扩到**三家**（WorkBuddy / 小浣熊 / AutoClaw，各自签到链路
+//!     互不相通，见 `core::billing::checkin::checkin_for`）；其余 CRUD 语义保持不变。
 //!
 //! 出网代理的两条（/api/proxies、/api/proxies/test）在 `api::proxies`，
 //! 但它们的入口 `proxies_entry` 留在本文件 —— 与账号入口挨着，便于对照
@@ -329,12 +330,21 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             }
         }
         // AutoClaw（W4b-T-c2）：粘贴 token / refreshToken（含 `enc:` 密文自动解密）
-        // → 手动添加；`importDesktop: true` → 导入桌面端实时登录态（记录不落 token）
-        Some(crate::server::core::providers::ProviderKind::AutoClaw) => {
+        // → 手动添加；`importDesktop: true` → 导入桌面端实时登录态（记录不落 token）。
+        //
+        // 两个地区走**同一份实现**、按地区参数化（`autoclaw::region`）：账号集合
+        // 按 provider 隔离，因此这里的 kind → region 必须逐字对应，不能让国际版
+        // 落进国内版的记录里（那会让两家的账号在同一分组里混着，选路也按错误的
+        // 域名发请求）。`importDesktop` 只对国内版有意义 —— 那个文件没有地区
+        // 标记，国际版分支会在存储层明确拒绝（见 `import_autoclaw_desktop_account`）。
+        Some(kind @ (crate::server::core::providers::ProviderKind::AutoClaw
+            | crate::server::core::providers::ProviderKind::AutoClawIntl)) => {
+            let region = crate::server::core::providers::autoclaw::Region::from_kind(kind)
+                .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
             if import_desktop {
-                store.import_autoclaw_desktop_account("manual")
+                store.import_autoclaw_desktop_account(region, "manual")
             } else {
-                store.add_autoclaw_account(&payload, import_name)
+                store.add_autoclaw_account(region, &payload, import_name)
             }
         }
         Some(crate::server::core::providers::ProviderKind::Qoder) => {
@@ -552,15 +562,24 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     // **桌面端实时登录态不主动刷新**（原项目 `account-routes.mjs` 的同款拒绝）：
     // 网关与桌面端共用同一个 refresh_token，网关侧刷新会造成轮换竞态，
     // 因此这类账号明确报 400 并说明做法（`autoclaw::credentials` 模块头详述）。
-    if let Some(record) = state.store().autoclaw_account_record(&id) {
-        if record.get("desktop").and_then(Value::as_bool).unwrap_or(false) {
-            return management_error(
-                400,
-                "AutoClaw 桌面端登录态由桌面客户端维护，网关不主动刷新：\
-                 请在 AutoClaw 桌面端重新登录后重试",
-            );
+    //
+    // 两个地区各查一次（账号集合按 provider 隔离）。顺序无关紧要 —— 同一 id
+    // 不可能同时属于两家（撞 id 在存储层就报错了），这里按注册表顺序写，
+    // 读起来与 `PROVIDERS` 一致。
+    for region in [
+        crate::server::core::providers::autoclaw::Region::Cn,
+        crate::server::core::providers::autoclaw::Region::Intl,
+    ] {
+        if let Some(record) = state.store().autoclaw_account_record(region, &id) {
+            if record.get("desktop").and_then(Value::as_bool).unwrap_or(false) {
+                return management_error(
+                    400,
+                    "AutoClaw 桌面端登录态由桌面客户端维护，网关不主动刷新：\
+                     请在 AutoClaw 桌面端重新登录后重试",
+                );
+            }
+            return refresh_provider_account(state, &id, region.kind()).await;
         }
-        return refresh_provider_account(state, &id, ProviderKind::AutoClaw).await;
     }
     // CatPaw 账号：没有刷新机制（见本函数的说明）
     if state.store().catpaw_account_record(&id).is_some() {

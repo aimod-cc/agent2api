@@ -19,6 +19,7 @@
 //!   models.rs     POST /api/models/refresh（手动刷新模型清单；管理 API，
 //!                 与上一条的对外只读探针是两个分组，见该文件模块头）
 //!   sanitize.rs   GET/PUT /api/sanitize（出站指纹脱敏开关）
+//!   prompt.rs     GET/PUT /api/prompt（系统提示词模式 + 内容拦截降级状态）
 //!   auto_checkin.rs /api/auto-checkin*（定时签到设置 / 手动执行）
 //!   scheduled_tasks.rs /api/scheduled-tasks*（间隔型定时任务的开关 / 间隔 / 立即执行）
 //!   update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
@@ -46,6 +47,7 @@ pub mod logs_api;
 pub mod model_manage;
 pub mod models;
 pub mod pipeline;
+pub mod prompt;
 pub mod protocol;
 pub mod proxies;
 pub mod retry_api;

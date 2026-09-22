@@ -1,11 +1,12 @@
 //! 报表 API 与数据保留策略（设置页「数据保留」）。
 //!
 //! ```text
-//! GET    /api/stats/summary     报表聚合（概览 / 热力图 / 缓存命中率 / 趋势）
-//! GET    /api/stats/requests    请求日志（分页 + 模型 / 状态 / 时间区间过滤）
-//! DELETE /api/stats/requests    清空明细与按天聚合
-//! GET    /api/retention         三档保留天数（事件日志 / 请求日志 / 按天聚合）
-//! PUT    /api/retention         更新保留天数并**立即**触发清理
+//! GET    /api/stats/summary            报表聚合（概览 / 热力图 / 缓存命中率 / 趋势）
+//! GET    /api/stats/requests           请求日志（分页 + 模型 / 提供商 / 状态 / 时间区间过滤）
+//! GET    /api/stats/requests/filters   请求日志筛选下拉的候选清单（出现过的模型 / 提供商）
+//! DELETE /api/stats/requests           清空明细与按天聚合
+//! GET    /api/retention                三档保留天数（事件日志 / 请求日志 / 按天聚合）
+//! PUT    /api/retention                更新保留天数并**立即**触发清理
 //! ```
 //!
 //! ── 为什么两条前缀放在一个文件里 ─────────────────────────────
@@ -45,6 +46,12 @@
 //! 所以它比 providers 更细。两点差异：`label` 是**聚合时留下的名字快照**
 //! 而不是现算（账号可能已被删除，注册表里查不到），取「快照名 → id」，
 //! 两者都空的那一组 label 为「未知账号」。
+//!
+//! ── 按 provider 筛选（本次新增）────────────────────────────
+//! `GET` / `DELETE` 两条都多了 `provider` 查询参数（精确匹配 provider id），
+//! 与 `model` 同一份过滤链（存储层的 `sql::FilterPlan`）—— 所以「列表里筛出
+//! 的 N 条」与「清空删掉的那批」是同一个集合。候选清单走
+//! `GET /api/stats/requests/filters`，理由见那个处理函数。
 //!
 //! 以上都是**新增键**，既有字段的键名、类型、语义一个都没动
 //! （前端按「providers / accounts 存在则展示、缺失则隐藏」消费）。
@@ -138,17 +145,21 @@ pub async fn stats_summary(State(state): State<ServerState>, Query(params): Quer
     ok_json(state.request_stats().usage_summary(&requested))
 }
 
-/// GET /api/stats/requests?offset=&limit=&model=&status=&start=&end=
+/// GET /api/stats/requests?offset=&limit=&model=&provider=&status=&start=&end=
 ///
 /// 每行含 `provider`（id）与 `providerLabel`（展示名），由存储层的 `entry_json`
-/// 在序列化后派生填入；**不新增查询参数**（按 provider 筛选不在本期契约里，
-/// 前端要筛就在本地按 id 过滤已有的 `provider` 字段）。
+/// 在序列化后派生填入。
+///
+/// `provider` 与 `model` 都是**精确匹配**（下拉里选的是明细里出现过的原值，
+/// 不做模糊匹配 —— 模糊匹配会让「筛了 A 却看到 B」变得无法解释）。
 pub async fn stats_requests(State(state): State<ServerState>, Query(params): Query<Params>) -> Response {
     let filter = RequestQuery {
         offset: parse_offset(params.get("offset")),
         limit: parse_limit(params.get("limit")),
         // 模型名精确匹配；空串（输入框清空）当没筛
         model: text_of(&params, "model"),
+        // provider id 精确匹配；空串当没筛（见 RequestQuery::provider）
+        provider: text_of(&params, "provider"),
         // 只认 ok / error，其余值在存储层被忽略（不在这里重复实现归一）
         status: text_of(&params, "status"),
         // 闭开区间 [start, end)：翻页时上一页末尾的 ts 可直接当下页的 end
@@ -158,13 +169,26 @@ pub async fn stats_requests(State(state): State<ServerState>, Query(params): Que
     ok_json(state.request_stats().query_requests(&filter))
 }
 
-/// DELETE /api/stats/requests?model=&status=&start=&end=&all=
+/// GET /api/stats/requests/filters —— 筛选下拉的候选清单。
+///
+/// 形状 `{models: [名字…], providers: [{id, label}…]}`，两者都按出现次数降序
+/// （常用的排前面）。清单来自**明细里实际出现过的值**，不是当前的配置清单 ——
+/// 历史请求用过的模型名 / 已删除账号所属的 provider 同样要能筛到，否则会出现
+/// 「列表里有这一行、下拉里却没有这个选项」这种最难解释的不一致。
+///
+/// 不带任何查询参数：它与时间档位无关（理由见存储层 `select_filter_options`）。
+pub async fn stats_request_filters(State(state): State<ServerState>) -> Response {
+    ok_json(state.request_stats().filter_options())
+}
+
+/// DELETE /api/stats/requests?model=&provider=&status=&start=&end=&all=
 ///
 /// 带筛选参数时**只删命中的明细**并重算受影响日期的聚合（「清空筛选结果」，
-/// 与 GET 同一份过滤链）；清空全部必须**显式**带 `all=1`（不带的空请求给 400）——
+/// 与 GET 同一份过滤链 —— 界面上「当前筛选出 N 条」与这里删掉的那批必然是
+/// 同一个集合）；清空全部必须**显式**带 `all=1`（不带的空请求给 400）——
 /// 与 `logs_api::clear_logs` 同一道护栏（理由见那边的注释：筛选清空漏传参数
 /// 的代价是全部明细没了）。响应带删除后的存储概况，有删除时另带 `removed`。
-/// 清空**不动保留期设置**。
+/// 清空**不动**保留期设置。
 pub async fn clear_stats_requests(
     State(state): State<ServerState>,
     Query(params): Query<Params>,
@@ -173,12 +197,16 @@ pub async fn clear_stats_requests(
         offset: 0,
         limit: None,
         model: text_of(&params, "model"),
+        provider: text_of(&params, "provider"),
         status: text_of(&params, "status"),
         start: parse_query_ms(params.get("start")),
         end: parse_query_ms(params.get("end")),
     };
-    let has_filters =
-        filter.model.is_some() || filter.status.is_some() || filter.start.is_some() || filter.end.is_some();
+    let has_filters = filter.model.is_some()
+        || filter.provider.is_some()
+        || filter.status.is_some()
+        || filter.start.is_some()
+        || filter.end.is_some();
     if !has_filters {
         let explicit_all = params.get("all").map_or(false, |value| {
             let text = value.trim();
@@ -199,7 +227,7 @@ pub async fn clear_stats_requests(
     // 全量清空时连调试模式的原始报文一起清：那些报文是按 id 关联到明细的，
     // 明细没了它们就成了永远取不到的孤儿，白占磁盘。
     // **按筛选条件清空时不动**：筛选清的是部分明细，报文可能还对应着留下的行，
-    // 且筛选语义（模型 / 状态 / 时间）在报文侧没有对应字段可判。
+    // 且筛选语义（模型 / 提供商 / 状态 / 时间）在报文侧没有对应字段可判。
     if !has_filters {
         crate::server::core::debug_traffic::clear();
     }

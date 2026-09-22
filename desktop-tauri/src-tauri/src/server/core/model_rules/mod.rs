@@ -777,7 +777,7 @@ fn is_opaque_raccoon_id(id: &str) -> bool {
 /// 跨家的主备切换断掉一半。这张表按「上游 id → 额外别名」点名补挂，
 /// 同一 alias 允许多家各一条（见模块头），不会遮蔽任何东西，只是把候选链补全。
 ///
-/// 三条现有条目的来由：
+/// 四组现有条目的来由：
 ///   - 小浣熊把 4.1 写成连字符（`sn-deepseek-v4-1-flash`），去前缀只能给出
 ///     `deepseek-v4-1-flash`，而下游习惯点号写法；
 ///   - Cline 的 `deepseek-v4.1-flash` **两池都有**（`cline-free/` 与
@@ -787,12 +787,21 @@ fn is_opaque_raccoon_id(id: &str) -> bool {
 ///     路由时两条一起进候选链，发送名跟着实际承载的 provider 走
 ///     （见 `catalog::wire_target_for_provider` 的 ②）。缺了任何一条，
 ///     「短名默认能路由到那个池」这件事就会随刷新顺序时断时续。
+///   - `glm-5.3-flash` 同理但**更隐蔽**：免费池那条是裸 id
+///     （`z-ai/glm-5.3-flash`，剥厂商前缀得到短名），订阅池那条带通道前缀
+///     （`cline-pass/glm-5.3-flash`，剥通道前缀得到同一个短名）—— 两条来自
+///     **不同的剥离规则**却撞在同一个短名上，同样会「先到先得」，所以也两家
+///     都点名。它还与 CatPaw / AutoClaw 的原生 id 同名，那不影响：
+///     同一对外名由多家承载正是主备路由的常态。
 const EXTRA_ALIASES: &[(&str, &str, &str)] = &[
     ("raccoon", "sn-deepseek-v4-1-flash", "deepseek-v4.1-flash"),
     // 两家 provider id 从 `Pool` 推导，别处已无 `"cline"` 这个 id（见
     // `providers::PROVIDERS` 的 cline-free / cline-pass 两条）
     ("cline-free", "cline-free/deepseek-v4.1-flash", "deepseek-v4.1-flash"),
     ("cline-pass", "cline-pass/deepseek-v4.1-flash", "deepseek-v4.1-flash"),
+    // 免费池的裸 id：短名 `glm-5.3-flash` 与订阅池那条撞名（见上文）
+    ("cline-free", "z-ai/glm-5.3-flash", "glm-5.3-flash"),
+    ("cline-pass", "cline-pass/glm-5.3-flash", "glm-5.3-flash"),
 ];
 
 /// 额外别名的种子键：`<provider>:<id>#alias:<alias>`。

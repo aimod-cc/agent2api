@@ -49,6 +49,7 @@ use crate::server::errors::GatewayError;
 use super::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
 };
+use super::content_block;
 use super::ProviderKind;
 
 /// 出站请求体归一化（角色 / tool_choice / image_url / max_tokens / tool 配对 /
@@ -152,7 +153,9 @@ impl ProviderAdapter for WorkBuddyAdapter {
     /// 上游错误分类（照抄改造前 `upstream` 的判定与文案）：
     ///   - 401 → TokenExpired（刷新后同账号重试一次）
     ///   - 429 或 code 6004 → QuotaLimited（冷却 + 换账号）
-    ///   - 其余 → Fatal（原样透传；11128 追加敏感词指引）
+    ///   - 内容策略拦截（11128 或审核文案）→ ContentBlocked（**不罚账号**：换中性提示词后
+    ///     同账号重试一次 + 触发降级，见 `core::degrade`）
+    ///   - 其余 → Fatal（原样透传）
     ///
     /// 文案逐字对齐改造前 `rotate::request_with_waf_retry` 的那三行
     /// `format!("上游返回 {status}: {message}{hint}")`。
@@ -179,10 +182,35 @@ impl ProviderAdapter for WorkBuddyAdapter {
             };
         }
         // 11128 透传时追加敏感词指引（改造前在 rotate::request_with_waf_retry 里）
-        let hint = if code == Some(RATE_LIMIT_CODE) { WAF_HINT } else { "" };
+        let is_waf_code = code == Some(RATE_LIMIT_CODE);
+        let hint = if is_waf_code { WAF_HINT } else { "" };
+        let message = format!("上游返回 {status}: {raw}{hint}");
+        // 内容策略拦截（11128 及其历史文案）：**不罚账号**，交给编排层降级到
+        // 中性提示词后同账号重试一次（见 `core::degrade`）。判据取并集 ——
+        // 业务码兜住「上游改了文案」、共用文案规则兜住「上游改了码」，两条
+        // 指向的是同一件事（论证见 `providers::content_block` 模块头）。
+        //
+        // 提示文案分两种：11-128 用它自己那句既有措辞（`WAF_HINT`，改造前
+        // 就在 —— 既有用户的错误文案逐字不变是本项目的约定，不并进共用提示）；
+        // 只按文案命中的那一支才补共用提示（两条提示说的是同一件事，
+        // 叠在一起只是噪音）。
+        if is_waf_code {
+            return UpstreamErrorClass::ContentBlocked {
+                status,
+                message,
+                upstream_code: code,
+            };
+        }
+        if content_block::matched(status, error_body) {
+            return UpstreamErrorClass::ContentBlocked {
+                status,
+                message: format!("{message}{}", content_block::CONTENT_BLOCK_HINT),
+                upstream_code: code,
+            };
+        }
         UpstreamErrorClass::Fatal {
             status,
-            message: format!("上游返回 {status}: {raw}{hint}"),
+            message,
             upstream_code: code,
         }
     }
@@ -373,7 +401,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
         let retry = crate::server::config::retry_settings();
         Some(RetryAdvice {
             delay_ms: retry.delay_ms(),
-            reason: "上游敏感词拦截（11128），请检查提示词中的敏感词（可在「脱敏」页维护词表）"
+            reason: "上游敏感词拦截（11128），请检查提示词中的敏感词（可在设置页「通用 → 指纹脱敏」开关）"
                 .to_string(),
         })
     }

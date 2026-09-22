@@ -337,6 +337,57 @@ pub(super) fn build_providers(totals: &[ProviderAccum]) -> Vec<Value> {
         .collect()
 }
 
+/// 未知模型的展示名（模型名为空串的那一组）。
+///
+/// 与 provider / 账号那两条是**三个独立的常量**：三者的「未知」成因各不相同
+/// （没记下承载的家 / 没走账号列表 / 没记下模型名），文案将来若分叉，
+/// 共用会让改一处等于改两处。
+pub(super) const UNKNOWN_MODEL_LABEL: &str = "未知模型";
+
+/// 区间级的按模型汇总 → `/api/stats/summary` 的 `models` 数组。
+///
+/// 与 `build_providers` / `build_accounts` 同形同序（requests 降序 → tokens 降序
+/// → 名字升序）。模型维度比那两维更早存在（`model_totals` 一直是
+/// `range_totals` 的一部分，`topModel` 就是从它算出来的），但此前只对外暴露了
+/// 冠军一个 —— 这里把整张表给出去，供报表的「模型用量」环形图使用。
+///
+/// ── 与 providers 的两处差异 ─────────────────────────────────
+///   1. **空模型名的组照常返回**（label 为「未知模型」）：`build_top_model` 特意
+///      把空名字排除在冠军评选之外（避免标题栏显示空白），但这里是要画一张
+///      「用量都花在哪」的图，那一组代表的真实用量不该从图上消失 ——
+///      它会让各扇区之和对不上 `overview.tokens`。
+///   2. 没有 `label` 与 `id` 的区分：模型名既是身份也是展示名，一个字段就够。
+///
+/// 全零的组仍然滤掉（与另两维一致）：只可能来自手改过的数据，
+/// 画出来是一段永远为 0 的扇区。
+pub(super) fn build_models(totals: &[ModelAccum]) -> Vec<Value> {
+    let mut rows: Vec<&ModelAccum> = totals
+        .iter()
+        .filter(|item| item.requests > 0 || item.tokens > 0)
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .requests
+            .cmp(&left.requests)
+            .then(right.tokens.cmp(&left.tokens))
+            .then(left.model.cmp(&right.model))
+    });
+    rows.into_iter()
+        .map(|item| {
+            json!({
+                "model": item.model,
+                "label": if item.model.is_empty() {
+                    UNKNOWN_MODEL_LABEL.to_string()
+                } else {
+                    item.model.clone()
+                },
+                "requests": item.requests,
+                "totalTokens": item.tokens,
+            })
+        })
+        .collect()
+}
+
 /// 区间级的按账号汇总 → `/api/stats/summary` 的 `accounts` 数组。
 ///
 /// 与 `build_providers` 同形同序（requests 降序 → tokens 降序 → 身份升序）：

@@ -74,6 +74,8 @@ use crate::server::core::models::{list_item, list_response_from, model_id, sugge
 use crate::server::core::providers::adapter::adapter_for;
 use crate::server::core::providers::{kind_from_id, kind_id, ProviderKind, PROVIDERS};
 
+use super::autoclaw::region::Region;
+
 /// 某一 provider 当前的模型清单（克隆；调用方看不到后续刷新）。
 ///
 /// **来源 = 适配器注册表**（Agent2API W2b-T3 接线）：每家清单由它自己的
@@ -166,6 +168,17 @@ fn workbuddy_catalog() -> ModelCatalog {
 /// 分别是 `POST /api/agent/maas/model-types` 与
 /// `GET .../proxy/autoclaw-model-config`；Cline 与 Qoder 接入时就带着各自的
 /// 目录接口）。
+/// AutoClaw 某一地区的「有没有远程目录 / 上次刷新时刻」。
+///
+/// 抽成函数是因为两个地区的判据逐字相同、只有地区不同 —— 直接写两遍会让
+/// 将来改判据时只改一处（另一处静默停留在旧口径）。
+fn autoclaw_catalog_state(region: Region) -> (bool, i64) {
+    (
+        !crate::server::core::providers::autoclaw::catalog::remote_models(region).is_empty(),
+        crate::server::core::providers::autoclaw::catalog::last_refreshed_at(region),
+    )
+}
+
 fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
     match kind {
         ProviderKind::WorkBuddy => (
@@ -192,10 +205,10 @@ fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             !crate::server::core::providers::catpaw::catalog::remote_models().is_empty(),
             crate::server::core::providers::catpaw::catalog::last_refreshed_at(),
         ),
-        ProviderKind::AutoClaw => (
-            !crate::server::core::providers::autoclaw::catalog::remote_models().is_empty(),
-            crate::server::core::providers::autoclaw::catalog::last_refreshed_at(),
-        ),
+        ProviderKind::AutoClaw => autoclaw_catalog_state(Region::Cn),
+        // 国际版是**另一份目录**（另一个站点的 `autoclaw-model-config`，
+        // 缓存也各占一格）：两地的模型集合可以不同，因此必须分开判
+        ProviderKind::AutoClawIntl => autoclaw_catalog_state(Region::Intl),
         // Cline 也有远程目录（`GET /api/v1/ai/cline/recommended-models`，实测
         // **无需鉴权**即可拉），刷新到非空才算「远程」。两个池共用同一份缓存
         // （一次请求就拿到两池），所以这两个 provider 的元信息是同一个值。

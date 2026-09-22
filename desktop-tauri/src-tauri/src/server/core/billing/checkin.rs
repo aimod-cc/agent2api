@@ -13,20 +13,27 @@
 //! store / billing 句柄调用它，规则依旧只有一份。调用方负责把 `CheckinError`
 //! 翻成响应（api 层用管理信封，调度器只取 message 记进 lastResult）。
 //!
-//! ── 两处易错点（照抄 Node，不做「顺手统一」）─────────────────
-//!   ① 指定 id 时**不看 available**：Node 的 `resolveTargets(id)` 从全量账号里
-//!      `find` 命中即用，只有批量分支才过滤 `available !== false`；
-//!      **但 enabled 两条路径都要看**（见 ② 与 `resolve_checkin_targets` 的说明）——
-//!      「不看 available」与「不看 enabled」是两回事：前者是「账号暂时不可用不影响
-//!      手动操作」，后者是「用户明确禁用了它」，语义相反，不能一起照抄；
-//!   ② `skipped` 的分母是「可用账号总数」，同时含「已禁用」与「国际版无签到」
-//!      两类，与 /api/accounts/usage 的口径（只算被禁用的）**不同**。
+//! ── 签到不看 `enabled`（本次改动；此前两轮口径相反）─────────
+//! `enabled` 管的是「别让这个账号承接转发」，签到则是用户对某个账号显式发起的
+//! 一次动作（定时签到则是调度器对所有账号的统一动作），与转发无关：一个被禁用的
+//! 账号依然可以每天签到攒积分。所以单账号与批量两条路径都**不看** `enabled` ——
+//! 禁用账号照常进入签到目标集合，界面上照常有签到按钮。
 //!
-//! ── 本次修的 BUG：单账号路径漏查 enabled ────────────────────
-//! 上面 ① 原先被过度执行成了「单账号路径什么状态都不看」，于是对已禁用的账号
-//! 点「签到」会真的打上游签到接口。修复后单账号路径按 `enabled` → `supports_checkin`
-//! 顺序检查、都返回 400；批量路径维持「过滤掉 + 计入 skipped」。
-//! 「不看的只有 available」这一条**没有变**（那是原版 Node 的既定语义）。
+//! ── 历史（别又改回去）────────────────────────────────────────
+//! 这里先后有过两种相反口径：先是单账号路径漏查 `enabled`（当时算 bug ——
+//! 「显式指定就什么都不看」被过度执行了，于是对禁用账号点签到会真的打上游），
+//! 修成「单账号 400 / 批量过滤」；再是现在这次全部放开。中间那版把「禁用转发」
+//! 与「禁止签到」当成了一件事 —— 但签到消耗的是**积分额度**，与转发配额不是
+//! 同一个池子，用户对禁用账号点「签到」本身就是明确意图，替他拦下来反而多余。
+//!
+//! 仍然要看的只剩两处，两条路径各自一致：`available`（批量路径过滤，单账号不看 ——
+//! Node 版既定语义：账号暂时不可用不影响手动操作）与 `supports_checkin`
+//! （国际版没有签到活动，两条路径都排除）。
+//!
+//! ── `skipped` 的分母 ────────────────────────────────────────
+//! 「可用账号总数 − 可签到数」，只可能由**国际版**与**范围外的提供商**两类构成
+//! （`enabled` 不再参与），与 /api/accounts/usage 的「只算被禁用的」口径不同 ——
+//! 两个动作的「不适用」集合本来就不一样。
 
 use serde_json::{json, Value};
 
@@ -85,14 +92,6 @@ fn is_available(account: &Value) -> bool {
         .unwrap_or(true)
 }
 
-/// 账号快照里的「启用」判定（Node: `account.enabled !== false`）
-fn is_enabled(account: &Value) -> bool {
-    account
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-}
-
 /// 账号列表快照（`store.listAccounts().accounts`）
 fn accounts_of(store: &AccountStore) -> Vec<Value> {
     store
@@ -105,31 +104,22 @@ fn accounts_of(store: &AccountStore) -> Vec<Value> {
 
 /// 签到目标集合。
 ///
-/// 批量（`id` 为空）：可用账号 ∩ 已启用 ∩ **提供商在 `providers` 范围内** ∩ 非国际版，
-/// `skipped` = 可用总数 − 可签到数。范围由配置给出（WorkBuddy / 小浣熊可勾选），
-/// 定时签到与账号页批量签到共用同一份口径。
+/// 批量（`id` 为空）：可用账号 ∩ **提供商在 `providers` 范围内** ∩ 非国际版，
+/// `skipped` = 可用总数 − 可签到数。范围由配置给出（WorkBuddy / 小浣熊 / AutoClaw
+/// 可勾选），定时签到与账号页批量签到共用同一份口径。**禁用账号照常参与** ——
+/// 签到与转发是两件事（见模块头「签到不看 enabled」）。
 ///
 /// 指定 id：命中即用（**不过滤 available，也不过滤 provider**），
-/// 国际版与**已禁用**都直接报 400 —— 用户点的是谁就签谁，与「显式指定就执行」
-/// 的既有语义一致；批量路径必须过滤，否则会把范围外的账号也签一遍。
+/// 国际版直接报 400 —— 用户点的是谁就签谁，与「显式指定就执行」的既有语义一致；
+/// 批量路径必须过滤 available 与 provider，否则会把范围外的账号也签一遍。
 ///
 /// ── 两条路径的「不满足条件」为什么语义不同（有意如此）──────────
 ///   批量路径 → **静默跳过**（计入 `skipped`）：定时任务会一次扫过几十个账号，
 ///     用户没在看着，为一个「国际版没有签到活动」把整轮任务报错没有意义。
 ///   单账号路径 → **明确 400 + 原因**：用户显式点了某个账号的按钮，
 ///     他需要知道为什么不行。静默成功或静默跳过都会让他以为签到了。
-/// 所以两种检查（`supports_checkin` 与 `enabled`）在单账号路径都是报错，
-/// 在批量路径都是过滤掉 —— **不要为了「统一」把其中一处改掉**。
-///
-/// ── `enabled` 检查是本次修的 BUG ──────────────────────────────
-/// 改造前单账号路径只查了 `supports_checkin`，没有查 `enabled`：用户对
-/// **已禁用**的账号点「签到」会真的打上游签到接口。禁用是「别用它转发」的意思，
-/// 而签到会消耗上游的每日额度、并写回 `checkinAt`（前端据此显示「已签到」）——
-/// 一个被禁用的账号不该产生这类副作用。原先的漏判让「禁用」这个动作漏了半张网。
-///
-/// 检查顺序与批量路径的过滤器顺序一致（`is_enabled` → `supports_checkin`）：
-/// 两者用同一套判据、同一套顺序，读起来就是「同一份规则的两条出口」。
-/// 顺序本身不影响结果（两个条件互不依赖），一致只是为了少一层认知负担。
+/// 所以 `supports_checkin` 在单账号路径报错、在批量路径过滤掉 ——
+/// **不要为了「统一」把其中一处改掉**。
 pub fn resolve_checkin_targets(
     store: &AccountStore,
     providers: &[String],
@@ -144,14 +134,10 @@ pub fn resolve_checkin_targets(
         if found.is_empty() {
             return Err(CheckinError::new("账号不存在", 404));
         }
-        // 已禁用 → 400 并说明怎么恢复（而不是静默跳过）：
-        // 用户显式点了按钮，必须给他一句能操作的话。文案与账号页
-        // 明细面板里那句「账号已禁用，不参与批量签到；如需签到请先启用」
-        // 同源同义（见 ui/accounts-model.js 的 checkinPanelHtml）——
-        // 两处说法不一致会让用户以为遇到的是两个不同的问题。
-        if !is_enabled(&found[0]) {
-            return Err(CheckinError::new("账号已被禁用，请先启用后再签到", 400));
-        }
+        // 唯一的拒绝理由：上游这一站根本没有签到活动（国际版）。
+        // 文案与账号页明细面板里那句「国际版暂无签到活动」同源同义
+        // （见 ui/accounts-model.js 的 checkinPanelHtml）—— 两处说法不一致
+        // 会让用户以为遇到的是两个不同的问题。
         if !supports_checkin(&found[0]) {
             return Err(CheckinError::new("国际版账号暂不支持签到", 400));
         }
@@ -161,7 +147,6 @@ pub fn resolve_checkin_targets(
     let total = available.len();
     let eligible: Vec<Value> = available
         .into_iter()
-        .filter(is_enabled)
         .filter(supports_checkin)
         .filter(|account| matches_provider_filter(account, providers))
         .collect();
@@ -189,7 +174,11 @@ pub async fn checkin_for(
     let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
     let display = name.as_str().unwrap_or(&id).to_string();
-    match provider_of(account) {
+    // 分派的键就是账号的 provider id（`provider_of` 已归一）；AutoClaw 两个
+    // 地区各是一个 provider，因此下面按 `region.provider_id()` 反查地区，
+    // 而不是写死 `"autoclaw"`（那样国际版账号会掉进 `_` 分支）
+    let provider_id = provider_of(account);
+    match provider_id {
         "raccoon" => {
             let claim =
                 crate::server::core::providers::raccoon::balance::claim_daily_grant(store, &id)
@@ -197,11 +186,16 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
-        "autoclaw" => {
-            let claim =
-                crate::server::core::providers::autoclaw::checkin::claim_daily_signin(store, &id)
-                    .await
-                    .map_err(|error| error.message);
+        "autoclaw" | "autoclaw-intl" => {
+            let region = crate::server::core::providers::autoclaw::Region::from_provider_id(
+                provider_id,
+            )
+            .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
+            let claim = crate::server::core::providers::autoclaw::checkin::claim_daily_signin(
+                region, store, &id,
+            )
+            .await
+            .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
         _ => {
@@ -336,7 +330,7 @@ pub async fn run_checkin(
     if skipped > 0 {
         logging::log(
             "[Accounts]",
-            &format!("已跳过 {skipped} 个账号（已禁用或国际版无签到活动）"),
+            &format!("已跳过 {skipped} 个账号（国际版无签到活动或不在签到范围内）"),
         );
     }
     logging::log(

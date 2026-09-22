@@ -58,6 +58,7 @@ use crate::server::errors::GatewayError;
 use crate::server::logging;
 
 use super::crypto;
+use super::region::Region;
 
 /// 桌面端实时账号的固定 id（对照源实现 `account-store.mjs` 的
 /// `DESKTOP_ACCOUNT_ID = 'desktop-auth'`）。
@@ -94,13 +95,6 @@ pub(crate) const PROACTIVE_REFRESH_MARGIN_MS: f64 = 300_000.0;
 /// 收到它说明 `/userapi/v1/refresh` 的签名校验没过，改用 `agent-refresh` 再试一次。
 pub(crate) const REFRESH_FALLBACK_CODE: i64 = 400_002;
 
-/// 上游 LLM 代理基址（源实现 `DEFAULT_UPSTREAM_BASE_URL`）
-pub const DEFAULT_UPSTREAM_BASE_URL: &str =
-    "https://autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw";
-
-/// 用户中心（userapi）基址（源实现 `DEFAULT_USERAPI_BASE_URL`）——刷新接口在这里
-const DEFAULT_USERAPI_BASE_URL: &str = "https://autoglm-acceleration-api.zhipuai.cn";
-
 // ── 签名常量（AUTH_APP_ID / AUTH_APP_KEY）不在这里 ─────────────
 // 它们的使用点是**刷新请求的头**（`X-Auth-Sign = MD5(appId&ts&appKey)`），
 // 因此只在 `refresh.rs` 里声明一份。本文件曾留过一份同名副本，
@@ -112,6 +106,19 @@ const DEFAULT_USERAPI_BASE_URL: &str = "https://autoglm-acceleration-api.zhipuai
 pub struct AutoClawCredentials {
     /// 账号 id：`desktop-auth`（桌面端登录态）或 `user-<userId>`（手动账号）
     pub id: String,
+    /// **这份凭证属于哪个地区**（国内版 / 国际版）。
+    ///
+    /// ── 为什么地区是凭证的一部分，而不是「调用方知道就行」──────
+    /// 凭证的每一步都要它：刷新打哪个 userapi 域、积分查哪个站、转发发到哪个
+    /// 代理、环境变量读哪一组前缀。把这些散到调用方等于让每个调用点都自己
+    /// 决定「这个凭证是哪一家的」—— 而凭证是从账号记录 / 桌面端文件 / 环境
+    /// 变量三条来源解析出来的，只有**解析点**知道它属于谁。放进来之后，
+    /// 下游（refresh / balance / checkin / adapter）一律读 `credentials.region`，
+    /// 不再各猜一次。
+    ///
+    /// 缺省 [`Region::Cn`]：与 provider id 的历史口径一致（`autoclaw` 是历史
+    /// 已有的那一家，存量账号都是它）。
+    pub region: Region,
     /// access token（已去 `Bearer ` 前缀）
     pub token: String,
     /// refresh token（已去 `Bearer ` 前缀）；桌面端来源与手动账号都可能为空
@@ -261,22 +268,25 @@ pub fn gateway_config_file() -> PathBuf {
     home_dir().join(".openclaw-autoclaw").join("openclaw.json")
 }
 
-/// 用户中心基址（源实现 `AUTOCLAW_USERAPI_BASE_URL` 可覆盖）
-pub fn userapi_base_url() -> String {
-    std::env::var("AUTOCLAW_USERAPI_BASE_URL")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_USERAPI_BASE_URL.to_string())
+/// 用户中心基址（源实现 `AUTOCLAW_USERAPI_BASE_URL` 可覆盖；国际版是
+/// `AUTOCLAW_INTL_USERAPI_BASE_URL`）。
+///
+/// ── 为什么必须带 region 参数 ─────────────────────────────────
+/// 改造前这里是「读一个全局环境变量、回落到唯一那个默认域名」的写法 ——
+/// 那套写法默认了「AutoClaw 只有一个站点」。国际版接入后，同一个函数要回答
+/// 「哪个地区的 userapi」，因此地区是**入参**而不是隐含的全局状态。
+pub fn userapi_base_url(region: Region) -> String {
+    region
+        .env_override("USERAPI_BASE_URL")
+        .unwrap_or_else(|| region.userapi_base_url().to_string())
 }
 
-/// 上游 LLM 代理基址（源实现 `AUTOCLAW_UPSTREAM_BASE_URL` 可覆盖）
-pub fn upstream_base_url() -> String {
-    std::env::var("AUTOCLAW_UPSTREAM_BASE_URL")
-        .ok()
-        .map(|value| value.trim().trim_end_matches('/').to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_UPSTREAM_BASE_URL.to_string())
+/// 上游 LLM 代理基址（源实现 `AUTOCLAW_UPSTREAM_BASE_URL` 可覆盖；国际版是
+/// `AUTOCLAW_INTL_UPSTREAM_BASE_URL`）。
+pub fn upstream_base_url(region: Region) -> String {
+    region
+        .env_override("UPSTREAM_BASE_URL")
+        .unwrap_or_else(|| region.upstream_base_url().to_string())
 }
 
 // ─── 文件读取（形态防御 + mtime）─────────────────────────────
@@ -331,10 +341,10 @@ fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
 
 // ─── 凭证缓存（一份缓存承担两件事）───────────────────────────
 
-/// 进程级凭证缓存：`(缓存键, 解析好的凭证)`，只有一格。
+/// 进程级凭证缓存：`(缓存键, 解析好的凭证)`，**按地区各一格**。
 ///
-/// 缓存键是「来源 + 文件 mtime」（`auth:<mtime>` / `gw:<mtime>`），一份缓存同时
-/// 承担两件事 —— 这正是源实现 `cache = { key, value }` 的语义：
+/// 缓存键是「来源 + 地区 + 路径指纹 + mtime」，一份缓存同时承担两件事 ——
+/// 这正是源实现 `cache = { key, value }` 的语义：
 ///
 ///   1. **mtime 缓存**：文件没变就不重复解密/解析。AutoClaw 的 auth.json 是加密的，
 ///      每请求一次 DPAPI + AES-GCM 是纯浪费；mtime 变了（桌面端重新登录）自然失配。
@@ -342,15 +352,30 @@ fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
 ///      这条覆盖就自动作废，回到「重新解密原文件」—— 正是「刷新只在内存生效、
 ///      重启后回到原文件」想要的语义，不需要额外的失效逻辑。
 ///
-/// 之所以是**一格**：AutoClaw 用户数据目录只有一个（源实现也是单槽缓存）。
-fn credentials_cache() -> &'static Mutex<Option<(String, AutoClawCredentials)>> {
-    static CACHE: OnceLock<Mutex<Option<(String, AutoClawCredentials)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+/// ── 为什么从「一格」改成「按地区各一格」（本次修正）────────────
+/// 源实现是单槽（它只有一家）。两地接入后，两家的**桌面端来源读的是同一个
+/// 文件**（同一个路径、同一个 mtime），而它们的缓存键（在带地区之前）逐字相同 ——
+/// 后果有两个，都是真的：
+///   1. **串味**：先解析的那家把凭证连同**它自己的 region** 缓存进去，另一家
+///      命中后拿到「带着对方域名的凭证」→ 转发打到错误站点、稳定 401，
+///      且日志上完全看不出原因（缓存命中，没有任何解析痕迹）；
+///   2. **抖动**：即便键带上了地区，若缓存只有一格，两家交替请求会**互相顶掉**
+///      对方的条目，于是每次请求都重跑一遍 DPAPI + AES-GCM（那正是这层缓存
+///      存在的意义）。
+/// 两格之后两个问题一起消失，而每格内部仍是「一格 + 比较再写」的既有语义。
+fn credentials_cache(region: Region) -> &'static Mutex<Option<(String, AutoClawCredentials)>> {
+    static CN: OnceLock<Mutex<Option<(String, AutoClawCredentials)>>> = OnceLock::new();
+    static INTL: OnceLock<Mutex<Option<(String, AutoClawCredentials)>>> = OnceLock::new();
+    let slot = match region {
+        Region::Cn => &CN,
+        Region::Intl => &INTL,
+    };
+    slot.get_or_init(|| Mutex::new(None))
 }
 
 /// 查缓存（锁在返回前释放 → 调用方不会持锁跨 await）
-fn lookup_cached(cache_key: &str) -> Option<AutoClawCredentials> {
-    let guard = match credentials_cache().lock() {
+fn lookup_cached(region: Region, cache_key: &str) -> Option<AutoClawCredentials> {
+    let guard = match credentials_cache(region).lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -361,8 +386,8 @@ fn lookup_cached(cache_key: &str) -> Option<AutoClawCredentials> {
 }
 
 /// 写缓存（解析成功时与刷新成功时共用）
-pub(crate) fn store_cached(cache_key: &str, credentials: &AutoClawCredentials) {
-    let mut guard = match credentials_cache().lock() {
+pub(crate) fn store_cached(region: Region, cache_key: &str, credentials: &AutoClawCredentials) {
+    let mut guard = match credentials_cache(region).lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -381,6 +406,7 @@ pub(crate) fn store_cached(cache_key: &str, credentials: &AutoClawCredentials) {
 /// 都还是旧值」会骗过纯缓存比较；多查一次文件 mtime 才能在落缓存前确认来源确实
 /// 没变。文件被删/损坏时同样拒绝写入（没有可确认的原文件，不替用户猜）。
 pub(crate) fn store_cached_if_current(
+    region: Region,
     cache_key: &str,
     expected: &AutoClawCredentials,
     credentials: &AutoClawCredentials,
@@ -388,7 +414,7 @@ pub(crate) fn store_cached_if_current(
     if !local_source_unchanged(expected) {
         return false;
     }
-    let mut guard = match credentials_cache().lock() {
+    let mut guard = match credentials_cache(region).lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -448,19 +474,27 @@ fn local_source_unchanged(credentials: &AutoClawCredentials) -> bool {
 ///   - 解密结果为空 → 「token 解密结果为空」（源实现同款）；
 ///   - `userId` 取 JWT 的 `user_id`，`expiresAt` 取 `exp` × 1000；
 ///   - `deviceId` 优先文件里的 `deviceId`，回落 JWT 的 `device_id`。
-fn from_auth_file() -> Result<AutoClawCredentials, String> {
+fn from_auth_file(region: Region) -> Result<AutoClawCredentials, String> {
     let Some(auth_path) = desktop_auth_file() else {
         return Err("AutoClaw 桌面端登录态仅支持 Windows".to_string());
     };
     let snapshot = read_json_file(&auth_path, "AutoClaw auth.json")?;
     // 缓存键带上**来源路径**：`AUTOCLAW_USER_DATA_DIR` 被改过、或换了一台机器上
-    // 的同名文件时，mtime 有可能撞上，路径不同就不该复用同一格
+    // 的同名文件时，mtime 有可能撞上，路径不同就不该复用同一格。
+    //
+    // ── 为什么还要带地区（本次修正的一处真 bug）────────────────────
+    // 两地的 `auth.json` 是**同一个文件**（同一个目录、同一个路径、同一个
+    // mtime），若键里不带地区，先解析的那一家会把凭证连同**它自己的 region**
+    // 一起缓存进去，另一家读到后拿到的是「带着对方域名的凭证」——
+    // 表现是转发打到错误站点、稳定 401，而且日志上完全看不出原因
+    // （缓存命中，没有任何解析痕迹）。
     let cache_key = format!(
-        "auth:{}:{}",
+        "auth:{}:{}:{}",
+        region.provider_id(),
         crate::server::core::providers::refresh_flight::fingerprint(&auth_path.to_string_lossy()),
         snapshot.modified_at
     );
-    if let Some(cached) = lookup_cached(&cache_key) {
+    if let Some(cached) = lookup_cached(region, &cache_key) {
         return Ok(cached);
     }
     let text_field = |key: &str| -> String {
@@ -507,6 +541,7 @@ fn from_auth_file() -> Result<AutoClawCredentials, String> {
     let claims = crypto::decode_jwt_claims(&token);
     let credentials = credentials_from_claims(
         DESKTOP_ACCOUNT_ID.to_string(),
+        region,
         token,
         refresh_token,
         device_id,
@@ -515,7 +550,7 @@ fn from_auth_file() -> Result<AutoClawCredentials, String> {
         Some(cache_key.clone()),
     );
     // 解密结果进缓存：下一次同一 mtime 的请求不再做 DPAPI + AES-GCM
-    store_cached(&cache_key, &credentials);
+    store_cached(region, &cache_key, &credentials);
     Ok(credentials)
 }
 
@@ -528,16 +563,17 @@ fn from_auth_file() -> Result<AutoClawCredentials, String> {
 /// providers 的插入序 → models 数组序 → headers 里的两个键名）。
 /// 只有 access token，所以 `refresh_token` 恒为空 —— 也就意味着这条来源
 /// **天然不可刷新**（`can_refresh()` 返回 false）。
-fn from_gateway_config() -> Result<AutoClawCredentials, String> {
+fn from_gateway_config(region: Region) -> Result<AutoClawCredentials, String> {
     let path = gateway_config_file();
     let snapshot = read_json_file(&path, "AutoClaw 网关配置 openclaw.json")?;
-    // 缓存键带上来源路径（理由同 `from_auth_file`）
+    // 缓存键带上来源路径与地区（理由同 `from_auth_file`：两地共用同一个文件）
     let cache_key = format!(
-        "gw:{}:{}",
+        "gw:{}:{}:{}",
+        region.provider_id(),
         crate::server::core::providers::refresh_flight::fingerprint(&path.to_string_lossy()),
         snapshot.modified_at
     );
-    if let Some(cached) = lookup_cached(&cache_key) {
+    if let Some(cached) = lookup_cached(region, &cache_key) {
         return Ok(cached);
     }
     let providers = snapshot
@@ -573,6 +609,7 @@ fn from_gateway_config() -> Result<AutoClawCredentials, String> {
     let claims = crypto::decode_jwt_claims(&token);
     let credentials = credentials_from_claims(
         DESKTOP_ACCOUNT_ID.to_string(),
+        region,
         token,
         String::new(),
         String::new(),
@@ -580,14 +617,18 @@ fn from_gateway_config() -> Result<AutoClawCredentials, String> {
         CredentialOrigin::GatewayConfig,
         Some(cache_key.clone()),
     );
-    store_cached(&cache_key, &credentials);
+    store_cached(region, &cache_key, &credentials);
     Ok(credentials)
 }
 
 /// 按 JWT claims 补齐一份凭证（`user_id` / `device_id` / `expires_at` 的口径
-/// 在三个来源之间共用，避免各写一遍导致字段规则分叉）
+/// 在三个来源之间共用，避免各写一遍导致字段规则分叉）。
+///
+/// `region` 由**来源**决定（账号记录读它自己的 `provider`、桌面端文件与
+/// 环境变量按「哪一家的调用方在问」传入），见 [`AutoClawCredentials::region`]。
 pub(crate) fn credentials_from_claims(
     id: String,
+    region: Region,
     token: String,
     refresh_token: String,
     device_id: String,
@@ -614,6 +655,7 @@ pub(crate) fn credentials_from_claims(
     };
     AutoClawCredentials {
         id,
+        region,
         token,
         refresh_token,
         device_id,
@@ -652,10 +694,30 @@ pub(crate) fn number_value(value: &Value) -> Option<f64> {
 ///
 /// 同步函数：解密链（读文件 / DPAPI / AES-GCM）全是同步的，没有 await 点，
 /// 所以调用它的 async 链路不会因此持有非 Send 状态。
-pub fn local_credentials() -> Result<AutoClawCredentials, GatewayError> {
-    match from_auth_file() {
+///
+/// ── 为什么只有国内版能用（本次新增地区时的硬判断）─────────────
+/// 两个构建的 Electron 应用名都是 `autoclaw`、userData 都落在
+/// `%APPDATA%/AutoClaw`（Windows 大小写不敏感，实测是同一个目录），而
+/// `auth.json` 里**没有任何地区标记**。也就是说这个文件属于哪个地区，
+/// 只取决于用户装的是哪个构建 —— 本机无法判断。
+///
+/// 处置是**不猜**：这个文件归国内版（历史行为，`autoclaw` 一直读它），
+/// 国际版明确报错并指路（手机验证码登录 / 填写凭证，那两条把凭证落在账号
+/// 记录里，与桌面端文件无关，因此两地可以并存）。反过来若让国际版也读它，
+/// 一个只装了国际版客户端的用户会得到一个「国际版」账号却拿着国内版的域名
+/// 去请求 —— 上游 401，而错误信息会把排查方向带偏到「token 过期」上。
+/// 见 `region.rs` 模块头的完整讨论。
+pub fn local_credentials(region: Region) -> Result<AutoClawCredentials, GatewayError> {
+    if region != Region::Cn {
+        return Err(GatewayError::with_status(
+            401,
+            "AutoClaw 桌面端登录态文件（auth.json）没有地区标记，只归国内版使用；\
+             国际版请用「手机验证码登录」或「填写凭证」添加账号",
+        ));
+    }
+    match from_auth_file(region) {
         Ok(credentials) => Ok(credentials),
-        Err(auth_file_error) => match from_gateway_config() {
+        Err(auth_file_error) => match from_gateway_config(region) {
             Ok(credentials) => Ok(credentials),
             Err(_) => Err(GatewayError::with_status(
                 401,
@@ -665,28 +727,30 @@ pub fn local_credentials() -> Result<AutoClawCredentials, GatewayError> {
     }
 }
 
-/// 环境变量凭证（源实现 `envCredentials`）：`AUTOCLAW_TOKEN` 必填，
-/// `AUTOCLAW_REFRESH_TOKEN` / `AUTOCLAW_DEVICE_ID` 可选；未配置时 None。
+/// 环境变量凭证（源实现 `envCredentials`）：`{prefix}TOKEN` 必填，
+/// `{prefix}REFRESH_TOKEN` / `{prefix}DEVICE_ID` 可选；未配置时 None。
+///
+/// 前缀由地区决定（国内 `AUTOCLAW_` / 国际 `AUTOCLAW_INTL_`，见
+/// [`Region::env_prefix`]）—— 两地共用一个变量名会让「只想给国际版配一个
+/// token」变成「两地一起改」。
 ///
 /// 优先级在源实现里是「账号列表选中项 > 环境变量」，由适配器负责排序
 /// （本函数只回答「环境变量里有没有可用凭证」）。
-pub fn env_credentials() -> Option<AutoClawCredentials> {
-    let token = std::env::var("AUTOCLAW_TOKEN").ok()?;
+pub fn env_credentials(region: Region) -> Option<AutoClawCredentials> {
+    let token = region.env_override("TOKEN")?;
     let token = crypto::strip_bearer(&token);
     if token.is_empty() {
         return None;
     }
-    let refresh_token = std::env::var("AUTOCLAW_REFRESH_TOKEN")
-        .ok()
+    let refresh_token = region
+        .env_override("REFRESH_TOKEN")
         .map(|value| crypto::strip_bearer(&value))
         .unwrap_or_default();
-    let device_id = std::env::var("AUTOCLAW_DEVICE_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default();
+    let device_id = region.env_override("DEVICE_ID").unwrap_or_default();
     let claims = crypto::decode_jwt_claims(&token);
     Some(credentials_from_claims(
         "env".to_string(),
+        region,
         token,
         refresh_token,
         device_id,
@@ -705,7 +769,20 @@ pub fn env_credentials() -> Option<AutoClawCredentials> {
 /// `desktop: true` 的记录（桌面端实时登录态）**不走本函数**：那种账号的凭证
 /// 按设计不落 accounts.json，应由调用方改调 `local_credentials`
 /// （`snapshot_for` 已把这层判断收进去了）。
-pub fn credentials_from_record(record: &Value) -> Result<AutoClawCredentials, GatewayError> {
+///
+/// ── `region` 的取值口径 ─────────────────────────────────────
+/// 优先读记录自己的 `provider` 字段（那才是这条账号属于哪一家的**事实**），
+/// 读不出来才用调用方给的 `fallback`。两者不一致时以记录为准 —— 传参只是
+/// 「调用方以为它属于谁」，而记录里的 provider 是落盘契约。
+pub fn credentials_from_record(
+    record: &Value,
+    fallback: Region,
+) -> Result<AutoClawCredentials, GatewayError> {
+    let region = record
+        .get("provider")
+        .and_then(Value::as_str)
+        .and_then(Region::from_provider_id)
+        .unwrap_or(fallback);
     // 源实现的取法是「token 非空就用 token，否则看 accessToken」——
     // **不是** `token ?? accessToken`：`token` 存在但是空串/非字符串时也要落到
     // `accessToken`（账号记录被手工编辑过就是这个形态），
@@ -774,6 +851,7 @@ pub fn credentials_from_record(record: &Value) -> Result<AutoClawCredentials, Ga
     let claims = crypto::decode_jwt_claims(&token);
     let mut credentials = credentials_from_claims(
         id,
+        region,
         token,
         refresh_token,
         device_id,
@@ -795,11 +873,17 @@ pub fn credentials_from_record(record: &Value) -> Result<AutoClawCredentials, Ga
 ///   - `Some(record)` 且 `desktop: true` 或 id 为 `desktop-auth` → 本地实时登录态
 ///     （凭证不落 accounts.json，见架构文档 §3.2 的桌面态约定）；
 ///   - `Some(record)` 其余 → 记录里的 token（含 `enc:` 自动解密）。
-pub fn snapshot_for(record: Option<&Value>) -> Result<AutoClawCredentials, GatewayError> {
+///
+/// `region` 是**调用方问的是哪一家**：记录形态下以记录自己的 `provider` 为准
+/// （见 [`credentials_from_record`]），只有「无记录」的本地 / 环境变量来源
+/// 才真正按这个参数取域名与变量前缀。
+pub fn snapshot_for(
+    record: Option<&Value>,
+    region: Region,
+) -> Result<AutoClawCredentials, GatewayError> {
     let Some(record) = record else {
-        return local_credentials().or_else(|error| {
-            env_credentials().ok_or(error)
-        });
+        return local_credentials(region)
+            .or_else(|error| env_credentials(region).ok_or(error));
     };
     let is_desktop = record
         .get("desktop")
@@ -807,9 +891,9 @@ pub fn snapshot_for(record: Option<&Value>) -> Result<AutoClawCredentials, Gatew
         .unwrap_or(false)
         || record.get("id").and_then(Value::as_str) == Some(DESKTOP_ACCOUNT_ID);
     if is_desktop {
-        return local_credentials();
+        return local_credentials(region);
     }
-    credentials_from_record(record)
+    credentials_from_record(record, region)
 }
 
 /// 本地登录态的**摘要**（账号导入与状态展示用；**不含 token 本身**）。
@@ -818,11 +902,20 @@ pub fn snapshot_for(record: Option<&Value>) -> Result<AutoClawCredentials, Gatew
 /// `userId` / `tokenTail` / `tokenExpiresAt` / `hasRefreshToken` / `source`，
 /// 另加 `mtime`（`updatedAt` 用）与 `canRefresh`（其实等于 hasRefreshToken，
 /// 保留它是因为前端状态接口用的是这个名字）。
-pub fn local_summary() -> Result<Value, String> {
-    let credentials = local_credentials().map_err(|error| error.message)?;
+///
+/// **两个地区都能调**：这个文件没有地区标记，两地的调用方各自传入自己那一项
+/// （见 [`local_credentials`]）。返回里带 `region`，让调用方能确认拿到的是
+/// 哪一家的凭证。
+pub fn local_summary(region: Region) -> Result<Value, String> {
+    let credentials = local_credentials(region).map_err(|error| error.message)?;
     Ok(json!({
         "ok": true,
+        // 这里是**凭证对象**的 id（`desktop-auth`），不是账号记录的 id ——
+        // 账号记录那边按地区取 `autoclaw-desktop` / `autoclaw-intl-desktop`
+        // （见 `account_store::autoclaw_accounts`）。两者不是一回事，见 mod.rs
+        // 的「两个 id 别搞混」。
         "id": DESKTOP_ACCOUNT_ID,
+        "region": region.provider_id(),
         "userId": credentials.user_id,
         "tokenTail": token_tail(&credentials.token),
         "tokenExpiresAt": credentials

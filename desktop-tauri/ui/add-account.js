@@ -19,6 +19,10 @@ function closeModal() {
   // 关窗即放弃等待：通知主进程中止后端轮询，否则按钮会一直卡在禁用态。
   // 不传 provider = 「谁在等待就取消谁」：两家共用同一个弹窗，这里无需区分。
   void window.wbWebLogin?.cancelIfActive('');
+  // AutoClaw 国际版的 OAuth 另有一套等待（先跑验证码、再等登录窗口），
+  // 与上面那条链的取消语义不同（它还要作废本地那次验证码等待），因此
+  // 单独通知一次。没有发起过时它什么都不做。
+  window.wbAutoclawOauth?.cancel?.();
 }
 
 /**

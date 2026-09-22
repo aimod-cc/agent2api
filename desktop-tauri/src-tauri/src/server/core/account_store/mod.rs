@@ -115,8 +115,6 @@ pub enum CredentialWrite {
     Stale,
 }
 
-/// 账号数上限（对照 Node 版 MAX_ACCOUNTS）
-pub const MAX_ACCOUNTS: usize = 20;
 /// token 长度上限（对照 Node 版 MAX_TOKEN_LENGTH）
 pub const MAX_TOKEN_LENGTH: usize = 8192;
 
@@ -128,8 +126,21 @@ pub(crate) const CATPAW_PROVIDER_ID: &str = crate::server::core::providers::kind
 
 /// AutoClaw provider id（账号存储内部多处要用；**从注册表推导**，同
 /// [`RACCOON_PROVIDER_ID`] 的口径）。
+///
+/// 这是**国内版**的 id（历史值，不改名 —— 存量账号的落盘契约）；
+/// 国际版见 [`AUTOCLAW_INTL_PROVIDER_ID`]。判「是不是 AutoClaw 系」用
+/// [`is_autoclaw_family`]。
 pub(crate) const AUTOCLAW_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::AutoClaw,
+);
+
+/// AutoClaw **国际版** provider id（同 [`AUTOCLAW_PROVIDER_ID`] 的口径）。
+///
+/// 两个地区是两家 provider（理由见 `providers::autoclaw::region` 的模块头）：
+/// 各有独立的账号集合，因此账号层的「按家过滤」必须区分它们 ——
+/// 而「公开形态 / 身份字段」这类两地同形的判定用 [`is_autoclaw_family`]。
+pub(crate) const AUTOCLAW_INTL_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::AutoClawIntl,
 );
 
 /// Qoder provider id（账号存储内部多处要用；**从注册表推导**，同
@@ -161,6 +172,16 @@ pub(crate) const CLINE_PASS_PROVIDER_ID: &str = crate::server::core::providers::
 /// 是个不会报错的静默失配，所以这里给出唯一的判据函数。
 pub(crate) fn is_cline_family(provider_id: &str) -> bool {
     provider_id == CLINE_FREE_PROVIDER_ID || provider_id == CLINE_PASS_PROVIDER_ID
+}
+
+/// 这个 provider 是不是 **AutoClaw 系**（两个地区之一）。
+///
+/// 与 [`is_cline_family`] 同一形态、同一理由：账号层有几处判断只关心
+/// 「是不是 AutoClaw」（公开形态、身份字段落在 `userId` 上），不关心哪个地区 ——
+/// 那些分支走本函数，于是加地区或改名时只改这里一处，而不是散在各文件里的
+/// `id == "autoclaw"`（那种写法对国际版恒为假，是个不会报错的静默失配）。
+pub(crate) fn is_autoclaw_family(provider_id: &str) -> bool {
+    provider_id == AUTOCLAW_PROVIDER_ID || provider_id == AUTOCLAW_INTL_PROVIDER_ID
 }
 
 /// 小浣熊 provider id（账号存储内部多处要用）。

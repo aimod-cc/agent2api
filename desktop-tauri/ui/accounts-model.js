@@ -162,9 +162,8 @@
     if (!supportsCheckin(account)) {
       return `<div class="row-panel">国际版暂无签到活动，该账号不参与签到。${close}</div>`;
     }
-    if (!isEnabled(account)) {
-      return `<div class="row-panel">账号已禁用，不参与批量签到；如需签到请先启用。${close}</div>`;
-    }
+    // 禁用账号不再拦在这里：签到与转发是两件事，禁用只表示「别用它转发」。
+    // 面板照常走到下面的「已签到 / 签到中 / 结果」分支，与后端一致。
     if (entry === undefined) {
       // 今天已签过时按钮是「已签到」（不可点），所以这句提示不能再叫用户去点它 ——
       // 那会把人引到一个点不动的按钮上。已签到的事实来自后端落盘的时间，

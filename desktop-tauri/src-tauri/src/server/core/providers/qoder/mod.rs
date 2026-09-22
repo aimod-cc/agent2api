@@ -61,6 +61,7 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
@@ -183,11 +184,14 @@ impl ProviderAdapter for QoderAdapter {
                     status: if status == 0 { 429 } else { status },
                 }
             }
-            _ => UpstreamErrorClass::Fatal {
+            // 内容策略拦截（审核文案）→ ContentBlocked：不罚账号，交给编排层换
+            // 中性提示词重试一次 + 触发降级（见 `core::degrade`）
+            _ => content_block::classify_or_fatal(
                 status,
+                error_body,
                 message,
-                upstream_code: error_body.get("code").and_then(Value::as_i64),
-            },
+                error_body.get("code").and_then(Value::as_i64),
+            ),
         }
     }
 

@@ -119,6 +119,13 @@ pub struct RuntimeConfig {
     /// 请求就生效，不重启进程），从 `Value` 里翻一次要处理类型判定，解析一次存
     /// 下来最省事 —— 这条判定在转发热路径上。
     sanitize_fingerprints: bool,
+    /// 系统提示词设置（设置页「通用 → 系统提示词」）。
+    ///
+    /// 与 `sanitize_fingerprints` 同一理由（转发层逐请求取一次，改完下一个请求
+    /// 生效），另外多一件事：**提示词文件在构造快照时就读完**（见 `prompt_from`），
+    /// 于是转发热路径上一次磁盘 IO 都没有；文件读不到时这里已经是「内置默认 +
+    /// 一条原因」的形态，转发层不必再处理失败路径。
+    prompt: PromptSettings,
     /// 磁盘上那份 JSON 对象（含未知字段），写盘时的全量底稿
     raw: Map<String, Value>,
 }
@@ -158,6 +165,25 @@ impl RuntimeConfig {
     /// 出站指纹脱敏是否开启（转发层每次发送前判一次，见字段说明）
     pub fn sanitize_fingerprints(&self) -> bool {
         self.sanitize_fingerprints
+    }
+
+    /// 系统提示词设置（界面 / 日志用；转发层要的是下面的借用视图）
+    pub fn prompt_settings(&self) -> &PromptSettings {
+        &self.prompt
+    }
+
+    /// 转发层要的**提示词决定**：模式 + 提示词文本的借用视图。
+    ///
+    /// 借用而不是克隆：文本可能有几百行，而本方法在**每个请求**上调用一次
+    /// （`upstream::forward` 取快照），克隆一份纯属浪费。生命周期绑在
+    /// `&self` 上 —— 调用方必须让快照活过整条转发链（见 `upstream::forward`
+    /// 里那个 `config` 局部变量的说明）。
+    pub fn prompt_plan(&self) -> crate::server::core::prompt::PromptPlan<'_> {
+        crate::server::core::prompt::PromptPlan {
+            mode: self.prompt.mode,
+            text: &self.prompt.text,
+            source: self.prompt.source,
+        }
     }
 
     /// 掩码后的 API Key，格式照抄 server.mjs 920 行：前 6 后 4。
@@ -341,7 +367,77 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .get(KEY_SANITIZE_FINGERPRINTS)
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        // 系统提示词：模式非法/缺失 → passthrough（默认），文件读不到 → 内置默认
+        // + 一条原因（见 `prompt_from`）
+        prompt: prompt_from(&raw),
         raw,
+    }
+}
+
+/// 从原始配置解析系统提示词设置（**在这里就把文件读完**，见字段说明）。
+///
+/// 口径与既有配置一致：
+///   - 模式非法 / 缺失 → `passthrough`（默认）。手改文件写坏了**不报错**，
+///     与「写坏回落」的既有取向相同；走接口的非法值由 `api::prompt` 拦成 400；
+///   - `passthrough`：不读文件、不加载文本（`text` 为空串，转发层据此零开销透传）；
+///   - `custom` / `append`：文件非空就读它；读失败（不存在 / 非 UTF-8 / 空文件）
+///     回落**内置默认**并把原因记进 `file_error` —— 桌面应用不能因为一个提示词
+///     文件启动不了、也不能因此拒绝转发，而原因会显示在设置页上，用户当场能改；
+///   - 文件未指定 → 内置默认。
+fn prompt_from(raw: &Map<String, Value>) -> PromptSettings {
+    use crate::server::core::prompt::{PromptMode, PromptSource, BUILT_IN_PROMPT};
+
+    let mode = raw
+        .get(KEY_PROMPT_MODE)
+        .and_then(Value::as_str)
+        .and_then(PromptMode::parse)
+        .unwrap_or_default();
+    let file = string_field(raw, KEY_PROMPT_FILE);
+    if !matches!(mode, PromptMode::Custom | PromptMode::Append) {
+        return PromptSettings { mode, file, ..PromptSettings::default() };
+    }
+    let built_in = || PromptSettings {
+        mode,
+        file: file.clone(),
+        text: BUILT_IN_PROMPT.to_string(),
+        source: PromptSource::BuiltIn,
+        file_error: None,
+    };
+    let Some(path) = file
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return built_in();
+    };
+    match read_prompt_file(path) {
+        Ok(text) => PromptSettings {
+            mode,
+            file,
+            text,
+            source: PromptSource::File,
+            file_error: None,
+        },
+        Err(error) => PromptSettings { file_error: Some(error), ..built_in() },
+    }
+}
+
+/// 读提示词文件（UTF-8 文本）；`Err` 是**可直接显示给用户**的原因。
+///
+/// 空文件（或只有空白）算读失败：它在 `custom` 模式下等于「什么都不做」
+/// （空文本被 `prompt::rewrite` 当成「不动」），静默失效比显式回落更坏 ——
+/// 所以按「没配」处理，回落内置默认并说明原因。
+pub fn read_prompt_file(path: &str) -> Result<String, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("提示词文件路径为空".to_string());
+    }
+    match std::fs::read_to_string(trimmed) {
+        Ok(text) if text.trim().is_empty() => {
+            Err(format!("提示词文件是空的：{trimmed}（已回落内置默认提示词）"))
+        }
+        Ok(text) => Ok(text),
+        Err(error) => Err(format!("读不到提示词文件 {trimmed}: {error}")),
     }
 }
 
@@ -745,6 +841,38 @@ pub fn set_sanitize_fingerprints(enabled: bool) -> bool {
             .raw
             .insert(KEY_SANITIZE_FINGERPRINTS.to_string(), Value::Bool(enabled));
         config.sanitize_fingerprints = enabled;
+    })
+}
+
+// ─── 系统提示词（promptMode / promptFile）───────────────────────
+
+/// 写入系统提示词设置（模式 + 文件），并**按新值重新解析一遍生效文本**。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式，但多一步：写完两个键之后重跑一次
+/// [`prompt_from`]。只改字段不重解析会出现「模式换了、`text` 还是上一份」的
+/// 静默错配（`custom` 模式却拿着空文本 = 什么都不做），而重解析顺带把
+/// 「文件此刻读不到」的原因一起刷新 —— 用户改完路径立刻能在界面上看到结果。
+///
+/// `file` 为空串/None 时**删掉这个键**（而不是写空串）：与 `set_api_key(None)`
+/// 同一语义，配置里不留下没意义的空值。
+///
+/// 返回是否落盘成功（失败时内存仍已更新，见调用点）。
+pub fn set_prompt(mode: crate::server::core::prompt::PromptMode, file: Option<String>) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_PROMPT_MODE.to_string(), Value::String(mode.as_str().to_string()));
+        match file.filter(|text| !text.trim().is_empty()) {
+            Some(path) => {
+                config
+                    .raw
+                    .insert(KEY_PROMPT_FILE.to_string(), Value::String(path));
+            }
+            None => {
+                config.raw.remove(KEY_PROMPT_FILE);
+            }
+        }
+        config.prompt = prompt_from(&config.raw);
     })
 }
 

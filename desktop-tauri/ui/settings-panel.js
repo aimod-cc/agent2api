@@ -170,6 +170,7 @@
       loadRetry(),
       loadDebug(),
       loadSanitize(),
+      loadPrompt(),
       loadStorage(),
       window.wbUpdatePanel?.load?.(),
     ]);
@@ -986,12 +987,161 @@
   $('settings-sanitize')?.addEventListener('change', event => saveSanitize(event.target));
   $('btn-sanitize-refresh')?.addEventListener('click', () => loadSanitize().then(() => toast('指纹脱敏设置已刷新')));
 
+  /**
+   * ─── 系统提示词（模式 + 文件 + 降级状态）───────────────────────
+   *
+   * 与请求重试同构：两个字段**逐项保存**（改哪个存哪个，不设「保存」按钮），
+   * 响应体是生效后的全量状态（含降级是否生效），直接用响应刷新界面。
+   *
+   * 与那两处（重试 / 脱敏）的差别只有一处：多了一个**运行期状态**要显示 ——
+   * 内容拦截降级（撞了上游内容审核后网关自动切中性提示词，次日 00:00 解除，
+   * 见后端 core::degrade）。它不是配置，所以没有对应的输入控件，只有一行
+   * 「现在是否降级 + 到什么时候 + 立即解除」。
+   *
+   * 模式与文件都只在首次读到后端值之前锁住控件（读到之前不许改：否则会出现
+   * 「改了我却不知道原来是什么」，回滚也没依据）。
+   */
+  let prompt = null;
+
+  /** 下拉选项的展示文案（提示语里要用，与 HTML 里的 option 文案一致） */
+  const MODE_LABELS = {
+    passthrough: '透传客户端 system',
+    custom: '替换为网关提示词',
+    append: '追加网关提示词',
+  };
+
+  function renderPrompt(data) {
+    if (data !== undefined) prompt = data;
+    const badge = $('prompt-badge');
+    const modeSelect = $('settings-prompt-mode');
+    const fileInput = $('settings-prompt-file');
+    const degradeRow = $('prompt-degrade-row');
+    if (!badge || !modeSelect || !fileInput) return;
+
+    if (!prompt || typeof prompt !== 'object') {
+      badge.className = 'badge bad';
+      badge.textContent = '不可用';
+      modeSelect.disabled = true;
+      fileInput.disabled = true;
+      if (degradeRow) degradeRow.hidden = true;
+      $('prompt-state').textContent = '未能读取系统提示词设置，请稍后重试';
+      return;
+    }
+
+    const mode = String(prompt.promptMode || 'passthrough');
+    modeSelect.value = mode;
+    // 下拉是自绘组件（select.js）：直接赋 value 后要把界面同步一次，
+    // 否则显示的仍是上一项的文案
+    window.wbSelect?.sync?.(modeSelect);
+    fileInput.value = String(prompt.promptFile || '');
+    modeSelect.disabled = false;
+    fileInput.disabled = false;
+    badge.className = 'badge ok';
+    badge.textContent = mode === 'passthrough' ? '透传' : '已接管';
+
+    const source = prompt.promptSource === 'file'
+      ? '提示词文件'
+      : prompt.promptSource === 'builtin'
+        ? '内置默认提示词'
+        : '';
+    const lines = Number(prompt.promptLines) || 0;
+    const parts = [];
+    if (mode === 'passthrough') {
+      parts.push('客户端 system 原样出站（只靠指纹脱敏改写模板句）。');
+    } else {
+      parts.push(
+        `${mode === 'custom' ? '替换' : '追加'}生效：上游收到的 system 来自${source}${lines ? `（${lines} 行）` : ''}。`,
+      );
+    }
+    if (prompt.promptFileError) parts.push(`⚠️ ${prompt.promptFileError}`);
+    $('prompt-state').textContent = parts.join('');
+
+    // 降级行只在真的处于降级期时出现 —— 平时它是一行与用户无关的状态噪音
+    if (degradeRow) {
+      const active = prompt.degradeActive === true;
+      degradeRow.hidden = !active;
+      if (active) {
+        $('prompt-degrade-hint').textContent =
+          `已自动切换到最小中性提示词（撞了上游内容拦截，多半是 system 指纹误报），`
+          + `到 ${prompt.degradeUntilText || '次日 00:00'} 自动解除。`
+          + '期间本模式自己的提示词不会发出；把提示词改好后可以立即解除。';
+      }
+    }
+  }
+
+  async function loadPrompt() {
+    try {
+      renderPrompt(await api.getPrompt());
+    } catch (error) {
+      console.warn('读取系统提示词设置失败:', error.message);
+      renderPrompt(null);
+    }
+  }
+
+  /** 保存一个字段（模式 / 文件）：另一项按当前输入框的值原样回传（后端允许部分字段） */
+  async function savePromptField(label, patch) {
+    if (panelBusy) {
+      await loadPrompt(); // 有别的操作在跑：把界面拉回后端真实值，别让用户以为改了
+      return;
+    }
+    panelBusy = true;
+    const modeSelect = $('settings-prompt-mode');
+    const fileInput = $('settings-prompt-file');
+    modeSelect.disabled = true;
+    fileInput.disabled = true;
+    try {
+      const saved = await api.savePrompt({
+        promptMode: patch.promptMode !== undefined ? patch.promptMode : modeSelect.value,
+        promptFile: patch.promptFile !== undefined ? patch.promptFile : fileInput.value,
+      });
+      renderPrompt(saved);
+      toast(`✅ 已保存：${label}`);
+    } catch (error) {
+      toast(`保存失败: ${error.message}`, 'err');
+      await loadPrompt(); // 回滚到后端的真实值
+    } finally {
+      panelBusy = false;
+    }
+  }
+
+  /** 立即解除降级（后端把状态机清零；配置项一个都不动） */
+  async function clearDegrade(button) {
+    if (panelBusy) return;
+    panelBusy = true;
+    button.disabled = true;
+    try {
+      const saved = await api.savePrompt({ clearDegrade: true });
+      renderPrompt(saved);
+      toast('✅ 已解除内容拦截降级');
+    } catch (error) {
+      toast(`解除失败: ${error.message}`, 'err');
+      await loadPrompt();
+    } finally {
+      button.disabled = false;
+      panelBusy = false;
+    }
+  }
+
+  // 模式：选完即存；文件：`change` 在失焦或回车时触发，所以不会边打字边存
+  $('settings-prompt-mode')?.addEventListener('change', event => {
+    const label = MODE_LABELS[event.target.value] || event.target.value;
+    void savePromptField(`模式改为「${label}」`, { promptMode: event.target.value });
+  });
+  $('settings-prompt-file')?.addEventListener('change', event => {
+    void savePromptField(
+      event.target.value.trim() ? '提示词文件已更新' : '已改回内置默认提示词',
+      { promptFile: event.target.value },
+    );
+  });
+  $('btn-prompt-clear-degrade')?.addEventListener('click', event => clearDegrade(event.target));
+  $('btn-prompt-refresh')?.addEventListener('click', () => loadPrompt().then(() => toast('系统提示词设置已刷新')));
+
   // 保存位置是**只读展示**，没有按钮要绑事件（三个「更改…」入口随单库语义
   // 一起删除，理由见上面那一节的注释）。这里只留一个「刷新」出口：用户手工
   // 改过配置目录后能立刻重读一次，不必重开程序。
   $('btn-storage-refresh')?.addEventListener('click', () => loadStorage().then(() => toast('存储概况已刷新')));
 
-  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderSanitize, renderStorage };
+  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderSanitize, renderPrompt, renderStorage };
 
   // 重试设置同样在首次读到后端值之前保持禁用：空输入框既能被误改，
   // 也会让「值与后端是否一致」的判断失真。读成功后由 renderRetry 解禁，
@@ -1005,6 +1155,11 @@
     // 指纹脱敏开关同理
     const sanitizeToggle = $('settings-sanitize');
     if (sanitizeToggle) sanitizeToggle.disabled = true;
+    // 系统提示词的模式下拉与文件框同理（读到后端值之前不许改）
+    const promptMode = $('settings-prompt-mode');
+    const promptFile = $('settings-prompt-file');
+    if (promptMode) promptMode.disabled = true;
+    if (promptFile) promptFile.disabled = true;
   }
 
   // 保留天数在首次读到后端值之前保持禁用：空输入框既能被误改，也没法参与

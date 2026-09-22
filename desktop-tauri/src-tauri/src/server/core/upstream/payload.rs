@@ -2,15 +2,23 @@
 //!
 //! ── 发送体为什么在转发前决定 ────────────────────────────────
 //! 请求体从 `api::chat` **原样**进来（去重键也取自原始请求体）。内容处理只在
-//! **凭证已就绪、即将发送之前**发生，且是否处理由配置里的全局开关
-//! `sanitizeBlacklistFingerprints` 决定（快照见
-//! [`ProviderContext::sanitize_fingerprints`]）：
-//!   - 开关关着 → 客户端**原始**请求体（不处理、不计数）；
-//!   - 开关开着 → 用 `core::sanitize` 在**副本**上处理一次。
+//! **凭证已就绪、即将发送之前**发生，按**两层**依次落到副本上：
+//!
+//!   ① **系统提示词层**（`core::prompt`）：按配置的模式（透传 / 替换 / 追加）
+//!      把网关自有提示词写进出站 body；降级期（`core::degrade`）改用最小中性
+//!      提示词。`passthrough` + 未降级时**一个字节都不动**（默认路径）。
+//!   ② **指纹脱敏层**（`core::sanitize`）：由全局开关
+//!      `sanitizeBlacklistFingerprints` 决定（快照见
+//!      [`ProviderContext::sanitize_fingerprints`]）：开关关着 → 原样；
+//!      开着 → 在副本上剥离/改写指纹。
+//!
+//! 顺序不能反（与参考项目一致）：脱敏在后，于是网关提示词自己万一命中指纹
+//! 也会被清掉。两层都在**副本**上做，客户端原始体（`ctx.body`）始终不变。
+//!
 //! 于是首选与故障转移到的家拿到的都是同一份处理结果；同一 provider **同池**
-//! 换账号重试复用同一份（不重复处理、不重复统计 —— 键是「家 × 账号池」，
-//! 因为发送名跟着账号所在池走，见下）；「这一家没有可用凭证」时根本走不到
-//! 处理点，不产生一次已转发的处理。
+//! 换账号重试复用同一份（不重复处理、不重复统计 —— 键是「家 × 账号池 ×
+//! 是否降级」，因为发送名跟着账号所在池走、而降级会在请求中途翻转）；
+//! 「这一家没有可用凭证」时根本走不到处理点，不产生一次已转发的处理。
 //!
 //! ── 与改造前的差异：不再有「按 provider 作用范围」────────────────
 //! 改造前脱敏是按 provider 逐家判定的（配置里勾了哪几家，只有那几家的请求
@@ -74,6 +82,16 @@ pub(super) struct ProviderContext<'a> {
     /// 否则用户在请求进行中改了设置，会出现「前一家脱敏过、后一家没脱敏」
     /// 这类语义漂移；快照也让判定与日志用的是同一份值。
     pub sanitize_fingerprints: bool,
+    /// 本次请求的**系统提示词决定**（模式 + 文本，请求开始时从配置快照取一次）。
+    ///
+    /// 与 `sanitize_fingerprints` 同一取舍：模式与文本在同一次请求内必须一致，
+    /// 否则会出现「前一家换了提示词、后一家没换」。文本以借用形式随请求传递
+    /// （提示词可能几百行，逐请求克隆纯属浪费），生命周期由
+    /// `upstream::forward` 的配置快照持有。
+    ///
+    /// 它**不是**只读的：撞内容拦截后本请求会切到中性提示词（降级），
+    /// 那个开关不在本结构里 —— 它由转发层按请求持有并传给 [`send_body`]。
+    pub prompt: crate::server::core::prompt::PromptPlan<'a>,
     /// 本次请求命中的网关 Key 的**可用提供商**白名单（R9；`None` = 不限制，
     /// 见 `core::key_scope` 模块头）。
     ///
@@ -135,9 +153,40 @@ pub(super) fn send_body<'a>(
     ctx: &'a ProviderContext<'_>,
     provider_id: &str,
     account: Option<&Value>,
+    degraded: bool,
 ) -> SendBody<'a> {
+    // ── ① 系统提示词层（网关自有提示词：透传 / 替换 / 追加）──────────────
+    // 在脱敏**之前**：与参考项目同序（提示词改写 → 脱敏），于是网关提示词
+    // 自己万一命中指纹也会被后一层清掉；反过来的话，「刚换上去的那段提示词」
+    // 就没人过一遍了。
+    //
+    // `degraded` = 本请求是否已进入降级（请求开始时状态机已生效，或本次撞了
+    // 内容拦截后由转发层置位）：降级期用最小中性提示词（`custom` 模式除外，
+    // 见 `PromptPlan::text_for`）。
+    let after_prompt = match ctx.prompt.apply(ctx.body, degraded) {
+        Some(next) => {
+            logging::verbose(
+                "[Upstream]",
+                &format!(
+                    "系统提示词层：{}（{}）messages {} → {}",
+                    ctx.prompt.mode.label(),
+                    if degraded && ctx.prompt.mode.degradable() {
+                        "降级期：中性提示词"
+                    } else {
+                        ctx.prompt.source.label()
+                    },
+                    message_count(ctx.body),
+                    message_count(&next),
+                ),
+            );
+            Cow::Owned(next)
+        }
+        // passthrough 且未降级：一个字节都不动（默认路径，零拷贝沿用客户端原始体）
+        None => Cow::Borrowed(ctx.body),
+    };
+    // ── ② 指纹脱敏层（核心规则见 `core::sanitize`）─────────────────────
     let mut body = match ctx.sanitize_fingerprints {
-        true => match crate::server::core::sanitize::sanitize_body(ctx.body) {
+        true => match crate::server::core::sanitize::sanitize_body(after_prompt.as_ref()) {
             Some((scrubbed, hits)) => {
                 // 命中表可能为空：`sanitize_text` 末尾的去空白也能单独构成一次
                 // 改动（预检命中、但没有任何规则真正替换）。那时不该往请求日志
@@ -147,9 +196,9 @@ pub(super) fn send_body<'a>(
                 }
                 Cow::Owned(scrubbed)
             }
-            None => Cow::Borrowed(ctx.body),
+            None => after_prompt,
         },
-        false => Cow::Borrowed(ctx.body),
+        false => after_prompt,
     };
     let requested = body
         .get("model")
@@ -178,6 +227,14 @@ pub(super) fn send_body<'a>(
         wire.reasoning.as_deref(),
     );
     SendBody { body, wire_model: wire.model }
+}
+
+/// 请求体里的消息条数（提示词层的详细日志用；没有 messages 数组时给 0）。
+fn message_count(body: &Value) -> usize {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }
 
 /// 把发送体里的 model 字段换成该 provider 认识的真名（仅当需要换时才复制）。

@@ -15,8 +15,8 @@
 //! ── 写入粒度：单条操作只碰一行（本切片的改造）────────────────
 //! 改造前每条路径都是「load 全量 → 改内存里那一份 → save 全量」。现在的分布是：
 //!   - 读：`record_by_id` / `records_for_provider` 按需取（不再全表解析）；
-//!   - 判重与号段：`priority_holder` / `count_except` / `priorities_except`
-//!     直接在投影列上查（不再把 20 条记录的 JSON 全解析出来数一遍）；
+//!   - 判重与号段：`priority_holder` / `priorities_except`
+//!     直接在投影列上查（不再把全部记录的 JSON 全解析出来数一遍）；
 //!   - 写：`sql::put` / `sql::update_in_place` / `sql::delete` 单行落地。
 //!
 //! **两条例外**（都要整队或全局排序，见各自函数的说明）：
@@ -46,7 +46,7 @@ use crate::server::core::account_store::store_util::{
     js_string, number_or, object_or_empty, optional_text, pick_token, token_tail_of, truncate_chars,
     value_or, value_or_nullish,
 };
-use crate::server::core::account_store::{MAX_ACCOUNTS, MAX_TOKEN_LENGTH};
+use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
 use crate::server::core::providers::DEFAULT_PROVIDER_ID;
 use crate::server::core::proxies::describe_account_proxy;
@@ -123,15 +123,6 @@ impl AccountStore {
             .as_ref()
             .map(StoredAccount::provider)
             .unwrap_or_else(|| DEFAULT_PROVIDER_ID.to_string());
-        // 上限判定：`count_except(&id)` 就是旧实现里的 `others.len()`
-        // （`others` 排除了同 id 的既有记录）—— 投影列上数一行，不必把
-        // 其余 19 条记录的 JSON 读出来。
-        let others_count = self.with_conn(&_guard, |conn| sql::count_except(conn, &id))?;
-        if existing.is_none() && others_count as usize >= MAX_ACCOUNTS {
-            return Err(AccountStoreError::bad_request(format!(
-                "最多保存 {MAX_ACCOUNTS} 个账号"
-            )));
-        }
 
         // 代理/优先级校验放在写盘前：非法输入直接报错，不留下半成品记录
         let resolved_proxy = if payload_object.contains_key("proxy") {

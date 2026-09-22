@@ -51,7 +51,6 @@ use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::AccountStore;
 use crate::server::core::account_store::store_util::{strip_bearer_prefix, token_tail_of, truncate_chars};
-use crate::server::core::account_store::MAX_ACCOUNTS;
 use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::logging;
 
@@ -152,7 +151,15 @@ impl AccountStore {
             ),
         }
         // 来源 2：桌面端登录态（实时解密链可用即导入；读不到只记 verbose）
-        match self.import_autoclaw_desktop_account("imported") {
+        // 这里显式传**国内版**：这条是启动期的**旧数据**迁移（原项目
+        // `~/.autoclaw-proxy/accounts.json` 那批账号），全部来自国际版存在之前，
+        // 因此归国内版。与「用户手动点导入」不同 —— 那个由用户选的那一项决定
+        // 地区（见 `import_autoclaw_desktop_account` 的说明）；这里没有用户在场，
+        // 按历史归属处理。
+        match self.import_autoclaw_desktop_account(
+            crate::server::core::providers::autoclaw::Region::Cn,
+            "imported",
+        ) {
             Ok(_) => {
                 imported += 1;
             }
@@ -245,15 +252,6 @@ impl AccountStore {
                 logging::log(
                     "[Accounts]",
                     &format!("⚠️  AutoClaw 旧账号 {id} 与本机记录同 id，已跳过（不覆盖现有数据）"),
-                );
-                continue;
-            }
-            // 账号总数上限：已存在的 + 本批已收下的
-            if taken_ids.len() >= MAX_ACCOUNTS {
-                skipped += 1;
-                logging::log(
-                    "[Accounts]",
-                    &format!("⚠️  账号数已达上限 {MAX_ACCOUNTS}，AutoClaw 旧账号 {id} 未导入"),
                 );
                 continue;
             }

@@ -28,17 +28,21 @@
    * 漂移的症状：用户双击把手「还原」后列宽跳到另一个值（还原读的是这里的
    * DEFAULTS，而首屏渲染走的是 CSS）。
    *
-   * 本次改造只动了一列：actions 250 → 200。原因是「设为首选」从行上
-   * 搬进了 ⋯ 菜单（见 accounts-table.js 的 actionsCell 与 accounts-model.js 的
-   * moreMenuHtml），最坏组合从五颗按钮变成四颗
-   * 「签到 + 余额 + 设置 + 已签到 + ⋯」里的四颗实际同现组合 ——
-   * 算式见 page-accounts-table.css 那条声明。省下的 50px 全部归账号列。
+   * 本次改造动了两处：
+   *   · 新增 `proxy`（代理列，156px）—— 默认排在 account 与 connections 之间，
+   *     顺序由 accounts-table.js 的 COLUMNS 决定，这里的键序只影响「还原默认」
+   *     时的遍历顺序（还原按 key 逐个删覆盖，与顺序无关）；
+   *   · actions 250 → 200（上一轮改造）：「设为首选」从行上搬进了 ⋯ 菜单，
+   *     最坏组合从五颗按钮变成四颗「签到 + 余额 + 设置 + 已签到 + ⋯」里的
+   *     四颗实际同现组合 —— 算式见 page-accounts-table.css 那条声明。
+   *     省下的 50px 全部归账号列。
    */
   const DEFAULTS = {
     pick: 26,
     priority: 132,
     provider: 132,
     account: 300,
+    proxy: 156,
     connections: 56,
     status: 80,
     limits: 148,

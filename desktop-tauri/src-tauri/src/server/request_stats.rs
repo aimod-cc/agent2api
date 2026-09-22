@@ -79,9 +79,9 @@ use crate::server::db::Db;
 use clock::{date_key, day_of, local_midnight_ms, today};
 use record::{DailyEntry, MAX_DAILY_DAYS, MAX_ENTRIES};
 use report::{
-    build_accounts, build_providers, build_top_model, cache_rates, cache_trend_24h, daily_trend,
-    entry_json, heatmap, normalize_range, push_account_accum, push_model_accum,
-    push_provider_accum, range_bounds, range_totals, streak,
+    build_accounts, build_models, build_providers, build_top_model, cache_rates, cache_trend_24h,
+    daily_trend, entry_json, heatmap, normalize_range, provider_label, push_account_accum,
+    push_model_accum, push_provider_accum, range_bounds, range_totals, streak,
 };
 
 pub use record::{
@@ -93,6 +93,14 @@ pub use record::{
 /// 报表要从明细里取的数据**全部落在这个窗口内**，所以查询按它下界，
 /// 不必把 2 万条明细整体读回内存再逐条丢。
 const SUMMARY_WINDOW_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// 筛选下拉的候选上限（模型名与 provider id 各一份）。
+///
+/// 200 是个「够用且不失控」的数：真实使用的模型名通常在几十个量级，而这份清单
+/// 按出现次数降序，尾部那些只出现一两次的值本来也没人会用下拉去选。
+/// 截断的只是**候选**，不影响筛选能力 —— 前端会把当前选中的值保留在列表里
+/// （见 `ui/requests-panel.js` 的 `fillFilterSelect`）。
+const MAX_FILTER_OPTIONS: usize = 200;
 
 /// 请求统计存储本体。所有公开方法取 `&self`，内部一把 `Mutex` 串行化调用序列。
 pub struct RequestStats {
@@ -381,6 +389,35 @@ impl RequestStats {
         })
     }
 
+    /// 筛选下拉的候选清单：明细里出现过的模型名与 provider（各按出现次数降序）。
+    ///
+    /// 形状 `{models: ["…"], providers: [{id, label}]}` —— provider 带 label 是
+    /// 为了让前端不必维护第二份 id → 展示名映射（与明细行的 `providerLabel`
+    /// 同一个换算函数，见 `report::provider_label`）。
+    ///
+    /// ── 为什么是独立端点而不是塞进列表响应 ──────────────────────
+    /// 候选清单与「这一页显示什么」无关：它只在进页面时拉一次，之后翻页 / 换筛选
+    /// 都不该重算（一次全表 GROUP BY 挂到每个分页请求上，是白烧）。反过来，
+    /// 列表响应里塞一份清单会让每页多背几百个字符串，而消费方一个都用不上。
+    ///
+    /// 降级：库不可用时给空清单（`{models: [], providers: []}`）——
+    /// 前端据此只保留「全部」选项，筛选器退化成不可用但界面不报错；
+    /// 与 `query_requests` 的空表降级同一取向（少一个功能好过整页失败）。
+    pub fn filter_options(&self) -> Value {
+        let loaded = {
+            let guard = self.guard();
+            self.with_conn(&guard, |conn| {
+                sql::select_filter_options(conn, MAX_FILTER_OPTIONS)
+            })
+        };
+        let (models, providers) = loaded.unwrap_or((Vec::new(), Vec::new()));
+        let providers: Vec<Value> = providers
+            .into_iter()
+            .map(|id| json!({ "id": id, "label": provider_label(&id) }))
+            .collect();
+        json!({ "models": models, "providers": providers })
+    }
+
     /// 按筛选条件清空明细，并**重算受影响日期**的按天聚合。
     /// 返回 `{ removed: 删除条数, ...stats() }`。
     ///
@@ -640,6 +677,9 @@ fn summarize(
     // accounts 与 providers / topModel **同源同区间**（同上）：账号排行的
     // 请求数之和也等于 overview.requests
     let accounts = build_accounts(&totals.account_totals);
+    // models 同样与 topModel 同源（`topModel` 就是这张表的冠军）：
+    // 报表的「模型用量」环形图读它，各扇区之和等于 overview.tokens
+    let models = build_models(&totals.model_totals);
     let trend = daily_trend(daily, &start_date, &end_date);
     let map = heatmap(daily, now_day);
     let consecutive = streak(daily, now_day);
@@ -668,6 +708,10 @@ fn summarize(
         // 账号是比 provider 更细的一维（一家可挂多个账号），所以这张排行回答的是
         // 「具体哪个登录态在出力」——同一家的多个账号会各占一行。
         "accounts": accounts,
+        // 按模型维度的区间汇总（**新增字段，不改既有字段**，与上两维同形态）。
+        // 模型比 provider 更细：一家可以承载多个模型，所以这张表回答的是
+        // 「用量花在哪个模型上」——报表的「模型用量」环形图直接读它
+        "models": models,
         "heatmap": map,
         "cacheRates": rates,
         "cacheTrend24h": cache_trend,

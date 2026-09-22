@@ -51,13 +51,15 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///
 ///   - **WorkBuddy**：腾讯的每日签到接口；
 ///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
-///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
-///     （`providers::autoclaw::checkin`）。
+///   - **AutoClaw 国内版 / 国际版**：通用任务接口的 `daily_signin` 任务
+///     （`providers::autoclaw::checkin`）。两个地区**都支持** —— 任务接口在
+///     两地是同一套路径、同一套任务 id，只是站点不同（已实测），因此两家
+///     都列进来；地区由 `billing::checkin` 从账号的 provider 反查。
 ///
 /// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw / Qoder 有积分
 /// 查询但没有签到，因此不在此列 —— 它们的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 3] = ["workbuddy", "raccoon", "autoclaw"];
+pub const CHECKIN_PROVIDERS: [&str; 4] = ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl"];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {
@@ -78,8 +80,9 @@ pub fn default_providers() -> Vec<String> {
 /// 「签到这条链路只有国内版能走」—— 标签替用户把这件事讲清楚，
 /// 他勾上它时就知道国际版账号不会参与，而不是签完发现被跳过了才回来查。
 ///
-/// 另外两家没有这个后缀：小浣熊没有版本区分（`edition` 概念不适用于它），
-/// AutoClaw 的签到链路也没有国际版分支。
+/// 另外几家没有这个后缀：小浣熊没有版本区分（`edition` 概念不适用于它），
+/// AutoClaw 两地的签到链路都存在且同形 —— 它的展示名已经带「国内版 / 国际版」
+/// 后缀（注册表里就是），因此不需要在这里再补。
 fn provider_label(id: &str) -> &str {
     match id {
         "workbuddy" => "WorkBuddy 国内版",

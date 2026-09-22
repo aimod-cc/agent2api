@@ -156,6 +156,38 @@ const BRIDGE_JS: &str = r#"
       }),
     getLoginState: () => invoke('login_state'),
     cancelLogin: () => invoke('cancel_login'),
+    // ── AutoClaw 国际版 OAuth（**授权地址由界面先拿好**）──────────
+    // 与 startLogin 的区别：那条是「壳去问后端要地址」，这条是「界面已经
+    // 拿到地址了，壳只负责开窗口并等待」。原因是这条链前面有一次**必须在
+    // 浏览器里跑完**的强制风控验证码（阿里云 SDK），而主窗口就是那个环境
+    // —— 顺序因此被倒过来（见 commands.rs 的 start_autoclaw_oauth_login）。
+    //
+    // state / authUrl 来自 `POST /api/session/login/oauth/start`，
+    // 界面原样把它们交给这里；两个都不能为空（壳侧会拒绝）。
+    startAutoclawOauthLogin: (state, authUrl, mode) =>
+      invoke('start_autoclaw_oauth_login', {
+        state: String(state || ''),
+        authUrl: String(authUrl || ''),
+        // 缺省内嵌窗口：与另外几家的默认一致（系统浏览器是可选方式）
+        mode: mode === 'external' ? 'external' : 'embedded',
+      }),
+    // AutoClaw OAuth 的两条前置查询（都直接走网关，不经壳）：
+    //   captchaConfig 取风控配置（前端据此初始化阿里云 SDK）；
+    //   oauthStart    带验证码参数换授权地址。
+    // 放在这里而不是让界面自己拼路径：桥接层是「界面 → 网关」的唯一入口，
+    // 绕开它（直接 invoke('api_request')）会丢掉 asError 的错误归一化
+    // —— 那时 rejection 携带的是裸字符串，`error.message` 是 undefined，
+    // 界面会显示成「登录失败：undefined」（见 sendSmsCode 的同款说明）。
+    getAutoclawOauthCaptchaConfig: provider =>
+      call('POST', '/api/session/login/oauth/captcha-config', {
+        ...(provider ? { provider: String(provider) } : {}),
+      }),
+    startAutoclawOauth: (provider, vendor, captchaVerifyParam) =>
+      call('POST', '/api/session/login/oauth/start', {
+        ...(provider ? { provider: String(provider) } : {}),
+        vendor: String(vendor || ''),
+        captchaVerifyParam: String(captchaVerifyParam || ''),
+      }),
     onLoginState: callback => on('login:state', callback),
     refreshSession: async () => {
       await call('POST', '/api/session/refresh', {});
@@ -255,7 +287,7 @@ const BRIDGE_JS: &str = r#"
     getAccountConnections: () => call('GET', '/api/accounts/connections'),
     checkinAllAccounts: id => call('POST', '/api/accounts/checkin', id ? { id } : {}),
 
-    // ── 手机验证码登录（AutoClaw 专用）──
+    // ── 手机验证码登录（AutoClaw **国内版**专用）──
     // 与网页登录那条链（开窗口、等回调）不同：上游没有授权页，就是「发码 →
     // 用码换 token」两次同步调用，所以走管理 API 而不是 start_login。
     //
@@ -264,7 +296,23 @@ const BRIDGE_JS: &str = r#"
     // 界面的 `error.message` 会拿到 undefined，显示成「登录失败：undefined」。
     // `sendSmsCode` 返回的 deviceId 要原样回传给 verify（上游把验证码绑在发码时
     // 那台设备上，见 api::session::login_sms_send 的说明）。
-    sendSmsCode: phone => call('POST', '/api/session/login/sms/send', { phone: String(phone || '') }),
+    // ── `sendSmsCode` 的入参形态（两种都收）──────────────────────
+    // 老界面传**裸手机号字符串**（历史契约），新界面传 `{phone, provider}`。
+    // 两种都要收：界面与壳是两个独立产物，升级不同步时旧界面不能直接坏掉。
+    //
+    // `provider` 是**哪一个地区**（`autoclaw` 国内版 / `autoclaw-intl` 国际版）：
+    // 两个地区的接口是同一套路径、两个站点，因此原样带上去 —— 国际版会在后端
+    // 被明确拒绝（它的手机验证码入口已移除，见 api::session::login_sms_send），
+    // 不带则按历史口径落国内版。省略即国内版（与老界面的行为一致）。
+    sendSmsCode: input => {
+      const isObject = input && typeof input === 'object';
+      const phone = String((isObject ? input.phone : input) || '');
+      const provider = isObject && input.provider ? String(input.provider) : '';
+      return call('POST', '/api/session/login/sms/send', {
+        phone,
+        ...(provider ? { provider } : {}),
+      });
+    },
     verifySmsLogin: payload =>
       call('POST', '/api/session/login/sms/verify', {
         phone: String((payload && payload.phone) || ''),
@@ -273,6 +321,7 @@ const BRIDGE_JS: &str = r#"
         // 因此按「有值才带」整形（与其它命令的省略语义一致）
         ...((payload && payload.deviceId) ? { deviceId: String(payload.deviceId) } : {}),
         ...((payload && payload.name) ? { name: String(payload.name) } : {}),
+        ...((payload && payload.provider) ? { provider: String(payload.provider) } : {}),
       }),
 
     // ── 定时签到 ──
@@ -311,6 +360,18 @@ const BRIDGE_JS: &str = r#"
     saveSanitize: enabled =>
       call('PUT', '/api/sanitize', { sanitizeBlacklistFingerprints: enabled === true }),
 
+    // ── 系统提示词与内容拦截降级 ──
+    // 与 getRetry / saveRetry 同形：GET 读、PUT 写（允许部分字段），响应体是
+    // 生效后的全量状态（含降级是否生效）。`clearDegrade` 是同一端点上的一个
+    // 动作位（参考项目只能等到零点，本项目允许用户当场解除）。
+    getPrompt: () => call('GET', '/api/prompt'),
+    savePrompt: payload =>
+      call('PUT', '/api/prompt', {
+        promptMode: payload && payload.promptMode != null ? String(payload.promptMode) : null,
+        promptFile: payload && payload.promptFile != null ? String(payload.promptFile) : null,
+        clearDegrade: !!(payload && payload.clearDegrade),
+      }),
+
     // ── 运行日志 ──
     getLogs: query => call('GET', '/api/logs' + toQuery(query)),
     getLogStats: () => call('GET', '/api/logs/stats'),
@@ -326,6 +387,10 @@ const BRIDGE_JS: &str = r#"
     // 筛选条件是可选对象，复用上面 toQuery 的「空值跳过」语义：
     // 清空的输入框不该变成 `?model=` 这种永不命中的条件
     getStatsRequests: query => call('GET', '/api/stats/requests' + toQuery(query)),
+    // 筛选下拉的候选清单（出现过的模型 / 提供商）。不带参数、不随筛选变化 ——
+    // 它只在进页面时拉一次（理由见 api::stats_api::stats_request_filters）。
+    // 读不到时前端只保留「全部」选项，不弹错（筛选器退化成不可用，列表照常）
+    getStatsRequestFilters: () => call('GET', '/api/stats/requests/filters'),
     // 清空同样支持筛选条件（带条件 = 只删命中的明细，不传 = 全部清空）
     clearStatsRequests: query => call('DELETE', '/api/stats/requests' + toQuery(query)),
     getRetention: () => call('GET', '/api/retention'),

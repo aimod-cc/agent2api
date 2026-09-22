@@ -42,7 +42,7 @@ use crate::server::core::account_store::store::{AccountStore, AccountStoreError}
 use crate::server::core::account_store::store_util::{
     js_string, object_or_empty, strip_bearer_prefix, token_tail_of, truncate_chars,
 };
-use crate::server::core::account_store::{MAX_ACCOUNTS, MAX_TOKEN_LENGTH};
+use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 /// 余额凭证字段名（定义在 `providers::catpaw::balance`：那里是消费方，
 /// 字段名只该有一份，账号层引用它而不是另写一个字符串字面量）
 use crate::server::core::providers::catpaw::balance::BALANCE_TOKEN_FIELD;
@@ -201,16 +201,6 @@ impl AccountStore {
                 ));
             }
         }
-        if existing.is_none() {
-            // 上限判定查投影列（COUNT），不把记录读出来数
-            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
-            if total as usize >= MAX_ACCOUNTS {
-                return Err(AccountStoreError::new(
-                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
-                    400,
-                ));
-            }
-        }
         let explicit_name = name
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -351,16 +341,6 @@ impl AccountStore {
                     format!(
                         "账号 id「{id}」已被{existing_provider}账号占用，无法导入 CatPaw 桌面端登录态"
                     ),
-                    400,
-                ));
-            }
-        }
-        if existing.is_none() {
-            // 上限判定查投影列（COUNT），不把记录读出来数
-            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
-            if total as usize >= MAX_ACCOUNTS {
-                return Err(AccountStoreError::new(
-                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
                     400,
                 ));
             }

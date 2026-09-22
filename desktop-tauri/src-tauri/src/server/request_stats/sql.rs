@@ -181,6 +181,18 @@ impl FilterPlan {
             binds.push(SqlValue::Text(want.to_string()));
         }
 
+        // ①′ provider id 精确匹配（同一口径：空串当没筛）。
+        //
+        // 按 `provider` 列而不是「账号属于哪一家」判：那一列记的是**实际承载本次
+        // 请求的那一家**（备援换号后是最后扛下来的那家），与列表里显示的提供商
+        // 是同一个值 —— 筛选结果与肉眼看到的行必然一致。
+        // 空 id 的行（一次都没发出去就失败）不会被任何非空 id 命中，这是有意的：
+        // 它们不属于任何一家，用 status=error 看更直接（见 RequestQuery::provider）。
+        if let Some(want) = filter.provider.as_deref().filter(|text| !text.is_empty()) {
+            fragments.push("provider = ?".to_string());
+            binds.push(SqlValue::Text(want.to_string()));
+        }
+
         // ② 成功 / 失败：与 `RequestEntry::is_success` **逐字等价**的复合条件。
         //
         // 成功的判据是「2xx **且**没有错误摘要」（两列合起来才算一个条件，见
@@ -243,6 +255,56 @@ pub(super) fn count_matching(
     let sql = format!("SELECT COUNT(*) FROM requests{}", plan.where_sql);
     let count: i64 = conn.query_row(&sql, params_from_iter(plan.binds.iter()), |row| row.get(0))?;
     Ok(count.max(0) as usize)
+}
+
+/// 筛选下拉的候选清单：明细里出现过的模型名与 provider id（各按出现次数降序）。
+///
+/// ── 为什么不按当前时间档位过滤 ──────────────────────────────
+/// 清单回答的是「这份日志里出现过什么」，与界面上的时间档位是两个独立维度：
+/// 跟着档位过滤的话，切一次档位就要重拉一次清单，而下拉的内容还会在用户正要选
+/// 的时候整体换掉（选中项可能凭空消失）。全量清单稳定得多，代价是切到「今天」
+/// 档位后可能列出一个只在 30 天前出现过的模型 —— 选中它得到空结果，
+/// 而原因一眼可见（时间档位那一栏还写着「今天」）。
+///
+/// ── 上限只截断展示 ──────────────────────────────────────────
+/// 下拉是给人扫读的，几百项已超出可读范围；而且这份清单按出现次数排序，
+/// 尾部那些只出现一两次的值价值极低。截断的是**候选**，不是筛选能力：
+/// 前端仍会把当前选中的值保留在列表里（见 ui/requests-panel.js 的
+/// `fillFilterSelect`），所以「筛了某值 → 清单里没有它」不会发生。
+pub(super) fn select_filter_options(
+    conn: &Connection,
+    max: usize,
+) -> rusqlite::Result<(Vec<String>, Vec<String>)> {
+    Ok((
+        select_distinct_ordered(conn, "model", max)?,
+        select_distinct_ordered(conn, "provider", max)?,
+    ))
+}
+
+/// 取某一列的非空值，按出现次数降序、同次数按值升序（最多 `max` 个）。
+///
+/// 同次数时**必须**有第二个排序键：只按 `COUNT(*)` 排序时同次数的值顺序由
+/// SQLite 的扫描顺序决定，两次调用可能给出不同的顺序 —— 下拉里的项会无理由地
+/// 换位置（用户刚要点的那一项可能正好跳走）。
+///
+/// 列名由调用方以字面量给出（不接收任何用户输入），所以直接拼进 SQL 是安全的；
+/// 上限值仍走绑定参数，与其它查询保持同一种写法。
+fn select_distinct_ordered(
+    conn: &Connection,
+    column: &str,
+    max: usize,
+) -> rusqlite::Result<Vec<String>> {
+    let sql = format!(
+        "SELECT {column} FROM requests WHERE {column} <> '' \
+         GROUP BY {column} ORDER BY COUNT(*) DESC, {column} ASC LIMIT ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(params![max as i64])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(row.get(0)?);
+    }
+    Ok(out)
 }
 
 /// 最早 / 最晚的明细时间戳（空表为 `None`）—— `stats()` 的 `firstTs` / `lastTs`。

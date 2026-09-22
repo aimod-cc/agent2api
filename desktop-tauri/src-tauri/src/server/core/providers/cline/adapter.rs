@@ -71,6 +71,7 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
@@ -222,11 +223,9 @@ impl ProviderAdapter for ClineAdapter {
                 status,
             };
         }
-        UpstreamErrorClass::Fatal {
-            status,
-            message,
-            upstream_code: None,
-        }
+        // 内容策略拦截（审核文案）→ ContentBlocked：不罚账号，交给编排层换中性
+        // 提示词重试一次 + 触发降级（见 `core::degrade`）
+        content_block::classify_or_fatal(status, error_body, message, None)
     }
 
     /// 取可用 access token：**凭证快照 + 临期主动刷新**（10 分钟窗口，

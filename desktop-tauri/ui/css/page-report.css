@@ -232,6 +232,157 @@
    56px 下限，名字列跟着收到放得下的宽度 —— 列轨是 minmax(0, max-content)，
    上限只是「不许长过」，放不下时它自己会缩，所以这里不需要额外断点。 */
 
+/* ─── 用量环形图（模型 / 提供商两张并排）───
+   两张卡各占一半宽度，与上面两张排行卡同一取舍：它们回答的是同一个问题的
+   两个维度（用量花在哪个模型 / 落到哪家），并排放才便于对照。
+   用 flex + flex-basis 而不是 grid：两张卡**各自独立决定显隐**（models 是新增
+   字段，旧后端不返回），flex-wrap 下藏掉一张时剩下一张自动铺满整行；
+   grid 的固定两列会留下半行空白。与 .report-rank-grid 同一手法。 */
+.report-donut-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.report-donut-grid > .panel {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
+/* 上面给 .panel 写了 flex 显示，就压过了浏览器对 hidden 的默认 display:none ——
+   于是「字段缺失就藏起来」会失效（卡片留在原地空着）。显式补回来。 */
+.report-donut-grid > .panel[hidden] { display: none; }
+
+/* 环 + 右侧图例列表：窄窗口下改成上下排（环在上、列表在下），
+   否则 220px 的环会把列表挤到只剩几十像素、名字全被截断。 */
+.donut-layout {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.donut-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.donut-svg { display: block; }
+
+.donut-slice { transition: opacity .12s ease; }
+
+/* 悬停某一段时其余各段淡出：扇区窄的时候光靠描边看不出选中的是哪一段 */
+.donut-svg:hover .donut-slice { opacity: .45; }
+.donut-svg .donut-slice:hover { opacity: 1; }
+
+/* 扇区内的百分比：白色字 + 深色描边，保证落在任意一段底色上都读得清
+   （浅黄 / 浅绿那些段的对比度单靠白字是不够的）。paint-order 让描边压在字下面，
+   字本身不被描边吃掉笔画。 */
+.donut-label {
+  fill: #fff;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  paint-order: stroke;
+  stroke: oklch(0 0 0 / 55%);
+  stroke-width: 2px;
+  pointer-events: none;
+}
+
+/* 环心读数：绝对定位盖在 SVG 中间（环的中空处）。
+   pointer-events:none 让鼠标穿过它落在扇区上，否则正中间那块会挡住 hover。 */
+.donut-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  text-align: center;
+}
+
+.donut-center-value {
+  color: var(--text);
+  font-size: 21px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.donut-center-label {
+  margin-top: 1px;
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+
+/* 右侧图例列表：一行「色点 + 名字 + Token + 百分比」。
+   名字列吃掉剩余宽度（模型名长短不一，固定宽度要么截断要么白占），
+   两个数值列定宽右对齐，各行竖着比对才齐。 */
+.donut-legend {
+  flex: 1 1 180px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  /* 条目多时列表自己滚动，不把卡片撑高 —— 与 Top 排行只显示前 N 名不同，
+     这里全量给出（环形图本来就是看整体构成），所以需要一个上限 */
+  max-height: 232px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.donut-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  border-radius: var(--r-xs);
+}
+
+.donut-legend-row:hover { background: var(--row-hover); }
+
+.donut-dot {
+  flex: 0 0 9px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}
+
+.donut-legend-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.donut-legend-tokens,
+.donut-legend-percent {
+  flex: 0 0 auto;
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* 百分比比 Token 用量更重要（它是扇区角度本身的读数），给更重的字重 */
+.donut-legend-percent { width: 46px; color: var(--text); font-weight: 600; }
+
+/* 窄窗口：环与列表改成上下排，环自己居中 */
+@media (max-width: 720px) {
+  .donut-layout { flex-direction: column; align-items: stretch; }
+  .donut-wrap { align-self: center; }
+}
+
 /* ─── 热力图 ───
    53 列（365 天）在格子下限 7px 时约 550px 宽，正常窗口都放得下；
    overflow-x 只是兜底：窗口被拖到极窄时让方格网横向滚动，

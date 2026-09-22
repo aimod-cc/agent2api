@@ -132,11 +132,11 @@
    * 界面只能兜底成「未返回余额数据」—— 用户分不清是禁用了还是上游挂了。
    * 所以单查带 id 走后端那条**不看启用状态**的分支（见 core::usage_query）。
    *
-   * **这条口径与「签到」刻意不同**（`checkin.rs` 的单账号路径会拒掉已禁用账号）：
-   * 余额查询是**只读**的（不产生任何上游副作用，也不改本机状态），
-   * 「这个禁用账号还剩多少」是一个合理且无害的问题；而签到会消耗上游每日额度、
-   * 写回 `checkinAt`，那才需要「禁用就不做」。同一条 `enabled` 在两个动作上
-   * 语义相反是有意的，不要为了「统一口径」把其中一处改掉。
+   * **签到那边本次改成了同样的口径**（`checkin.rs` 的单账号路径不再看
+   * `enabled`，只拒国际版）：余额查询是只读的，「这个禁用账号还剩多少」是
+   * 合理且无害的问题；签到虽然会消耗上游额度、写回 `checkinAt`，但用户对
+   * 某个账号显式点「签到」本身就是明确意图，替他拦下来反而多余 ——
+   * 禁用管的是「别让它承接转发」，不该顺手管到积分签到。
    *
    * 批量（`id` 缺省）仍是「全部启用账号」，行为与改造前一致。
    */
@@ -242,8 +242,8 @@
   /**
    * 签到。`id` 缺省 = 全部可签到账号串行签到；指定 id = 单账号签到。
    *
-   * 目标集合、按钮可用性与确认文案三处都必须只用「有签到概念 + 启用 + 国内版」的账号
-   * （后端 core::billing::checkin 同样只把 workbuddy 账号当目标）。
+   * 目标集合、按钮可用性与确认文案三处都只用「有签到概念 + 国内版」的账号
+   * （后端 core::billing::checkin 同样只把国际版排除在外，**不看启用状态**）。
    */
   async function checkinFor(id) {
     const data = await api.checkinAllAccounts(id || null);
@@ -293,7 +293,7 @@
       const total = data?.total ?? 0;
       const skipped = Number(data?.skipped) || 0;
       toast(`签到完成：${succeeded}/${total} 个账号成功领取`
-        + (skipped ? `（跳过 ${skipped} 个已禁用 / 国际版 / 所属家无签到的账号）` : ''), succeeded < total ? 'err' : 'ok');
+        + (skipped ? `（跳过 ${skipped} 个国际版 / 所属家无签到的账号）` : ''), succeeded < total ? 'err' : 'ok');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       targets.forEach(a => checkinMap.set(a.id, `签到失败：${message}`));

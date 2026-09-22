@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use crate::server::logging;
 
 use super::credentials::AutoClawCredentials;
+use super::region::Region;
 
 /// 配置基址：`{DEFAULT_UPSTREAM_BASE_URL}` 砍掉尾部的 `/autoclaw`，再补 `/proxy/`。
 ///
@@ -38,8 +39,8 @@ use super::credentials::AutoClawCredentials;
 /// return ZAI_PROXY_BASE_URL.slice(0, idx + "/proxy/".length);
 /// ```
 /// 取 `lastIndexOf` 而不是首次出现：域名里也可能出现 `/proxy/` 片段。
-fn config_base_url() -> String {
-    let upstream = super::credentials::upstream_base_url();
+fn config_base_url(region: Region) -> String {
+    let upstream = super::credentials::upstream_base_url(region);
     match upstream.rfind("/proxy/") {
         Some(index) => format!("{}/", &upstream[..index + "/proxy/".len()]),
         // 没有 `/proxy/` 时按 `URL.origin + /autoclaw-proxy/proxy/` 拼
@@ -67,26 +68,44 @@ struct CatalogState {
     fetched_at: i64,
 }
 
-fn catalog() -> &'static RwLock<CatalogState> {
-    static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
-    CATALOG.get_or_init(|| RwLock::new(CatalogState::default()))
+/// 按地区取那一格目录缓存。
+///
+/// ── 为什么必须按地区分格（本次新增地区时的硬判断）────────────
+/// 两地的 `autoclaw-model-config` 是**两个站点的两份清单**：国内版目录里
+/// 是 `zaicoding_glm-5.3` 这类路由，国际版的清单是另一套（且各自的模型集合
+/// 可以不同）。共用一个缓存格的后果是**两家的模型互相覆盖** —— 用户刚刷完
+/// 国内版，切到国际版看到的却是国内版的模型，而刷新时间戳还显示「刚刚更新」，
+/// 界面上完全看不出这是另一家的数据。
+///
+/// 用两个独立的 `OnceLock<RwLock<_>>` 而不是 `HashMap<Region, _>`：地区的
+/// 取值是编译期已知的两个，静态格子没有锁竞争、也不需要哈希开销，
+/// 与「provider 是编译期内置的」这一既有取舍一致（见 `providers/mod.rs`
+/// 对静态注册表的说明）。
+fn catalog(region: Region) -> &'static RwLock<CatalogState> {
+    static CN: OnceLock<RwLock<CatalogState>> = OnceLock::new();
+    static INTL: OnceLock<RwLock<CatalogState>> = OnceLock::new();
+    let slot = match region {
+        Region::Cn => &CN,
+        Region::Intl => &INTL,
+    };
+    slot.get_or_init(|| RwLock::new(CatalogState::default()))
 }
 
-fn read_state() -> CatalogState {
-    match catalog().read() {
+fn read_state(region: Region) -> CatalogState {
+    match catalog(region).read() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
 /// 远程清单（空 = 还没成功拉过，调用方回落到静态路由表）
-pub fn remote_models() -> Vec<Value> {
-    read_state().models
+pub fn remote_models(region: Region) -> Vec<Value> {
+    read_state(region).models
 }
 
 /// 上次成功刷新时刻（毫秒；0 = 从未成功）
-pub fn last_refreshed_at() -> i64 {
-    read_state().fetched_at
+pub fn last_refreshed_at(region: Region) -> i64 {
+    read_state(region).fetched_at
 }
 
 /// 按**目录口径**找一个模型对应的**完整路由 ID**（`X-Request-Model` 要发的那个）。
@@ -100,12 +119,12 @@ pub fn last_refreshed_at() -> i64 {
 /// `id` 是**剥过前缀的目录名**、`routeId` 才是完整路由 ID。剥前缀不可逆：
 /// `auto` 无法知道自己是 `zai_auto` 还是 `zaicoding_auto`，而发错路由 ID
 /// 等于换了一个模型（还可能走错计费通道）。所以这里读 `routeId` 字段本身。
-pub fn remote_route_id(name: &str) -> Option<String> {
+pub fn remote_route_id(region: Region, name: &str) -> Option<String> {
     let wanted = name.trim().to_lowercase();
     if wanted.is_empty() {
         return None;
     }
-    read_state().models.iter().find_map(|item| {
+    read_state(region).models.iter().find_map(|item| {
         let route = item
             .get("routeId")
             .and_then(Value::as_str)
@@ -225,8 +244,9 @@ pub async fn refresh(
 ) -> crate::server::core::providers::adapter::ModelRefreshOutcome {
     use crate::server::core::providers::adapter::ModelRefreshOutcome;
 
+    let region = credentials.region;
     if !force {
-        let state = read_state();
+        let state = read_state(region);
         if !state.models.is_empty()
             && state.fetched_at > 0
             && logging::now_ms() - state.fetched_at < CACHE_TTL_MS
@@ -241,7 +261,7 @@ pub async fn refresh(
         return ModelRefreshOutcome::unchanged();
     }
 
-    let url = format!("{}{MODEL_CONFIG_PATH}", config_base_url());
+    let url = format!("{}{MODEL_CONFIG_PATH}", config_base_url(region));
     let headers = super::refresh::signed_auth_headers(&credentials.token);
     let outcome = crate::server::core::auth_http::send_raw(
         "GET",
@@ -284,19 +304,25 @@ pub async fn refresh(
         return ModelRefreshOutcome::failed("上游返回的模型目录为空");
     }
     let count = models.len();
-    let mut state = read_state();
+    let mut state = read_state(region);
     state.models = models;
     state.fetched_at = logging::now_ms();
-    match catalog().write() {
+    match catalog(region).write() {
         Ok(mut guard) => *guard = state,
         Err(poisoned) => *poisoned.into_inner() = state,
     }
-    logging::log("[Models]", &format!("✅ AutoClaw 模型目录已更新（{count} 个）"));
+    logging::log(
+        "[Models]",
+        &format!(
+            "✅ AutoClaw {}模型目录已更新（{count} 个）",
+            region.label()
+        ),
+    );
     ModelRefreshOutcome::refreshed(count)
 }
 
 /// 供排障：远程目录条数
 #[allow(dead_code)]
-pub fn count() -> usize {
-    remote_models().len()
+pub fn count(region: Region) -> usize {
+    remote_models(region).len()
 }

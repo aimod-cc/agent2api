@@ -39,7 +39,6 @@ use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::AccountStore;
 use crate::server::core::account_store::store_util::{strip_bearer_prefix, token_tail_of, truncate_chars};
-use crate::server::core::account_store::MAX_ACCOUNTS;
 use crate::server::core::providers::catpaw::credentials;
 use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::logging;
@@ -231,15 +230,6 @@ impl AccountStore {
                 logging::log(
                     "[Accounts]",
                     &format!("⚠️  CatPaw 旧账号 {id} 与本机记录同 id，已跳过（不覆盖现有数据）"),
-                );
-                continue;
-            }
-            // 账号总数上限：已存在的 + 本批已收下的
-            if taken_ids.len() >= MAX_ACCOUNTS {
-                skipped += 1;
-                logging::log(
-                    "[Accounts]",
-                    &format!("⚠️  账号数已达上限 {MAX_ACCOUNTS}，CatPaw 旧账号 {id} 未导入"),
                 );
                 continue;
             }

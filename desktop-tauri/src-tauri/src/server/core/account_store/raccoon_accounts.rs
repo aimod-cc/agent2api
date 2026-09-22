@@ -40,7 +40,7 @@ use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::live_desktop_credentials;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{pick_token, token_tail_of, truncate_chars};
-use crate::server::core::account_store::{CredentialWrite, MAX_ACCOUNTS, MAX_TOKEN_LENGTH};
+use crate::server::core::account_store::{CredentialWrite, MAX_TOKEN_LENGTH};
 use crate::server::core::providers::raccoon::{credentials, jwt, models};
 use crate::server::core::providers::kind_id;
 use crate::server::core::providers::ProviderKind;
@@ -166,16 +166,6 @@ impl AccountStore {
                         "账号 id「{id}」已被{existing_provider}账号占用，无法添加同一 userId 的\
                          小浣熊账号（请先处理那个账号）"
                     ),
-                    400,
-                ));
-            }
-        }
-        if existing.is_none() {
-            // 上限判定查投影列（COUNT），不把记录读出来数
-            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
-            if total as usize >= MAX_ACCOUNTS {
-                return Err(AccountStoreError::new(
-                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
                     400,
                 ));
             }
@@ -320,15 +310,6 @@ impl AccountStore {
         let _guard = self.guard();
         let id = credentials::DESKTOP_ACCOUNT_ID.to_string();
         let existing = self.record_by_id(&_guard, &id);
-        if existing.is_none() {
-            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
-            if total as usize >= MAX_ACCOUNTS {
-                return Err(AccountStoreError::new(
-                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
-                    400,
-                ));
-            }
-        }
         let default_name = if user_id.is_empty() {
             "桌面端登录账号".to_string()
         } else {

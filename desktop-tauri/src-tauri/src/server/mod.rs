@@ -85,6 +85,8 @@
 //!       version.rs   版本比较、域名白名单、资产挑选、文件名安全化（纯函数）
 //!       client.rs    出网候选（直连 → Clash）与 GitHub 请求头
 //!     sanitize.rs  出站请求体指纹脱敏（硬编码规则集，纯函数）
+//!     prompt.rs    网关自有系统提示词（透传 / 替换 / 追加三模式，纯函数）
+//!     degrade.rs   内容拦截降级状态机（撞审核误报后到次日 00:00 用中性提示词）
 //!     upstream/    对话转发：
 //!       mod.rs       转发主链路（选路循环 / 429 轮换 / 去重排队 / SSE 流）
 //!       request.rs   请求构造（头集合、URL、system 注入、错误解析）
@@ -101,6 +103,9 @@
 //!   - 模型目录与转发：`ServerState::models()` / `upstream()`。
 //!   - 指纹脱敏：无句柄，转发层每次出站前读 `config::current().sanitize_fingerprints()`
 //!     决定要不要调 `core::sanitize::sanitize_body`（纯函数，无状态）。
+//!   - 系统提示词：同样无句柄，转发层逐请求取一次 `config::current().prompt_plan()`
+//!     交给 `core::prompt` 落到出站副本上；撞内容拦截时由转发层触发
+//!     `core::degrade`（进程级原子状态，无句柄）并就地换中性提示词重试一次。
 //!   - 定时签到：`ServerState::auto_checkin()`；停机清理走
 //!     `core::auto_checkin::stop_global()`（backend::shutdown 里调用）。
 //!   - 间隔型定时任务：`core::scheduled_tasks`（注册表 + 调度循环，循环在
@@ -462,8 +467,22 @@ impl ServerState {
                 },
             ),
         );
-        logging::log("[Config]", &format!("配置目录: {}", state.config_dir.display()));
-        // 数据库状态一行（排障第一手信息：库在哪、有没有就绪）。
+        // 系统提示词一行：模式 + 生效文本来源（内置默认 / 文件）+ 文件读不到时的
+        // 原因。降级期是运行期状态（不是启动事实），只在设置页与日志里显示，
+        // 这里不读它 —— 启动那一刻还没人触发过降级。
+        logging::log(
+            "[Config]",
+            &format!(
+                "系统提示词: {}（{}）{}",
+                snapshot.prompt_settings().mode.label(),
+                snapshot.prompt_settings().source.label(),
+                match snapshot.prompt_settings().file_error.as_deref() {
+                    Some(reason) => format!("；⚠️  {reason}"),
+                    None => String::new(),
+                },
+            ),
+        );
+        logging::log("[Config]", &format!("配置目录: {}", state.config_dir.display()));        // 数据库状态一行（排障第一手信息：库在哪、有没有就绪）。
         // 放在「配置目录」之后：坏库时的第一句话就是「库在哪、能不能打开」，
         // 而 `Db::file()` 是唯一知道自己路径的对象（不让别处再拼一次
         // `config_dir.join(FILE_NAME)` —— 那是把路径知识复制到第二个地方）。

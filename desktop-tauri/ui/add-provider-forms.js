@@ -164,16 +164,27 @@
     {
       // AutoClaw 最终凭证解析只读取 token / accessToken、refreshToken、deviceId；name 由 API 读取。
       // 入口虽列出 access_token / refresh_token，解析链未消费；不宣称支持这两个别名或 enc_value。
+      //
+      // ── 两个地区各占一项（与 Cline 两池同一手法）──────────────────
+      // `autoclaw`（国内版，id 不变 —— 存量账号的落盘契约）与
+      // `autoclaw-intl`（国际版，本次新增）。两项**相邻**排列：它们是同一条
+      // 产品线的两个版本，中间隔着别家会让「找国际版」变成一次扫描。
+      //
+      // 两地的差别有三处，其余配置逐字相同：
+      //   1. 域名（后端 `autoclaw::region` 里，前端不体现）；
+      //   2. **桌面端导入两个地区都给** —— auth.json 没有地区标记，只归国内版
+      //      （见 src-tauri/.../autoclaw/credentials.rs 的 `local_credentials`）；
+      //   3. **登录方式完全不同**：国内版只有手机验证码；国际版只有
+      //      Zai / Google OAuth 网页登录（本次把它的手机验证码入口移除，
+      //      理由见下面国际版那一项）。
       provider: 'autoclaw',
-      label: 'AutoClaw',
+      label: 'AutoClaw 国内版',
       manualNote: 'token 可填明文 JWT；token / refreshToken 字符串支持 enc: 前缀，后端在 Windows 上使用本机密钥解密。未填写 refreshToken 无法自动续期；deviceId 可选。',
-      // 手机验证码登录（AutoClaw 国内版**唯一**的官方登录方式）。
-      // 这一家没有网页登录：上游不开授权页、没有授权码回调，也没有公网 Web 版，
-      // 官方客户端自己就是手机号 + 短信验证码。理由详见
-      // src-tauri/src/server/core/providers/autoclaw/login.rs 的模块头。
+      // 手机验证码登录：国内版**唯一**的官方登录方式（它的登录页不渲染
+      // OAuth 按钮 —— 已核对构建产物）。理由详见 login.rs 的模块头。
       smsLogin: {
         noteHtml: '用 AutoClaw 绑定的手机号登录：点「获取验证码」，收到短信后填入并登录。'
-          + '这是 AutoClaw 官方唯一的登录方式（它没有网页授权登录），'
+          + '这是 AutoClaw 国内版官方唯一的登录方式（它没有网页授权登录），'
           + '验证码由本机直接提交给官方接口，界面不显示 token。',
       },
       fields: [
@@ -186,6 +197,75 @@
       desktopHint: '读取 %APPDATA%/AutoClaw/auth.json 并解密，仅 Windows',
       // 这一家的登录态是 Electron safeStorage 密文，解密要走 DPAPI（仅 Windows），
       // 因此 macOS 上整段收起（理由见 desktopImportAvailable）
+      desktopWindowsOnly: true,
+    },
+    {
+      // AutoClaw 国际版（`autoglm-api.autoglm.ai`）：与国内版同一套协议、
+      // 同一套签名指纹（appId/appKey 两地逐字相同，已实测），只有站点不同。
+      provider: 'autoclaw-intl',
+      label: 'AutoClaw 国际版',
+      manualNote: 'token 可填明文 JWT。未填写 refreshToken 无法自动续期；deviceId 可选。国际版与国内版是两套独立的账号体系，请填国际版账号的凭证。若你是用 Zai / Google 账号登录国际版客户端的，可直接用上方「网页登录」或下方「导入桌面端登录态」。',
+      // ── OAuth 网页登录：国际版**唯一**的登录方式 ──────────────
+      // 这一家的登录页只渲染 Zai / Google 两个按钮（手机验证码表单被死代码
+      // 消除，已核对构建产物），因此这里把它放在**第一位** —— 用户最该先看到
+      // 的就是官方推荐的那条路。
+      //
+      // 与另外五家的网页登录差别：授权地址前有一次**强制风控验证码**
+      // （阿里云滑块），必须在浏览器里跑完才能拿地址，因此点按钮后会先在
+      // 本弹窗里弹滑块（见 ui/autoclaw-oauth.js 的文件头）。
+      //
+      // 「打开方式」这一级与另外四家同款（见 `modes`）。
+      oauthLogin: {
+        title: '网页登录（Zai / Google）',
+        noteHtml: '用你的 Zai 或 Google 账号登录 AutoClaw <strong>国际版</strong>：'
+          + '点下方按钮后先完成一次滑块验证（官方要求的风控步骤），'
+          + '随后会打开官方登录页，登录完成即自动添加账号。'
+          + '<br>这是国际版官方唯一的登录方式；若你已在客户端登录过，'
+          + '用「导入桌面端登录态」更快。',
+        // ── 两种打开方式（与 CatPaw / Qoder / Cline 同一级）──────
+        // 回调落在本机网关的 loopback 端口（见后端 oauth.rs 的模块头），
+        // 与浏览器在哪无关，因此两条路都走得通：
+        //   · 内嵌窗口每次用**全新的临时环境**，连着加多个账号互不影响；
+        //   · 系统浏览器复用你已登录的 Zai / Google 账号 —— Google 在部分
+        //     环境下会拒绝内嵌窗口登录，那条路走不通时用它兜底。
+        modes: [
+          {
+            value: 'embedded',
+            label: '内嵌窗口（推荐）',
+            hint: '将打开内嵌窗口完成官方登录，登录完成后自动加入账号列表。'
+              + '关掉窗口即取消等待（Google 账号若在此被拒，改用「系统浏览器」）',
+          },
+          {
+            value: 'external',
+            label: '系统浏览器',
+            hint: '将用系统默认浏览器打开官方登录页（会复用浏览器里已登录的 '
+              + 'Zai / Google 账号）；完成登录后自动加入账号列表，关掉弹窗即取消等待',
+          },
+        ],
+      },
+      fields: [
+        { key: 'token', label: 'token', rows: 3, placeholder: '明文 JWT（国际版账号的 access token）' },
+        { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: '没有则无法自动续期' },
+        { key: 'deviceId', label: 'deviceId', optional: true, placeholder: '可选，续期时带上' },
+        { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空则用 userId' },
+      ],
+      // 桌面端登录态导入：**两个地区都给**。
+      //
+      // ── 为什么不再对国际版收起（本次修正）──────────────────────
+      // `%APPDATA%/AutoClaw/auth.json` 里没有地区标记，两个构建共用同一个
+      // 目录 —— 这一点没变，但**结论要反过来**：正因为本机判断不了，才更该
+      // 让用户自己选。他在哪一项下点导入，就得到哪一家的账号；猜错的后果是
+      // 上游 401（可见的失败），换一项重导即可。
+      //
+      // 更要紧的是：国际版客户端的**主登录方式是 Zai / Google OAuth**，
+      // 而当时那条链路网关走不通（强制风控验证码，见后端 login.rs 的模块头），
+      // 于是「从客户端导入」几乎是 OAuth 用户唯一实用的入口。收起它等于
+      // 把最需要这条路的人挡在外面。
+      //
+      // OAuth 现已接上（上方那一项），导入不再是唯一入口 —— 但它照旧两个地区
+      // 都给：它不需要过一次验证码，是一条独立可用的路径。
+      desktopNote: '读本机 AutoClaw 客户端当前的登录态（%APPDATA%/AutoClaw/auth.json，DPAPI + AES-GCM 解密）建一个「桌面端实时登录态」账号：凭证不落账号文件、每次实时读取（删掉这条记录不影响客户端登录态）。用 Zai / Google 账号登录国际版客户端的用户走这一条。',
+      desktopHint: '读取 %APPDATA%/AutoClaw/auth.json 并解密，仅 Windows',
       desktopWindowsOnly: true,
     },
     window.wbQoderAddForm,
@@ -249,10 +329,19 @@
    * `${provider}-${id}-block`。
    *
    * 露出哪些项由 methodsOf 按各家配置裁剪：手机验证码登录只给配了 `smsLogin`
-   * 的家（AutoClaw）且排在最前 —— 它是那一家唯一走得通的官方登录方式，用户
-   * 最该先看到它；网页登录只给支持它的家；桌面端导入只给 desktop !== false 的家。
+   * 的家（当前只有 AutoClaw **国内版** —— 国际版那条入口已移除，它只有 OAuth
+   * 网页登录）；网页登录只给支持它的家；桌面端导入只给 desktop !== false 的家。
+   *
+   * ── `oauth` 为什么单独一项（不并进「网页登录」）──────────────
+   * 对用户来说两者都是「跳去官方页面登录」，但**交互不同**：网页登录点一下就
+   * 开窗口（等待态由 web-login.js 统一管），而 AutoClaw 国际版要先在**本弹窗
+   * 里弹一个阿里云滑块**让用户拖完，才能拿到授权地址（见 ui/autoclaw-oauth.js
+   * 的文件头）。并进网页登录那一段会让那个引擎多出「有些家要先跑一段验证码」
+   * 的分支，而两者的发起时序（验证码在前 / 窗口在前）与按钮布局都不一样
+   * （这一项是两个变体各一个按钮）。因此各占一项。
    */
   const ADD_METHODS = [
+    { id: 'oauth', label: '网页登录（Zai / Google）', oauthOnly: true },
     { id: 'sms', label: '手机验证码登录', smsOnly: true },
     { id: 'web', label: '网页登录', webOnly: true },
     { id: 'manual', label: '填写凭证' },
@@ -262,6 +351,7 @@
   const regionOf = config => segValueOf($(`${prefixOf(config)}-region-seg`))
     || config.regionOptions?.[0]?.value;
   const methodsOf = config => ADD_METHODS.filter(method => {
+    if (method.id === 'oauth') return Boolean(config.oauthLogin);
     if (method.id === 'sms') return Boolean(config.smsLogin);
     if (method.id === 'web') return config.webLogin
       && (!config.webLogin.region || regionOf(config) === config.webLogin.region);
@@ -349,6 +439,8 @@
           aria-label="${esc(config.label)} 账号的添加方式">${methodItems}</div>
       </div>
 
+      ${oauthLoginBlockOf(config)}
+
       ${smsLoginBlockOf(config)}
 
       ${webLoginBlockOf(config)}
@@ -395,7 +487,56 @@
   }
 
   /**
-   * 手机验证码登录那一段（只有配了 `smsLogin` 的家生成，当前只有 AutoClaw）。
+   * OAuth 网页登录那一段（只有配了 `oauthLogin` 的家生成，当前只有 AutoClaw 国际版）。
+   *
+   * ── 与 `webLoginBlockOf` 的两处结构差别 ──────────────────────
+   *   1. **两个按钮**（Zai / Google）：上游是两个独立端点、两套账号体系，
+   *      不能用一个按钮加一个下拉 —— 用户点的那个账号在哪个体系里，只有他知道；
+   *   2. **hint 由引擎按阶段改写**：验证码那一段在弹窗里（「请在弹出的滑块中
+   *      完成验证」），拿到地址之后才进入等窗口/浏览器 —— 而 `webLoginBlockOf`
+   *      的 hint 只在打开方式变化时改一次。这里给的初值仍是「打开方式对应的
+   *      空闲文案」，流程结束后引擎会恢复成它（见 autoclaw-oauth.js 的 hint）。
+   *
+   * 「打开方式」这一级与网页登录那一段同款（`.add-sub`）：两条路的回调都落在
+   * 本机网关，与浏览器在哪无关，因此都走得通；内嵌窗口用全新临时环境，
+   * 系统浏览器复用已有的 Zai / Google 登录态。
+   *
+   * 交互本身在 ui/autoclaw-oauth.js（含阿里云验证码的移植），本文件只拼 DOM
+   * 与交出回调 —— 与 smsLogin / webLogin 同一分工。
+   */
+  function oauthLoginBlockOf(config) {
+    if (!config.oauthLogin) return '';
+    const prefix = prefixOf(config);
+    const oauth = config.oauthLogin;
+    const modes = oauth.modes?.length ? oauth.modes : [];
+    const modeSeg = modes.length
+      ? `<div class="add-sub">
+          <span class="detail">打开方式</span>
+          <div class="seg" id="${prefix}-oauth-mode" role="radiogroup"
+            aria-label="${esc(config.label)} 网页登录的打开方式">${modes.map((mode, index) =>
+    `<button type="button" class="seg-item${index ? '' : ' active'}" data-value="${esc(mode.value)}"`
+    + ` role="radio" aria-checked="${index ? 'false' : 'true'}"`
+    + ` tabindex="${index ? '-1' : '0'}">${esc(mode.label)}</button>`).join('')}</div>
+        </div>`
+      : '';
+    return `<div class="modal-section" id="${prefix}-oauth-block" hidden>
+        <h3>${esc(oauth.title || '网页登录')}</h3>
+        <p>${oauth.noteHtml || ''}</p>
+        ${modeSeg}
+        <div class="field-row">
+          <button id="${prefix}-oauth-zai" class="primary">使用 Zai 账号登录</button>
+          <button id="${prefix}-oauth-google">使用 Google 账号登录</button>
+          <button id="${prefix}-oauth-cancel" style="display:none">取消等待</button>
+        </div>
+        <div class="field-row">
+          <span class="detail" id="${prefix}-oauth-hint">${esc(modes[0]?.hint || oauth.hint || '')}</span>
+        </div>
+      </div>`;
+  }
+
+  /**
+   * 手机验证码登录那一段（只有配了 `smsLogin` 的家生成，当前只有 AutoClaw
+   * **国内版** —— 国际版那条入口已移除，它只有 OAuth 网页登录）。
    *
    * ── 为什么它不是「网页登录」的一种形态 ───────────────────────
    * 网页登录的交互是「开窗口 → 用户在官方页面上操作 → 网关等回调」，因此复用了
@@ -405,6 +546,9 @@
    *
    * 「获取验证码」与「登录」是两个按钮：发码是个独立的用户动作（要等短信到达），
    * 合并成一个按钮就得替用户猜「这次点的是发码还是登录」。
+   *
+   * 手机号形态因此只有国内那一种（`1[2-9]` 开头 11 位）—— 国际版曾在同一段里
+   * 走 6-15 位的宽松规则，那条分支随入口一起删掉了（见 sms-login.js 的说明）。
    */
   function smsLoginBlockOf(config) {
     if (!config.smsLogin) return '';
@@ -749,6 +893,47 @@
     });
   }
 
+  /**
+   * AutoClaw 国际版的 OAuth 网页登录：把配置与收尾交给 ui/autoclaw-oauth.js
+   * （DOM 已由 `oauthLoginBlockOf` 拼好）。与另外两套同一分工 —— 本文件只回答
+   * 「这一家有这条链路时把 DOM 与回调交出去」，交互（验证码 SDK、登录窗口、
+   * 取消）都在那个文件里。
+   *
+   * ── 交给引擎的三样东西 ─────────────────────────────────────
+   *   · `mode`：「打开方式」分段控件**现读**（惰性函数而不是快照值）——
+   *     用户可能在发起之前来回切换，快照会让最后一次切换不生效；
+   *   · `hint`：当前打开方式对应的空闲提示，引擎在流程结束与切换打开方式时
+   *     用它恢复那一行文案（流程中的阶段提示由引擎自己写，见那个文件的说明）；
+   *   · `cancelId`：「取消等待」按钮。系统浏览器模式下没有可关的窗口，
+   *     没有它就只能靠关弹窗取消（另外几家的 external 都有这个按钮）。
+   *
+   * `onSuccess` 复用 afterAdd：那条链最终也是往账号库里加一条记录，收尾逻辑
+   * 与「填写凭证」「手机验证码」没有理由分三套（响应形状由后端统一）。
+   */
+  function mountOauthLogin(config) {
+    if (!config.oauthLogin) return;
+    const prefix = prefixOf(config);
+    const oauth = config.oauthLogin;
+    const modeSeg = $(`${prefix}-oauth-mode`);
+    const modeOf = () => segValueOf(modeSeg) || oauth.modes?.[0]?.value || 'embedded';
+    const hintOf = () => oauth.modes?.find(mode => mode.value === modeOf())?.hint
+      || oauth.hint || '';
+    const controller = window.wbAutoclawOauth?.create({
+      provider: config.provider,
+      mode: modeOf,
+      hint: hintOf,
+      cancelId: `${prefix}-oauth-cancel`,
+      // 不传账号名：这条链的账号由**网关侧**在回调里落库（壳只回 `{ok:true}`，
+      // 拿不到账号记录），传 provider 名当 name 会得到
+      // 「AutoClaw 国际版账号已添加：AutoClaw 国际版」这种同义重复。
+      // 账号名由 `afterAdd` 里的列表刷新显示。
+      onSuccess: () => afterAdd('', config.label),
+    });
+    // 切换打开方式只影响文案（两个变体按钮、方式列表与所选方式都不变）
+    bindSeg(modeSeg);
+    modeSeg?.addEventListener(SEG_EVENT, () => controller?.syncTexts());
+  }
+
   /** 「登录态文件在哪」的提示：点一下把路径显示在旁边（不打开文件管理器，只给地址） */
   function showRaccoonHint(event) {
     event.preventDefault();
@@ -784,6 +969,7 @@
     $(`${prefix}-desktop-button`)?.addEventListener('click', () => addProviderDesktop(config));
     mountWebLogin(config);
     mountSmsLogin(config);
+    mountOauthLogin(config);
   }
   document.addEventListener('click', event => {
     if (event.target.closest('[data-raccoon-hint]')) showRaccoonHint(event);

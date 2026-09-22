@@ -60,18 +60,46 @@ use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{pick_token, token_tail_of, truncate_chars};
-use crate::server::core::account_store::{CredentialWrite, MAX_ACCOUNTS, MAX_TOKEN_LENGTH};
-use crate::server::core::providers::autoclaw::{credentials, crypto};
-use crate::server::core::providers::{kind_id, ProviderKind};
+use crate::server::core::account_store::{is_autoclaw_family, CredentialWrite, MAX_TOKEN_LENGTH};
+use crate::server::core::providers::autoclaw::{credentials, crypto, Region};
 use crate::server::logging;
 
-/// AutoClaw 的 provider id（`providers::kind_id` 的常量形态，避免每处都调函数）
-fn autoclaw_id() -> &'static str {
-    kind_id(ProviderKind::AutoClaw)
+/// 按地区取 provider id（国内版 `autoclaw` / 国际版 `autoclaw-intl`）。
+///
+/// **不要**再另写一个不带参数的 `autoclaw_id()`：所有判定都必须按地区分派
+/// （两个地区的账号集合是分开的），留一个「默认国内版」的便捷函数只会让
+/// 新代码顺手用它、然后在国际版上静默失配。函数体走注册表，不存在第二份 id 清单。
+fn autoclaw_id_for(region: Region) -> &'static str {
+    region.provider_id()
 }
 
-/// 桌面端实时登录态账号的固定 id（见模块头的「有意偏离」第 2 条）
+/// 桌面端实时登录态账号的固定 id（见模块头的「有意偏离」第 2 条）—— **国内版**。
+///
+/// 国际版的对应 id 见 [`desktop_account_id`]：两地**必须不同**。那个文件两地
+/// 共用（`%APPDATA%/AutoClaw/auth.json`，没有地区标记），但账号记录是两条
+/// 独立的记录、各归各的 provider；若用同一个 id，第二次导入会撞上存储层的
+/// 跨 provider 保护而报错（「账号 id 已被 xxx 账号占用」），两地也就无法并存。
 pub const DESKTOP_ACCOUNT_ID: &str = "autoclaw-desktop";
+
+/// 国际版桌面端账号的固定 id（[`DESKTOP_ACCOUNT_ID`] 的国际版对应值）。
+///
+/// `pub` 而不是私有：账号迁移的「保留 id」清单要列出它
+/// （`account_transfer::identity::RESERVED_DESKTOP_IDS`）——
+/// 漏了它，这条桌面端记录就能被当成普通账号导入，然后因为「不落 token」
+/// 而永远 `available: false`。
+pub const INTL_DESKTOP_ACCOUNT_ID: &str = "autoclaw-intl-desktop";
+
+/// 按地区取桌面端账号的固定 id。
+///
+/// 国内版保持历史值 `autoclaw-desktop`（存量记录的 id，不能变）；
+/// 国际版用 `autoclaw-intl-desktop`。与 [`autoclaw_id_for`] 同一手法 ——
+/// 一切按地区分派，不提供「默认国内版」的便捷写法。
+fn desktop_account_id(region: Region) -> &'static str {
+    match region {
+        Region::Cn => DESKTOP_ACCOUNT_ID,
+        Region::Intl => INTL_DESKTOP_ACCOUNT_ID,
+    }
+}
 
 /// 备注名长度上限（原项目 `name.trim().slice(0, 100)`）
 const MAX_NAME_LENGTH: usize = 100;
@@ -92,9 +120,9 @@ impl AccountStore {
     /// 为什么返回原始 JSON 而不是公开形态：适配器的 `resolve_credentials` 需要
     /// 把记录交给凭证层（`credentials::snapshot_for`），而公开形态按设计只有
     /// `tokenTail`（见 `to_autoclaw_public_account`）。
-    pub fn autoclaw_account_record(&self, account_id: &str) -> Option<Value> {
+    pub fn autoclaw_account_record(&self, region: Region, account_id: &str) -> Option<Value> {
         let _guard = self.guard();
-        let autoclaw = autoclaw_id();
+        let autoclaw = autoclaw_id_for(region);
         if !account_id.is_empty() {
             // 按 id 直查一行（不读别家、也不读其余 AutoClaw 账号）
             let record = self.record_by_id(&_guard, account_id)?;
@@ -129,9 +157,11 @@ impl AccountStore {
     /// 他人记录（与另外三家同一策略）。
     pub fn add_autoclaw_account(
         &self,
+        region: Region,
         payload: &Value,
         name: Option<&str>,
     ) -> Result<Value, AccountStoreError> {
+        let autoclaw = autoclaw_id_for(region);
         let Some(object) = payload.as_object() else {
             return Err(AccountStoreError::new("上传内容必须是 JSON 对象", 400));
         };
@@ -157,7 +187,7 @@ impl AccountStore {
         // （401 = 拿不到可用凭证），而这里是一次「上传账号」的管理动作 ——
         // 失败原因是用户给的内容，400 才与另外三家添加路径一致
         // （400 也让前端的报错提示走「参数问题」而不是「需要重新登录」）。
-        let parsed = credentials::credentials_from_record(payload)
+        let parsed = credentials::credentials_from_record(payload, region)
             .map_err(|error| AccountStoreError::new(error.message, 400))?;
         if parsed.user_id.is_empty() {
             return Err(AccountStoreError::new(
@@ -171,27 +201,20 @@ impl AccountStore {
         let device_id = truncate_chars(&parsed.device_id, MAX_IDENTITY_LENGTH);
 
         let _guard = self.guard();
-        let id = format!("user-{user_id}");
+        // id 前缀按地区给：国内版保持裸 `user-`（存量账号的 id 就长这样），
+        // 国际版带 `intl-` 前缀 —— 两地的 userId 可能撞，前缀让它们天然不相交
+        // （完整理由见 `Region::account_id_prefix`）。
+        let id = format!("{}{user_id}", region.account_id_prefix());
         // 只读这一行（不再读全量）：既有记录决定「更新还是新建」与多处沿用值
         let existing = self.record_by_id(&_guard, &id);
         if let Some(existing) = existing.as_ref() {
             let existing_provider = existing.provider();
-            if existing_provider != autoclaw_id() {
+            if existing_provider != autoclaw {
                 return Err(AccountStoreError::new(
                     format!(
                         "账号 id「{id}」已被{existing_provider}账号占用，无法添加同一 userId 的\
                          AutoClaw 账号（请先处理那个账号）"
                     ),
-                    400,
-                ));
-            }
-        }
-        if existing.is_none() {
-            // 上限判定查投影列（COUNT），不把记录读出来数
-            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
-            if total as usize >= MAX_ACCOUNTS {
-                return Err(AccountStoreError::new(
-                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
                     400,
                 ));
             }
@@ -224,7 +247,7 @@ impl AccountStore {
         let now = logging::now_ms();
         let mut record = Map::new();
         record.insert("id".to_string(), Value::String(id.clone()));
-        record.insert("provider".to_string(), Value::String(autoclaw_id().to_string()));
+        record.insert("provider".to_string(), Value::String(autoclaw.to_string()));
         record.insert("name".to_string(), Value::String(record_name.clone()));
         record.insert("userId".to_string(), Value::String(user_id.clone()));
         if !device_id.is_empty() {
@@ -317,35 +340,45 @@ impl AccountStore {
     /// 这是用户点按钮时的即时反馈，静默建一条空记录只会让人以为成功了。
     pub fn import_autoclaw_desktop_account(
         &self,
+        region: Region,
         source: &str,
     ) -> Result<Value, AccountStoreError> {
-        let summary =
-            credentials::local_summary().map_err(|reason| AccountStoreError::new(reason, 400))?;
+        let autoclaw = autoclaw_id_for(region);
+        // ── 桌面端登录态文件没有地区标记（一次真实的歧义，这里不猜）────
+        // `%APPDATA%/AutoClaw/auth.json` 里只有 `{deviceId, updatedAt, userInfo,
+        // token, refreshToken}`，**没有**任何地区字段；两个构建的 Electron
+        // 应用名都是 `autoclaw`、userData 也是同一个目录（实测 inode 相同）。
+        // 也就是说这个文件属于哪个地区，只取决于用户装的是哪个构建。
+        //
+        // 因此**地区由用户选的那一项决定**，本函数不替他判断：他在「国内版」
+        // 区块点导入，就得到一条国内版账号；在国际版区块点，就得到国际版账号。
+        // 这是唯一诚实的做法 —— 本机无从判断，而用户自己知道装的是哪个客户端。
+        //
+        // 猜错的后果是**可见的**而不是静默的：凭证与域名不匹配时上游直接 401，
+        // 用户看到明确的失败，换到另一项重新导入即可。反过来，若在这里替用户
+        // 拒绝（曾经如此），最需要这条路的人反而被挡住 —— 当时国际版的 OAuth
+        // 登录还没接上（那条链路强制风控验证码），「从客户端导入」几乎是 OAuth
+        // 用户唯一实用的入口。OAuth 现已接上（见 `providers::autoclaw::oauth`），
+        // 但导入照旧两个地区都给：它是一条独立可用的路径（不需要过一次验证码），
+        // 没有理由因为「多了 OAuth」就把它收回去。
+        // 本机这份 auth.json 正是一个 OAuth 账号（邮箱有值、手机号为空）。
+        let summary = credentials::local_summary(region)
+            .map_err(|reason| AccountStoreError::new(reason, 400))?;
         let user_id = summary
             .get("userId")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
         let _guard = self.guard();
-        let id = DESKTOP_ACCOUNT_ID.to_string();
+        let id = desktop_account_id(region).to_string();
         let existing = self.record_by_id(&_guard, &id);
         if let Some(existing) = existing.as_ref() {
             let existing_provider = existing.provider();
-            if existing_provider != autoclaw_id() {
+            if existing_provider != autoclaw {
                 return Err(AccountStoreError::new(
                     format!(
                         "账号 id「{id}」已被{existing_provider}账号占用，无法导入 AutoClaw 桌面端登录态"
                     ),
-                    400,
-                ));
-            }
-        }
-        if existing.is_none() {
-            // 上限判定查投影列（COUNT），不把记录读出来数
-            let total = self.with_conn(&_guard, |conn| sql::count_all(conn))?;
-            if total as usize >= MAX_ACCOUNTS {
-                return Err(AccountStoreError::new(
-                    format!("最多保存 {MAX_ACCOUNTS} 个账号"),
                     400,
                 ));
             }
@@ -373,7 +406,7 @@ impl AccountStore {
         let now = logging::now_ms();
         let mut record = Map::new();
         record.insert("id".to_string(), Value::String(id.clone()));
-        record.insert("provider".to_string(), Value::String(autoclaw_id().to_string()));
+        record.insert("provider".to_string(), Value::String(autoclaw.to_string()));
         record.insert("name".to_string(), Value::String(record_name.clone()));
         record.insert("userId".to_string(), Value::String(user_id));
         for (target, key) in [
@@ -448,6 +481,7 @@ impl AccountStore {
     /// 第二次写入。桌面端账号仍然拒绝（它的凭证在 auth.json）。
     pub fn update_autoclaw_account_tokens_if_current(
         &self,
+        region: Region,
         id: &str,
         expected_access_token: &str,
         expected_refresh_token: &str,
@@ -467,8 +501,11 @@ impl AccountStore {
                 "桌面端账号的凭证不落盘（实时读 auth.json 并解密），无需回写".to_string(),
             );
         }
-        if record.provider() != autoclaw_id() {
-            return Err(format!("账号 {id} 不是 AutoClaw 账号"));
+        if record.provider() != autoclaw_id_for(region) {
+            return Err(format!(
+                "账号 {id} 不是 AutoClaw {}账号",
+                region.label()
+            ));
         }
         // 比较：记录里此刻的凭证必须仍是刷新前那份
         if record.access_token() != expected_access_token
@@ -573,10 +610,18 @@ impl AccountStore {
             .to_string();
         let mut available = true;
         let mut reason = String::new();
+        // 桌面端实时登录态只存在于**国内版**（那个文件没有地区标记，见
+        // `providers::autoclaw::credentials::local_credentials`），因此这里只对
+        // 国内版记录去读实时摘要 —— 国际版记录不可能来自那条来源，读它只会
+        // 白跑一次 DPAPI 解密。
         let (token_tail, expires_at, has_refresh) = if record.is_desktop()
-            && record.provider() == autoclaw_id()
+            && is_autoclaw_family(&record.provider())
         {
-            match credentials::local_summary() {
+            // 地区取记录自己的 provider：桌面端登录态文件两地共用，
+            // 实时摘要必须按这条记录所属的那一家去解析（否则国际版记录会拿到
+            // 国内版域名的凭证 —— 见 credentials.rs 的缓存键说明）
+            let record_region = Region::from_provider_id(&record.provider()).unwrap_or(Region::Cn);
+            match credentials::local_summary(record_region) {
                 Ok(summary) => {
                     let live_user = summary
                         .get("userId")

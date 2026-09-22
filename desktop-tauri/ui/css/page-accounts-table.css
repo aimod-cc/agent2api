@@ -10,12 +10,18 @@
    状态列就被推走）；而账号列是唯一内容长度不可控的（昵称 / uid / 邮箱），
    只有它该参与伸缩。
 
-   预算：九个固定列合计 938px
-   （26 + 132 + 132 + 56 + 80 + 148 + 80 + 84 + 200，逐列见下方声明）。
+   预算：十个固定列合计 1094px
+   （26 + 132 + 132 + 156 + 56 + 80 + 148 + 80 + 84 + 200，逐列见下方声明）。
    默认窗口 1060px 时列表可用宽度约 791px，也就是说**默认窗口下这张表横向滚动**，
    账号列拿到的是它的最小值而不是「剩余宽度」。这是有意的：
    表格**不压缩列宽**（见下），宁可横滚也不把行内按钮折成两行、
    把优先级控件挤到点不准。拉宽窗口或拖窄某几列之后，账号列才开始吃剩余空间。
+
+   **本次新增了代理列（156px）**，min-width 同步从 900 提到 1056（= 900 + 156）：
+   这个值是「表格不能再窄」的底线，而它必须随列数走 —— 不动它的话，多出来的一列
+   会按比例从**所有**列（含操作列那四颗按钮）身上扣，正是上面那条「宁可横滚」要
+   避免的事。想收回这 156px 的用户可以在列设置里把代理列关掉或拖窄
+   （列的显隐与顺序都是用户可调的，见 table-col-settings.js）。
 
    固定列里最贵的是操作列 200px：那是「已签到 / 余额 / 设置 / ⋯」
    四颗按钮并排的最坏情况（按 11.5px 字号逐颗算出来的，算式见那条声明）。
@@ -42,8 +48,8 @@
        这类文案长度不可控，84px 下仍按省略号收口、完整值在 title 里 ——
        这一列现在没有任何可点控件，它的全部职责就是「一眼看出还剩多少」。
 
-   最小窗口 820px 时（侧栏已收到 68px）可用宽度约 699px，按下面 900px 的
-   最小宽度横向滚动约 200px。
+   最小窗口 820px 时（侧栏已收到 68px）可用宽度约 699px，按下面 1056px 的
+   最小宽度横向滚动约 357px。
 
    注意：这份「预算说明」在历史上曾与 CSS 的实际数值漂移过（注释里写 92/106，
    CSS 里是 132/132）。改动任何一列的默认宽度时**同时**改三处：
@@ -52,7 +58,9 @@
 
 .acct-table {
   width: 100%;
-  min-width: 900px;
+  /* 「不能再窄」的底线：随固定列数走（本次因新增代理列从 900 提到 1056，
+     算式与理由见文件头的列宽预算）。低于它时表格横向滚动，而不是压缩各列 */
+  min-width: 1056px;
   border-collapse: separate;
   /* 列间距归零：border-collapse: separate 是给行首竖条留出绘制空间的
      （border-collapse: collapse 下单元格的定位上下文会被合并掉） */
@@ -112,6 +120,16 @@
 .acct-table td.cell-pick { padding-inline: 0; text-align: center; }
 .cell-priority { width: 132px; }
 .cell-provider { width: 132px; }
+/* 代理列（本次新增）：要放得下「http://127.0.0.1:7890」（约 137px）这类
+   自定义代理的展示名 —— 它比 Clash 那两种（「Clash 混合端口 7890」约 98px、
+   「节点名（:7890）」约 102px）都长，而三者的信息价值一样（都要能一眼读全）。
+   156px 的内容盒是 140px，刚好容得下上面那串最常见的形态；
+   更长的节点名由省略号收口、完整值进 title（与账号列同一手法）。 */
+.cell-proxy { width: 156px; }
+/* 表头与单元格一起居中：整格是一颗按钮，居中之后与相邻的读数列（有效期 / 余额）
+   在同一条中轴上，扫读时不会忽左忽右 */
+.acct-table th.cell-proxy,
+.acct-table td.cell-proxy { text-align: center; }
 .cell-connections { width: 56px; }
 /* 表头与单元格一起居中：数字居中而标题左对齐时，视线要从标题左端跳到格子中央 */
 .acct-table th.cell-connections,
@@ -136,6 +154,7 @@
 
 .acct-row .cell-account,
 .acct-row .cell-priority,
+.acct-row .cell-proxy,
 .acct-row .cell-usage,
 .acct-row .cell-actions { min-width: 0; }
 
@@ -244,10 +263,43 @@
 }
 
 .acct-sub > span { flex: 0 0 auto; }
-/* 代理名长度不可控（用户在设置里自由填），由它参与收缩并加省略号；
-   uid / 尾号是定长标识，压窄了反而读不全 */
-.acct-sub .proxy { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--info); }
-.acct-sub .sep { opacity: .5; }
+
+/* ─── 代理列（本次新增）───
+   整格是一颗按钮（点击打开账号设置里的代理表单，见 accounts-table.js 的 proxyCell）。
+   做成「chip」而不是实心按钮：这一列绝大多数时候是**读数**（走哪个出口），
+   只有想改的时候才点 —— 做成实心按钮会让整列看起来全是主操作，
+   与相邻的读数列（有效期 / 余额 / 连接数）格格不入。
+   边框默认透明、悬停才显形：静态时它读起来就是一段文本，指上去才提示「这里能点」。 */
+.proxy-cell {
+  display: inline-block;
+  vertical-align: middle;
+  max-width: 100%;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: none;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--text-2);
+  cursor: pointer;
+  /* 省略号三件套：display 必须是 inline-block（button 的默认值就是，显式写出来
+     是因为文本溢出只在块级 / inline-block 的盒上生效，将来有人改成 flex 布局
+     会让省略号静默失效） */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 悬停用 surface-3 而不是 --row-hover：整行悬停时行底色就是 --row-hover
+   （= surface-2），chip 再用同一个值等于没有任何反馈 */
+.proxy-cell:hover { border-color: var(--border); background: var(--surface-3); }
+/* 直连：中性色（它不是异常，只是没有配置） */
+.proxy-cell.none { color: var(--text-3); }
+/* 已配置：info 色 —— 与账号列原先那句「代理 xxx」同色，换列不换语义 */
+.proxy-cell.on { color: var(--info); }
+/* 解析失败：红字。转发会回退直连，属于要留意但不阻断的情况（账号列的
+   异常说明里还有一份带原因的，两处都指向同一个修复入口） */
+.proxy-cell.bad { color: var(--danger); }
 
 /* 健康说明（限流恢复时间 / 代理不可用）：只在异常时出现，正常行不留空行 */
 .acct-note {

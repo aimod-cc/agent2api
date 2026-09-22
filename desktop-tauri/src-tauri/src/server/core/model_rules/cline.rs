@@ -14,6 +14,8 @@
 
 use super::*;
 
+use crate::server::core::providers::cline::models::{friendly_alias, Pool};
+
 /// Cline 清单的**默认映射种子**（按池调用，两家各跑一遍）。
 ///
 /// ── 为什么要映射（而不是在转发时剥前缀）─────────────────────
@@ -24,11 +26,19 @@ use super::*;
 /// 自动配一条 `deepseek-v4.1-flash → cline-free/deepseek-v4.1-flash` 的别名，
 /// 两种名字都能用。
 ///
+/// ── 免费池的裸 id 也建映射（本次修复）───────────────────────
+/// 免费组里有两条不带通道前缀的条目（`z-ai/glm-5.3-flash`、
+/// `poolside/laguna-s-2.1:free`），它们同样该有能直接敲的短名字。剥什么由
+/// [`friendly_alias`] 按池给出：免费池的裸 id 剥**厂商前缀**（那是承载方，
+/// 与通道前缀同层含义），`recommended` 组的 `openai/gpt-6-astra` 则不剥
+/// （那里厂商前缀是模型身份）。撞上别家原生 id（`glm-5.3-flash` 也是 CatPaw
+/// 的模型名）**不回避**：同一对外名由多家承载正是主备路由的常态。
+///
 /// ── 三条纪律（与小浣熊种子同构）─────────────────────────────
 ///   1. **幂等**：处理过的 `(provider, id)` 记入 `seeded`，用户事后删掉这条自动
 ///      映射不会被下一次刷新改回来；
 ///   2. **不抢别名**：alias 已被别的映射占用 → 跳过；
-///   3. **不与上游 id 撞名**：alias 与清单里任何上游 id 同名 → 跳过。
+///   3. **不与上游 id 撞名**：alias 与**本池**清单里任何上游 id 同名 → 跳过。
 ///      **本家会撞**：`deepseek-v4.1-flash` 两池都有，而**两池现在是两家
 ///      provider** —— `has_alias` 是「任何人占用都不动」，所以先跑种子的那家
 ///      拿到短名，另一家只记 seeded、不建映射。没拿到的那家由
@@ -50,6 +60,11 @@ pub fn seed_cline_defaults(provider: &str, ids: &[String]) -> Option<String> {
     let mut rules = current();
     let seeded_before = rules.seeded.len();
     let mut mappings_added: Vec<String> = Vec::new();
+    // 本家是哪个池：友好名的判据要用它（免费池的裸 id 要剥厂商前缀，见
+    // `models::friendly_alias`）。查不出池（不该发生：调用方传的就是两个池的
+    // provider id）时按订阅池处理 —— 那是最保守的一支（不剥任何前缀）。
+    let pool = crate::server::core::providers::cline::models::Pool::from_provider_id(provider)
+        .unwrap_or(Pool::Pass);
     for id in ids {
         let id = id.trim();
         if id.is_empty() {
@@ -65,8 +80,10 @@ pub fn seed_cline_defaults(provider: &str, ids: &[String]) -> Option<String> {
             continue;
         }
         rules.seeded.push(format!("{provider}:{id}"));
-        // 无池前缀的条目（`openai/gpt-6-astra` 那类）本身就是友好名，不需要映射
-        let Some(alias) = strip_cline_pool_prefix(id) else {
+        // 剥出友好名：带通道前缀的剥通道前缀，免费池的裸 id 剥厂商前缀
+        // （`z-ai/glm-5.3-flash` → `glm-5.3-flash`）。上游本来就给的友好名
+        // 与「不该剥」的条目（`openai/gpt-6-astra` 那类）返回 None，不建映射。
+        let Some(alias) = friendly_alias(pool, id) else {
             continue;
         };
         if alias.is_empty() || !alias_valid(alias) {
@@ -75,6 +92,11 @@ pub fn seed_cline_defaults(provider: &str, ids: &[String]) -> Option<String> {
         // 纪律 2 + 3：别名被占用或与任何上游 id 同名 → 只记 seeded。
         // `has_alias` 是「任何人占用都不动」—— 于是两池同名时先跑的池拿到别名；
         // 没拿到的池由 `EXTRA_ALIASES` 点名补上（不受此限制）。
+        //
+        // **纪律 2 只挡映射占用，不挡别家的原生 id**：`glm-5.3-flash` 同时是
+        // CatPaw / AutoClaw 的原生模型名，那不妨碍这里给它建别名 ——
+        // 同一对外名由多家承载正是本项目主备路由的常态（见 `model_rules` 模块头），
+        // 候选链会把两家一起列上，谁先谁后按账号优先级走。
         if rules.has_alias(alias)
             || ids.iter().any(|other| other.eq_ignore_ascii_case(alias))
         {
@@ -107,29 +129,6 @@ pub fn seed_cline_defaults(provider: &str, ids: &[String]) -> Option<String> {
         "🧩 Cline 模型默认映射: [{}]",
         mappings_added.join(", ")
     ))
-}
-
-/// 剥掉 Cline 的**池前缀**（`cline-free/` / `cline-pass/`），返回对下游的友好名。
-///
-/// 无池前缀时返回 `None`（不需要映射）—— 注意与「剥完是空串」是两回事：
-/// `cline-free/` 这种畸形 id 会剥出空串，由调用方按 `alias_valid` 挡掉。
-///
-/// ── 为什么不剥 `openai/` 这类厂商前缀 ────────────────────────
-/// 那是**模型身份**（`openai/gpt-6-astra` 与 `anthropic/claude-opus-5` 是不同
-/// 模型），而 `cline-free/` / `cline-pass/` 是**同一模型的两个计费通道**。
-/// 剥掉通道前缀才得到用户认得的名字；剥掉厂商前缀会造出上游不存在的名字，
-/// 还让两家的同名模型更容易撞车。
-///
-/// ── `cline-cloud/` 也剥（防御性）────────────────────────────
-/// 那个池当前不收录（实测未开通 403，见 `providers::cline::models` 的模块头），
-/// 但清单万一混进来也要能给出友好名，不该让它以完整形态污染对外目录。
-fn strip_cline_pool_prefix(id: &str) -> Option<&str> {
-    for prefix in ["cline-free/", "cline-pass/", "cline-cloud/"] {
-        if let Some(rest) = id.strip_prefix(prefix) {
-            return Some(rest);
-        }
-    }
-    None
 }
 
 // ─── Cline 拆分为两家 provider 的存量键迁移 ──────────────────

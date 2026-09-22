@@ -2,10 +2,9 @@
 //!
 //! ── 为什么单独一层 ──────────────────────────────────────────
 //! 改造前账号数据在 `{config_dir}/accounts.json`：每次读写都是「整份 JSON 解析 →
-//! 内存里改一条 → 整份重新序列化写回」。账号上限 20 条（`MAX_ACCOUNTS`），
-//! 单看数据量不大，但「改一个字段要重写整份文件」意味着：改备注名要碰全部账号
-//! 的凭证、一次写盘失败丢掉的是全部账号、且每次读都要把 20 条记录的 JSON
-//! 全部解析一遍（含 rateLimits 这类嵌套结构）。
+//! 内存里改一条 → 整份重新序列化写回」。单看数据量不大，但「改一个字段要重写整份文件」
+//! 意味着：改备注名要碰全部账号的凭证、一次写盘失败丢掉的是全部账号、且每次读都要
+//! 把全部记录的 JSON 全部解析一遍（含 rateLimits 这类嵌套结构）。
 //!
 //! 换到 SQLite 之后，单条增删改只该动**涉及的那一行**。本文件就是这件事的落点：
 //! 把「一行 ↔ `StoredAccount`」的编解码、以及各种按需查询集中在这里，
@@ -69,7 +68,7 @@ fn decode_data(text: &str) -> Option<StoredAccount> {
 ///
 /// 这是「确实需要整份数据」的路径才用的读法：列表快照、导出、启动迁移、
 /// 批量操作、`pick_current` 一类的全局派生。**单条增删改不该用它** ——
-/// 那些路径走 [`load_by_id`] / [`count_except`] / [`priorities_except`]。
+/// 那些路径走 [`load_by_id`] / [`priorities_except`]。
 pub(crate) fn load_all(conn: &Connection) -> rusqlite::Result<Vec<StoredAccount>> {
     let mut stmt = conn.prepare("SELECT data FROM accounts ORDER BY rowid")?;
     let mut rows = stmt.query([])?;
@@ -117,17 +116,7 @@ pub(crate) fn load_by_provider(
     Ok(records)
 }
 
-/// 「除某 id 之外」的账号数 —— 新增路径的 `MAX_ACCOUNTS` 判定用它
-/// （旧代码是 `others.len()`，其中 `others` 排除了同 id 的既有记录）。
-pub(crate) fn count_except(conn: &Connection, id: &str) -> rusqlite::Result<i64> {
-    conn.query_row(
-        "SELECT COUNT(*) FROM accounts WHERE id <> ?1",
-        params![id],
-        |row| row.get(0),
-    )
-}
-
-/// 账号总数 —— `MAX_ACCOUNTS` 上限判定用（各家的添加路径都要问一次）。
+/// 账号总数 —— 统计与管理接口用（如清空前的确认提示）。
 pub(crate) fn count_all(conn: &Connection) -> rusqlite::Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
 }

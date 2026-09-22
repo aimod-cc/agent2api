@@ -1,4 +1,4 @@
-/* Agent2API · 「手机验证码登录」交互引擎（当前只有 AutoClaw 用）
+/* Agent2API · 「手机验证码登录」交互引擎（当前只有 AutoClaw 国内版用）
 
    与小浣熊 / Qoder 的网页登录（web-login.js）是**两套东西**，不要合并：
 
@@ -8,6 +8,8 @@
    上游形态决定了这个差别 —— AutoClaw 国内版没有授权页、没有授权码回调
    （理由见 src-tauri/src/server/core/providers/autoclaw/login.rs 的模块头），
    硬塞进网页登录引擎只会让那边多出一堆「这条路没有窗口也没有 state」的分支。
+   国际版的手机验证码入口已从添加账号弹窗移除（它只有 Zai / Google 网页登录），
+   因此这个引擎现在只服务国内版：手机号规则只有大陆那一种，没有地区分叉。
 
    依赖 app.js 的顶层全局（经典 script 的顶层声明在全局可见）：$ / toast /
    __TAURI_INTERNALS__ 的 api_request。脚本顺序见 index.html：与 web-login.js
@@ -74,7 +76,9 @@
     const request = (path, payload) => {
       const bridge = window.workbuddyDesktop;
       if (path.endsWith('/send') && typeof bridge?.sendSmsCode === 'function') {
-        return bridge.sendSmsCode(payload.phone);
+        // 整个 payload 传过去（不是裸手机号）：`provider` 要一起带上，
+        // 后端按它决定发到哪个地区。桥接层两种入参都收（兼容旧界面）
+        return bridge.sendSmsCode(payload);
       }
       if (path.endsWith('/verify') && typeof bridge?.verifySmsLogin === 'function') {
         return bridge.verifySmsLogin(payload);
@@ -91,7 +95,16 @@
     const phoneOf = () => phoneInput()?.value.trim() || '';
     const codeOf = () => codeInput()?.value.trim() || '';
 
-    /** 手机号 / 验证码的本地校验（与后端同一条正则，先在界面上挡一次） */
+    /**
+     * 手机号 / 验证码的本地校验（与后端同一条规则，先在界面上挡一次）。
+     *
+     * ── 为什么只有国内那一条规则（国际版分支已删）───────────────
+     * 这条链路现在只服务 AutoClaw **国内版**（`1[2-9]` 开头的 11 位大陆号）：
+     * 国际版的手机验证码入口已从添加账号弹窗移除，它的登录方式只有
+     * Zai / Google 网页登录（见 add-provider-forms.js 里那一家的配置）。
+     * 曾经这里按 provider 分叉出 6-15 位的国际规则，随入口一起删掉了 ——
+     * 留着一条永远走不到的分支，只会让「手机号格式不对时该看哪段代码」变模糊。
+     */
     const PHONE_RE = /^1[2-9]\d{9}$/;
     const CODE_RE = /^\d{6}$/;
 
@@ -163,7 +176,9 @@
       if (button) { button.disabled = true; button.textContent = '发送中…'; }
       setHint('');
       try {
-        const data = await request('/api/session/login/sms/send', { phone });
+        // provider 照带：这条链路只服务国内版，但把值显式传上去之后，后端能对
+        // 「传了国际版」的请求给出明确拒绝，而不是静默发到国内版站点去
+        const data = await request('/api/session/login/sms/send', { phone, provider: prefix });
         // ── deviceId 为什么要留住 ─────────────────────────────────
         // 上游把「刚发的这个码」绑在发码时的 device_id 上，登录必须带同一个。
         // 存在这个闭包里而不是每次现取，也不放进模块级状态 —— 它只在这两次
@@ -200,7 +215,7 @@
       if (button) { button.disabled = true; button.textContent = '登录中…'; }
       setHint('');
       try {
-        const payload = { phone, code };
+        const payload = { phone, code, provider: prefix };
         // deviceId 缺省时不传：后端会现生成一个（上游接受「新设备直接登录」），
         // 传空串反而会覆盖掉那个兜底
         if (deviceId) payload.deviceId = deviceId;

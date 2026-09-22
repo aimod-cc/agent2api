@@ -241,6 +241,24 @@ pub async fn login_start(State(state): State<ServerState>, body: Bytes) -> Respo
         return ok_json(json!({ "state": task.state, "authUrl": task.auth_url,
             "edition": task.edition, "provider": "catpaw" }));
     }
+    // AutoClaw：网页登录走**另一条入口**（`/api/session/login/oauth/start`），
+    // 因此这里必须显式挡掉并说清去哪儿 —— 不能让它落到下面的通用分支：
+    // 通用分支会回「这家不支持网页登录」，而国际版**是支持的**，只是发起方式
+    // 不同（它的授权地址要先过一次浏览器端风控验证码，因此由前端拿地址再交壳
+    // 开窗口，见 `providers::autoclaw::oauth` 与 `login.rs` 的
+    // `start_autoclaw_oauth`）。一条「不支持」的文案会把用户引向
+    // 「填写凭证」，而那条路只是绕远，不是必须。
+    if let Some(region) = crate::server::core::providers::autoclaw::Region::from_kind(kind) {
+        let message = if region == crate::server::core::providers::autoclaw::Region::Intl {
+            "AutoClaw 国际版的网页登录需要先完成一次风控验证，请回到「添加账号」弹窗，\
+             用「网页登录（Zai / Google）」发起"
+        } else {
+            // 国内版确实没有 OAuth（上游 `oauth-captcha-config` 返回 enabled:false），
+            // 它的官方唯一登录方式是手机验证码 —— 文案要指向那条
+            "AutoClaw 国内版没有网页授权登录，请改用「手机验证码登录」或「填写凭证」"
+        };
+        return management_error(400, message);
+    }
     if kind != crate::server::core::providers::ProviderKind::WorkBuddy {
         return start_web_login(state, kind).await;
     }
@@ -519,45 +537,76 @@ fn catpaw_callback_page(status: u16, message: &str) -> Response {
 
 // ─── POST /api/session/login/sms/send 与 /verify ────────────
 
-/// 发送短信验证码（**AutoClaw 专用**，手机号验证码登录的第一步）。
+/// 从请求体里读 AutoClaw 地区（`provider` 字段，与 `POST /api/accounts` 同名）。
+///
+/// 缺省与未知值都落**国内版**：与 provider id 的历史口径一致 ——
+/// 老客户端不带这个字段，而那些用户本来就在用国内版。
+/// 用 `Region::from_provider_id` 而不是自己 match 字符串：地区 ↔ id 的映射
+/// 只有 `autoclaw::region` 一份，这里再写一遍就会在加地区时静默漏掉。
+///
+/// 读到国际版**不是**错误：这条链路的入口现在只服务国内版，但拒绝的判定在
+/// 核心层（`providers::autoclaw::login::ensure_sms_region`）—— 让那里返回一条
+/// 「该走哪条路」的人话错误，比在这里静默改成国内版好得多（静默改写的后果是
+/// 用户在国际版弹窗里填的号码被发到另一个站点去，排障时看不出异常）。
+fn autoclaw_region_of(payload: &Value) -> crate::server::core::providers::autoclaw::Region {
+    payload
+        .get("provider")
+        .and_then(Value::as_str)
+        .and_then(crate::server::core::providers::autoclaw::Region::from_provider_id)
+        .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn)
+}
+
+/// 发送短信验证码（**AutoClaw 国内版专用**，手机号验证码登录的第一步）。
 ///
 /// ── 为什么这不是「网页登录」──────────────────────────────────
 /// 另外两家的网页登录形态是「开登录窗口 → 用户登录 → 回调带授权码 → 换凭证」。
-/// AutoClaw 没有这条路（详见 `providers::autoclaw::login` 的模块头：桌面端没有
-/// 公网 Web 应用、账号体系里没有授权码，国内版唯一入口是手机号 + 验证码）。
-/// 因此这里既不开窗口也不起任务，就是**一次同步的上游调用**。
+/// AutoClaw 国内版没有这条路（详见 `providers::autoclaw::login` 的模块头：
+/// 桌面端没有公网 Web 应用、账号体系里没有授权码，它的唯一入口是手机号 +
+/// 验证码；国际版反过来，只有 OAuth 网页登录）。因此这里既不开窗口也不起任务，
+/// 就是**一次同步的上游调用**。
 ///
-/// body `{phone}` → `{deviceId}`。
+/// body `{phone, provider?}` → `{deviceId}`。
 ///
 /// ── 为什么把 deviceId 回给前端 ──────────────────────────────
 /// 上游把「发的这个码」绑在发码时的 device_id 上，登录必须带同一个 ——
 /// 但网关不替用户保存这个中间态（一次登录可以跨多次 HTTP 请求、也可以被用户
 /// 放弃，存在服务端只会多一份要清理的状态）。回给前端让它随下一次请求带回，
 /// 是这里最省事又不丢正确性的做法。
+///
+/// ── 地区从哪来（`provider` 字段）────────────────────────────
+/// 两个地区的接口是**同一个路径、两个站点**，因此「发给哪一家」由请求带上来
+/// （前端把它要添加的那一家的 provider id 原样放进 `provider`，与
+/// `POST /api/accounts` 的字段同名同语义；缺省与未知值落国内版）。
+/// 但**只有国内版能走通**：国际版的手机验证码入口已从界面移除，带国际版进来
+/// 会在核心层被明确拒绝（理由见 `ensure_sms_region`）。
 pub async fn login_sms_send(body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
     let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
-    match crate::server::core::providers::autoclaw::login::send_code(phone).await {
+    let region = autoclaw_region_of(&payload);
+    match crate::server::core::providers::autoclaw::login::send_code(region, phone).await {
         Ok(result) => ok_json(result),
         Err(error) => management_error(error.status_code, error.message),
     }
 }
 
-/// 用手机号 + 验证码登录并**直接落成账号**（AutoClaw 专用）。
+/// 用手机号 + 验证码登录并**直接落成账号**（**AutoClaw 国内版专用**）。
 ///
-/// body `{phone, code, deviceId?, name?}` → `{account, list}` —— 响应形状与
-/// `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，落盘、
-/// 命名、去重、优先级分配全部复用既有的添加路径（`add_autoclaw_account`），
-/// 前端因此可以直接把结果交给同一个「已添加账号」收尾逻辑。
+/// body `{phone, code, deviceId?, name?, provider?}` → `{account, list}` ——
+/// 响应形状与 `POST /api/accounts` **逐字一致**：登录只是另一种拿到凭证的方式，
+/// 落盘、命名、去重、优先级分配全部复用既有的添加路径
+/// （`add_autoclaw_account`），前端因此可以直接把结果交给同一个
+/// 「已添加账号」收尾逻辑。`provider` 的语义见 `login_sms_send`。
 pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> Response {
     let payload = parse_body(&body).unwrap_or(Value::Null);
     let phone = payload.get("phone").and_then(Value::as_str).unwrap_or("");
     let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
     let device_id = payload.get("deviceId").and_then(Value::as_str);
-    let credentials =
-        match crate::server::core::providers::autoclaw::login::login_with_code(phone, code, device_id)
-            .await
-        {
+    let region = autoclaw_region_of(&payload);
+    let credentials = match crate::server::core::providers::autoclaw::login::login_with_code(
+        region, phone, code, device_id,
+    )
+    .await
+    {
             Ok(credentials) => credentials,
             Err(error) => return management_error(error.status_code, error.message),
         };
@@ -576,17 +625,173 @@ pub async fn login_sms_verify(State(state): State<ServerState>, body: Bytes) -> 
                 .map(str::to_string)
         });
     let store = state.store();
-    match store.add_autoclaw_account(&credentials, name.as_deref()) {
+    match store.add_autoclaw_account(region, &credentials, name.as_deref()) {
         Ok(account) => {
             let label = account
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("AutoClaw 账号");
-            logging::log("[Login]", &format!("✅ AutoClaw 登录成功: {label}"));
+            logging::log(
+                "[Login]",
+                &format!("✅ AutoClaw {}登录成功: {label}", region.label()),
+            );
             ok_json(json!({ "account": account, "list": store.list_accounts() }))
         }
         Err(error) => super::accounts::store_error(error),
     }
+}
+
+// ─── AutoClaw OAuth 网页登录（国际版，三段）──────────────────
+
+/// 从请求体里读 OAuth 变体（`vendor` 字段：`zai` / `google`）。
+///
+/// 不认识的值一律 400：**不静默回落**到某一个变体 —— 那会让用户点 Google
+/// 却打开 Zai 的授权页（而两者用的是不同的账号体系，登进去是个陌生账号）。
+fn oauth_vendor_of(payload: &Value) -> Result<crate::server::core::providers::autoclaw::oauth::Vendor, Response> {
+    let raw = payload
+        .get("vendor")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    crate::server::core::providers::autoclaw::oauth::Vendor::from_id(raw)
+        .ok_or_else(|| management_error(400, format!("未知的登录方式「{raw}」（只支持 zai / google）")))
+}
+
+/// `GET /api/session/login/oauth/captcha-config` —— 取风控验证配置。
+///
+/// 前端据此初始化阿里云 SDK（`prefix` / `sceneId` 是 SDK 的必填参数）。
+/// `?provider=` 决定问哪个地区；缺省国内版。
+///
+/// ── 为什么这条单独成一个端点（不塞进 start）──────────────────
+/// 验证码要在**浏览器环境**里跑（SDK 是浏览器端 JS），而 SDK 初始化需要
+/// `prefix` / `sceneId` —— 那两个值只能从上游拿。若把「取配置」与「取授权
+/// 地址」合并成一个请求，就变成「网关先取配置、但它没法自己跑验证码」，
+/// 前端仍然要再发一次请求带验证码回来。分成两步之后，每一步的职责清楚：
+/// 这一步拿配置（无状态、可缓存），下一步拿地址（带验证码）。
+///
+/// `enabled: false`（国内版）不是错误：前端据此不渲染 OAuth 按钮。
+pub async fn login_oauth_captcha_config(body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let region = autoclaw_region_of(&payload);
+    match crate::server::core::providers::autoclaw::oauth::captcha_config(region).await {
+        Ok(config) => ok_json(config),
+        Err(error) => management_error(error.status_code, error.message),
+    }
+}
+
+/// `POST /api/session/login/oauth/start` —— 带验证码参数发起 OAuth 登录。
+///
+/// body `{provider, vendor, captchaVerifyParam}` → `{state, authUrl, provider, edition}`
+/// （与另外几条登录链**同一个响应形状**，前端与壳侧的等待逻辑不必为新家分叉）。
+///
+/// ── 为什么这条不走壳侧的 `start_login` ────────────────────────
+/// 壳侧那条命令的职责是「打开一个窗口去登录」，而这条的前提是「前端已经在
+/// **主窗口里**跑完验证码 SDK 了」（SDK 只能在浏览器环境跑，主窗口就是那个
+/// 环境）。把验证码参数从渲染层传给壳、再让壳回头调网关，等于绕一圈传一个
+/// 不该由壳理解的不透明字符串。因此这条直接是**前端 → 网关**的一跳，
+/// 拿到 authUrl 后由前端交给壳去打开（与其它家最终都由壳开窗口一致）。
+pub async fn login_oauth_start(State(state): State<ServerState>, body: Bytes) -> Response {
+    let payload = parse_body(&body).unwrap_or(Value::Null);
+    let region = autoclaw_region_of(&payload);
+    let vendor = match oauth_vendor_of(&payload) {
+        Ok(vendor) => vendor,
+        Err(response) => return response,
+    };
+    let captcha = payload
+        .get("captchaVerifyParam")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // 回调挂在本网关自己的 loopback 端口上（理由见 `autoclaw::oauth` 模块头：
+    // 上游不校验 navigate_uri 的形态与主机，实测）
+    let callback_base = format!("http://127.0.0.1:{}", state.port);
+    let handle = match state
+        .login()
+        .start_autoclaw_oauth_login(region, vendor, captcha, &callback_base)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(reason) => return management_error(400, reason),
+    };
+    let task = handle.snapshot();
+    ok_json(json!({
+        "state": task.state,
+        "authUrl": task.auth_url,
+        "edition": task.edition,
+        "provider": region.provider_id(),
+    }))
+}
+
+/// `GET /api/session/login/autoclaw-oauth-callback/{vendor}/{state}` —— 浏览器回调。
+///
+/// ── 为什么这条免鉴权（挂 public 组）──────────────────────────
+/// 调用方是**用户的浏览器**（授权页 302 到这里），它当然没有我们的 API Key。
+/// 安全性由一次性 state 承担：它在网关进程内生成、与登录任务一一对应、
+/// 回调时逐字比对（见 `finish_autoclaw_oauth_callback`）。与 CatPaw 那条
+/// loopback 回调同一取舍。
+///
+/// ── 为什么是 GET 且 state 在路径里 ──────────────────────────
+/// 上游在 `navigate_uri` 后面拼 `?code=…&state=…`，是**顶层导航**（浏览器
+/// 直接跳过来）。把变体与 state 放进路径段，就不必猜上游是追加 `?` 还是
+/// `&`（`navigate_uri` 里已经带了查询串时会变成 `&`）—— 我们给上游的
+/// `navigate_uri` 里不带查询串，但让回调的解析不依赖这一点更稳。
+///
+/// 响应是给人看的 HTML（浏览器停在这一页），因此不走 `ok_json` 那套信封。
+pub async fn login_autoclaw_oauth_callback(
+    State(state): State<ServerState>,
+    axum::extract::Path((vendor_id, task_state)): axum::extract::Path<(String, String)>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    use crate::server::core::providers::autoclaw::oauth::Vendor;
+    let Some(vendor) = Vendor::from_id(vendor_id.trim()) else {
+        return oauth_callback_page(400, "登录失败：无法识别的登录方式");
+    };
+    let code = params.get("code").cloned().unwrap_or_default();
+    // 上游在查询串里回的 state —— 换码要用的**是这一个**（不是路径里的 task_state，
+    // 两者是不同的值，见 `finish_autoclaw_oauth_callback` 的说明）
+    let upstream_state = params.get("state").cloned().unwrap_or_default();
+    // 上游把 error 也回在这个查询串里（用户拒绝授权时）
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    match state
+        .login()
+        .finish_autoclaw_oauth_callback(vendor, &task_state, &upstream_state, &code)
+        .await
+    {
+        Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
+        Err(error) => oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message)),
+    }
+}
+
+/// OAuth 回调结果页（浏览器停在它上边，用户看到人话即可）。
+///
+/// 与 `catpaw_callback_page` 同形（不带任何脚本与外链，注入面越小越好），
+/// 但状态码可能是 410（登录上下文已丢失）这类非 200 —— 统一用 `from_u16`
+/// 兜底成 200，避免一个非法状态码让响应构造失败。
+fn oauth_callback_page(status: i32, message: &str) -> Response {
+    use axum::response::IntoResponse;
+
+    let escaped = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    let html = format!(
+        "<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\">\
+         <title>AutoClaw 登录</title></head>\
+         <body style=\"font-family:system-ui,sans-serif;padding:48px;text-align:center\">\
+         <p style=\"font-size:16px\">{escaped}</p></body></html>"
+    );
+    let status = u16::try_from(status)
+        .ok()
+        .and_then(|code| axum::http::StatusCode::from_u16(code).ok())
+        .unwrap_or(axum::http::StatusCode::OK);
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        html,
+    )
+        .into_response()
 }
 
 // ─── POST /api/session/refresh ──────────────────────────────

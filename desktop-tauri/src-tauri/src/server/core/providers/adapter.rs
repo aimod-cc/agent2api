@@ -7,12 +7,15 @@
 //! 只做**协议无关的编排**（去重、逐家轮询、SSE 透传、聚合），
 //! 所有「这一家长什么样」的知识收进各自的适配器 —— 本模块定义的就是那份契约。
 //!
-//! ── 三个动作（语义不得改，架构文档 §4.2 的硬要求）────────────
+//! ── 四个动作（语义不得改，架构文档 §4.2 的硬要求 + 内容拦截一档）──
 //!   1. [`UpstreamErrorClass::QuotaLimited`] → 标记账号对该模型冷却 + 换下一个账号；
 //!   2. [`UpstreamErrorClass::TokenExpired`] → 刷新凭证后**同一账号**重试一次；
-//!   3. [`UpstreamErrorClass::Fatal`]        → 原样透传给客户端。
+//!   3. [`UpstreamErrorClass::ContentBlocked`] → **不罚账号**：换中性提示词后同一
+//!      账号立即重试一次，并触发降级状态机（`core::degrade`；照搬参考项目的
+//!      `ErrContentBlocked` 语义 —— 那是审核误报，不是账号问题）；
+//!   4. [`UpstreamErrorClass::Fatal`]        → 原样透传给客户端。
 //!
-//! 这三档是转发编排唯一认识的错误处理方式，适配器只能在这三档里归类 ——
+//! 这四档是转发编排唯一认识的错误处理方式，适配器只能在这四档里归类 ——
 //! 多出来的分类在编排层没有对应分支，只会静默落进 Fatal，
 //! 等于把「该轮换账号」的错误当成终态发给用户。
 //!
@@ -159,10 +162,24 @@ pub enum UpstreamErrorClass {
         /// 客户端可见的完整文案（`上游返回 401: {上游原文}`）
         message: String,
     },
+    /// 内容策略拦截（HTTP 400 + 审核文案）→ **不罚账号**：换中性提示词后
+    /// 同一账号立即重试一次，并触发降级状态机（见 `core::degrade`）。
+    ///
+    /// 它是「误报」信号而不是账号问题：账号余额健康、未限流、session 未死，
+    /// 换账号再试只会白扔另一个账号的额度（同一份 body 换谁发都会被拦）。
+    /// 判定规则是五家共用的（见 `providers::content_block`），编排层的动作见
+    /// `upstream::provider_loop` 的「动作 0」。
+    ContentBlocked {
+        status: u16,
+        /// 客户端可见的完整文案（含 11-128 之类的 provider 提示）
+        message: String,
+        /// 上游业务码（原样进 GatewayError 的 `upstream_code`）
+        upstream_code: Option<i64>,
+    },
     /// 透传给客户端的错误
     Fatal {
         status: u16,
-        /// 客户端可见的完整文案（含 11128 之类的 provider 提示）
+        /// 客户端可见的完整文案（含 11-128 之类的 provider 提示）
         message: String,
         /// 上游业务码（原样进 GatewayError 的 `upstream_code`）
         upstream_code: Option<i64>,
@@ -802,7 +819,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::WorkBuddy => &super::workbuddy::WORKBUDDY_ADAPTER,
         ProviderKind::Raccoon => &super::raccoon::RACCOON_ADAPTER,
         ProviderKind::CatPaw => &super::catpaw::adapter::CATPAW_ADAPTER,
-        ProviderKind::AutoClaw => &super::autoclaw::adapter::AUTOCLAW_ADAPTER,
+        ProviderKind::AutoClaw => &super::autoclaw::AUTOCLAW_ADAPTER,
+        // AutoClaw 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `autoclaw::adapter` 与 `autoclaw::region` 的模块头）
+        ProviderKind::AutoClawIntl => &super::autoclaw::AUTOCLAW_INTL_ADAPTER,
         ProviderKind::Qoder => &super::qoder::QODER_ADAPTER,
         // Cline 的两个额度池是两个 provider、两个实例（同一份实现的按池
         // 参数化，见 `cline::adapter` 的模块头）
@@ -818,13 +838,18 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 /// 注册表项都在、但适配器是占位」的中间态，那时它**不在本列表里**；
 /// W4b-T-c2 接上真身（`autoclaw::adapter::AUTOCLAW_ADAPTER`）后列入本表 ——
 /// 与 CatPaw 在 W5-T-d4 走过的路径相同。Qoder 也走过同一条路：接入推理转发
-/// 之前它只有账号管理能力，本波次接上真身后列入。**现在七家全部在列表里**，
-/// 与 `PROVIDERS` 的 id 集合一一对应（过渡期的占位实现已在 W6 随
-/// `pending.rs` 删除）。
+/// 之前它只有账号管理能力，本波次接上真身后列入。**现在八家全部在列表里**
+/// （AutoClaw 的两个地区算两家），与 `PROVIDERS` 的 id 集合一一对应
+/// （过渡期的占位实现已在 W6 随 `pending.rs` 删除）。
 ///
 /// Cline 算两家（`ClineFree` / `ClinePass`）：它们是两个 provider、两份清单，
 /// 刷新时各刷各的 —— 尽管底层那次远程请求是同一个接口（`cline::models::refresh`
 /// 一次拉回两池，缓存共用），两次调用是幂等的。
+///
+/// AutoClaw 同理算两家（`AutoClaw` / `AutoClawIntl`）：两个站点的模型目录
+/// **是两份独立数据**（各自的 `autoclaw-model-config`，缓存也各占一格），
+/// 刷新必须分别打各自的站点 —— 与 Cline 那次「同一个接口、两次幂等调用」
+/// 不同，这里两次调用是真的两次上游请求。
 ///
 /// 为什么这份列表必须排除占位实现（当时的口径）：它的消费方是后台目录刷新
 /// （`refresh_implemented` ← `api::chat::spawn_catalog_refresh` 与
@@ -842,6 +867,7 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::Raccoon,
         ProviderKind::CatPaw,
         ProviderKind::AutoClaw,
+        ProviderKind::AutoClawIntl,
         ProviderKind::Qoder,
         ProviderKind::ClineFree,
         ProviderKind::ClinePass,

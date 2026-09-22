@@ -48,6 +48,7 @@ use crate::server::core::auth_http::send_raw;
 use crate::server::errors::GatewayError;
 
 use super::credentials::{self, AutoClawCredentials};
+use super::region::Region;
 use super::refresh::signed_auth_headers;
 
 /// 积分 / 订阅接口的请求超时（源实现 `REQUEST_TIMEOUT_MS`）
@@ -60,8 +61,23 @@ const POINTS_WALLET_LEGACY_PATH: &str =
     "/agent-assetmgr/api/v1/wallet-instances?wallet_type=all&wallet_scope=all";
 /// 即将过期积分路径（源实现 `POINTS_EXPIRING_PATH`）
 const POINTS_EXPIRING_PATH: &str = "/agent-assetmgr/api/v1/points/expiring?biz_app_id=autoclaw";
-/// 订阅信息路径（源实现 `querySubscription` 的 path）
-const SUBSCRIBE_INFO_PATH: &str = "/agentpay/v1/assistant/subscribe-info";
+
+/// 订阅信息路径（源实现 `getSubscribeInfo` 的 path）——**按地区分叉**。
+///
+/// ── 为什么两地路径不同（从客户端产物里核对出来的）────────────
+/// 国际版构建（`isOversea = true`）里 `getSubscribeInfo` 写死的是
+/// `/agentpay/v1/assistant/oversea-subscribe-info`，国内构建用的是
+/// `/agentpay/v1/assistant/subscribe-info` —— 订阅体系本身是两套（国际版走
+/// Stripe，国内走自有支付，见客户端 AB 注释「海外订阅走 Stripe 的
+/// oversea-subscribe-info，会员身份由 isMember 归一后两地同源」）。
+/// 发错路径的表现是订阅块查不出来（而非整体失败），因此这里按地区给路径，
+/// 积分那三条路径两地相同、不参与分叉。
+fn subscribe_info_path(region: Region) -> &'static str {
+    match region {
+        Region::Cn => "/agentpay/v1/assistant/subscribe-info",
+        Region::Intl => "/agentpay/v1/assistant/oversea-subscribe-info",
+    }
+}
 
 /// 登录态失效的业务码（源实现的两处判定合并：`41e4` === 410000，与 400000）。
 ///
@@ -88,21 +104,28 @@ const WALLET_SCOPE_LABELS: &[(&str, &str)] = &[
 ];
 
 /// 查询某账号的积分 / 订阅（归一化形状见 `ProviderAdapter::query_usage` 的文档）。
+///
+/// `region` 决定账号在哪一家的记录里找、凭证的域名与订阅路径 —— 两个地区的
+/// 账号集合与站点都是分开的，不能拿一家的 account_id 去另一家查。
 pub(super) async fn query_usage(
+    region: Region,
     store: &AccountStore,
     account_id: &str,
 ) -> Result<Value, GatewayError> {
-    let record = store.autoclaw_account_record(account_id);
+    let record = store.autoclaw_account_record(region, account_id);
     if !account_id.is_empty() && record.is_none() {
         return Err(GatewayError::with_status(
             404,
-            format!("AutoClaw 账号 {account_id} 不存在或不属于 AutoClaw"),
+            format!(
+                "AutoClaw {}账号 {account_id} 不存在或不属于该地区",
+                region.label()
+            ),
         ));
     }
     // 与适配器的 `resolve_credentials` 同一条链（账号记录 → 桌面端实时登录态 →
     // 环境变量），但这里只取快照、**不触发刷新**：余额查询是只读展示动作，
     // 过期就让上游回 401，由调用方走「刷新后重试一次」那条既有链路。
-    let credentials = credentials::snapshot_for(record.as_ref())?;
+    let credentials = credentials::snapshot_for(record.as_ref(), region)?;
     if credentials.token.trim().is_empty() {
         return Err(GatewayError::with_status(
             401,
@@ -349,7 +372,13 @@ async fn query_subscription(credentials: &AutoClawCredentials) -> Result<Value, 
             );
         }
     }
-    let payload = userapi_post(credentials, SUBSCRIBE_INFO_PATH, &body, "订阅查询").await?;
+    let payload = userapi_post(
+        credentials,
+        subscribe_info_path(credentials.region),
+        &body,
+        "订阅查询",
+    )
+    .await?;
     if let Some(code) = payload.get("code").and_then(Value::as_i64) {
         if AUTH_EXPIRED_CODES.contains(&code) {
             return Err(GatewayError::with_status(
@@ -467,7 +496,10 @@ pub(super) async fn userapi_get(
     path: &str,
     what: &str,
 ) -> Result<Value, GatewayError> {
-    let url = format!("{}{path}", credentials::userapi_base_url());
+    let url = format!(
+        "{}{path}",
+        credentials::userapi_base_url(credentials.region)
+    );
     let headers = signed_auth_headers(&credentials.token);
     let response = send_raw("GET", &url, None, &headers, None, Some(REQUEST_TIMEOUT_MS))
         .await
@@ -484,7 +516,10 @@ pub(super) async fn userapi_post(
     body: &Value,
     what: &str,
 ) -> Result<Value, GatewayError> {
-    let url = format!("{}{path}", credentials::userapi_base_url());
+    let url = format!(
+        "{}{path}",
+        credentials::userapi_base_url(credentials.region)
+    );
     let headers = signed_auth_headers(&credentials.token);
     let response = send_raw(
         "POST",

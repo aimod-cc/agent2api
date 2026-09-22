@@ -93,6 +93,7 @@ pub mod autoclaw;
 pub mod catalog;
 pub mod catpaw;
 pub mod cline;
+pub mod content_block;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
@@ -118,10 +119,32 @@ pub enum ProviderKind {
     /// CatPaw（美团；架构文档 §9）。适配实现在 `catpaw/adapter.rs`
     /// （W5-T-d4 接线）：有状态会话式转发，`is_stateful()` 为 true。
     CatPaw,
-    /// AutoClaw（智谱 autoglm；架构文档 §10）。适配实现在
+    /// AutoClaw（智谱 autoglm）**国内版**；架构文档 §10。适配实现在
     /// `autoclaw/adapter.rs`（W4b-T-c2 接线）：**无状态**（OpenAI 兼容 +
     /// `X-Authorization`，与 raccoon 同构），`sse_model_rewrite()` 为 true。
+    ///
+    /// ── 与 [`ProviderKind::AutoClawIntl`] 是同一套协议的两个地区 ────
+    /// 两个构建（客户端里 `isOversea` 编译期常量）共用账号接口与签名指纹
+    /// （appId/appKey 两地逐字相同，已实测），只有站点不同。
+    /// **provider id 保持 `autoclaw` 不改名**：它是存量账号 `accounts.json` 里的
+    /// 落盘契约，改名会让那些账号升级后变成「未知 provider」而静默消失
+    /// （见 `autoclaw::region` 的模块头）。变的只有展示名。
     AutoClaw,
+    /// AutoClaw **国际版**（`autoclaw-intl`）。与 [`ProviderKind::AutoClaw`]
+    /// 同一套协议、不同站点（`autoglm-api.autoglm.ai`）。
+    ///
+    /// ── 为什么两个地区是两家 provider（与 Cline 两池同一思路）──────
+    /// 把地区做成「一家的一个字段」的后果与 Cline 那次一模一样：地区成了
+    /// **账号的属性**，界面上混在一起，而「哪个账号走哪个站点」在列表里
+    /// 看不出来；账号记录也无法按地区隔离。按两家建模之后，各自有独立的账号、
+    /// 清单、启停与映射，界面上各占一个分组、在添加弹窗里相邻。
+    ///
+    /// 实现是**一套**：`autoclaw::adapter::AutoClawAdapter` 持有一个
+    /// `autoclaw::region::Region`，两个静态实例（`AUTOCLAW_ADAPTER` /
+    /// `AUTOCLAW_INTL_ADAPTER`）由 `adapter_for` 按 kind 给出。地区 → provider
+    /// 的互查在 `autoclaw::region::Region`（`kind` / `provider_id` /
+    /// `from_provider_id`），别处不要再写 `"autoclaw-intl"` 这类字面量。
+    AutoClawIntl,
     /// Qoder。适配实现在 `qoder/`：账号管理（国际版设备授权登录 / PAT /
     /// 凭证续期 / 额度查询）**加推理转发**。上游鉴权不是 Bearer 而是一套自签名
     /// 的 COSY 头、请求体要先编码再签名、响应还多包一层信封，因此
@@ -188,7 +211,11 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "workbuddy", label: "WorkBuddy" },
     ProviderMeta { id: "raccoon", label: "小浣熊" },
     ProviderMeta { id: "catpaw", label: "CatPaw" },
-    ProviderMeta { id: "autoclaw", label: "AutoClaw" },
+    // AutoClaw 两个地区**相邻**排列（本次改动的要求）：界面上它们是同一条产品线的
+    // 两个版本，中间隔着别的家会让「找国际版」变成一次扫描。顺序也决定模型目录
+    // 合并时同名模型先归谁家 —— 国内版在前，与存量账号的归属一致。
+    ProviderMeta { id: "autoclaw", label: "AutoClaw 国内版" },
+    ProviderMeta { id: "autoclaw-intl", label: "AutoClaw 国际版" },
     ProviderMeta { id: "qoder", label: "Qoder" },
     ProviderMeta { id: "cline-free", label: "Cline Free" },
     ProviderMeta { id: "cline-pass", label: "Cline Pass" },
@@ -256,6 +283,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "raccoon" => Some(ProviderKind::Raccoon),
         "catpaw" => Some(ProviderKind::CatPaw),
         "autoclaw" => Some(ProviderKind::AutoClaw),
+        "autoclaw-intl" => Some(ProviderKind::AutoClawIntl),
         "qoder" => Some(ProviderKind::Qoder),
         "cline-free" => Some(ProviderKind::ClineFree),
         "cline-pass" => Some(ProviderKind::ClinePass),
@@ -281,6 +309,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Raccoon => "raccoon",
         ProviderKind::CatPaw => "catpaw",
         ProviderKind::AutoClaw => "autoclaw",
+        ProviderKind::AutoClawIntl => "autoclaw-intl",
         ProviderKind::Qoder => "qoder",
         ProviderKind::ClineFree => "cline-free",
         ProviderKind::ClinePass => "cline-pass",

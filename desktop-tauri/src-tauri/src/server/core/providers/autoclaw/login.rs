@@ -1,35 +1,86 @@
 //! AutoClaw 手机号验证码登录（**逆向**：老项目没有，接口从 AutoClaw 桌面端的
 //! `app.asar` 里读出并实测确认）。
 //!
-//! ── 为什么不是「网页登录」────────────────────────────────────
-//! 另外两家（小浣熊 / Qoder）的网页登录形态是「打开官方登录页 → 用户登录 →
-//! 回调带一次性授权码 → 网关换凭证」。AutoClaw **没有这条路**：
+//! ── 两个地区的登录方式**不一样**，而且各只有一条（本次修正）──────
+//! 早先的结论是「AutoClaw 没有网页登录，手机号 + 验证码是国内版唯一入口，
+//! 海外版那条 OAuth 与国内无关」。那个结论**只对国内版成立**，被当成了
+//! 「这一家都这样」—— 国际版接入时才发现它是错的。实测（2026-09-22）：
 //!
-//!   - 桌面端没有公网部署的 Web 应用（网页版是本地 29100 端口的自托管 shell，
-//!     与账号登录无关）；
-//!   - 账号体系里**没有授权码 / device code / grant_type 这套东西**
-//!     （在 `out/` 里搜 `authorization_code` / `device_code` / `code_verifier`
-//!     的命中全部落在第三方库 node_modules 里）；
-//!   - 自定义协议 `autoclaw://` 只服务**海外版** OAuth（`auth/callback-google`
-//!     / `-zai`），而国内构建里 `isOversea = false`，登录页不渲染 OAuth 按钮。
+//! ```text
+//!                        国内版（autoclaw）      国际版（autoclaw-intl）
+//!   手机验证码登录        ✅ 唯一官方方式          ❌ 本模块不提供（见下）
+//!   OAuth 网页登录        ❌ 登录页不渲染按钮      ✅ **唯一登录方式**（Zai / Google）
+//!   oauth-captcha-config  enabled: false           enabled: true, supplier: aliyun
+//! ```
 //!
-//! 国内版唯一的登录方式就是**手机号 + 短信验证码**，两个接口：
+//! 两条链路在两个地区的可用性都不是「猜」出来的，证据如下：
+//!   - **国际版 OAuth 是主方式**：登录页（`index-CPolB0VZ.js` 的 `LoginView`）
+//!     在海外构建下**只渲染两个 OAuth 按钮**（Zai / Google），
+//!     `phoneInputRef` / `codeInputRef` 只有声明与 focus 调用、**没有任何 JSX
+//!     使用** —— 手机号表单被死代码消除了。国内构建反过来。
+//!   - **国内版没有 OAuth**：`oauth-captcha-config` 返回 `enabled: false`
+//!     且 `prefix` / `scene_id` 为空串；国际版返回 `enabled: true` +
+//!     阿里云场景参数。这个接口本身就是「这个构建要不要走 OAuth」的开关。
+//!
+//! ── 国际版的手机验证码为什么**移除**了（曾经可用，这是产品决策）────
+//! 两个地区的接口**逐字相同**，国际版那份实测也通（`POST {intl}/userapi/v1/
+//! agent-send-code` 返回 `{"code":0}`，`agent-login` 用错误验证码返回
+//! `630202 验证码错误` 而不是 400001 参数错误 —— 说明参数结构被接受、接口真的
+//! 在工作）。也就是说移除**不是**因为它坏掉了，而是：
+//!   - 国际版的官方主登录方式就是 Zai / Google OAuth，它的用户里**大量是用
+//!     Google / 邮箱注册、根本没绑手机号**的人 —— 对这些人，那个入口点下去
+//!     只会稳定失败，是一块「看着能用、实际不能用」的按钮；
+//!   - 这一侧的取舍是「**界面上的每一项都该走得通**」：与其留一个多数国际版
+//!     用户用不上的入口，不如把它收起来，只留 OAuth 网页登录与填写凭证。
+//! 因此本模块的两个入口对 [`Region::Intl`] 直接返回一条人话错误（见
+//! [`ensure_sms_region`]），前端也不再渲染那一段（见 ui/add-provider-forms.js
+//! 里国际版那一项）。**不要因为「接口通」就把它加回来** —— 那会重新引入一批
+//! 必然失败的入口。
+//!
+//! ── OAuth 网页登录在**另一个模块**（不再是缺口）──────────────
+//! 国际版 OAuth 的链路是：
+//!
+//! ```text
+//! POST {intl}/userapi/overseasv1/zai-oauth-url    {"source_id","device_id",
+//!                                                  "navigate_uri","ali_captcha_verify_param"}
+//!   → data.oauth_url（官方登录页）
+//!   浏览器登录 → 回调 {navigate_uri}?code=…&state=…
+//! POST {intl}/userapi/overseasv1/zai-oauth-login  {"code","state","navigate_uri"} → token 对
+//! ```
+//!
+//! **卡点是第一个请求强制要求阿里云验证码**：不带 `ali_captcha_verify_param`
+//! 得到 `631002 当前版本已停止服务`（一个与真实原因无关的误导性错误码 ——
+//! 换任何 `X-Version` 都是这个码，实测 1.18.5 / 1.19.0 / 1.20.0 / 2.0.0 一致）；
+//! 带一个假值则得到 `630014 抱歉,审核失败`。也就是说**必须先在客户端跑通
+//! 阿里云验证码 SDK**（`o.alicdn.com` 的 `AliyunCaptcha.js`，场景
+//! `sq51tr` / `18vhnjxl`）才能拿到那个参数。
+//!
+//! 这一点**已经解决**：不复刻 SDK 的算法（成本高且会随上游更新失效），而是把
+//! 官方那套浏览器端 SDK 原样搬到主窗口里跑（主窗口 `csp: null`，没有拦截）——
+//! 服务端那两跳在 [`super::oauth`]，浏览器那一半在 `ui/autoclaw-oauth.js`。
+//! 这条链路**不是**本模块的职责（它没有验证码、也没有窗口），因此分成两个模块。
+//!
+//! ── 国内版：唯一的登录方式就是手机号 + 短信验证码 ────────────────
+//! 两个接口：
 //!
 //! ```text
 //! POST {userapi}/userapi/v1/agent-send-code   {"phone","source_id","device_id"}
 //! POST {userapi}/userapi/v1/agent-login/      {"phone","code","platform","source_id","device_id"}
 //! ```
 //!
+//! 两地的**路径逐字相同**，只有域名不同 —— 因此本模块的每个函数都收
+//! [`Region`] 参数，由它决定打哪个站点（见 `region.rs`）。
+//!
 //! `agent-login` **直接返回 token 对**（不经授权码），`platform: "web"` 是网页端
 //! 与桌面端唯一的差别（源实现 `loginWebWithPhoneCode`）。因此这条链路在网关上就是
 //! 「代收验证码 → 换 token → 落账号」，没有回调窗口、没有轮询。
 //!
-//! ── 实测确认（2026-09-19）────────────────────────────────────
-//! 签名头与积分 / 签到链路**完全一致**（`X-Auth-Sign = MD5(appId&秒级ts&appKey)`），
-//! 复用 `refresh::signed_auth_headers`；接口可达，业务错误以 HTTP 200 +
-//! `code != 0` 表达（错误验证码实测返回 `{"code":400001,"msg":"请求数据有问题,
-//! 请检查后重试"}`）。因此这里**每个业务码都要单独翻成人话** —— 上游的 msg 对
-//! 用户没有指导意义。
+//! ── 实测确认 ────────────────────────────────────────────────
+//! 签名头与积分 / 签到链路**完全一致**（`X-Auth-Sign = MD5(appId&秒级ts&appKey)`，
+//! 且**两地密钥逐字相同** —— 国际版不需要第二套），复用
+//! `refresh::signed_auth_headers`；接口可达，业务错误以 HTTP 200 +
+//! `code != 0` 表达。因此这里**每个业务码都要单独翻成人话** —— 上游的 msg 对
+//! 用户没有指导意义（`631002` 那条尤其误导，见上）。
 //!
 //! ── deviceId 从哪来 ─────────────────────────────────────────
 //! 官方客户端是「ed25519 公钥的 SHA-256」（`fingerprintPublicKey`），但**服务端
@@ -37,6 +88,10 @@
 //! 刷新接口同样只回传它）。因此这里生成一个密码学随机的 32 字节十六进制串 ——
 //! 不需要为「复刻一个客户端指纹」引进 ed25519 依赖，而它承担的全部职责就是
 //! 「区分不同设备」。
+//!
+//! **它还是很多接口的必填项**：实测 `agent-send-code` 与 `zai-oauth-url`
+//! 不带 `device_id` 时都返回 `400001 请求数据有问题`（一个不指明字段的参数错误），
+//! 带上就正常 —— 排障时这个坑值得先排除。
 
 use serde_json::{json, Value};
 
@@ -46,6 +101,7 @@ use crate::server::logging;
 
 use super::credentials;
 use super::refresh::signed_auth_headers;
+use super::region::Region;
 
 /// 发验证码路径（源实现 `sendCode`）
 const SEND_CODE_PATH: &str = "/userapi/v1/agent-send-code";
@@ -55,8 +111,33 @@ const LOGIN_PATH: &str = "/userapi/v1/agent-login/";
 /// 登录接口的请求超时（与积分 / 签到同一档；验证码接口偶发慢，给到 20 秒）
 const REQUEST_TIMEOUT_MS: u64 = 20_000;
 
-/// 中国大陆手机号（源实现的 `normalizePhone` 正则等价物：`1[2-9]` 开头的 11 位）
-fn normalize_phone(raw: &str) -> Option<String> {
+/// 这条链路只服务哪个地区。
+///
+/// ── 为什么要有这个判断（而不是让前端不显示就够了）────────────
+/// 国际版的手机验证码入口已从前端移除（见模块头），但**入口只是入口**：
+/// 老界面、脚本、直接打 HTTP 的调用方都还能带着 `provider: "autoclaw-intl"`
+/// 进来。若不在这里挡一下，那些请求会被静默地发到**国内版站点**去
+/// （`Region::Intl` 只是决定了打哪个域，代码本身没有意见）—— 用户在国际版
+/// 弹窗里填的号码，验证码会从一个他不在那儿的站点发出来，排障时看不出任何
+/// 异常。因此这里明确拒绝，并且给出「该走哪条路」的指引。
+fn ensure_sms_region(region: Region) -> Result<(), GatewayError> {
+    if region == Region::Cn {
+        return Ok(());
+    }
+    Err(GatewayError::with_status(
+        400,
+        "AutoClaw 国际版不支持手机号登录，请改用「网页登录（Zai / Google）」或「填写凭证」",
+    ))
+}
+
+/// 中国大陆手机号（源实现的 `normalizePhone` 正则等价物：`1[2-9]` 开头的 11 位，
+/// 容忍 `+86` / `86` 前缀与空格、连字符）。
+///
+/// ── 为什么只剩这一种形态 ─────────────────────────────────────
+/// 国际版曾在这里有一条 6–15 位的宽松规则（各国号码 + 国家码），随它的手机
+/// 验证码入口一起删掉了：一条永远走不到的分支只会让「号码格式不对时该看哪段
+/// 代码」变模糊（与 ui/sms-login.js 那边删的是同一条规则）。
+fn normalize_phone(raw: &str) -> Result<String, GatewayError> {
     let trimmed: String = raw.chars().filter(|ch| !ch.is_whitespace() && *ch != '-').collect();
     let digits = trimmed.strip_prefix("+86").unwrap_or(&trimmed);
     let digits = digits.strip_prefix("86").filter(|rest| rest.len() == 11).unwrap_or(digits);
@@ -65,9 +146,9 @@ fn normalize_phone(raw: &str) -> Option<String> {
         && digits.chars().nth(1).is_some_and(|ch| ('2'..='9').contains(&ch))
         && digits.chars().all(|ch| ch.is_ascii_digit())
     {
-        Some(digits.to_string())
+        Ok(digits.to_string())
     } else {
-        None
+        Err(GatewayError::with_status(400, "请填写 11 位中国大陆手机号"))
     }
 }
 
@@ -100,7 +181,11 @@ fn normalize_code(raw: &str) -> Option<u32> {
 }
 
 /// 生成一个设备 id（32 字节随机 → 64 位十六进制，与官方客户端的形态一致）。
-fn new_device_id() -> String {
+///
+/// `pub(super)`：OAuth 那条链路（`oauth.rs`）也要一个 —— 两跳
+/// （`oauth-url` / `oauth-login`）必须带同一个值，因此它由调用方持有，
+/// 与这条链路的 `send_code` → `login_with_code` 同一手法。
+pub(super) fn new_device_id() -> String {
     let mut bytes = [0u8; 32];
     if getrandom::getrandom(&mut bytes).is_err() {
         // 随机源不可用是极罕见的系统级故障。退化成「纳秒时钟 + 进程内计数」仍然
@@ -127,8 +212,13 @@ fn new_device_id() -> String {
 /// `AutoClawCredentials`（要求已有 token），而登录时**还没有 token** ——
 /// 这正是不能复用的原因（用空 token 调 `signed_auth_headers` 恰好可行：
 /// 它只在 token 非空时才加 authorization 头）。
-async fn post_unauthenticated(path: &str, body: &Value, what: &str) -> Result<Value, GatewayError> {
-    let url = format!("{}{path}", credentials::userapi_base_url());
+async fn post_unauthenticated(
+    region: Region,
+    path: &str,
+    body: &Value,
+    what: &str,
+) -> Result<Value, GatewayError> {
+    let url = format!("{}{path}", credentials::userapi_base_url(region));
     let headers = signed_auth_headers("");
     let response = send_raw(
         "POST",
@@ -177,6 +267,25 @@ fn describe_login_error(code: i64, upstream_msg: &str) -> String {
         630_101 => "获取验证码过于频繁，请稍后再试".to_string(),
         410_000 | 400_000 => "登录态已失效，请重新登录".to_string(),
         400_002 => "请求签名校验失败（本机时钟可能有偏差），请校准系统时间后重试".to_string(),
+        // 631002 的原文是「当前版本已停止服务，请前往官网下载最新版」—— 这句话
+        // 对网关用户**没有指导意义**：它不是版本问题，而是**缺少风控验证**
+        // （实测换任何 X-Version 都是这个码，见模块头）。直译原文会把用户引去
+        // 「升级客户端」这个错误方向，因此这里改写。
+        //
+        // 文案里**不能**说「改用网页登录」：这条链路只服务国内版，而国内版
+        // 没有网页登录（它的 OAuth 开关是关的，见模块头）。指向一条不存在的路
+        // 比不指路更糟。
+        631_002 => {
+            "上游要求过风控验证，本次登录无法在此完成；\
+             请改用「填写凭证」（可从 AutoClaw 客户端登录态文件里取）"
+                .to_string()
+        }
+        // 阿里云验证码校验失败（带上了验证码参数但没通过）。与 631002 是同一族：
+        // 都在说「风控没过」，区别只是「没带」与「带了但无效」。同上的理由，
+        // 这里也不提「网页登录」。
+        630_014 => {
+            "风控验证未通过，请稍后重试；若持续失败请改用「填写凭证」".to_string()
+        }
         _ => {
             if upstream_msg.trim().is_empty() {
                 format!("登录失败（上游 code={code}）")
@@ -187,24 +296,23 @@ fn describe_login_error(code: i64, upstream_msg: &str) -> String {
     }
 }
 
-/// 发送短信验证码。
+/// 发送短信验证码（**AutoClaw 国内版专用**，手机号验证码登录的第一步）。
 ///
 /// `device_id` 由调用方持有并在随后的 `login` 里沿用 —— 上游把设备与登录会话
 /// 关联，两次调用用不同的 device_id 会让「刚发的码」配不上「正在登录的设备」。
-pub async fn send_code(phone: &str) -> Result<Value, GatewayError> {
-    let Some(phone) = normalize_phone(phone) else {
-        return Err(GatewayError::with_status(
-            400,
-            "请填写 11 位中国大陆手机号",
-        ));
-    };
+///
+/// `region` 只有国内版走得下去（国际版的手机验证码入口已移除，见模块头）：
+/// 国际版在这里就被 [`ensure_sms_region`] 挡下，不会带着它的域名走到请求那一步。
+pub async fn send_code(region: Region, phone: &str) -> Result<Value, GatewayError> {
+    ensure_sms_region(region)?;
+    let phone = normalize_phone(phone)?;
     let device_id = new_device_id();
     let body = json!({
         "phone": phone,
         "source_id": "autoclaw",
         "device_id": device_id,
     });
-    let payload = post_unauthenticated(SEND_CODE_PATH, &body, "发送验证码").await?;
+    let payload = post_unauthenticated(region, SEND_CODE_PATH, &body, "发送验证码").await?;
     let code = payload.get("code").and_then(Value::as_i64).unwrap_or(0);
     if code != 0 {
         let upstream_msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");
@@ -235,17 +343,16 @@ pub async fn send_code(phone: &str) -> Result<Value, GatewayError> {
 /// 返回形状与「粘贴 token 添加」的 payload **逐字一致**
 /// （`{token, refreshToken, deviceId}`）—— 登录只是另一种拿到凭证的方式，
 /// 落盘、命名、去重、优先级分配全部复用既有的添加路径，不新开一条写账号的通路。
+///
+/// `region` 的约束与 [`send_code`] 相同：只有国内版走得下去。
 pub async fn login_with_code(
+    region: Region,
     phone: &str,
     code: &str,
     device_id: Option<&str>,
 ) -> Result<Value, GatewayError> {
-    let Some(phone) = normalize_phone(phone) else {
-        return Err(GatewayError::with_status(
-            400,
-            "请填写 11 位中国大陆手机号",
-        ));
-    };
+    ensure_sms_region(region)?;
+    let phone = normalize_phone(phone)?;
     let Some(code) = normalize_code(code) else {
         return Err(GatewayError::with_status(400, "请填写 6 位数字验证码"));
     };
@@ -263,7 +370,7 @@ pub async fn login_with_code(
         "source_id": "autoclaw",
         "device_id": device_id,
     });
-    let payload = post_unauthenticated(LOGIN_PATH, &body, "登录").await?;
+    let payload = post_unauthenticated(region, LOGIN_PATH, &body, "登录").await?;
     let status = payload.get("code").and_then(Value::as_i64).unwrap_or(0);
     if status != 0 {
         let upstream_msg = payload.get("msg").and_then(Value::as_str).unwrap_or("");

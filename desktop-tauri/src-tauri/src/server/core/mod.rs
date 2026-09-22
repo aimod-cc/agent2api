@@ -15,6 +15,8 @@
 //!   billing/             积分 / 签到 / 运营活动         （workbuddy-billing.mjs）
 //!   models/              workbuddy 模型目录（内置 + /v3/config 刷新）（workbuddy-models.mjs）
 //!   sanitize.rs          出站请求体指纹脱敏（硬编码规则集，照搬 workbuddy2api）
+//!   prompt.rs            网关自有系统提示词（透传 / 替换 / 追加，照搬 workbuddy2api）
+//!   degrade.rs           内容拦截降级状态机（撞审核误报 → 中性提示词到次日 00:00）
 //!   routing.rs           账号选路（优先级 + 限额冷却）  （workbuddy-routing.mjs）
 //!   upstream/            对话转发（选路/轮换/SSE/聚合） （workbuddy-upstream-client.mjs）
 //!   auto_checkin.rs      定时签到调度（轮询 + 补签）    （workbuddy-auto-checkin.mjs）
@@ -49,12 +51,14 @@ pub mod billing;
 pub mod clash;
 pub mod credential_maintenance;
 pub mod debug_traffic;
+pub mod degrade;
 pub mod egress;
 pub mod endpoints;
 pub mod key_scope;
 pub mod login;
 pub mod model_rules;
 pub mod models;
+pub mod prompt;
 pub mod protocol;
 pub mod providers;
 pub mod proxies;

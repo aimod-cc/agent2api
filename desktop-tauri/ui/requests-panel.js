@@ -9,8 +9,18 @@
  * ── 数据口径 ────────────────────────────────────────────────
  * 明细按保留期（默认 30 天）存盘，条数没有上限，一次拉全不现实，
  * 所以走后端 offset/limit 真分页；每页 50 条（后端默认值，这里显式传，
- * 页数才可算），上限 500 条由后端夹紧。后端支持的筛选只有时间区间与
- * 状态（ok/error）—— 模型 / 提供商筛选、关键词搜索不在接口契约里。
+ * 页数才可算），上限 500 条由后端夹紧。后端支持的筛选是时间区间、状态、
+ * 模型与提供商四个维度（`RequestQuery`）—— 四个条件在**存储层的同一份
+ * `FilterPlan`** 里编译成 SQL，所以「页面上筛出来的 N 条」与「清空删掉的
+ * 那批」必然是同一个集合（见 `request_stats/sql.rs`）。
+ *
+ * ── 模型 / 提供商两个下拉的选项从哪来 ───────────────────────
+ * 不来自前端配置，而是 `GET /api/stats/requests/filters` —— 明细里**实际
+ * 出现过**的模型名与 provider id（按出现次数降序）。按配置清单列会让
+ * 「列表里有这一行、下拉里没有这个选项」发生（历史请求用过的模型名、
+ * 已删除账号所属的提供商都会漏），那是最难向用户解释的一类不一致。
+ * 清单进页面时拉一次：它与时间档位无关，翻页 / 换筛选都不重拉。
+ * 拉不到时两个下拉只留「全部」选项（筛选器退化成不可用，列表照常显示）。
  *
  * ── 「重试」列为什么是一个入口而不是一个标记（本次改造）─────
  * 后端明细里有 `attemptDetails`（每一次上游尝试的 provider / 状态码 /
@@ -474,14 +484,23 @@
     return '没有符合筛选条件的请求';
   }
 
-  /** 页脚读数：范围与状态都写出来，「为什么只有这几条」一眼可查 */
+  /**
+   * 页脚读数：范围、状态、提供商与模型都写出来，「为什么只有这几条」一眼可查。
+   *
+   * 后两项显示**当前选中的原值**（提供商按注册表换展示名，取不到就回显 id）——
+   * 与列表里那一列同一个口径（见 targetCell），所以读数与行内容对得上。
+   */
   function renderSummary() {
     const box = $('req-summary');
     if (!box) return;
-    const status = $('req-status')?.value;
     const parts = [RANGE_LABEL[range] || '全部'];
+    const status = $('req-status')?.value;
     if (status === 'ok') parts.push('只看成功');
     else if (status === 'error') parts.push('只看失败');
+    const provider = $('req-provider')?.value;
+    if (provider) parts.push(window.wbProviders?.labelOf?.(provider) || provider);
+    const model = $('req-model')?.value;
+    if (model) parts.push(model);
     box.textContent = parts.join(' · ');
   }
 
@@ -527,14 +546,97 @@
     list.innerHTML = headHtml() + entries.map(rowHtml).join('');
   }
 
+  // ─── 筛选下拉（提供商 / 模型）─────────────
+
+  /**
+   * 用候选清单重建一个筛选下拉，**保留「全部」项与当前选中的值**。
+   *
+   * ── 为什么必须保住当前选中值（一个真实的坑）─────────────────
+   * 清单来自后端（按出现次数降序、上限 200 条）。若当前选中的值不在这次清单里
+   * （筛着某个模型时把日志清空了、或它排在第 201 位），重建之后 `select.value`
+   * 会被浏览器重置成空 —— 用户看到的筛选条件**静默消失**，而列表还是上一次的
+   * 结果（要等下一次 load 才按新条件拉）。所以：选中值不在清单里时把它自己补进去。
+   *
+   * 第一项（「全部提供商」/「全部模型」）由 HTML 声明，原样保留 ——
+   * 它的文案是页面的一部分，不在数据里。
+   */
+  function fillFilterSelect(id, items) {
+    const select = $(id);
+    if (!select) return;
+    const current = select.value;
+    const head = select.options[0];
+    const headHtml = head ? head.outerHTML : '<option value="">全部</option>';
+    const labels = new Map(items.map(item => [String(item.value), String(item.label)]));
+    const values = [...labels.keys()].filter(Boolean);
+    if (current && !labels.has(current)) labels.set(current, current);
+    if (current && !values.includes(current)) values.unshift(current);
+    select.innerHTML = headHtml + values.map(value =>
+      `<option value="${esc(value)}">${esc(labels.get(value) || value)}</option>`).join('');
+    select.value = current;
+  }
+
+  /** 上次拉取筛选清单的时刻（节流用；见 refreshFilterOptions） */
+  let filterOptionsAt = 0;
+  /** 清单的复用窗口：翻页 / 换筛选都会走非静默 load，不值得每次都重算一遍 */
+  const FILTER_OPTIONS_TTL_MS = 30_000;
+
+  /**
+   * 刷新两个筛选下拉的候选清单（内部节流 30 秒）。
+   *
+   * ── 清单不随筛选条件收窄（有意的）──────────────────────────
+   * 筛了「今天」之后，下拉里仍会列出 30 天前用过的模型。跟着结果集收窄看着更
+   * 「聪明」，代价是选中项会在下一次刷新后凭空消失（用户连取消筛选都要重新找）——
+   * 而它本来就是「这份日志里出现过什么」的清单，与时间档位无关。
+   * 它只随**明细里出现过什么**变，所以新用过的模型名会在下一次进页面
+   * （或 30 秒后的下一次非静默 load）出现在下拉里。
+   *
+   * 失败静默：读不到清单时两个下拉只留「全部」项 —— 筛选器退化成不可用，
+   * 列表照常显示（与 `load` 的静默失败同一取向：一个辅助功能不该让整页报错）。
+   */
+  async function refreshFilterOptions() {
+    if (Date.now() - filterOptionsAt < FILTER_OPTIONS_TTL_MS) return;
+    filterOptionsAt = Date.now();
+    try {
+      const filters = await api.getStatsRequestFilters();
+      const providers = Array.isArray(filters?.providers) ? filters.providers : [];
+      fillFilterSelect('req-provider', providers.map(item => ({
+        value: String(item?.id || ''),
+        label: String(item?.label || item?.id || ''),
+      })));
+      const models = Array.isArray(filters?.models) ? filters.models : [];
+      fillFilterSelect('req-model', models.map(name => ({
+        value: String(name || ''),
+        label: String(name || ''),
+      })));
+    } catch (error) {
+      console.warn('读取请求日志筛选清单失败，筛选项退化为「全部」:', error.message);
+    }
+  }
+
   // ─── 加载 ──────────────────────────────────
 
-  function queryParams() {
+  /**
+   * 当前筛选条件（**不含分页**）→ URLSearchParams。
+   *
+   * GET 与 DELETE（清空）共用它：「清空当前筛选结果」必须与列表用的是同一套条件，
+   * 两处各写一遍迟早会漂 —— 少传一个参数，用户看到的就是「清空删掉的条数
+   * 与筛选出的条数不一致」，而那种 bug 只在同时用两个筛选维度时才出现。
+   */
+  function filterParams() {
     const params = new URLSearchParams();
     const start = rangeStart(range);
-    const status = $('req-status')?.value;
     if (start !== null) params.set('start', String(start));
+    const status = $('req-status')?.value;
     if (status) params.set('status', status);
+    const provider = $('req-provider')?.value;
+    if (provider) params.set('provider', provider);
+    const model = $('req-model')?.value;
+    if (model) params.set('model', model);
+    return params;
+  }
+
+  function queryParams() {
+    const params = filterParams();
     params.set('offset', String(offset));
     params.set('limit', String(PAGE_SIZE));
     return params.toString();
@@ -546,6 +648,9 @@
     // 兜一次间隔配置：冷启动时首次读取可能撞上「后端还没起来」而失败，
     // 那时会把兜底值一直用下去（同步过一次就立刻返回，无额外开销）
     void syncAutoRefresh();
+    // 非静默调用（进页面 / 翻页 / 换筛选）顺带刷新筛选清单（内部有节流，
+    // 见 refreshFilterOptions）—— 轮询不碰它，否则每秒一次全表 GROUP BY
+    if (!silent) void refreshFilterOptions();
     // 连点翻页时不做互斥锁，只认最后一次响应：用锁会把后面的点击直接吞掉
     const token = ++seq;
     try {
@@ -685,8 +790,8 @@
   }
 
   /**
-   * 清空用的筛选参数：与 queryParams 同一套条件（不含 offset/limit）。
-   * 带条件 = 只删命中的明细（受影响日期的按天聚合由后端重算）；
+   * 清空用的筛选参数：与 `queryParams` 同一套条件（不含 offset/limit，两者都从
+   * `filterParams` 来）。带条件 = 只删命中的明细（受影响日期的按天聚合由后端重算）；
    * 不带条件 = 全部清空，此时调用方要显式带 `all=1`（后端护栏，见 clearRequests）。
    *
    * 返回**查询串**（与 queryParams 一致）而不是 URLSearchParams 对象：
@@ -694,12 +799,7 @@
    * 那样筛选清空就变成了全清 —— 这个 bug 已经踩过一次，别再踩。
    */
   function clearParams() {
-    const params = new URLSearchParams();
-    const start = rangeStart(range);
-    const status = $('req-status')?.value;
-    if (start !== null) params.set('start', String(start));
-    if (status) params.set('status', status);
-    return params.toString();
+    return filterParams().toString();
   }
 
   async function clearRequests() {
@@ -720,6 +820,10 @@
       // 无筛选时显式带 all=1：后端要求「清空全部」必须显式声明，
       // 免得哪天参数漏传又被当成全清（前端写错一次就是全部数据没了）
       await api.clearStatsRequests(hasFilters ? query : 'all=1');
+      // 清单跟着明细一起变（可能整批模型名都没了）：把节流计时清零强制重拉一次。
+      // 不重拉的话，清空后下拉里还列着已经不存在的值 —— 选中它得到空列表，
+      // 而用户刚清空过日志，这个空列表看不出是「被清掉了」还是「筛错了」
+      filterOptionsAt = 0;
       // 清空后没有「当前页」可言：回到第 1 页并把滚动位置一起归零
       await load({ resetPage: true });
       toast('请求日志已清空');
@@ -749,8 +853,11 @@
   $('btn-req-clear').addEventListener('click', clearRequests);
   $('btn-req-prev').addEventListener('click', () => gotoPage(Math.floor(offset / PAGE_SIZE)));
   $('btn-req-next').addEventListener('click', () => gotoPage(Math.floor(offset / PAGE_SIZE) + 2));
-  // 状态筛选会换掉结果集，页码必须回到第 1 页，否则停的位置没有意义
-  $('req-status').addEventListener('change', () => load({ resetPage: true }));
+  // 四个筛选维度都会换掉结果集，页码必须回到第 1 页，否则停的位置没有意义。
+  // 三个下拉共用一条绑定（它们的语义完全一致，逐个写三遍只会多三处要同步的地方）
+  for (const id of ['req-status', 'req-provider', 'req-model']) {
+    $(id)?.addEventListener('change', () => load({ resetPage: true }));
+  }
 
   // ─── 详情弹窗（上游原始报文）─────────────────
   //
@@ -806,6 +913,9 @@
   // 自动刷新先按兜底值起一次（页面立刻有轮询），同时异步读配置校准 ——
   // 不 await：一次本地接口调用不该拖住首屏，读到后 applyAutoRefresh 会重启定时器。
   void load({ silent: true });
+  // 筛选清单与首屏数据并行拉（都是本地接口，互不依赖）：清单晚到一点不影响
+  // 列表显示，而它决定两个下拉什么时候可用（首屏那次 load 是静默的，不会带它）
+  void refreshFilterOptions();
   startAuto();
   void syncAutoRefresh();
 })();

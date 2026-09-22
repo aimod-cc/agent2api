@@ -288,6 +288,21 @@
 
 .retention-input .unit { color: var(--text-3); font-size: 12px; }
 
+/* ─── 系统提示词（模式下拉 + 文件路径）───
+   版式复用 .retention-row 的两列（定宽标签 + 输入），但输入不是「窄数字框」，
+   所以单独给宽度：模式下拉够放下最长选项；路径框吃满剩余宽度（路径可能很长，
+   靠 flex 收缩 + min-width:0 随面板自适应，不会撑出横向滚动）。 */
+.prompt-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.prompt-input select { flex: 0 0 auto; width: 240px; }
+
+.prompt-input input[type="text"] { width: 100%; }
+
 /* ─── 数据存储（只读展示）───
    复用 .retention-row 的两列版式；第二列是路径：路径是主体，可能很长，
    允许在任意字符处折行 —— 目录路径没有天然的断点，靠 word-break 拆，

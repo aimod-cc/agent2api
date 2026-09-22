@@ -51,6 +51,7 @@
 //! 配置项的名字若与某个固定键撞了，写一次配置就会把那份状态**删掉**
 //! （比如配置里出现 `desktopSettings`，用户改一次 API Key 就丢了桌面设置）。
 //! 当前配置项（`apiKeys` / `modelRules` / `logRetentionDays` / `debugMode` /
+//! `sanitizeBlacklistFingerprints` / `promptMode` / `promptFile` /
 //! `scheduledTasks` / `autoCheckin` / `locale` / `lastRequestModel` /
 //! `providerRoute` / 三个 `*Dir` / 三个 `*RetentionDays` / 三个 `retry*` /
 //! 六条 `scheduledTasks.*` 子键 / 三个 `*Imported` 标记 / 旧字段 `apiKey`）

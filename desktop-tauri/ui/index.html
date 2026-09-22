@@ -199,11 +199,38 @@
             </section>
           </div>
 
+          <!-- ── 用量环形图：模型 / 提供商两张并排 ──
+               两张卡各自独立判断显隐（字段是两个，可能一新一旧）：models 是本次
+               新增的字段，旧后端不会返回它，那时整块藏起来 —— 与上面两张排行卡
+               同一判据（前者是版本落后，摆一个空卡片只会让人以为哪里坏了）。
+               提供商那张复用 providers 字段（它同时喂着 Top 提供商那张排行卡）。 -->
+          <div class="report-donut-grid">
+            <section class="panel" id="report-models-panel" hidden>
+              <div class="panel-head">
+                <h2>模型用量</h2>
+                <span class="tip-q" data-tip="所选范围内每个模型各消耗了多少 Token，按用量从多到少排，扇区角度即占比。中心是这一维的合计（等于概览里的总 Token），右侧每行给出该模型的 Token 用量与百分比。扇区内的百分比只在 ≥3% 时标出，更小的会挤成一团 —— 完整读数在右侧列表与悬停气泡里。颜色按用量排名分配：最大的那段是红色，依次往后；同一份报表里换个维度看，配色口径不变。"></span>
+              </div>
+              <div class="panel-body">
+                <div id="report-models-donut"></div>
+              </div>
+            </section>
+
+            <section class="panel" id="report-providers-pie-panel" hidden>
+              <div class="panel-head">
+                <h2>提供商用</h2>
+                <span class="tip-q" data-tip="所选范围内每个提供商各消耗了多少 Token，按用量从多到少排，扇区角度即占比。同一个模型名可能有多家都能提供，网关按设置页「转发路由」的优先级依次尝试，所以占比也反映了实际落到谁身上。中心是这一维的合计（等于概览里的总 Token），右侧每行给出该提供商的 Token 用量与百分比。「未知」是指那批请求没记下承载它的提供商 —— 主要是记录提供商这个功能上线之前的旧明细，其次是请求在选定上游之前就失败了。"></span>
+              </div>
+              <div class="panel-body">
+                <div id="report-providers-donut"></div>
+              </div>
+            </section>
+          </div>
+
           <!-- ── 热力图（固定 365 天，与时间范围筛选解耦）── -->
           <section class="panel">
             <div class="panel-head">
               <h2>活跃热力图</h2>
-              <span class="panel-sub">近 365 天，按天请求数着色</span>
+              <span class="panel-sub">近 365 天，按天 Token 用量着色（档位按本窗口峰值自动定）</span>
             </div>
             <div class="panel-body">
               <div class="heat-wrap" id="report-heatmap">
@@ -211,7 +238,7 @@
               </div>
             </div>
             <div class="panel-foot">
-              <span class="heat-scale-label">请求数</span>
+              <span class="heat-scale-label">Token</span>
               <span class="heat-legend" id="report-heat-legend"></span>
               <div class="spacer"></div>
               <span>方格为本地自然日，无请求显示为空槽</span>
@@ -625,7 +652,7 @@
         <section class="page" data-page="requests">
           <div class="page-head">
             <h2>请求日志</h2>
-            <p class="intro">网关每次转发到上游的模型请求：提供商与账号、重试、状态码、模型、用时与 Token 用量，按时间倒序。悬停「重试」列的标签可看每次尝试的账号、失败原因与重试明细；开启调试模式后「详情」列可查看完整的上游原始报文。本页的自动刷新间隔在「定时任务」页设置。</p>
+            <p class="intro">网关每次转发到上游的模型请求：提供商与账号、重试、状态码、模型、用时与 Token 用量，按时间倒序。可按时间、状态、提供商、模型四个维度筛选（后两个的选项是这份日志里实际出现过的值）。悬停「重试」列的标签可看每次尝试的账号、失败原因与重试明细；开启调试模式后「详情」列可查看完整的上游原始报文。本页的自动刷新间隔在「定时任务」页设置。</p>
           </div>
 
           <section class="panel">
@@ -653,6 +680,16 @@
                   <option value="">全部状态</option>
                   <option value="ok">成功</option>
                   <option value="error">失败</option>
+                </select>
+                <!-- 提供商 / 模型两个维度：选项由 requests-panel.js 进页面时从
+                     `/api/stats/requests/filters` 拉一次填进来（那是「明细里出现过
+                     的值」，不是当前配置清单 —— 已删除账号所属的提供商、历史请求
+                     用过的模型名同样要能筛到）。这里只声明「全部」这个空值项。 -->
+                <select id="req-provider" title="按提供商筛选（只列日志里出现过的）">
+                  <option value="">全部提供商</option>
+                </select>
+                <select id="req-model" title="按模型筛选（只列日志里出现过的；精确匹配模型名）">
+                  <option value="">全部模型</option>
                 </select>
                 <div class="spacer"></div>
                 <span class="panel-sub" id="req-summary">—</span>
@@ -836,6 +873,54 @@
                     </div>
                     <div class="settings-state" id="sanitize-state">—</div>
                     <div class="hint retention-note">默认开启。命中明细会记进请求日志的「敏」标签（悬停可看命中了哪几条规则）。本项只改发给上游的副本，客户端看到的响应内容不变。</div>
+                  </div>
+                </section>
+
+                <!-- ── 通用：系统提示词 ──
+                     模式与提示词文件读写后端 config.json（经 /api/prompt，HTTP 桥）。
+                     custom / append 用网关自有提示词替换 / 追加 system 消息 ——
+                     指纹脱敏之外的第二层防护：从源头消灭 system 来源的指纹
+                     （见 core::prompt）。降级状态是运行期状态（撞内容拦截后自动
+                     进入、次日 00:00 解除），这里显示它并提供「立即解除」。 -->
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>系统提示词</h2>
+                    <span class="tip-q" data-tip="客户端（Claude Code / Codex 等 CLI）会在 system 提示词里注入几十句固定模板，上游按逐字匹配审核，命中就整单拦截（HTTP 400）。指纹脱敏能改写实测命中过的那几句，但换一个客户端版本就可能冒出新的。这里可以把 system 整段换成网关自己那份：①「透传」= 不动客户端 system（默认，行为与之前完全一致）；②「替换」= 删掉客户端所有 system / developer 消息，换成网关的提示词（客户端项目规范随之消失）；③「追加」= 在开头连续 system 块之后插入一条网关提示词，既有消息逐字不动（客户端规范与网关提示词并用）。提示词文件留空用内置默认，也可以指向你自己的 UTF-8 文本文件。另外，透传 / 追加模式下撞了内容拦截（多半是指纹误报）时，网关会自动换一段最小中性提示词重试一次，并把「降级期」开到次日 00:00 —— 期间所有请求直接带中性提示词出门，不再先撞一次 400；这里能看见并提前解除它。"></span>
+                    <span id="prompt-badge" class="badge">检测中…</span>
+                    <div class="head-actions">
+                      <button id="btn-prompt-refresh">刷新</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="retention-list">
+                      <div class="retention-row">
+                        <label for="settings-prompt-mode">模式</label>
+                        <span class="prompt-input">
+                          <select id="settings-prompt-mode">
+                            <option value="passthrough">透传客户端 system（默认）</option>
+                            <option value="custom">替换为网关提示词</option>
+                            <option value="append">追加网关提示词</option>
+                          </select>
+                        </span>
+                        <div class="hint">替换 = 客户端 system / developer 消息全部删掉，换成网关的提示词；追加 = 保留客户端内容，只在开头 system 块之后多插一条。两者都只改发给上游的副本，客户端看到的响应不变。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="settings-prompt-file">提示词文件</label>
+                        <span class="prompt-input">
+                          <input type="text" id="settings-prompt-file" placeholder="留空 = 用内置默认提示词">
+                        </span>
+                        <div class="hint">UTF-8 文本文件路径，留空用内置默认提示词（通用编码助手提示词，不含任何会被上游拦截的模板句）。只在「替换 / 追加」模式下生效，透传模式不读它。</div>
+                      </div>
+                      <div class="retention-row" id="prompt-degrade-row" hidden>
+                        <label>内容拦截降级</label>
+                        <span class="prompt-input">
+                          <button id="btn-prompt-clear-degrade">立即解除</button>
+                        </span>
+                        <div class="hint" id="prompt-degrade-hint">—</div>
+                      </div>
+                    </div>
+                    <div class="settings-state" id="prompt-state">—</div>
+                    <div class="hint retention-note">改完立即生效，不用重启（下一个请求就用新模式）。降级是自动的临时状态，解除后本模式自己的提示词立刻恢复。</div>
                   </div>
                 </section>
               </div>
@@ -1517,6 +1602,11 @@
        东西 —— 那条链路开窗口等回调，这条在本弹窗里「发码 → 填码 → 换 token」。
        必须在 add-provider-forms.js 之前 —— 加载期由它建 AutoClaw 那一份。 -->
   <script src="sms-login.js"></script>
+  <!-- AutoClaw 国际版的 OAuth 网页登录（Zai / Google）。单独一个文件是因为它的
+       顺序与另外五家相反：点按钮后先在**本弹窗**里跑阿里云风控验证码（浏览器端
+       SDK，从 o.alicdn.com 加载），拿到验证串才去换授权地址、再交壳开窗口。
+       必须在 add-provider-forms.js 之前 —— 加载期由它建国际版那一份。 -->
+  <script src="autoclaw-oauth.js"></script>
   <script src="add-account.js"></script>
   <!-- 提供商目录：provider 摘要与「作用提供商」写入的唯一前端入口。
        必须排在所有消费者（accounts-groups / logs-panel）之前 -->

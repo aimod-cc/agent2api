@@ -596,8 +596,11 @@ impl AccountStore {
 /// 时间/能否刷新）必须来自同一份实时值，否则界面与转发看到的就是两个状态。
 pub(crate) fn live_desktop_credentials(record: &StoredAccount) -> Option<(String, String, f64)> {
     if record.provider() == super::AUTOCLAW_PROVIDER_ID && record.is_desktop() {
-        let credentials =
-            crate::server::core::providers::autoclaw::credentials::local_credentials().ok()?;
+        // 国内版专用来源（桌面端文件没有地区标记），因此这里显式传 `Cn`
+        let credentials = crate::server::core::providers::autoclaw::credentials::local_credentials(
+            crate::server::core::providers::autoclaw::Region::Cn,
+        )
+        .ok()?;
         return Some((
             credentials.token,
             credentials.refresh_token,

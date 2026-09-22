@@ -62,6 +62,7 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
 use super::adapter::{ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass};
+use super::content_block;
 use super::{kind_id, ProviderKind};
 
 pub mod balance;
@@ -157,11 +158,14 @@ impl ProviderAdapter for RaccoonAdapter {
                 status,
             };
         }
-        UpstreamErrorClass::Fatal {
+        // 内容策略拦截（审核文案）→ ContentBlocked：不罚账号，交给编排层换中性
+        // 提示词重试一次 + 触发降级（见 `core::degrade`）
+        content_block::classify_or_fatal(
             status,
+            error_body,
             message,
-            upstream_code: error_body.get("code").and_then(Value::as_i64),
-        }
+            error_body.get("code").and_then(Value::as_i64),
+        )
     }
 
     /// 取可用 access token（临期主动刷新；刷新结果按来源回写）。

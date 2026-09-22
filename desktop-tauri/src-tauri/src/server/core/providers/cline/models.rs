@@ -8,10 +8,13 @@
 //!   "recommended": [{"id":"openai/gpt-6-astra","name":"gpt-6-astra",...}, ...],  // 4 条
 //!   "free":        [{"id":"cline-free/deepseek-v4.1-flash","name":"Deepseek-v4.1-Flash",...},
 //!                   {"id":"z-ai/glm-5.3-flash","name":"glm-5.3-flash",...}, ...],  // 5 条，**混着无前缀条目**
-//!   "clinePass":   [{"id":"cline-pass/glm-5.3","name":"cline-pass/glm-5.3",...}, ...], // 16 条
+//!   "clinePass":   [{"id":"cline-pass/glm-5.3","name":"cline-pass/glm-5.3",...}, ...], // 14 条
 //!   "clineCloud":  [{"id":"cline-cloud/glm-5.3",...}]                                  // 3 条
 //! }
 //! ```
+//!
+//! **归池一律以响应里的分组为准**（`free` 组 → 免费池、`clinePass` 组 → 订阅池），
+//! 不按 id 前缀猜 —— 理由见下面第 2 条。
 //!
 //! ── 三组模型怎么取舍（这是本模块最需要想清楚的一件事）────────
 //!
@@ -19,15 +22,19 @@
 //!      这是 ClinePass 订阅用户的实际可用集，也是我们主要在意的那个池。
 //!   2. **`free`（免费池）**：**只有部分条目带 `cline-free/` 前缀** ——
 //!      实测 5 条里有 2 条是别家的裸 id（`z-ai/glm-5.3-flash`、
-//!      `poolside/laguna-s-2.1:free`）。那些无前缀条目属于上游的「免费额度转售」
-//!      （走 OpenRouter 那类通道），**能不能用取决于账号额度而不是前缀**，
-//!      因此原样收录，不去猜。
+//!      `poolside/laguna-s-2.1:free`）。那两条**同样是免费池成员**（实测用
+//!      免费账号打它们返回 200，走 OpenRouter 那类通道转售），只是上游用了
+//!      承载方的裸 id 而没加自己的通道前缀。**因此归池必须看分组，不能看前缀**
+//!      —— 早先按 `pool_of(id)` 猜前缀，把这 2 条错判进订阅池，而订阅池没有
+//!      账号时整家不广告，于是它们在界面上**彻底消失**（只显示 3 条的那个 bug）。
 //!   3. **`recommended`**：上游的「推荐位」（4 条），与上面两组**有重叠**
 //!      （如 `moonshotai/kimi-k3` 与 pass 池的 `cline-pass/kimi-k3` 是同一个模型
 //!      的不同通道）。收录它们会让 `/v1/models` 里出现一批「同一个模型的两种
 //!      写法」，而它们的计费通道不同、可用性也不同 —— 用户点名哪一个就走哪一个，
 //!      这符合本项目「不静默替换模型」的既有纪律（README 的模型名契约），
-//!      所以照收，并按前缀给它们各自的默认映射。
+//!      所以照收。这一组**没有池归属信息**（上游只按「推荐」分组，不分池），
+//!      只能按 id 前缀兜底判池 —— 它们实测走 credit 计费（402 余额不足），
+//!      与两个池都不同，判进哪一池都只是「挂在哪家广告」的问题。
 //!   4. **`clineCloud`**：实测打它返回 403（未开通），**不收录** ——
 //!      广告一个必然 403 的模型只会让客户端在列表里选中它然后失败。
 //!
@@ -178,39 +185,124 @@ static REFRESHED_AT: OnceLock<Mutex<i64>> = OnceLock::new();
 /// 覆盖「装上就能用」的最低限度。**不抄全**：上游那个清单会变（模型上下架频繁），
 /// 抄全了只会得到一份很快过时的表；这里只留稳定存在的主力模型，
 /// 其余靠远程刷新补齐。
-const FALLBACK_MODELS: &[(&str, &str, i64, bool)] = &[
-    // (上游 id, 展示名, 上下文窗口, 是否支持思维链)
-    ( "cline-pass/glm-5.3",             "GLM-5.3 (ClinePass)",          200_000, true),
-    ( "cline-pass/kimi-k3",             "Kimi K3 (ClinePass)",          256_000, true),
-    ( "cline-pass/deepseek-v4.1-flash", "DeepSeek V4.1 Flash (ClinePass)", 1_000_000, true),
-    ( "cline-pass/deepseek-v4-pro",     "DeepSeek V4 Pro (ClinePass)",  128_000, true),
-    ( "cline-pass/qwen3.8-max",         "Qwen3.8 Max (ClinePass)",      256_000, true),
-    ( "cline-free/deepseek-v4.1-flash", "DeepSeek V4.1 Flash (免费)",   1_000_000, true),
-    ( "cline-free/muse-spark-1.3-contributor", "Muse Spark 1.3 (免费)", 200_000, true),
-    ( "cline-free/solar-pro4",          "Solar Pro 4 (免费)",           128_000, false),
+const FALLBACK_MODELS: &[(&str, &str, Pool, i64, bool)] = &[
+    // (上游 id, 展示名, 归属池, 上下文窗口, 是否支持思维链)
+    //
+    // **池在这里显式写死**（不调 `pool_of` 猜）：表里那两条免费池的裸 id 正是
+    // 按前缀猜会判错的那一类（见模块头第 2 条）。
+    ( "cline-pass/glm-5.3",             "GLM-5.3 (ClinePass)",           Pool::Pass, 200_000, true),
+    ( "cline-pass/kimi-k3",             "Kimi K3 (ClinePass)",           Pool::Pass, 256_000, true),
+    ( "cline-pass/deepseek-v4.1-flash", "DeepSeek V4.1 Flash (ClinePass)", Pool::Pass, 1_000_000, true),
+    ( "cline-pass/deepseek-v4-pro",     "DeepSeek V4 Pro (ClinePass)",   Pool::Pass, 128_000, true),
+    ( "cline-pass/qwen3.8-max",         "Qwen3.8 Max (ClinePass)",       Pool::Pass, 256_000, true),
+    ( "cline-free/deepseek-v4.1-flash", "DeepSeek V4.1 Flash (免费)",    Pool::Free, 1_000_000, true),
+    ( "cline-free/muse-spark-1.3-contributor", "Muse Spark 1.3 (免费)", Pool::Free, 200_000, true),
+    ( "cline-free/solar-pro4",          "Solar Pro 4 (免费)",            Pool::Free, 128_000, false),
+    // 免费池的裸 id 两条（**不带 `cline-free/` 前缀**，见模块头第 2 条）。
+    // 兜底表也收它们：上游目录接口拉不到时，它们同样是「装上就能用」的免费模型，
+    // 少了这两条会让免费池在离线/未刷新时又退回「只有 3 个」的旧观感。
+    // 上下文窗口取自 Cline 官方目录（`@cline/llms` 的 `cline` 块实测值）。
+    ( "z-ai/glm-5.3-flash",             "GLM-5.3-Flash (免费)",          Pool::Free, 1_310_720, true),
+    ( "poolside/laguna-s-2.1:free",     "Laguna S 2.1 (免费)",           Pool::Free, 262_144, true),
 ];
 
-/// 前缀 → 池
+/// 上游 id 的**通道前缀** → 池（按 id 前缀猜的兜底判据）。
+///
+/// ── 它不再是归池的主判据（本次修复的要点）────────────────────
+/// 远程目录的归池看**响应里的分组**（见 [`parse_recommended`]）：免费组里有
+/// 不带 `cline-free/` 前缀的裸 id，按前缀猜会把它们错判进订阅池。
+///
+/// 保留本函数的三个用途：
+///   - `recommended` 组没有池信息，只能按前缀兜底（那里带前缀的只有 pass）；
+///   - **拆分迁移**的判据（`model_rules::cline::migrate_cline_split`）：存量账号
+///     的 `pool` 字段当初就是按这个口径写的，迁移必须给出逐字相同的结果；
+///   - 静态兜底的条目全部带前缀，按它判与分组判等价。
+///
+/// ── 兜底表优先于前缀（本次修复）─────────────────────────────
+/// 前缀判不出来时先查 [`FALLBACK_MODELS`]：免费池那两条裸 id 的归属写在表里，
+/// 查表比「无前缀一律 Pass」准 —— 而且**迁移与运行期因此同一口径**
+/// （存量规则若把这两条判进 pass，迁移后它们会与运行期的归属不一致）。
+///
+/// 表里也查不到才回落 `Pass`：前缀都没带时无从判断通道，归 pass 是**保守**选择。
 pub fn pool_of(model_id: &str) -> Pool {
     if model_id.starts_with(FREE_PREFIX) {
-        Pool::Free
-    } else {
-        // 无前缀的免费组条目（`z-ai/...` 那类）与 pass 前缀都归 pass 池：
-        // 无前缀条目按「非免费池」处理是保守的 —— 它们实际能不能用取决于
-        // 账号额度（模块头第 2 条已说明不去猜）。
-        //
-        // 这条归属**同时是迁移的判据**：拆分前账号的 `pool` 字段只影响广告，
-        // 而广告内容正是按这个函数分的，所以按它把旧账号归到 `cline-pass`
-        // 与「保持原样」等价。
-        Pool::Pass
+        return Pool::Free;
     }
+    if let Some((_, _, pool, _, _)) = FALLBACK_MODELS
+        .iter()
+        .find(|(id, ..)| id.eq_ignore_ascii_case(model_id))
+    {
+        return *pool;
+    }
+    // 无前缀的 id 与 pass 前缀都归 pass 池。这条归属**同时是迁移的判据**：
+    // 拆分前账号的 `pool` 字段只影响广告，而广告内容正是按这个函数分的，
+    // 所以按它把旧账号归到 `cline-pass` 与「保持原样」等价。
+    Pool::Pass
+}
+
+/// 上游 id → 对下游的**友好名**（这条模型该有的去前缀写法）；没有可剥的返回 None。
+///
+/// ── 按池判，而不是只看 id（本次修复）─────────────────────────
+/// 免费池里混着**不带通道前缀**的条目（`z-ai/glm-5.3-flash`、
+/// `poolside/laguna-s-2.1:free`，见模块头第 2 条）：它们的通道由分组给出，
+/// id 上只有承载方的厂商前缀。这类条目同样该有一个能直接敲的短名字，于是：
+///   - 带通道前缀（`cline-free/` / `cline-pass/` / `cline-cloud/`）→ 剥通道前缀；
+///   - **免费池**里不带通道前缀、但带厂商前缀（`z-ai/…`）→ 剥厂商前缀；
+///   - 其余（订阅池的无前缀条目、`recommended` 组的 `openai/gpt-6-astra` 这类）
+///     → `None`。那里厂商前缀是**模型身份**（`openai/gpt-6-astra` 与
+///     `anthropic/claude-opus-5` 是不同模型），剥掉会造出上游不存在的名字。
+///
+/// ── 为什么只在免费池剥厂商前缀（别类推到别处）─────────────────
+/// `z-ai/glm-5.3-flash` 里的 `z-ai/` 是「这条免费额度由谁承载」，与
+/// `cline-free/` 属于同一层含义（都是**通道**）；而 `openai/gpt-6-astra` 里的
+/// `openai/` 是模型本身是谁（**身份**）。剥通道前缀才得到用户认得的名字，
+/// 剥身份前缀会造出上游不存在的名字。免费池这 2 条恰好把承载方写在了通道位上。
+///
+/// ── 撞名（明确接受）─────────────────────────────────────────
+/// 剥出来的短名可能与别家的原生 id 撞（`glm-5.3-flash` 同时是 CatPaw 的原生
+/// id）。撞名在本项目的路由语义下是**正常**的：同一 alias 允许多家各一条映射、
+/// 一起进候选链做主备（见 `model_rules` 模块头），不遮蔽任何东西 ——
+/// 「这家也能接这个名字」这件事本来就该在候选链里体现出来。
+pub fn friendly_alias(pool: Pool, model_id: &str) -> Option<&str> {
+    let id = model_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    // 通道前缀优先：`cline-free/deepseek-v4.1-flash` → `deepseek-v4.1-flash`
+    for prefix in [FREE_PREFIX, PASS_PREFIX, CLOUD_PREFIX] {
+        if let Some(rest) = id.strip_prefix(prefix) {
+            return Some(rest);
+        }
+    }
+    // 免费池的裸厂商 id：`z-ai/glm-5.3-flash` → `glm-5.3-flash`。
+    // 没有 `/` 的 id（上游本来就给的友好名）无需映射。
+    if pool == Pool::Free {
+        let (_, rest) = id.split_once('/')?;
+        // 再剥变体后缀 `:free`（`poolside/laguna-s-2.1:free` → `laguna-s-2.1`）——
+        // Cline 自己的展示名归一化也是这么做的（它的 `oK()` 就是去掉 `:free`
+        // 与 ` (free)` 后缀）。留着后缀会得到一个客户端难敲的名字。
+        let rest = rest.strip_suffix(":free").unwrap_or(rest);
+        return (!rest.is_empty()).then_some(rest);
+    }
+    None
 }
 
 /// 上下文窗口兜底（上游 recommended 接口不给这个字段）。
 ///
 /// 按模型名里能看出的家族给一个**保守**值：宁可小报（客户端会自己按需截断），
 /// 不要大报（超了上游会报错，而客户端以为还有空间）。
+///
+/// ── 兜底表里有权威值的先查表 ────────────────────────────────
+/// 表里那两条免费池裸 id 的窗口取自 Cline 官方目录（实测值），比按家族猜准得多
+/// （`z-ai/glm-5.3-flash` 猜出来是 256K、实际 1.28M）。先查表还有第二个好处：
+/// **远程与静态两条路径给出同一个数** —— 否则同一个模型刷新前后会报不同的窗口。
 fn context_window_for(model_id: &str) -> i64 {
+    if let Some((_, _, _, context, _)) = FALLBACK_MODELS
+        .iter()
+        .find(|(id, ..)| id.eq_ignore_ascii_case(model_id))
+    {
+        return *context;
+    }
     let name = model_id.to_ascii_lowercase();
     if name.contains("deepseek-v4.1") || name.contains("1m") {
         1_000_000
@@ -250,10 +342,10 @@ pub fn entries() -> Vec<ModelEntry> {
     }
     FALLBACK_MODELS
         .iter()
-        .map(|(id, name, context, reasoning)| ModelEntry {
+        .map(|(id, name, pool, context, reasoning)| ModelEntry {
             id: (*id).to_string(),
             name: (*name).to_string(),
-            pool: pool_of(id),
+            pool: *pool,
             context_window: *context,
             reasoning: *reasoning,
         })
@@ -379,9 +471,18 @@ pub async fn refresh() -> Result<usize, String> {
 ///
 /// 取舍见模块头：收 `clinePass` 与 `free`，收 `recommended`（按通道身份区分），
 /// **不收 `clineCloud`**（实测 403）。
+///
+/// ── 归池看分组，不看前缀（本次修复）──────────────────────────
+/// 遍历时把**分组本身**作为归池依据传下去：`free` 组一律进免费池、
+/// `clinePass` 组一律进订阅池。早先这里丢掉分组、改调 `pool_of(id)` 按前缀猜，
+/// 于是免费组里那 2 条裸 id 被错判进订阅池 —— 订阅池没有账号时整家不广告，
+/// 它们在界面上直接消失（用户看到「免费只有 3 个」）。
+///
+/// `recommended` 组没有池信息（上游只按「推荐」分组），仍按前缀兜底判池，
+/// 见模块头第 3 条。
 pub fn parse_recommended(payload: &Value) -> Vec<ModelEntry> {
     let mut out: Vec<ModelEntry> = Vec::new();
-    let push = |item: &Value, out: &mut Vec<ModelEntry>| {
+    let push = |item: &Value, group: Option<Pool>, out: &mut Vec<ModelEntry>| {
         let Some(id) = item
             .get("id")
             .and_then(Value::as_str)
@@ -405,15 +506,21 @@ pub fn parse_recommended(payload: &Value) -> Vec<ModelEntry> {
         out.push(ModelEntry {
             id: id.to_string(),
             name: name.to_string(),
-            pool: pool_of(id),
+            // 分组给的就用分组，没给（recommended）才按前缀兜底
+            pool: group.unwrap_or_else(|| pool_of(id)),
             context_window: context_window_for(id),
             reasoning: reasoning_for(id),
         });
     };
-    for key in ["clinePass", "free", "recommended"] {
+    // 组名 → 该组的池归属；`None` = 这组不携带池信息（按前缀兜底）
+    for (key, group) in [
+        ("clinePass", Some(Pool::Pass)),
+        ("free", Some(Pool::Free)),
+        ("recommended", None),
+    ] {
         if let Some(items) = payload.get(key).and_then(Value::as_array) {
             for item in items {
-                push(item, &mut out);
+                push(item, group, &mut out);
             }
         }
     }

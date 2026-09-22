@@ -16,7 +16,9 @@ OpenAI client / any SDK
         ├──▶ catpaw     ai.catpaw.meituan.com · Cookie: X-Passport-Token=… + user-uid
         │                (its own conversation session protocol)
         ├──▶ autoclaw   autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw
-        │                X-Authorization: Bearer <token> (OpenAI-compatible)
+        │                (domestic) X-Authorization: Bearer <token> (OpenAI-compatible)
+        ├──▶ autoclaw-intl  autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw
+        │                (international) same protocol and signing fingerprint, different site
         └──▶ qoder      api3.qoder.sh (Global) / gateway.qoder.com.cn (China)
                          COSY self-signed headers (not Bearer) · envelope-style SSE (custom encoding and signing)
 ```
@@ -32,7 +34,6 @@ OpenAI client / any SDK
 - [Quick Start](#quick-start)
 - [Screenshots](#screenshots)
 - [Data Storage](#data-storage)
-- [Outbound Fingerprint Sanitization](#outbound-fingerprint-sanitization)
 - [Project Layout](#project-layout)
 - [Development & Build](#development--build)
 - [Usage Notice](#usage-notice)
@@ -45,7 +46,9 @@ OpenAI client / any SDK
 Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\Program Files\Agent2API` by default, and needs administrator approval during setup), then launch it — **no Node or any other runtime required**.
 
 1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If an older version's data directory or data files are found, a dialog walks you through the migration (see [Data Storage](#data-storage) for details).
-2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw / Qoder / Cline), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again).
+2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw domestic / AutoClaw international / Qoder / Cline), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again).
+
+> **The two AutoClaw regions sign in differently**: the domestic build only offers SMS code; the international build only offers Zai / Google OAuth web authorization — pick "web login (Zai / Google)" in the add-account dialog and complete one slider check first (the risk-control step the vendor requires, handled by the vendor's own captcha component running locally), after which the official login page opens. You can choose how it opens: **embedded window** or **system default browser** (the latter reuses the Zai / Google account already signed in there). The international build does not offer SMS-code login (the official client does not either, and most international accounts have no phone number bound); if you have already signed in with the desktop client, "import desktop login state" is the quickest route, or paste credentials directly.
 3. Set your OpenAI client's `base_url` to `http://127.0.0.1:3065/v1` and put anything in `api_key` (for example `sk-local`; the server does not check it while authentication is disabled).
 
 Closing the window only minimizes to the tray by default, and the gateway keeps forwarding in the background; to quit for real, right-click the tray icon and choose "Exit".
@@ -122,32 +125,6 @@ The database runs in WAL mode, so while the app is running you will also see `ag
 
 ---
 
-## Outbound Fingerprint Sanitization
-
-Upstream moderation matches **literal strings**, not meaning: the fixed template sentences that clients (Claude Code / Codex-style CLIs) inject into the system prompt, the billing-header field name, and certain bare error codes will get the whole request rejected with HTTP 400. Such a rejection has nothing to do with whether the content is actually harmful — those exact strings just have to be present.
-
-With **fingerprint sanitization** enabled (Settings → General → Fingerprint sanitization, on by default), the gateway rewrites those fingerprints before every forward:
-
-- **Header key/value pairs are stripped entirely**: `x-anthropic-billing-header: ...` and trailing `cc_*=` pairs are removed; a leftover bare key name is abbreviated to `x-anthropic-billing-hdr` (breaks the literal match, meaning preserved).
-- **Semantic template sentences get a minimal rewrite** (one word changed, meaning intact):
-
-  | Original | Rewritten |
-  | --- | --- |
-  | `You are Claude Code, Anthropic's official CLI for Claude` | `...official CLI **tool** for Claude` |
-  | `Main branch (you will usually use this for PRs)` | `**Default** branch (you will usually use this for PRs)` |
-  | `You are a coding agent running in the Codex CLI, a terminal-based coding assistant.` | `...running in the Codex CLI **tool**, a terminal-based...` |
-  | `To give feedback, users should report...` | `To **provide** feedback, users should report...` |
-
-- **The bare error code `11128` becomes `11-128`**: that number is the trigger for an upstream anti-probing check — if it appears anywhere in the request body the whole request is rejected (`code=11128`, a bare `11128`, `错误码 11128` all match, regardless of context). The cost is that **a `11128` in your own conversation is rewritten too** — but its mere presence in a request is the rejection condition, so leaving it alone always fails. A hyphen is used rather than a zero-width space because the upstream was measured to normalize zero-width characters away.
-
-The rule set is **hard-coded** (ported from `internal/upstream/sanitize.go` in [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)). There is no maintainable word list and nothing to update over the network. Turning the switch off sends client templates upstream verbatim, and template sentences may be rejected again.
-
-Matches are recorded in the request log's "敏" tag (hover to see which rules matched); a `11128` rejection itself goes through the forwarding layer's backoff retry.
-
-> This only rewrites the **copy sent upstream**. What the client receives is unchanged.
-
----
-
 ## Project Layout
 
 Both the gateway and the desktop app live under `desktop-tauri/`: the backend is a Rust in-process HTTP server under `src-tauri/`, the frontend is plain HTML/CSS/JS under `ui/`.
@@ -176,8 +153,10 @@ agent2api/
 │  │  │  │  │  │                registry/ (session registry: table and handles / account identity / invalidation) /
 │  │  │  │  │  │                messages / blocks / tools / openai (translation layer) /
 │  │  │  │  │  │                upstream_http / image_compress / models / credentials / balance
-│  │  │  │  │  ├─ autoclaw/     Zhipu autoglm: adapter / credentials / refresh / crypto / models /
-│  │  │  │  │  │                balance / login (SMS code) / checkin (daily check-in task)
+│  │  │  │  │  ├─ autoclaw/     Zhipu autoglm (domestic + international): region (per-region
+│  │  │  │  │  │                domains and identity) / adapter / credentials / refresh / crypto / models /
+│  │  │  │  │  │                balance / login (SMS code, domestic only) /
+│  │  │  │  │  │                oauth (Zai / Google web login, international only) / checkin (daily check-in task)
 │  │  │  │  │  └─ qoder/        Qoder: adapter / endpoints (both sites) / oauth (device authorization) /
 │  │  │  │  │                   auth / cosy (COSY signing and body encoding) / protocol (envelope decoding) /
 │  │  │  │  │                   chat (session-style forwarding) / stream / machine (PKCE and machine id) /
@@ -194,6 +173,8 @@ agent2api/
 │  │  │  │  ├─ routing.rs / billing/   Account routing (global priority + rate-limit cooldown) / points check-in ops
 │  │  │  │  ├─ proxies.rs / clash.rs / egress.rs   Egress proxies and a per-exit cached Client
 │  │  │  │  ├─ sanitize.rs      Outbound fingerprint sanitization (header stripping + minimal rewrites)
+│  │  │  │  ├─ prompt.rs        Gateway-owned system prompt (passthrough / replace / append)
+│  │  │  │  ├─ degrade.rs       Content-block degradation state (neutral prompt until next 00:00)
 │  │  │  │  ├─ credential_maintenance.rs  Batch refresh of expired / soon-to-expire credentials
 │  │  │  │  ├─ usage_query.rs     Balance / points queries (concurrent across accounts + the snapshot taken by the scheduled run)
 │  │  │  │  ├─ scheduled_tasks.rs  Interval-based scheduled task registry and dispatch loop (toggle / interval /
@@ -202,7 +183,7 @@ agent2api/
 │  │  │  │                       Import/export (with identity normalization) / scheduled check-in / software updates
 │  │  │  └─ api/                 Per-route handlers (health/session/accounts/accounts_usage/
 │  │  │                          chat/models/keys/model_manage/stats/logs/billing/
-│  │  │                          sanitize/auto-checkin/scheduled-tasks/update/…)
+│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/…)
 │  │  ├─ lib.rs                  App entry point (config directory migration → settings → tray → main window → start backend)
 │  │  ├─ backend.rs              In-process server lifecycle
 │  │  ├─ legacy_install.rs       Cleanup of the old "current user" install (directory / shortcuts / uninstall entry / autostart; release only)

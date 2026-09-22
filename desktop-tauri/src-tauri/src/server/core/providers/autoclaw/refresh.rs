@@ -154,7 +154,7 @@ pub async fn refresh(
             // 旧结果不得用于后续请求（桌面端刚重新登录，它的凭证才是有效的）
             if let (true, Some(cache_key)) = (next.origin.is_local_file(), next.cache_key.as_ref())
             {
-                if !store_cached_if_current(cache_key, credentials, &next) {
+                if !store_cached_if_current(next.region, cache_key, credentials, &next) {
                     logging::verbose(
                         "[AutoClaw]",
                         &format!(
@@ -164,8 +164,10 @@ pub async fn refresh(
                     );
                     // 重新取当前登录态：桌面端刚重新登录时，它的凭证才是有效的。
                     // 读不到（文件被删/损坏）时**不重建、也不拿刷新结果顶替** ——
-                    // 明确报错，让用户去桌面端重新登录
-                    super::credentials::local_credentials().map_err(|error| {
+                    // 明确报错，让用户去桌面端重新登录。
+                    // 地区取刷新前那份凭证的（本地文件来源只可能是国内版，见
+                    // `credentials::local_credentials` 的说明）
+                    super::credentials::local_credentials(credentials.region).map_err(|error| {
                         GatewayError::with_status(
                             401,
                             format!(
@@ -235,6 +237,14 @@ pub(super) fn signed_auth_headers(token: &str) -> Vec<(String, String)> {
         // 品牌头：与桌面端一致的客户端指纹（源实现 `brandHeaders`）
         ("X-Product".to_string(), "autoclaw".to_string()),
         ("X-Client-Type".to_string(), "pc".to_string()),
+        // ── 这里**保留** `X-Harness-Type`（与转发那条路刻意不一致，别统一）──
+        // `adapter::brand_headers` 自 2026-09-22 起**不发**这个头：上游对
+        // `/chat/completions` 上的 `zcode` 值区别对待（403 pay-view / 406，见
+        // `adapter.rs` 模块头「上游 2026-09-22 起的两道闸」）。本函数服务的是
+        // **userapi 域**（刷新 / 余额 / 签到 / 模型目录），那条路当天实测带着它
+        // 照常 200（刷新与目录拉取都成功），而且它与 `X-Auth-Sign` 一起构成
+        // 「官方客户端指纹」—— 在这条链路上做未经实测的删减，风险方向是签名失败
+        // （code 400002），收益是零。
         ("X-Harness-Type".to_string(), "zcode".to_string()),
         (
             "X-Tm".to_string(),
@@ -261,11 +271,17 @@ pub(super) fn signed_auth_headers(token: &str) -> Vec<(String, String)> {
 ///
 /// 鉴权接口**不走账号级代理**：账号代理是给转发（流式长请求）准备的出口，
 /// 鉴权域与 LLM 域是两个站点（与 raccoon 刷新同一取舍）。
+///
+/// userapi 域由**凭证自己的地区**决定（`credentials.region`）—— 两地的刷新
+/// 接口路径逐字相同，只有域名不同，因此这里不需要第二份路径表。
 async fn call_refresh_api(
     credentials: &AutoClawCredentials,
     path: &str,
 ) -> Result<Value, GatewayError> {
-    let url = format!("{}{path}", super::credentials::userapi_base_url());
+    let url = format!(
+        "{}{path}",
+        super::credentials::userapi_base_url(credentials.region)
+    );
     let headers = signed_auth_headers(&credentials.token);
     let mut body = json!({
         "refresh_token": credentials.refresh_token,
@@ -353,6 +369,7 @@ async fn call_refresh_api_with_fallback(
     let claims = crypto::decode_jwt_claims(&access_token);
     let mut next = credentials_from_claims(
         credentials.id.clone(),
+        credentials.region,
         access_token,
         next_refresh,
         credentials.device_id.clone(),

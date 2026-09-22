@@ -1,4 +1,4 @@
-/* Agent2API · 报表页（时间范围 / 统计概览 / Top 提供商 / 热力图 / 缓存命中率 / 两个趋势图） */
+/* Agent2API · 报表页（时间范围 / 统计概览 / Top 提供商 / 用量环形图 / 热力图 / 缓存命中率 / 两个趋势图） */
 /* global workbuddyDesktop, wbApp */
 
 /**
@@ -7,13 +7,15 @@
  * 与 logs-panel.js / settings-panel.js 同构：依赖 window.wbApp 的 esc / currentPage，
  * 通过 window.wbReport 暴露 load 给 app.js（切到本页时立即刷新）。
  *
- * 三张图都是手写 SVG（项目没有图表库，也不为一个页面引依赖）：
+ * 四张图都是手写 SVG（项目没有图表库，也不为一个页面引依赖）：
  *   · 折线 / 柱状图按**像素坐标**画：先量容器宽度再算坐标，文字与刻度线因此
  *     不会被拉变形。改窗口时由 ResizeObserver 重算（见「尺寸自适应」一节）。
  *   · 热力图格子边长固定、只让列数随宽度自适应，观感与 GitHub 贡献图一致。
+ *   · 用量环形图（模型 / 提供商两张）尺寸固定、不随窗口变：它旁边挂着图例列表，
+ *     两者并排占满卡片，尺寸一动反而会让右侧那列读数跟着跳。
  *
- * 五块内容共用一次 /api/stats/summary 请求：它们本来就是同一次聚合的产物，
- * 拆成五个请求只会让「切范围」变成五次往返，还会出现各板块版本不一致的瞬间。
+ * 各块内容共用一次 /api/stats/summary 请求：它们本来就是同一次聚合的产物，
+ * 拆成多个请求只会让「切范围」变成多次往返，还会出现各板块版本不一致的瞬间。
  */
 
 (() => {
@@ -371,29 +373,300 @@
       list.reduce((sum, item) => sum + (Number(item?.totalTokens ?? item?.tokens) || 0), 0))} tokens`));
   }
 
-  // ─── 板块三：热力图 ────────────────────────
+  // ─── 板块三：用量环形图（模型 / 提供商）────
 
   /**
-   * 热力图分档：0 / 1-2 / 3-5 / 6-10 / 10+ 五档。
+   * 分色板：与 OmniProxy 的 `MODEL_COLORS` 逐字一致。
    *
-   * 用**固定阈值**而不是分位数：本工具的日请求量普遍是个位数，分位数会把
-   * 「那天只有 1 次请求」也涂成最深一档，颜色就不再表示「多少」，
-   * 只剩「相对排名」，反而看不出使用强度。
+   * 前 6 色是优先色（红 / 黄 / 绿 / 蓝 / 靛 / 青），按用量排名分配 ——
+   * 用量最大的那段拿红色，一眼就能找到「谁是大头」。后 10 色为补充色，
+   * 已逐一校验过与优先色及彼此在色相（<22°）与明度（<17）上都不接近，
+   * 明度也压在中间区段，所以浅色与深色两套主题下都能分辨。
    *
-   * 阈值只在这里定义一次：格子着色（levelOf）与图例上的说明文字都读它，
-   * 改一个数两处一起变 —— 否则会出现「图例写着 ≤5，实际 ≤7 才不变深」这种
-   * 谁也发现不了的漂移。
+   * 模型 / 提供商 / 客户端三处共用这一份：同一张报表里换个维度看同一批用量，
+   * 配色口径不该跟着变。条目数超过色板容量（16）时从头循环复用。
    */
-  const HEAT_LEVELS = [0, 2, 5, 10, Infinity];
+  const SLICE_COLORS = [
+    '#f73b00', '#f7bb07', '#4aaa4d', '#1872cb', '#3444a3', '#13c2c2',
+    '#722ed1', '#eb2f96', '#a0d911', '#34d399', '#d946ef', '#ff85c0',
+    '#b37feb', '#9d174d', '#ffa39e', '#69b1ff',
+  ];
 
-  /** 每一档的说明文字（图例用） */
-  function heatLevelText(level) {
+  /**
+   * 环形图几何：内半径 62%、外半径 88%（与 OmniProxy 的 innerRadius/outerRadius 同值）。
+   * `padAngle` 是扇区间隙的**上限**（度）—— 实际取值还会被每段自身角度夹一次，
+   * 见 donutHtml 里 `gap` 的说明。
+   */
+  const DONUT = { size: 220, inner: 0.62, outer: 0.88, padAngle: 2 };
+
+  /**
+   * 环形图扇区的 SVG 路径。
+   *
+   * 从 12 点方向顺时针画（SVG 的 0° 在 3 点方向，所以起点减 90°）——
+   * 与 OmniProxy 的 recharts 默认起始角一致，最大的那段落在右上，
+   * 阅读顺序与右侧图例从上到下相同。
+   *
+   * `padAngle` 是扇区之间的角度间隙（单位度），换算成弧度后从两端各让出半个 ——
+   * recharts 的 `paddingAngle` 就是这个语义。间隙让相邻扇区不粘在一起，
+   * 颜色接近的两段（比如两种蓝）也能靠这道缝分开。
+   *
+   * 整圆（单一段占满 100%）要特判：起终点重合时 SVG 的 A 命令画不出圆，
+   * 会退化成一条零长路径、整张图看起来是空的。用两段半圆拼出整圆。
+   *
+   * ── 整圆为什么必须配 evenodd 填充 ────────────────────────────
+   * 默认的 nonzero 规则按子路径的**绕向**累加：内外两圈都顺时针时绕数都是 1，
+   * 内圈不会挖空，整圆会渲染成一个**实心圆盘** —— 中心读数直接压在色块上。
+   * 多段那条路径没有这个问题（它是一圈外弧 + 一圈内弧连成的单条闭合路径，
+   * 内外绕向天然相反），所以只有整圆这个分支需要显式指定 evenodd。
+   * 这个缺陷肉眼只在「只有一个模型 / 只有一家提供商」时才出现，很容易漏测。
+   */
+  function donutSlicePath(cx, cy, outer, inner, startAngle, endAngle) {
+    const rad = angle => ((angle - 90) * Math.PI) / 180;
+    const point = (radius, angle) => [
+      round1(cx + radius * Math.cos(rad(angle))),
+      round1(cy + radius * Math.sin(rad(angle))),
+    ];
+    const sweep = endAngle - startAngle;
+    if (sweep >= 359.999) {
+      // 整圆：两段半圆（各自 180°），避免起终点重合导致 A 命令退化。
+      // `fill-rule="evenodd"` 由调用方（donutHtml）挂在这个分支的 path 上。
+      const [ox1, oy1] = point(outer, 0);
+      const [ox2, oy2] = point(outer, 180);
+      const [ix1, iy1] = point(inner, 0);
+      const [ix2, iy2] = point(inner, 180);
+      return `M ${ox1} ${oy1} A ${outer} ${outer} 0 1 1 ${ox2} ${oy2}`
+        + ` A ${outer} ${outer} 0 1 1 ${ox1} ${oy1} Z`
+        + ` M ${ix1} ${iy1} A ${inner} ${inner} 0 1 0 ${ix2} ${iy2}`
+        + ` A ${inner} ${inner} 0 1 0 ${ix1} ${iy1} Z`;
+    }
+    const [ox1, oy1] = point(outer, startAngle);
+    const [ox2, oy2] = point(outer, endAngle);
+    const [ix2, iy2] = point(inner, endAngle);
+    const [ix1, iy1] = point(inner, startAngle);
+    // largeArc 只在超过半圆时置 1；sweep 恒为 1（顺时针）
+    const large = sweep > 180 ? 1 : 0;
+    return `M ${ox1} ${oy1} A ${outer} ${outer} 0 ${large} 1 ${ox2} ${oy2}`
+      + ` L ${ix2} ${iy2} A ${inner} ${inner} 0 ${large} 0 ${ix1} ${iy1} Z`;
+  }
+
+  /**
+   * 环形图 + 右侧图例列表（模型用量 / 提供商用量的共用实现）。
+   *
+   * ── 为什么是手写 SVG 而不是引图表库 ──────────────────────────
+   * 本页三张图（热力图、两条折线）本来就是手写的，项目没有也不为一个页面引
+   * 依赖。环形图的几何只有「弧路径 + 一个中空中心」两件事，手写比引库更短，
+   * 也自动跟着 --surface / --text 这套令牌走主题。
+   *
+   * ── 数据形状（`[{label, totalTokens, requests}]`）──────────────
+   * 模型与提供商两维同形，所以共用这一个渲染。`idKey` 只用来做 DOM 的
+   * key（两维的身份字段名不同：模型是 `model`、提供商是 `id`）。
+   *
+   * ── 图例为什么带上 Token 与百分比 ────────────────────────────
+   * 扇区角度只表达「相对占比」，看不出绝对量级 —— 而「这段是 1.2 亿还是
+   * 1200 万」正是用户要问的。两列读数（Token 用量、百分比）让颜色从
+   * 「深浅感觉」变成可核对的数字。
+   *
+   * ── 中心读数为什么是总量 ─────────────────────────────────────
+   * 环形图的中空处是整张图视觉重心，写「总 Token」把各扇区的共同分母
+   * 摆在最显眼处，右侧每段的百分比立刻有了参照。
+   */
+  function donutHtml(list, options) {
+    const rows = (Array.isArray(list) ? list : [])
+      .map(item => {
+        // 后端两个维度同形，但身份字段名不同（模型是 `model`、提供商是 `id`），
+        // 这里按「label → model → id」依次兜底，两维共用一份实现
+        const label = String(item?.label ?? item?.model ?? item?.id ?? '').trim();
+        return {
+          label: label || options.unknownLabel,
+          tokens: Number(item?.totalTokens ?? item?.tokens) || 0,
+          requests: Number(item?.requests) || 0,
+        };
+      })
+      // 全零的组不画：只可能来自手改过的数据，扇区角为 0 什么也看不见
+      .filter(item => item.tokens > 0);
+
+    if (!rows.length) return placeholder(options.emptyText);
+
+    const total = rows.reduce((sum, item) => sum + item.tokens, 0);
+    if (!total) return placeholder(options.emptyText);
+
+    const { size, inner, outer, padAngle } = DONUT;
+    const cx = size / 2;
+    const cy = size / 2;
+    const outerR = (size / 2) * outer;
+    const innerR = (size / 2) * inner;
+
+    let angle = 0;
+    const slices = rows.map((item, index) => {
+      const percent = item.tokens / total;
+      const sweep = percent * 360;
+      // 间隙从两端各让出半个，但**不能超过本段自身的四分之一**：色板之外的段
+      // （模型很多时）单段可能只有 1° 多，固定 2° 的间隙会把整段吃成负角度、
+      // 直接从环上消失，而右侧图例还列着它 —— 图例与图形对不上是最难查的一类错。
+      // 夹到 sweep/4 之后每段至少还剩一半可见，颜色仍能认出来。
+      const gap = rows.length > 1 ? Math.min(padAngle / 2, sweep / 4) : 0;
+      const start = angle + gap;
+      const end = angle + sweep - gap;
+      angle += sweep;
+      const fill = SLICE_COLORS[index % SLICE_COLORS.length];
+      // 整圆（只有一段）必须用 evenodd：nonzero 下内外两圈同向、内圈不会挖空，
+      // 会渲染成实心圆盘把中心读数盖住。多段那条路径内外绕向天然相反，
+      // 加不加都一样，所以只在整圆时挂这个属性（见 donutSlicePath 的说明）。
+      const fillRule = sweep >= 359.999 ? ' fill-rule="evenodd"' : '';
+      // end > start 兜住「四舍五入后两者相等」的极端情形（千段以上才会出现），
+      // 此时这一段确实画不出来，但图例仍在 —— 悬停图例行照样能读到它的数值
+      const path = end > start
+        ? `<path class="donut-slice" d="${donutSlicePath(cx, cy, outerR, innerR, start, end)}"`
+          + ` fill="${fill}"${fillRule} tabindex="-1"`
+          + ` data-tip="${esc(`${item.label} · ${formatTokens(item.tokens)} tokens · ${formatPercent(percent)}`)}"></path>`
+        : '';
+      // 扇区内的百分比标签：只在 ≥3% 时画（再小就叠成一团），白色加描边保证
+      // 任意底色上都读得清 —— 与 OmniProxy 的 renderPieLabel 同一阈值与手法
+      let text = '';
+      if (percent >= 0.03) {
+        const mid = (start + end) / 2;
+        const radius = innerR + (outerR - innerR) * 0.6;
+        const rad = ((mid - 90) * Math.PI) / 180;
+        text = `<text class="donut-label" x="${round1(cx + radius * Math.cos(rad))}"`
+          + ` y="${round1(cy + radius * Math.sin(rad))}" text-anchor="middle"`
+          + ` dominant-baseline="central">${Math.round(percent * 100)}%</text>`;
+      }
+      return path + text;
+    }).join('');
+
+    const legend = rows.map((item, index) => {
+      const percent = item.tokens / total;
+      const fill = SLICE_COLORS[index % SLICE_COLORS.length];
+      const tip = `${item.label} · ${formatTokens(item.tokens)} tokens · ${formatInt(item.requests)} 次请求 · ${formatPercent(percent)}`;
+      return `<div class="donut-legend-row" data-tip="${esc(tip)}">`
+        + `<span class="donut-dot" style="background:${fill}"></span>`
+        + `<span class="donut-legend-name" title="${esc(item.label)}">${esc(item.label)}</span>`
+        + `<span class="donut-legend-tokens">${esc(formatTokens(item.tokens))}</span>`
+        + `<span class="donut-legend-percent">${esc(formatPercent(percent))}</span>`
+        + `</div>`;
+    }).join('');
+
+    return `<div class="donut-layout">
+        <div class="donut-wrap">
+          <svg class="donut-svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}"`
+      + ` role="img" aria-label="${esc(options.ariaLabel)}">${slices}</svg>`
+      + `<div class="donut-center">
+            <div class="donut-center-value">${esc(formatTokens(total))}</div>
+            <div class="donut-center-label">总 Token</div>
+          </div>
+        </div>
+        <div class="donut-legend">${legend}</div>
+      </div>`;
+  }
+
+  /** 两张环形图卡片（模型 / 提供商）的配置：渲染逻辑共用，差异全在这里 */
+  const DONUT_CARDS = {
+    models: {
+      panelId: 'report-models-panel',
+      listId: 'report-models-donut',
+      // 后端字段缺失（旧后端）时整块隐藏，与两张排行卡同一判据
+      unknownLabel: '未知模型',
+      emptyText: '所选范围内还没有模型用量',
+      ariaLabel: '模型用量占比',
+    },
+    providers: {
+      panelId: 'report-providers-pie-panel',
+      listId: 'report-providers-donut',
+      unknownLabel: '未知',
+      emptyText: '所选范围内还没有提供商用量',
+      ariaLabel: '提供商用占比',
+    },
+  };
+
+  /**
+   * 数据从调用方传进来（与 `paintRank(key, list)` 同签名）而不是读模块级的
+   * `summary`：两处读法不一致时，将来多一个调用点就会读到上一轮的数据，
+   * 而这种错误只在「刷新间隙」可见、极难复现。
+   */
+  function paintDonut(key, list) {
+    const config = DONUT_CARDS[key];
+    if (!config) return;
+    const panel = $(config.panelId);
+    if (!panel) return;
+    const has = Array.isArray(list);
+    panel.hidden = !has;
+    if (!has) return;
+    paint(config.listId, donutHtml(list, config));
+  }
+
+  // ─── 板块四：热力图 ────────────────────────
+
+  /**
+   * 热力图分档：0，以及按**本次窗口内的 Token 峰值**等分出的四档。
+   *
+   * ── 为什么不再用固定阈值（本次修的 BUG）──────────────────────
+   * 原先写死 `[0, 2, 5, 10, ∞]`（0 / ≤2 / 3–5 / 6–10 / >10 次请求），理由写在
+   * 旧注释里：「本工具的日请求量普遍是个位数」。这个前提在实际使用中不成立 ——
+   * 单日几千次请求、几亿 Token 是常态，于是**所有有请求的日子全部落进最深一档**，
+   * 365 个格子只剩「空槽」与「同一个深蓝」两种颜色，热力图彻底失去信息量。
+   *
+   * 分位数（按排名切）能自适应，但会把「当天只有 1 次请求」也涂成最深一档 ——
+   * 颜色就不再表示「多少」，只剩「相对排名」。所以这里保留「按绝对量级分档」的
+   * 思路，只把**量级本身改成按窗口峰值现算**：峰值大的窗口步长大、峰值小的窗口
+   * 步长小，同一张图内依然满足「越深越忙」。
+   *
+   * ── 步长为什么向下取整 ───────────────────────────────────────
+   * 直接 `peak / 4` 会切出「3.3亿」这种阈值，图例读起来要在心里换算一遍。
+   * 而向上取整到好读值（`niceStep` 那套）会让步长超过 `peak / 4`，把本该分开的
+   * 两天并进同一档 —— 实测「4.6亿 / 7亿」在向上取整下双双落到第 2 档，
+   * 正是要修的那个毛病。向下取整到 1 / 1.25 / 1.5 / 2 / 2.5 / 3 / 4 / 5 / 6 / 8
+   * × 10^n 这一串好读值，则同时满足两点：阈值是整数（3亿 / 6亿 / 9亿），
+   * 且四档比等分切得更细，相邻两天更容易分开。
+   *
+   * 阈值由 `heatLevelsFor` 算一次，格子着色与图例文字共用同一份 —— 否则会出现
+   * 「图例写着 ≤6亿、实际 ≤9亿 才不变深」这种谁也发现不了的漂移。
+   */
+  const HEAT_STEPS = [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10];
+
+  /** 向下取整到 `HEAT_STEPS × 10^n` 中不超过 `value` 的最大值 */
+  function heatStepFloor(value) {
+    if (!(value > 0)) return 1;
+    const pow = 10 ** Math.floor(Math.log10(value));
+    const norm = value / pow;
+    let best = 1;
+    for (const item of HEAT_STEPS) if (item <= norm + 1e-9) best = item;
+    return best * pow;
+  }
+
+  /** 四档阈值（含 0 与 Infinity，共五项）：0 / step / 2step / 3step / 以上 */
+  function heatLevelsFor(peak) {
+    const top = Number(peak) || 0;
+    // 全窗口零用量：给一组平凡阈值即可，所有格子都会落在第 0 档
+    if (top <= 0) return [0, 1, 2, 3, Infinity];
+    // 步长下限 1：Token 是整数，`peak/4` 小于 1 时会算出 0.25 这种没意义的阈值
+    const step = Math.max(1, heatStepFloor(top / 4));
+    return [0, step, step * 2, step * 3, Infinity];
+  }
+
+  /**
+   * 每一档的说明文字（图例用）。阈值随窗口峰值变，所以读当次算出的那一份。
+   *
+   * 档与档之间按「上一档的上限」直接接着写（`3亿–6亿`）而不是 `+1`：
+   * 判定用的是闭区间 `value <= 上限`，Token 又是大整数，逐 1 递增在读数上
+   * 看不出来，写出来反而把图例撑长。
+   */
+  function heatLevelText(level, thresholds) {
     if (level === 0) return '0';
-    const lower = HEAT_LEVELS[level - 1];
-    const upper = HEAT_LEVELS[level];
-    if (!Number.isFinite(upper)) return `>${lower}`;
-    // 上一档的上限 +1 才是本档起点（档与档之间是闭区间，不能重叠）
-    return lower === 0 ? `≤${upper}` : `${lower + 1}–${upper}`;
+    const lower = thresholds[level - 1];
+    const upper = thresholds[level];
+    if (!Number.isFinite(upper)) return `>${formatTokens(lower)}`;
+    return lower === 0 ? `≤${formatTokens(upper)}` : `${formatTokens(lower)}–${formatTokens(upper)}`;
+  }
+
+  /**
+   * 从一次报表数据里算出本窗口的阈值 —— 格子着色与图例文字**唯一**的来源。
+   * 两处各算一次是不行的：刷新间隔只有 1 秒，图例与格子很容易停在两批数据上，
+   * 那时图例的数字与实际着色就对不上了。
+   */
+  function heatThresholdsOf(days) {
+    const list = Array.isArray(days) ? days : [];
+    return heatLevelsFor(
+      list.reduce((max, day) => Math.max(max, Number(day?.tokens) || 0), 0));
   }
 
   /**
@@ -440,7 +713,13 @@
     const height = topH + 7 * step - gap + 2;
     const svgW = Math.max(gridW, Math.round(boxWidth));
 
-    const levelOf = requests => HEAT_LEVELS.findIndex(limit => Number(requests) <= limit);
+    // 分档口径是 **Token 用量**（不再是请求次数）：请求数是过程量，一条 3 次
+    // 重试的失败请求也会 +3 次却一个 Token 都不消耗，而这一整页的其余读数
+    // （概览总 Token、两张排行、按天趋势）全部以 Token 为准 —— 热力图跟着走，
+    // 用户对着同一天的格子和柱子看到的就是同一个量。
+    // 阈值由 heatThresholdsOf 统一给出，与图例是同一份（见那里的说明）。
+    const thresholds = heatThresholdsOf(list);
+    const levelOf = tokens => thresholds.findIndex(limit => Number(tokens) <= limit);
 
     let rects = '';
     for (let col = 0; col < cols; col += 1) {
@@ -448,13 +727,17 @@
         const day = cells[col * 7 + row];
         if (!day) continue;
         const requests = Number(day.requests) || 0;
+        const tokens = Number(day.tokens) || 0;
+        // 「有没有用过」看**请求数**，不看 Token：全部请求都失败的日子请求数大于 0
+        // 而 Token 为 0，按 Token 判会把它说成「无请求」（明明试过了）。
+        // Token 只是着色依据与其中一个读数，不承担「有无活动」的判定。
         const tip = requests
-          ? `${dayLabel(day.date)} · ${formatInt(requests)} 次请求 · ${formatTokens(day.tokens)} tokens`
+          ? `${dayLabel(day.date)} · ${formatTokens(tokens)} tokens · ${formatInt(requests)} 次请求`
           : `${dayLabel(day.date)} · 无请求`;
         // 预置 tabindex="-1"：tooltip.js 只在元素**不**匹配 [tabindex] 时才补 tabIndex=0，
         // 这样 365 个格子不进 Tab 序列（否则键盘用户要按几百次 Tab 才能走到下一个控件），
         // 同时仍然享受 data-tip 的气泡。
-        rects += `<rect class="hm-cell l${levelOf(requests)}" x="${round1(offsetX + labelW + col * step)}"`
+        rects += `<rect class="hm-cell l${levelOf(tokens)}" x="${round1(offsetX + labelW + col * step)}"`
           + ` y="${round1(topH + row * step)}" width="${size}" height="${size}" rx="2"`
           + ` tabindex="-1" data-tip="${esc(tip)}"></rect>`;
       }
@@ -486,18 +769,22 @@
   }
 
   /**
-   * 图例：五档色块 + 每档的请求数范围，与格子共用 --hm-* 变量与 HEAT_LEVELS
-   * 阈值，色值与档位都只定义一处。
+   * 图例：五档色块 + 每档的 Token 范围，与格子共用 --hm-* 变量与同一份阈值，
+   * 色值与档位都只定义一处。
    *
-   * 档位说明是必要的：本工具多数日子的请求数落在 0–5 之间，只给一个渐变色阶
-   * 看不出「这几格的颜色差一档到底差多少请求」，而它是这张图的全部信息量。
+   * 阈值必须由调用方传进来（而不是在这里自己算）：它随窗口峰值变，格子与图例
+   * 若各算一次，两份读数有可能在刷新间隙里对不上。传同一份就没有这个可能。
+   *
+   * 档位说明是必要的：只给一个渐变色阶，看不出「这几格的颜色差一档到底差多少
+   * Token」，而它是这张图的全部信息量。
    */
-  function heatLegendHtml() {
+  function heatLegendHtml(thresholds) {
     return [0, 1, 2, 3, 4].map(level =>
-      `<span class="heat-legend-item"><span class="l${level}"></span>${esc(heatLevelText(level))}</span>`).join('');
+      `<span class="heat-legend-item"><span class="l${level}"></span>`
+      + `${esc(heatLevelText(level, thresholds))}</span>`).join('');
   }
 
-  // ─── 板块三：缓存命中率四窗口 ──────────────
+  // ─── 板块五：缓存命中率四窗口 ──────────────
 
   function cacheRatesHtml(rates) {
     const data = rates || {};
@@ -519,7 +806,7 @@
     }).join('');
   }
 
-  // ─── 板块四：近 24 小时命中率折线 ──────────
+  // ─── 板块六：近 24 小时命中率折线 ──────────
 
   /**
    * 双轴折线：命中率（左轴，蓝）与总 Token（右轴，琥珀）。
@@ -689,7 +976,7 @@
         + ` viewBox="0 0 ${width} ${height}" aria-hidden="true">${hits}</svg>` : '');
   }
 
-  // ─── 板块五：按天 Token 柱状图 ─────────────
+  // ─── 板块七：按天 Token 柱状图 ─────────────
 
   /**
    * 按天 Token 柱状图。柱顶直接标出当天的用量。
@@ -829,7 +1116,13 @@
     // 两张排行卡：整块的显隐由 paintRank 自己判断（各自字段缺失就藏起来）
     paintRank('providers', summary.providers);
     paintRank('accounts', summary.accounts);
+    // 两张环形图：显隐同上（字段缺失即旧后端，整块藏起来）
+    paintDonut('models', summary.models);
+    paintDonut('providers', summary.providers);
     paint('report-heatmap', heatmapHtml(summary.heatmap));
+    // 图例与热力图共用同一份阈值：它随窗口峰值变（见 heatThresholdsOf），
+    // 所以每次重绘都要跟着刷新，否则图例上的数字会停在上一批数据上。
+    paint('report-heat-legend', heatLegendHtml(heatThresholdsOf(summary.heatmap)));
     paint('report-cache-rates', cacheRatesHtml(summary.cacheRates));
     paint('report-cache-trend', cacheTrendHtml(summary.cacheTrend24h));
     paint('report-daily-trend', dailyTrendHtml(summary.dailyTrend));
@@ -847,9 +1140,17 @@
     const html = placeholder(`读取报表失败：${message}`, 'empty report-error');
     ['report-overview', 'report-heatmap', 'report-cache-rates', 'report-cache-trend', 'report-daily-trend']
       .forEach(id => paint(id, html));
+    // 图例一并清空：它的档位说明是「≤3亿」这类**具体数值**，热力图已经换成
+    // 错误态之后还留着上一轮的数字，会让人以为那张图只是没画出来、数据还是好的。
+    paint('report-heat-legend', '');
     // 两张排行卡一起藏（各自的 panelId 从同一份配置取，不在这里另写一遍 id）
     Object.keys(RANK_CARDS).forEach(key => {
       const panel = $(RANK_CARDS[key].panelId);
+      if (panel) panel.hidden = true;
+    });
+    // 两张环形图同理：留着上一轮的扇区会让人以为那部分数据还是可信的
+    Object.keys(DONUT_CARDS).forEach(key => {
+      const panel = $(DONUT_CARDS[key].panelId);
       if (panel) panel.hidden = true;
     });
   }
@@ -1031,7 +1332,8 @@
   // 会让人以为「不点就不会更新」。要改节奏去「定时任务」页，要立刻看最新数据
   // 切走再切回来即可（`showPage` 会调一次 load）。
 
-  paint('report-heat-legend', heatLegendHtml());
+  // 图例不在这里画：它的档位阈值取自本次窗口的 Token 峰值，没有数据就算不出来
+  // （见 heatThresholdsOf）。由 renderAll 在拿到数据后与热力图一起画。
   syncRangeButtons();
 
   window.wbReport = {

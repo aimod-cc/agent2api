@@ -29,9 +29,31 @@
 //! 头名，见 `credentials.rs` 的来源 2）。这里按**源实现**发 `X-Authorization`：
 //! 那是唯一事实来源，认证头名发错会稳定 401。
 //!
+//! ── 上游 2026-09-22 起的两道闸（本文件的头集合与 `super::prompt` 都由它而来）──
+//! 上游给 LLM 代理加了「只服务自家客户端」的判定，实测（国内版免费账号）两条：
+//!
+//!   1. **`X-Harness-Type: zcode` 被区别对待**：同一请求只改这个头 —— 带上它
+//!      得 `403 pay-view`（`code 810001`，"当前使用人数较多…升级为连续包月会员"）
+//!      或 406（空响应体）；不带它、或换成别的值（`autoclaw`）都是 200。
+//!      这个头原本是从源实现 `brandHeaders` 照抄来的（源项目
+//!      `autoclaw-upstream-client.mjs` 第 119 行同样发它），但源实现是**网关
+//!      自己的模型代理客户端**的形态，不是官方客户端 agent 那条路的形态 ——
+//!      官方客户端 agent 的头发自 `openclaw.json` 的 `models.providers.zai.models[].headers`，
+//!      **没有**这个头。故本适配器不再发它。
+//!   2. **system 提示词白名单**：必须以 `You are a personal assistant running
+//!      inside OpenClaw.` 开头且带 `## Tooling` 段，且不得含外来 harness 身份句
+//!      （`You are ZCode…` / `You are Claude Code…`）。见 `super::prompt`（那里
+//!      有完整的实测表）。
+//!
+//! 两道闸都只在**国内版**实测过；国际版沿用同一套头集合与同一份提示规范化
+//! （两地是同一套客户端代码的两个构建，闸门形态一致的概率高，且去掉一个头 +
+//! 加一段前缀对国际版无害 —— 国际版实测 200 的那条请求本来就不带这个头）。
+//!
 //! ── 三处「不做什么」（与源实现对齐，别顺手补）────────────────
-//!   1. **不做 system 注入**：首条消息必须是 system 是 workbuddy 上游的硬要求，
-//!      AutoClaw 的代理是 OpenAI 兼容网关，源实现从不改消息序列。
+//!   1. **不做消息序列的增删**（但**要**给 system 加前缀，见下）：源实现从不改
+//!      消息序列，本适配器也只动首条 system 消息的**正文**。`super::prompt` 负责
+//!      那一步（上游 2026-09-22 起要求 system 以 OpenClaw 身份句开头且带
+//!      `## Tooling` 段），它不重排、不删除任何消息。
 //!   2. **不认「默认模型」**（`supports_default_model` = false）：客户端的
 //!      `defaultModel` 是 config.json 里的 workbuddy 语义（§4.4 末句）；
 //!      AutoClaw 自己的默认是**路由层**的 `zai_auto` 回退，由
@@ -57,6 +79,7 @@ use axum::http::HeaderMap;
 use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
+use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
@@ -68,6 +91,7 @@ use super::credentials::{self, AutoClawCredentials, CredentialOrigin};
 use super::models;
 use super::refresh;
 use super::catalog;
+use super::region::Region;
 
 /// 客户端版本号（源实现 `createUpstreamClient` 的 `desktopAppVersion` 默认值；
 /// `server.mjs` 从不覆盖它，所以这里是常量而不是配置项）。
@@ -90,29 +114,49 @@ const PASSTHROUGH_HEADERS: &[(&str, &str)] = &[
     ("X-ZCode-Invocation-Id", "x-autoclaw-zcode-invocation-id"),
 ];
 
-/// AutoClaw 适配器（无状态单例，见 `adapter::adapter_for`）
-pub struct AutoClawAdapter;
+/// AutoClaw 适配器（无状态单例，见 `adapter::adapter_for`）。
+///
+/// ── 为什么实例**持有地区**（与 `ClineAdapter` 持 `Pool` 同一手法）────
+/// `ProviderAdapter` 的契约里没有任何方法带 provider 参数 —— 适配器**就是**
+/// 那一家的代表。两个地区是两家 provider，因此各有一个实例，实例上的 `region`
+/// 决定它读哪组域名、哪格目录缓存、哪套环境变量前缀。
+///
+/// 反面做法是「一个实例 + 每个方法自己判断地区」：那样每个方法都要回答
+/// 「我是谁」，而答案只能从入参里猜 —— 转发路径拿得到 account、余额路径只拿
+/// 得到 account_id、模型清单路径**什么都拿不到**（`list_models()` 无参）。
+/// 持有地区之后，`list_models()` 这类无参方法也能给出正确答案。
+pub struct AutoClawAdapter {
+    /// 这个实例代表哪个地区
+    region: Region,
+}
 
-/// 进程级实例：适配器无状态，静态实例即可（`adapter_for` 返回它的引用）
-pub static AUTOCLAW_ADAPTER: AutoClawAdapter = AutoClawAdapter;
+/// 国内版实例（provider id `autoclaw`）
+pub static AUTOCLAW_ADAPTER: AutoClawAdapter = AutoClawAdapter { region: Region::Cn };
+/// 国际版实例（provider id `autoclaw-intl`）
+pub static AUTOCLAW_INTL_ADAPTER: AutoClawAdapter = AutoClawAdapter { region: Region::Intl };
 
 impl ProviderAdapter for AutoClawAdapter {
     fn kind(&self) -> ProviderKind {
-        ProviderKind::AutoClaw
+        self.region.kind()
     }
 
     /// AutoClaw 的模型清单（`autoclaw::models` 的静态路由表，源
-    /// `autoclaw-models.mjs` 的 `MODELS`）。
+    /// `autoclaw-models.mjs` 的 `MODELS`；远程目录按本实例的地区取）。
     fn list_models(&self) -> Vec<Value> {
-        models::list()
+        models::list(self.region)
     }
 
-    /// 构造 `POST {upstreamBaseUrl}/chat/completions`（头集合照抄源实现
-    /// `modelProxyUpstreamHeaders`，见模块头）。
+    /// 构造 `POST {upstreamBaseUrl}/chat/completions`（头集合见模块头
+    /// 「上游 2026-09-22 起的两道闸」——`modelProxyUpstreamHeaders` 的头里
+    /// **不发** `X-Harness-Type`）。
     ///
-    /// body **透传 + 改写一个字段**：`model` 换成 `body_model_id`（剥掉路由前缀
-    /// 的模型 ID）。源实现是 `JSON.stringify({ ...body, model: route.bodyModelId })`
-    /// —— 除了 `model` 一个字段，其余原样（含 `stream` / `tools` / 未知字段）。
+    /// body **透传 + 改写两处**：
+    ///   1. `model` 换成 `body_model_id`（剥掉路由前缀的模型 ID）。源实现是
+    ///      `JSON.stringify({ ...body, model: route.bodyModelId })` —— 其余字段
+    ///      （含 `stream` / `tools` / 未知字段）原样；
+    ///   2. **system 提示词规范化**（[`super::prompt::normalize`]）：给首条 system
+    ///      消息前置 OpenClaw 身份前缀、改写外来身份句。这是上游 2026-09-22 起的
+    ///      硬要求（不满足稳定 406 / 403），客户端自己的提示词逐字保留在前缀之后。
     ///
     /// `account` 是**会话形态**（`store.get_session_by_id` /
     /// `auth.get_current_session` 的返回值）：Authorization 从
@@ -141,7 +185,7 @@ impl ProviderAdapter for AutoClawAdapter {
         // `resolve_model_route` 回落到默认路由 `zai_auto`（源实现 requestedModel 的
         // 同款兜底），`requested_model` 也一并得到。
         let requested = body.get("model").and_then(Value::as_str).unwrap_or("");
-        let route = models::resolve_model_route(requested);
+        let route = models::resolve_model_route(self.region, requested);
         let mut headers: Vec<(String, String)> = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             // 源实现给的是 `Accept: */*`（LLM 代理两种响应形态都可能回；
@@ -164,10 +208,17 @@ impl ProviderAdapter for AutoClawAdapter {
         if let Some(object) = out_body.as_object_mut() {
             object.insert("model".to_string(), Value::String(route.body_model_id.clone()));
         }
+        // system 提示词规范化（上游白名单：身份前缀 + 外来身份句改写）。
+        // 放在 model 改写之后、返回之前 —— 这里是「即将发出去的字节」的最后一道
+        // 加工，此后没有任何一步会再动 body。
+        super::prompt::normalize(&mut out_body);
         // body 不是对象时原样透传（chat.rs 已保证是对象；这里的兜底只为不 panic，
         // 上游会自己报格式错误 —— 比在网关里编一个空对象更能说明问题）
         Ok(ChatRequestPlan {
-            url: format!("{}/chat/completions", credentials::upstream_base_url()),
+            url: format!(
+                "{}/chat/completions",
+                credentials::upstream_base_url(self.region)
+            ),
             headers,
             body: out_body,
         })
@@ -213,11 +264,14 @@ impl ProviderAdapter for AutoClawAdapter {
                 status,
             };
         }
-        UpstreamErrorClass::Fatal {
+        // 内容策略拦截（审核文案）→ ContentBlocked：不罚账号，交给编排层换中性
+        // 提示词重试一次 + 触发降级（见 `core::degrade`）
+        content_block::classify_or_fatal(
             status,
+            error_body,
             message,
-            upstream_code: error_body.get("code").and_then(Value::as_i64),
-        }
+            error_body.get("code").and_then(Value::as_i64),
+        )
     }
 
     /// 取可用 access token：**凭证快照 + 临期主动刷新**（源实现 `currentCredentials`）。
@@ -244,7 +298,7 @@ impl ProviderAdapter for AutoClawAdapter {
         Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let credentials = resolve_credentials(store, account_id)?;
+            let credentials = resolve_credentials(self.region, store, account_id)?;
             let refreshed = refresh::ensure_fresh(&credentials).await?;
             // 手动账号的刷新结果回写 accounts.json（桌面端账号按设计不回写，
             // 见 `persist_refresh`）：不回写的话，rotate 过后的 refreshToken
@@ -273,7 +327,7 @@ impl ProviderAdapter for AutoClawAdapter {
         Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let credentials = resolve_credentials(store, account_id)?;
+            let credentials = resolve_credentials(self.region, store, account_id)?;
             let refreshed = refresh::refresh(&credentials, true).await?;
             persist_refresh(store, &credentials, &refreshed);
             Ok(refreshed.token)
@@ -300,7 +354,7 @@ impl ProviderAdapter for AutoClawAdapter {
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     > {
         Box::pin(async move {
-            let credentials = match resolve_credentials(store, "") {
+            let credentials = match resolve_credentials(self.region, store, "") {
                 Ok(credentials) => credentials,
                 Err(error) => {
                     logging::verbose(
@@ -333,7 +387,7 @@ impl ProviderAdapter for AutoClawAdapter {
 
     /// 环境变量旁路凭证此刻是否存在（聚合目录判「这家现在有没有可用登录态」用）。
     fn env_credentials_present(&self) -> bool {
-        credentials::env_credentials().is_some()
+        credentials::env_credentials(self.region).is_some()
     }
 
     /// AutoClaw 没有「默认模型」概念：不指定模型时应由**它自己的路由层**回落到
@@ -387,7 +441,7 @@ impl ProviderAdapter for AutoClawAdapter {
         if account_id.is_empty() {
             return false;
         }
-        match resolve_credentials(store, account_id) {
+        match resolve_credentials(self.region, store, account_id) {
             Ok(credentials) => {
                 if !credentials.can_refresh() {
                     return false;
@@ -427,21 +481,31 @@ impl ProviderAdapter for AutoClawAdapter {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
     > {
-        Box::pin(async move { super::balance::query_usage(store, account_id).await })
+        Box::pin(async move {
+            super::balance::query_usage(self.region, store, account_id).await
+        })
     }
 }
 
-/// 品牌头（源实现 `brandHeaders`，逐条照抄）。
+/// 品牌头（源实现 `brandHeaders`，逐条照抄 —— **除了** `X-Harness-Type`）。
 ///
 /// `X-Tm` 是平台标识（源实现 `platformTm()`：darwin→mac、linux→linux、其余 win），
 /// `X-Version` 是客户端版本。`x_trace_id` 的**下划线写法也是照抄**（源实现里就
 /// 是这个键名，与后面那个 `X-Request-Id` 并存 —— 前者是客户端指纹的一部分，
 /// 后者是本次请求的关联 id）。
+///
+/// ── 为什么少了 `X-Harness-Type: zcode`（别加回来）────────────
+/// 源实现有它（`autoclaw-upstream-client.mjs` 第 119 行），照抄过来后上游自
+/// 2026-09-22 起对这个值区别对待：带 `zcode` 稳定 `403 pay-view`
+/// （`code 810001`）或 406，不带（或换 `autoclaw`）200 —— 同一账号、同一请求、
+/// 只改这一个头的实测结论。完整背景见模块头「上游 2026-09-22 起的两道闸」。
+///
+/// 注意 `X-Version` 与 `x_trace_id` **实测无害**（带着它们、只去掉 harness 头
+/// 同样 200），所以这两个照抄值保留 —— 改动头集合要一次只改一个变量再实测。
 fn brand_headers() -> Vec<(String, String)> {
     vec![
         ("X-Product".to_string(), "autoclaw".to_string()),
         ("X-Client-Type".to_string(), "pc".to_string()),
-        ("X-Harness-Type".to_string(), "zcode".to_string()),
         ("X-Tm".to_string(), platform_tm().to_string()),
         ("X-Version".to_string(), DESKTOP_APP_VERSION.to_string()),
         ("X-Lang".to_string(), CLIENT_LANG.to_string()),
@@ -483,27 +547,37 @@ fn passthrough_session_headers(client_headers: &HeaderMap) -> Vec<(String, Strin
 ///
 /// 顺序：
 ///   1. `account_id` 非空 → 该 AutoClaw 账号的记录（桌面端账号实时读 auth.json）；
-///   2. `account_id` 为空 → AutoClaw 组内的当前账号（若有）；
-///   3. 都没有 → 桌面端实时登录态；
-///   4. 桌面端也读不到 → `AUTOCLAW_TOKEN` 环境变量。
+///   2. `account_id` 为空 → **本地区**组内的当前账号（若有）；
+///   3. 都没有 → 桌面端实时登录态（**仅国内版**，见
+///      `credentials::local_credentials` 的地区说明）；
+///   4. 桌面端也读不到 → 本地区的 `{prefix}TOKEN` 环境变量。
 ///
-/// 2→3→4 的兜底链在 `credentials::snapshot_for(None)` 里（它是凭证层的统一入口，
-/// `local_credentials().or_else(env_credentials)`）—— 本函数只负责「先按账号收窄」。
+/// 2→3→4 的兜底链在 `credentials::snapshot_for(None, region)` 里（它是凭证层的
+/// 统一入口，`local_credentials().or_else(env_credentials)`）—— 本函数只负责
+/// 「先按账号收窄」。
 ///
 /// **环境变量排在最后**是与源实现一致的有意取舍：源实现的优先级是「账号列表
 /// 选中项 > 环境变量」，所以只有**一个账号记录都没有**时才轮到环境变量。
+///
+/// `region` 是**本实例代表哪一家**：账号查找只在本地区的记录里找
+/// （`autoclaw_account_record` 已按 provider 过滤），因此给国际版实例传
+/// account_id 时，一条国内版账号不会被误当成「属于国际版」而拿去发请求。
 fn resolve_credentials(
+    region: Region,
     store: &AccountStore,
     account_id: &str,
 ) -> Result<AutoClawCredentials, GatewayError> {
-    let record = store.autoclaw_account_record(account_id);
+    let record = store.autoclaw_account_record(region, account_id);
     if !account_id.is_empty() && record.is_none() {
         return Err(GatewayError::with_status(
             401,
-            format!("AutoClaw 账号 {account_id} 不存在或不属于 AutoClaw（请重新添加）"),
+            format!(
+                "AutoClaw {}账号 {account_id} 不存在或不属于该地区（请重新添加）",
+                region.label()
+            ),
         ));
     }
-    credentials::snapshot_for(record.as_ref())
+    credentials::snapshot_for(record.as_ref(), region)
 }
 
 /// 刷新结果回写（**只回写手动账号**，且只在真的刷新了的时候）。
@@ -544,6 +618,7 @@ fn persist_refresh(
         return;
     }
     match store.update_autoclaw_account_tokens_if_current(
+        refreshed.region,
         &refreshed.id,
         &previous.token,
         &previous.refresh_token,

@@ -23,6 +23,14 @@
 //!     凭证由网关轮询设备令牌接口取回（`providers::qoder::oauth`），桌面端同样
 //!     没有回调。内嵌与系统浏览器两种方式都可选（前者用全新的临时数据目录，
 //!     所以能连着添加多个互不影响的账号）。
+//!   - **CatPaw**：上游把 `{token, state}` 表单 **POST 到本机网关**的 loopback
+//!     端口，壳侧同样没有回调要处理（见 `core::login::catpaw`）。
+//!   - **AutoClaw 国际版（OAuth）**：与 CatPaw 同一形态（回调落在本机网关的
+//!     loopback 端口），但**发起顺序是倒的** —— 授权地址由**前端**拿好再交给壳
+//!     （它前面有一次必须在浏览器里跑完的强制风控验证码，见
+//!     [`start_autoclaw_oauth`] 的说明），所以它不走 `start()` 那条
+//!     「壳问后端要 authUrl」的路，而是由 `start_autoclaw_oauth_login` 这条
+//!     命令直接接收 `{state, authUrl}`。
 //!
 //! ── 凭什么三个 provider 共用同一段轮询 ────────────────────
 //! 三家的差别只有「授权地址怎么来」与「谁算登录成功」，两者都被后端收进了
@@ -206,16 +214,31 @@ const RACCOON_CALLBACK_PATH: &str = "/callback";
 /// ── 为什么 workbuddy / 小浣熊仍然白名单 ─────────────────────
 /// 那两家的登录链路是固定的几个站点（腾讯系 / 商汤系 + 各自的验证码托管方），
 /// 能列全；白名单在这里是免费的额外一层约束，就不放弃。
+///
+/// ── AutoClaw 国际版为什么不设限（本次新增，务必读）─────────────
+/// 它的登录页与身份提供方都不在我们的名单里（Zai 的授权页、Google 的
+/// `accounts.google.com`），而**更要紧的是回调落在本机**：授权完成后浏览器会
+/// **顶层导航到 `http://127.0.0.1:<网关端口>/api/session/login/autoclaw-oauth-callback/…`**
+/// （那就是我们交给上游的 `navigate_uri`，见 `providers::autoclaw::oauth`）。
+/// 那个 loopback 地址一旦被白名单拦下，症状是「用户明明登录成功、网关却永远
+/// 等不到授权码」—— 与 [`is_login_callback`] 注释里警告过的那类静默故障同形，
+/// 而这次连回调识别都救不了它：回调本身就是一次普通 HTTP 导航，
+/// 没有任何「非本机协议」的特征可供识别，只能在白名单这一层放行。
 fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
     match provider {
         "raccoon" => Some(RACCOON_ALLOWED_HOSTS),
-        // CatPaw / Qoder / Cline 都不设限（理由见上）；**新加 provider 时不要让它
-        // 落到默认分支** —— 那会静默沿用 WorkBuddy 的白名单，症状是登录窗口白屏。
+        // CatPaw / Qoder / Cline / AutoClaw 都不设限（理由见上）；**新加
+        // provider 时不要让它落到默认分支** —— 那会静默沿用 WorkBuddy 的
+        // 白名单，症状是登录窗口白屏（AutoClaw 那家还会连回调一起拦掉）。
         //
         // Cline 尤其要注意：它的授权页在 `authkit.cline.bot`，而确认动作可能被
         // 身份提供方接管（WorkOS AuthKit 会按账号配置跳到 Google / GitHub / SSO
         // 等不可穷举的主机）—— 与 Qoder 同一情形，白名单列不全。
-        "catpaw" | "qoder" | "cline-free" | "cline-pass" => None,
+        //
+        // AutoClaw 的两个地区**都列出来**：国内版目前走不到这条链（它没有
+        // 网页登录），但一起列上是有意的 —— 只列国际版的话，哪天国内版也接上
+        // OAuth 就会落进默认分支拿到 WorkBuddy 的白名单，而那个故障极难查。
+        "catpaw" | "qoder" | "cline-free" | "cline-pass" | "autoclaw" | "autoclaw-intl" => None,
         _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
@@ -289,8 +312,92 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         "catpaw" => Ok("catpaw"),
         "cline-free" => Ok("cline-free"),
         "cline-pass" => Ok("cline-pass"),
+        "autoclaw" | "autoclaw-intl" => Ok("autoclaw-intl"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
+}
+
+/// AutoClaw OAuth 登录：**授权地址已经由前端拿好了**，这里只负责开窗口 + 等待。
+///
+/// ── 为什么这条与另外五家的形态都不一样 ───────────────────────
+/// 那五家的授权地址要么由后端问上游拿（workbuddy / CatPaw / Qoder / Cline），
+/// 要么本地拼（小浣熊），壳侧统一做「POST /start → 拿 authUrl → 开窗口」。
+/// AutoClaw 国际版多出一个**必须在浏览器里完成的强制风控验证码**（阿里云
+/// 浏览器端 SDK，见 `providers::autoclaw::oauth` 的模块头），而主窗口就是
+/// 那个浏览器环境 —— 于是顺序被倒过来：**前端先跑验证码、带着参数调网关拿
+/// 授权地址，再把地址交给壳开窗口**。
+///
+/// 因此壳侧这条命令的入参是 `state` + `authUrl`（而不是让壳自己去
+/// `/login/start`）—— 那两个值前端已经拿到了，再让壳问一次等于把同一次登录
+/// 发起两遍（网关侧会登记两个任务，而回调只认其中一个）。
+///
+/// ── 回调不需要壳侧识别 ──────────────────────────────────────
+/// 授权码由浏览器**直接 302 到本机网关的 loopback 端口**
+/// （`navigate_uri` 就是网关自己的地址），因此壳侧既不用捕获自定义协议、
+/// 也不用转交回调 —— 与 CatPaw 那条同一形态（见 `core::login::catpaw`）。
+/// 这也意味着 `mode = "external"`（系统浏览器）**同样可用**：
+/// 回调落在本机网关，与浏览器在哪无关。
+pub async fn start_autoclaw_oauth(
+    app: &AppHandle,
+    state: String,
+    auth_url: String,
+    mode: &str,
+) -> Result<serde_json::Value, String> {
+    if state.trim().is_empty() || auth_url.trim().is_empty() {
+        return Err("缺少登录状态或授权地址，请重新发起".to_string());
+    }
+    let use_external = mode == "external";
+    let mode_id = if use_external { "external" } else { "embedded" };
+    {
+        let state_guard = app.state::<crate::state::AppState>();
+        let mut guard = state_guard.login.lock().map_err(|_| "登录状态锁不可用")?;
+        *guard = Some(ActiveLogin {
+            state: state.clone(),
+            edition: "intl".into(),
+            mode: mode_id.into(),
+            provider: "autoclaw-intl".to_string(),
+        });
+    }
+    emit_login_state(
+        app,
+        LoginState {
+            active: true,
+            mode: Some(mode_id.into()),
+            edition: Some("intl".into()),
+            provider: Some("autoclaw-intl".to_string()),
+        },
+    );
+
+    let result = if use_external {
+        open_external(app, &auth_url, "AutoClaw 国际版登录页", &state).await
+    } else {
+        // social_restore 传 false：那项能力只属于 WorkBuddy 的登录页。
+        // provider 传 "autoclaw-intl"：它决定白名单（这家不设限，见 allowed_hosts
+        // 的 AutoClaw 段 —— 回调落在 loopback，设限会把回调一起拦掉）。
+        run_embedded(
+            app,
+            "autoclaw-intl",
+            &auth_url,
+            "登录 AutoClaw 国际版账号",
+            &state,
+            false,
+        )
+        .await
+    };
+    if result
+        .as_ref()
+        .map(|value| value.get("ok").and_then(serde_json::Value::as_bool))
+        != Ok(Some(true))
+    {
+        let _ = gateway::call(
+            "POST",
+            "/api/session/login/cancel",
+            Some(&json!({ "state": state })),
+        )
+        .await;
+    }
+    clear_active_login(app, &state);
+    result
 }
 
 #[derive(Clone, serde::Serialize)]

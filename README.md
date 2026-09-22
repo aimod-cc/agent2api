@@ -16,12 +16,16 @@ OpenAI 客户端 / 任意 SDK
         ├──▶ catpaw     ai.catpaw.meituan.com · Cookie: X-Passport-Token=… + user-uid
         │                （自有 conversation 会话协议）
         ├──▶ autoclaw   autoglm-acceleration-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw
-        │                X-Authorization: Bearer <token>（OpenAI 兼容）
+        │                （国内版）X-Authorization: Bearer <token>（OpenAI 兼容）
+        ├──▶ autoclaw-intl  autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw
+        │                （国际版）同一套协议与签名指纹，站点不同
         ├──▶ qoder      api3.qoder.sh（国际版）/ gateway.qoder.com.cn（中国版）
         │                COSY 自签名头（不是 Bearer）· 信封式 SSE（自有编码与签名）
         └──▶ cline      api.cline.bot · Authorization: Bearer workos:<JWT>
                          X-CLIENT-TYPE: cline-sdk（缺了它免费池模型一律 403）
                          模型名带池前缀：cline-pass/…（订阅池）· cline-free/…（免费池）
+                         （免费池另有两条不带前缀的裸 id：z-ai/glm-5.3-flash、
+                           poolside/laguna-s-2.1:free，归池按上游分组而非前缀）
 ```
 
 > **本项目仅供学习与交流使用。** 它通过本地反向代理复用你自己账号的登录态，这种「以非官方客户端形态转发」的方式可能不符合上游服务的用户协议，使用风险（含账号被风控、封禁）由使用者自行承担；禁止用于商业用途或绕过计费。详见[使用声明](#使用声明)与 [LICENSE](./LICENSE)。
@@ -35,7 +39,6 @@ OpenAI 客户端 / 任意 SDK
 - [快速开始](#快速开始)
 - [界面预览](#界面预览)
 - [数据存储](#数据存储)
-- [出站指纹脱敏](#出站指纹脱敏)
 - [项目结构](#项目结构)
 - [开发与构建](#开发与构建)
 - [使用声明](#使用声明)
@@ -48,7 +51,9 @@ OpenAI 客户端 / 任意 SDK
 从 Releases 下载安装包（NSIS，简体中文，默认装到 `C:\Program Files\Agent2API`，安装时需要管理员授权），安装后启动即可，**无需安装 Node 或任何其它运行时**。
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口；若检测到旧版本的数据目录或数据文件，会弹窗提示迁移，按指引操作即可（详见[数据存储](#数据存储)）。
-2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw / Qoder / Cline），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上）。
+2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上）。
+
+> **AutoClaw 两个地区的登录方式不同**：国内版只有手机验证码；国际版只有 Zai / Google 账号网页授权 —— 在添加账号弹窗里选「网页登录（Zai / Google）」，按提示先完成一次滑块验证（官方要求的风控步骤，由本机内置的官方验证码组件完成），随后会打开官方登录页；打开方式可选**内嵌窗口**或**系统默认浏览器**（后者会复用你浏览器里已登录的 Zai / Google 账号）。国际版不提供手机验证码登录（官方客户端也不提供这一项，多数国际版账号没有绑定手机号）；若你已在客户端登录过，用「导入桌面端登录态」最快，也可以直接粘贴凭证。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。
@@ -125,34 +130,6 @@ print(resp.choices[0].message.content)
 
 ---
 
-## 出站指纹脱敏
-
-上游的内容审核是**逐字精确匹配**（不是语义审核）：客户端（Claude Code / Codex 一类 CLI）在 system prompt 里注入的固定模板句、计费头字段名、以及某些裸错误码出现在报文里就会整单拦截，返回 HTTP 400。这类拦截与内容是否真的有害无关，只要那几个固定字符串在场就会被拦。
-
-开启**指纹脱敏**（设置页「通用 → 指纹脱敏」，默认开）后，网关在每次转发前改写这些指纹：
-
-- **表头键值整段删除**：`x-anthropic-billing-header: ...` 与尾随的 `cc_*=` 键值对整个删掉；残留的裸键名缩写成 `x-anthropic-billing-hdr`（破坏逐字匹配、语义不变）。
-- **承载语义的模板句最小改写**（每句只换一个词，语义完全不变）：
-
-  | 原文 | 改写为 |
-  | --- | --- |
-  | `You are Claude Code, Anthropic's official CLI for Claude` | `...official CLI **tool** for Claude` |
-  | `Main branch (you will usually use this for PRs)` | `**Default** branch (you will usually use this for PRs)` |
-  | `You are a coding agent running in the Codex CLI, a terminal-based coding assistant.` | `...running in the Codex CLI **tool**, a terminal-based...` |
-  | `To give feedback, users should report...` | `To **provide** feedback, users should report...` |
-
-- **裸错误码 `11128` → `11-128`**：这串数字是上游反探测的触发条件，只要出现在请求体里就整单拦截（`code=11128`、裸 `11128`、`错误码 11128` 全部命中，而与上下文无关）。代价是**用户对话里出现的 `11128` 也会被改写** —— 但它出现在请求里本身就是拦截条件，不改写必然失败。这里用连字符而非零宽空格，是因为实测上游会对零宽字符做归一化。
-
-规则集是**硬编码**的（照搬 [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的 `internal/upstream/sanitize.go`），没有可维护的词表，也不需要联网更新。开关关掉后客户端模板会原样发往上游，可能重新出现模板句被误拦的报错。
-
-命中明细会记进请求日志的「敏」标签（悬停看命中了哪几条规则）；`11128` 这类拦截本身则走转发层的退避重试，见「请求重试」。
-
-> 本项只改**发给上游的副本**，客户端看到的响应内容不变。
-
----
-
----
-
 ## 项目结构
 
 网关与桌面端都在 `desktop-tauri/`：后端是 `src-tauri/` 下的 Rust 进程内 HTTP 服务器，前端是 `ui/` 下的原生 HTML/CSS/JS。
@@ -181,8 +158,10 @@ agent2api/
 │  │  │  │  │  │                registry/（会话注册表：表与句柄 / 账号身份 / 作废）/
 │  │  │  │  │  │                messages / blocks / tools / openai（翻译层）/
 │  │  │  │  │  │                upstream_http / image_compress / models / credentials / balance
-│  │  │  │  │  ├─ autoclaw/     智谱 autoglm：adapter / credentials / refresh / crypto / models /
-│  │  │  │  │  │                balance / login（手机验证码）/ checkin（每日签到任务）
+│  │  │  │  │  ├─ autoclaw/     智谱 autoglm（国内版 + 国际版两家）：region（两地域名与身份）/
+│  │  │  │  │  │                adapter / credentials / refresh / crypto / models /
+│  │  │  │  │  │                balance / login（手机验证码，仅国内版）/
+│  │  │  │  │  │                oauth（Zai / Google 网页登录，仅国际版）/ checkin（每日签到任务）
 │  │  │  │  │  ├─ qoder/        Qoder：adapter / endpoints（两站地址）/ oauth（设备授权）/
 │  │  │  │  │  │                auth / cosy（COSY 签名与体编码）/ protocol（信封解码）/
 │  │  │  │  │  │                chat（会话式转发）/ stream / machine（PKCE 与机器标识）/
@@ -203,6 +182,8 @@ agent2api/
 │  │  │  │  ├─ routing.rs / billing/   账号选路（全局优先级 + 限额冷却）/ 积分签到运营
 │  │  │  │  ├─ proxies.rs / clash.rs / egress.rs   出网代理与按出口缓存 Client
 │  │  │  │  ├─ sanitize.rs      出站指纹脱敏（硬编码规则集：表头剥离 + 模板句最小改写）
+│  │  │  │  ├─ prompt.rs        网关自有系统提示词（透传 / 替换 / 追加三模式）
+│  │  │  │  ├─ degrade.rs       内容拦截降级状态机（撞审核误报后到次日 00:00 用中性提示词）
 │  │  │  │  ├─ credential_maintenance.rs  已过期 / 临期凭证的批量刷新
 │  │  │  │  ├─ usage_query.rs     余额 / 积分查询（跨账号并发 + 定时那一轮的快照）
 │  │  │  │  ├─ scheduled_tasks.rs  间隔型定时任务注册表与调度循环（开关 / 间隔 /
@@ -211,7 +192,7 @@ agent2api/
 │  │  │  │                       导入导出（含身份归一）/ 定时签到 / 软件更新
 │  │  │  └─ api/                 各路由 handler（health/session/accounts/accounts_usage/
 │  │  │                          chat/models/keys/model_manage/stats/logs/billing/
-│  │  │                          sanitize/auto-checkin/scheduled-tasks/update/…）
+│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/…）
 │  │  ├─ lib.rs                 应用入口（配置目录迁移 → 设置 → 托盘 → 主窗口 → 启动后端）
 │  │  ├─ backend.rs              进程内服务器生命周期
 │  │  ├─ legacy_install.rs       旧「当前用户」安装的清理（目录 / 快捷方式 / 卸载项 / 自启；仅 release）

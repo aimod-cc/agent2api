@@ -37,7 +37,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
-use crate::server::core::account_store::{MAX_ACCOUNTS, MAX_TOKEN_LENGTH};
+use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::providers::kind_id;
 use crate::server::core::providers::ProviderKind;
 
@@ -333,9 +333,6 @@ fn import_one_item(
     }
 
     // ── 新增 ──
-    if state.accounts.len() >= MAX_ACCOUNTS {
-        return Err(format!("最多保存 {MAX_ACCOUNTS} 个账号"));
-    }
     // 走到这里说明本 provider 没有同身份的普通账号：若该 id 仍被本 provider 的
     // 别的身份占用，就是导出文件自相矛盾 —— 失败而不是覆盖，也不静默改名
     if let Some(existing) = state.accounts.iter().find(|record| record.id() == item_id) {

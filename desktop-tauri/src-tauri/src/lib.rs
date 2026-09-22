@@ -144,6 +144,7 @@ pub fn run() {
             commands::check_port,
             commands::change_port,
             commands::start_login,
+            commands::start_autoclaw_oauth_login,
             commands::login_state,
             commands::cancel_login,
             commands::export_logs,

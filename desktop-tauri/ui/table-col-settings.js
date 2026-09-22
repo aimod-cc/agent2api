@@ -70,10 +70,19 @@
    *
    * 归一的三条（都是为了让「改过列定义之后旧的本地配置还能用」）：
    *   1. 存盘里已经不存在的 key 丢掉（那一列被删了）；
-   *   2. spec 里新增的 key 按默认值**追加在末尾**（用户第一次看到它就在最后，
-   *      下一次自己拖到想要的位置）；
+   *   2. spec 里新增的 key 按默认值插到它在 spec 里的**相对位置**
+   *      （紧跟在 spec 中排在它前面、且用户配置里也存在的那一列之后）；
    *   3. align 只认三档，脏值退回该列默认。
    * 顺序以存盘为准 —— 顺序正是用户拖出来的东西。
+   *
+   * ── 新增列为什么插到声明位置而不是追加到末尾（本次修正）────────
+   * 早先一律追加到末尾，理由是「用户第一次看到它就在最后，下一次自己拖到想要
+   * 的位置」。那个理由只对**位置无所谓**的新列成立；列的位置有时是语义的：
+   * 账号表的代理列声明在「账号」与「连接数」之间（它读起来是账号的属性），
+   * 追加到末尾会让已经存过配置的老用户看到的默认位置与预期不符 ——
+   * 他还得自己拖一次才能回到「默认」。插到声明位置之后，新装与已存过配置的
+   * 两种用户看到的是同一个默认顺序，而用户拖过的列顺序仍然完全不受影响
+   * （插入只发生在「存盘里根本没有这个 key」时）。
    *
    * ── 对齐：要能分辨「存的是用户挑的」与「存的是当时的默认值」────────
    * 显示与顺序一律以存盘为准，对齐不能 —— **默认值本身会随版本调整**
@@ -120,9 +129,28 @@
     }
     for (const column of spec.columns) {
       if (seen.has(column.key)) continue;
-      out.push({ ...defaults.get(column.key) });
+      insertBySpecOrder(out, spec, { ...defaults.get(column.key) });
     }
     return out;
+  }
+
+  /**
+   * 把一个新增列插到 `out` 里、紧跟着它在 `spec.columns` 中的前驱
+   * （前驱不在 `out` 里就继续往前找，都找不到则插到最前）。
+   *
+   * 多个新增列按 `spec.columns` 的顺序依次调用本函数，最终相对次序与 spec 一致 ——
+   * 因为每个新列都插在「它前面那个已存在的列」之后，而它前面的新列已经先插好了。
+   */
+  function insertBySpecOrder(out, spec, item) {
+    const at = spec.columns.findIndex(column => column.key === item.key);
+    for (let index = at - 1; index >= 0; index -= 1) {
+      const previous = out.findIndex(entry => entry.key === spec.columns[index].key);
+      if (previous >= 0) {
+        out.splice(previous + 1, 0, item);
+        return;
+      }
+    }
+    out.unshift(item);
   }
 
   function load(spec) {

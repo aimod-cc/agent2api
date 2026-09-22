@@ -623,7 +623,8 @@
      *
      * 用 updateAccount 走 PATCH —— 后端 apply_patch 只改显式传入的字段，这里只传
      * enabled，别的一概不动。成功后 refresh() 会重新拉 getState 并 render()，
-     * 所以状态徽章（已禁用）、行内按钮（签到按启用状态显隐）会立即跟着变。
+     * 所以状态徽章（已禁用）与行样式会立即跟着变（签到按钮不在此列：
+     * 它不再随启用状态显隐，见 accounts-table.js 的 actionsCell）。
      */
     async function toggleAccountEnabled(id, enabled) {
       try {

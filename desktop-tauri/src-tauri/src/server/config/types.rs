@@ -66,6 +66,57 @@ pub const KEY_DEBUG_MODE: &str = "debugMode";
 /// 转发层逐请求读快照，改完下一个请求立即生效，不重启进程。
 pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
 
+/// 系统提示词模式的键（config.json 键，对应 workbuddy2api 的 `prompt.mode`）。
+///
+/// 取值 `passthrough` / `custom` / `append`（见 `core::prompt::PromptMode`）；
+/// **默认 `passthrough`**（与参考项目同默认）：不动客户端 system，行为与改造前
+/// 逐字相同。`custom` / `append` 改用网关自有提示词替换/追加 system 消息 ——
+/// 那是脱敏之外的第二层防护：从**源头**消灭 system 来源的指纹，而不是等它
+/// 出站前再改（两层叠加、互不替代，见 `core::prompt` 的模块头）。
+pub const KEY_PROMPT_MODE: &str = "promptMode";
+
+/// 系统提示词文件的键（config.json 键，对应 workbuddy2api 的 `prompt.file`）。
+///
+/// 空串 / 缺失 = 用内置默认提示词（`core::prompt::BUILT_IN_PROMPT`）；
+/// 否则读该路径（UTF-8 文本）。只在 `custom` / `append` 模式下有意义 ——
+/// `passthrough` 不读文件。
+pub const KEY_PROMPT_FILE: &str = "promptFile";
+
+/// 系统提示词设置（设置页「通用 → 系统提示词」）。
+///
+/// 与 `RetrySettings` 同一取舍：几个值总是一起用（转发层逐请求取一次、
+/// 接口一起返回），打包成一个值让调用方一次拿到，不必多次读锁。
+/// 与另外几个设置不同，这个**不是 `Copy`**：`text` 是提示词全文（可能几百行），
+/// 逐请求克隆它纯属浪费 —— 转发层拿的是借用视图（`core::prompt::PromptPlan`）。
+#[derive(Clone, Debug)]
+pub struct PromptSettings {
+    /// 模式（透传 / 替换 / 追加）
+    pub mode: crate::server::core::prompt::PromptMode,
+    /// 用户指定的提示词文件（`None` = 未指定）
+    pub file: Option<String>,
+    /// **实际生效**的提示词文本：`custom` / `append` 下是文件内容或内置默认，
+    /// `passthrough` 下为空串（不加载、不读盘）
+    pub text: String,
+    /// 文本来源（界面与日志要能回答「这次用的到底是哪一份」）
+    pub source: crate::server::core::prompt::PromptSource,
+    /// 指定了文件但读不到时的原因（`None` = 没这回事）；读失败时 `text`
+    /// 回落成内置默认 —— 与「写坏回落」的既有取向一致：桌面应用不能因为
+    /// 一个提示词文件的问题启动不了或转发不了
+    pub file_error: Option<String>,
+}
+
+impl Default for PromptSettings {
+    fn default() -> Self {
+        Self {
+            mode: crate::server::core::prompt::PromptMode::default(),
+            file: None,
+            text: String::new(),
+            source: crate::server::core::prompt::PromptSource::None,
+            file_error: None,
+        }
+    }
+}
+
 /// 三档保留天数的默认值（缺失时用它们）
 pub const DEFAULT_LOG_RETENTION_DAYS: i64 = 30;
 pub const DEFAULT_REQUEST_RETENTION_DAYS: i64 = 30;

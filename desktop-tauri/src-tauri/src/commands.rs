@@ -236,6 +236,12 @@ pub async fn change_port(app: AppHandle, port: u16) -> Result<Value, String> {
 /// `social_restore` 同样缺省为 false（不恢复 Google / GitHub 入口），
 /// 老界面不传它时得到的是与新界面默认不勾选一致的行为：登录窗口只按官方
 /// 登录页的形态走，不放宽域名白名单。
+///
+/// ── AutoClaw 国际版为什么不走这条命令 ────────────────────────
+/// 它的授权地址要先过一次**浏览器端**风控验证码（阿里云 SDK），而那个环境是
+/// 主窗口 —— 于是「拿地址」这一步在渲染层完成，壳只负责开窗口。因此它走
+/// [`start_autoclaw_oauth_login`]（入参是已经拿到的 state + authUrl），
+/// 不走这里。
 #[tauri::command]
 pub async fn start_login(
     app: AppHandle,
@@ -250,6 +256,32 @@ pub async fn start_login(
         mode,
         provider.unwrap_or_default(),
         social_restore.unwrap_or(false),
+    )
+    .await
+}
+
+/// AutoClaw 国际版 OAuth 登录：**授权地址已由前端拿好**，这里只开窗口并等待。
+///
+/// 入参 `state` 与 `authUrl` 来自 `POST /api/session/login/oauth/start`
+/// （前端跑完风控验证码之后调的那条）。理由见 `login::start_autoclaw_oauth`：
+/// 验证码只能在浏览器环境（主窗口）里跑，因此发起顺序与另外五家相反 ——
+/// 前端拿地址、壳开窗口，而不是壳回头问后端要地址。
+///
+/// `mode`：`embedded`（缺省，内嵌 WebView）或 `external`（系统浏览器）——
+/// 两者都可用，因为授权码由浏览器直接送到本机网关的 loopback 端口，
+/// 与浏览器在哪无关（与 CatPaw 同理）。
+#[tauri::command]
+pub async fn start_autoclaw_oauth_login(
+    app: AppHandle,
+    state: String,
+    auth_url: String,
+    mode: Option<String>,
+) -> Result<Value, String> {
+    login::start_autoclaw_oauth(
+        &app,
+        state,
+        auth_url,
+        &mode.unwrap_or_else(|| "embedded".to_string()),
     )
     .await
 }

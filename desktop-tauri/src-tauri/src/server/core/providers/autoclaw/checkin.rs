@@ -49,6 +49,7 @@ use crate::server::errors::GatewayError;
 
 use super::balance::{userapi_get, userapi_post};
 use super::credentials;
+use super::region::Region;
 
 /// 每日签到任务的 id（源实现 `DAILY_SIGNIN_TASK_ID`）
 const DAILY_SIGNIN_TASK_ID: &str = "daily_signin";
@@ -64,19 +65,26 @@ const TASK_LIST_PATH: &str = "/autoclaw-proxy/proxy/autoclaw-task-list";
 /// 返回 `{success, msg, ...}` —— `success` 的口径是「**本次真的领到了积分**」，
 /// 而不是「HTTP 通了」。今天已领过时 `success: false` 且 msg 说明原因；
 /// 前端把这条当 warn 提示显示（与 WorkBuddy 的「今天已签到」同一处理）。
+///
+/// `region` 决定账号在哪一家的记录里找、请求打哪个 userapi 域：两地的任务体系
+/// 各自独立（同一套接口路径、两个站点），不能跨地区查。
 pub async fn claim_daily_signin(
+    region: Region,
     store: &AccountStore,
     account_id: &str,
 ) -> Result<Value, GatewayError> {
-    let record = store.autoclaw_account_record(account_id);
+    let record = store.autoclaw_account_record(region, account_id);
     if !account_id.is_empty() && record.is_none() {
         return Err(GatewayError::with_status(
             404,
-            format!("AutoClaw 账号 {account_id} 不存在或不属于 AutoClaw"),
+            format!(
+                "AutoClaw {}账号 {account_id} 不存在或不属于该地区",
+                region.label()
+            ),
         ));
     }
     // 与积分查询同一条取凭证链（账号记录 → 桌面端实时登录态 → 环境变量）。
-    let credentials = credentials::snapshot_for(record.as_ref())?;
+    let credentials = credentials::snapshot_for(record.as_ref(), region)?;
     if credentials.token.trim().is_empty() {
         return Err(GatewayError::with_status(
             401,
