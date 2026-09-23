@@ -9,8 +9,10 @@ name: build
 # 不计分钟数 —— macOS runner 是私有仓库里最贵的一档，公开仓库没有这个问题。
 #
 # ── 触发方式 ──────────────────────────────────────────────────
-#   · 仅手动 workflow_dispatch（在 Actions 页面选分支触发）：
+#   · 手动 workflow_dispatch（在 Actions 页面选分支触发）：
 #     两个平台一起构建，产物作为 workflow artifact 下载，不发布 Release
+#   · 推送 v* tag：与 docker.yml 同时触发，一次打 tag 安装包与镜像全出；
+#     产物仍走 artifact，Release 由本地 gh release create 挂载
 #
 # ── action 版本为什么都钉在大版本 v7（本次升级）─────────────────
 # 原先用 checkout@v4 / setup-node@v4 / upload-artifact@v4，三者都跑在
@@ -45,6 +47,9 @@ name: build
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 env:
   RUST_BACKTRACE: 1
