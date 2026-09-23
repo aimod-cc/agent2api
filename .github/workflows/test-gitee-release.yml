@@ -1,0 +1,48 @@
+name: test-gitee-release
+
+# 临时工作流：验证 Gitee Release API 全链路（建发行版 → 传附件 → 删除），
+# 验证通过后本文件会被删除，正式逻辑在 build.yml 的 gitee-release job。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gitee Release API 连通性测试
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          set -e
+          TAG="v2.7.1"
+          API="https://gitee.com/api/v5/repos/aimodcc/agent2api"
+          AUTH="Authorization: Bearer ${GITEE_TOKEN}"
+
+          # 已存在同名发行版则先删（幂等）
+          CODE=$(curl -s -o /tmp/rel.json -w "%{http_code}" -H "$AUTH" "$API/releases/tags/$TAG")
+          echo "查询已有发行版: HTTP $CODE"
+          if [ "$CODE" = "200" ]; then
+            OLD_ID=$(jq -r '.id' /tmp/rel.json)
+            echo "已存在 id=$OLD_ID，先删除"
+            curl -sf -X DELETE -H "$AUTH" "$API/releases/$OLD_ID"
+          fi
+
+          # 建发行版
+          jq -n --arg tag "$TAG" '{tag_name:$tag, name:$tag, body:"CI API 连通性测试，稍后自动删除"}' > /tmp/rel.json
+          RELEASE_ID=$(curl -sf -X POST -H "$AUTH" -H "Content-Type: application/json" \
+            -d @/tmp/rel.json "$API/releases" | jq -r '.id')
+          echo "建发行版成功 id=$RELEASE_ID"
+
+          # 传附件
+          echo "test attachment" > /tmp/attach-test.txt
+          curl -sf -X POST -H "$AUTH" -F "file=@/tmp/attach-test.txt" \
+            "$API/releases/$RELEASE_ID/attach_files" | jq '{name, size}'
+          echo "传附件成功"
+
+          # 删除发行版（连附件一起清掉）
+          curl -sf -X DELETE -H "$AUTH" "$API/releases/$RELEASE_ID"
+          echo "测试发行版已删除，全链路 OK"
