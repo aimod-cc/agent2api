@@ -276,4 +276,45 @@ fn no_retry_codes_field(map: &Map<String, Value>, key: &str) -> std::sync::Arc<[
     std::sync::Arc::from(codes)
 }
 
+// ─── 上游请求超时的解析（四项，单位秒）────────────────────────
+
+/// 由原始 JSON 解析四项超时（缺字段各自用默认值；越界回落默认，同模块头口径）。
+///
+/// 四项的键名与默认值见 `types.rs`——「范围 1~3600」在写侧（timeouts_api）
+/// 是 400 报错，在这里是回落默认：手改库把 0 或 99999 写进去时，宁可回到
+/// 30/300 也不要让转发层拿到一个必然坏事的值（0 毫秒等于禁用该阶段保护）。
+pub(super) fn timeouts_from(map: &Map<String, Value>) -> TimeoutSettings {
+    let defaults = TimeoutSettings::default();
+    TimeoutSettings {
+        connect_seconds: bounded_int_field(
+            map,
+            KEY_TIMEOUT_CONNECT_SECONDS,
+            defaults.connect_seconds,
+            TIMEOUT_MIN_SECONDS,
+            TIMEOUT_MAX_SECONDS,
+        ),
+        headers_seconds: bounded_int_field(
+            map,
+            KEY_TIMEOUT_HEADERS_SECONDS,
+            defaults.headers_seconds,
+            TIMEOUT_MIN_SECONDS,
+            TIMEOUT_MAX_SECONDS,
+        ),
+        stream_idle_seconds: bounded_int_field(
+            map,
+            KEY_TIMEOUT_STREAM_IDLE_SECONDS,
+            defaults.stream_idle_seconds,
+            TIMEOUT_MIN_SECONDS,
+            TIMEOUT_MAX_SECONDS,
+        ),
+        body_seconds: bounded_int_field(
+            map,
+            KEY_TIMEOUT_BODY_SECONDS,
+            defaults.body_seconds,
+            TIMEOUT_MIN_SECONDS,
+            TIMEOUT_MAX_SECONDS,
+        ),
+    }
+}
+
 // ─── 历史路由优先级（providerRoute，只读，供账号迁移）───────────

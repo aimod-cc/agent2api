@@ -39,14 +39,19 @@ pub const NO_TOTAL_TIMEOUT: Option<u64> = None;
 ///
 /// 与 OmniProxy 的 `headers_timeout`（默认 300 秒）同义：连接建立之后、
 /// 响应头到达之前的静默等待必须有个上限 —— `read_timeout` 管的是「两次数据
-/// 之间」，虽然首包之前的等待也计入它，但 600 秒 × 重试链（同账号重发 ×
+/// 之间」，虽然首包之前的等待也计入它，但分钟级的等待 × 重试链（同账号重发 ×
 /// 换号）会把一条请求拖到几十分钟，而客户端早就等不及了。
 ///
-/// 为什么 300 秒是安全的：网关请求上游**恒带 `stream: true`**（见
+/// 现在是**配置项**（设置页「请求超时 → 等待响应超时」，默认 300 秒，
+/// 1–3600）：每次发送时从内存快照取一次，改完设置下一个请求就生效。
+///
+/// 为什么默认 300 秒是安全的：网关请求上游**恒带 `stream: true`**（见
 /// `UpstreamService::forward` 的说明），响应头在 SSE 建立时就到达，
 /// 与「模型思考多久」无关；非流式的长回答也走这条路径（本地聚合）。
 /// 超时按传输层失败处理（502 + 既有退避重试），与连接失败同一档。
-pub const HEADERS_TIMEOUT_MS: u64 = 300_000;
+fn headers_timeout() -> Duration {
+    Duration::from_millis(crate::server::config::timeout_settings().headers_ms())
+}
 
 /// 一次上游请求的全部素材（协议无关形态；provider 差异在构造阶段已消解）
 pub struct TransportRequest {
@@ -148,9 +153,10 @@ pub async fn send_chat_request(
         Some(proxy) => format!("经代理 {}", proxy.host),
         None => "直连".to_string(),
     };
-    // 等待响应头有上限（见 HEADERS_TIMEOUT_MS 的说明）：超时后 future 被丢弃，
+    // 等待响应头有上限（见 headers_timeout 的说明）：超时后 future 被丢弃，
     // 上游连接随之关闭（与客户端断开时的取消是同一机制）
-    match tokio::time::timeout(Duration::from_millis(HEADERS_TIMEOUT_MS), builder.send()).await {
+    let headers_budget = headers_timeout();
+    match tokio::time::timeout(headers_budget, builder.send()).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(error)) => Err(UpstreamRequestError {
             // 网络层错误（ECONNREFUSED、代理鉴权失败、DNS…）：带上根因与出口说明，
@@ -163,7 +169,7 @@ pub async fn send_chat_request(
         Err(_elapsed) => Err(UpstreamRequestError {
             message: format!(
                 "上游响应超时（等待响应头超过 {} 秒，出口 {via}）",
-                HEADERS_TIMEOUT_MS / 1000
+                headers_budget.as_secs()
             ),
         }),
     }

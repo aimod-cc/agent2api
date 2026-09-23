@@ -100,6 +100,11 @@ pub struct RuntimeConfig {
     /// 与保留期同一理由：转发层**每次重试判定**都要取它（改完设置下一个
     /// 失败请求就用新值，不重启进程），解析一次存下来最省事。
     retry: RetrySettings,
+    /// 上游请求的四项超时（设置页「通用 → 请求超时」区域）。
+    ///
+    /// 与 retry 同一理由：转发层**每次发送 / 每次分片**都要取它（改完设置
+    /// 下一个请求就用新值，不重启进程），解析一次存下来最省事。
+    timeouts: TimeoutSettings,
     /// 事件日志的保存目录（原始配置值；None = 未设置，用配置目录）。
     /// 低频字段（启动 + 设置页读写），不值得为它发明解析层，存原始值即可。
     log_dir: Option<String>,
@@ -365,6 +370,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
     let retention = retention_from(&raw);
     let scheduled = scheduled_from(&raw);
     let retry = retry_from(&raw);
+    let timeouts = timeouts_from(&raw);
     RuntimeConfig {
         // 文件里有就用文件的，否则环境变量兜底（对应 `if (config.apiKey && !opts.apiKey)`）
         api_key: string_field(&raw, "apiKey").or_else(env_api_key),
@@ -376,6 +382,7 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
         retention,
         scheduled,
         retry,
+        timeouts,
         log_dir: string_field(&raw, KEY_LOG_DIR),
         request_stats_dir: string_field(&raw, KEY_REQUEST_STATS_DIR),
         debug_dir: string_field(&raw, KEY_DEBUG_DIR),
@@ -851,6 +858,54 @@ pub fn set_retry(patch: RetryPatch) -> bool {
             next.no_retry_codes = std::sync::Arc::from(codes.as_slice());
         }
         config.retry = next;
+    })
+}
+
+// ─── 上游请求超时（connectTimeoutSeconds / headersTimeoutSeconds /
+//     streamIdleTimeoutSeconds / bodyTimeoutSeconds）──────────────────
+
+/// 只取四项超时的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retry_settings()` 同一取舍：转发层每次发送、每个分片都要取一次，
+/// 读锁取一份 `Copy` 快照即可。未初始化时给默认值。
+pub fn timeout_settings() -> TimeoutSettings {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.timeouts;
+        }
+    }
+    TimeoutSettings::default()
+}
+
+/// 更新四项超时（`None` = 该项不动），返回是否写盘成功。
+///
+/// 调用方（`timeouts_api::put_timeouts`）**必须先校验范围**：本函数按
+/// 「已合法」处理，越界值会被 `bounded_int_field` 的回读逻辑丢弃。
+/// 与 `set_retry` 同一模式：内存快照与 raw 底稿一起改。
+pub fn set_timeouts(patch: TimeoutPatch) -> bool {
+    update(|config| {
+        let mut next = config.timeouts;
+        let mut write = |key: &str, value: i64, slot: &mut i64| {
+            config.raw.insert(key.to_string(), Value::from(value));
+            *slot = value;
+        };
+        if let Some(seconds) = patch.connect_seconds {
+            write(KEY_TIMEOUT_CONNECT_SECONDS, seconds, &mut next.connect_seconds);
+        }
+        if let Some(seconds) = patch.headers_seconds {
+            write(KEY_TIMEOUT_HEADERS_SECONDS, seconds, &mut next.headers_seconds);
+        }
+        if let Some(seconds) = patch.stream_idle_seconds {
+            write(
+                KEY_TIMEOUT_STREAM_IDLE_SECONDS,
+                seconds,
+                &mut next.stream_idle_seconds,
+            );
+        }
+        if let Some(seconds) = patch.body_seconds {
+            write(KEY_TIMEOUT_BODY_SECONDS, seconds, &mut next.body_seconds);
+        }
+        config.timeouts = next;
     })
 }
 

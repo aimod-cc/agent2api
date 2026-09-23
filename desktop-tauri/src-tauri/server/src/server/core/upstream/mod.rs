@@ -51,6 +51,7 @@ mod payload;
 mod provider_loop;
 mod rotate;
 pub mod sse;
+pub mod stall;
 pub mod usage;
 
 use std::collections::HashMap;
@@ -470,7 +471,15 @@ impl ForwardStream {
                 std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
             })
         });
-        Self::from_translated(Box::pin(inner), slot, connection, telemetry, model_rewrite)
+        // 流式响应空闲超时（设置页「请求超时」第三项）：逐分片计时，
+        // 收到新数据即重置；计时器在流启动时就武装（见 stall 的模块头）
+        let guarded = stall::idle_guard(
+            Box::pin(inner),
+            std::time::Duration::from_millis(
+                crate::server::config::timeout_settings().stream_idle_ms(),
+            ),
+        );
+        Self::from_translated(guarded, slot, connection, telemetry, model_rewrite)
     }
 
     /// 翻译协议的构造入口：`inner` 已经是**标准 chat SSE** 帧流。
@@ -565,10 +574,13 @@ impl Stream for ForwardStream {
                         self.pending.push_back(frame);
                     }
                     // 错误描述已在构造时折进 io::Error（见 inner 字段说明）
-                    // 手动终止的旁路流给的就是原文（见 from_translated）：
-                    // 不加「上游流中断」前缀 —— 它不是上游的问题
+                    // 手动终止的旁路流给的就是原文（见 from_translated）；
+                    // 空闲守卫给的也是自带前缀的原文（见 stall::IDLE_TIMEOUT_PREFIX）
+                    // —— 两者都不加「上游流中断」前缀：那不是上游的不正常中断
                     let text = error.to_string();
-                    let message = if text == cancellation::MANUAL_TERMINATED {
+                    let message = if text == cancellation::MANUAL_TERMINATED
+                        || text.starts_with(stall::IDLE_TIMEOUT_PREFIX)
+                    {
                         text
                     } else {
                         format!("上游流中断: {error}")

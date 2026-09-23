@@ -87,7 +87,7 @@
         { key: 'time', sel: '.req-time', track: '92px' },
         { key: 'target', sel: '.req-target', track: 'minmax(0, 1.1fr)' },
         { key: 'retry', sel: '.req-retry', track: '52px' },
-        { key: 'status', sel: '.req-status', track: '68px' },
+        { key: 'status', sel: '.req-status', track: '96px' },
         { key: 'model', sel: '.req-model', track: 'minmax(0, 1.3fr)' },
         { key: 'dur', sel: '.req-dur', track: '96px' },
         { key: 'usage', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },

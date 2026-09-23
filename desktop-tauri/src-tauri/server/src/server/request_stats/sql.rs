@@ -70,7 +70,7 @@ use super::report::normalize_status_filter;
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning";
+     client_reasoning, upstream_reasoning, phase, phase_started_at";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -114,6 +114,10 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // 旧行的 DEFAULT '' 原样读出，前端按空串处理
         client_reasoning: row.get(19)?,
         upstream_reasoning: row.get(20)?,
+        // 末尾两列是 schema v6 加的（在途阶段与阶段起点）；不在途的行/旧行
+        // 读出来是 '' 与 NULL —— 与「不在途」在写入侧收敛成同一组值
+        phase: row.get(21)?,
+        phase_started_at: row.get(22)?,
     })
 }
 
@@ -417,6 +421,16 @@ pub(super) fn select_between(
 ///
 /// 只写四列，其余列走 DDL 的 DEFAULT：与「验收路径不预填字段」的取向一致 ——
 /// 进行中行只承诺「这条请求开始了、它叫什么名字」，终态字段一律等收尾时补。
+///
+/// ── 例外：阶段两列在这里就写 ────────────────────────────────
+/// `phase='connecting'` + `phase_started_at=ts`（请求开始时刻）是**在途行**的
+/// 固有属性，不是「将来才有的终态字段」：请求一进网关就处在「连接中」这一段
+/// （选路 / 取凭证 / 建连都在里面），起点就是这一行的 `ts`。在这里写而不是等
+/// 第一次在途回写，是为了让「刚插入、还没轮到任何采集点上报」的那一小段
+/// （毫秒级，但列表一拍就可能读到）也有阶段可显示 —— 少了它，状态列会先闪一下
+/// 空徽章再变成「连接中」。与 OmniProxy 的 `insertPendingLog`（落库即
+/// `phase='connecting'`）逐字同法。
+///
 /// 返回是否真的插入了新行（调用方目前不需要区分，但测试与日志可能想看）。
 pub(super) fn insert_started_request(
     conn: &Connection,
@@ -437,8 +451,9 @@ pub(super) fn insert_started_request(
     // client_reasoning 随首发写入：下游等级在请求开始时就定稿了（与 client_model
     // 同一时刻、同一来源），进行中行就能显示「请求的什么(等级)」
     conn.execute(
-        "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status, \
+         phase, phase_started_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2)",
         params![id, ts, model, client_model, client_reasoning],
     )?;
     Ok(true)
@@ -459,7 +474,7 @@ pub(super) fn finish_stale_running(
     conn.execute(
         "UPDATE requests SET status = 408, error = '网关重启或流中断，请求未能完成', \
          duration_ms = MAX(?2 - ts, 0), attempts = 1, \
-         attempt_details = '[]', sensitive_hits = '[]' \
+         attempt_details = '[]', sensitive_hits = '[]', phase = '', phase_started_at = NULL \
          WHERE status = 0 AND ts < ?1",
         params![cutoff, now],
     )
@@ -478,6 +493,10 @@ pub(super) fn finish_stale_running(
 /// `attempts` 取 `MAX(attempts, 1)`：保留在途已记录的轮数，但不让它落到 0
 /// （存储契约是「含首次、恒 ≥1」）。
 ///
+/// 两个阶段列**清掉**（与另两条收尾同一纪律）：阶段只在途有意义，这一行已经
+/// 落定成 408 了，留着「上次看到的阶段」会让状态列的第二行凭空多出一个
+/// 不再前进的计时。
+///
 /// 匹配条件与收尾 UPDATE 一致（`id + status = 0`）：已收尾的行打空，
 /// 不覆盖终态 —— 与「在途回写晚到一步」同一纪律。
 pub(super) fn finish_running_request(
@@ -488,7 +507,8 @@ pub(super) fn finish_running_request(
 ) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE requests SET status = 408, error = ?2, duration_ms = MAX(?3 - ts, 0), \
-         attempts = MAX(attempts, 1) WHERE id = ?1 AND status = 0",
+         attempts = MAX(attempts, 1), phase = '', phase_started_at = NULL \
+         WHERE id = ?1 AND status = 0",
         params![id, error, now],
     )
 }
@@ -507,6 +527,9 @@ pub(super) fn finish_running_request(
 ///     一次尝试失败，不该让列表里的行提前变成失败；
 ///   - `ts` / `model` / `client_model`：请求发起时就定稿了，在途没有新值；
 ///   - `duration_ms` / 四个 token 列：只有收尾才有值（用量在途中不显示）。
+///
+/// 阶段两列**在这一份里的含义与别处不同**：它们是要写的（见 `phase` 字段的
+/// 说明），只是与 status/error 一样属于「在途」而不是终态。
 pub(super) fn update_running_progress(
     conn: &Connection,
     id: &str,
@@ -515,7 +538,8 @@ pub(super) fn update_running_progress(
     conn.execute(
         "UPDATE requests SET provider = ?2, account_id = ?3, account_name = ?4, \
          upstream_model = ?5, upstream_reasoning = ?6, attempts = ?7, first_response_ms = ?8, \
-         attempt_details = ?9, sensitive_hits = ?10 WHERE id = ?1 AND status = 0",
+         attempt_details = ?9, sensitive_hits = ?10, phase = ?11, phase_started_at = ?12 \
+         WHERE id = ?1 AND status = 0",
         params![
             id,
             progress.provider,
@@ -527,6 +551,8 @@ pub(super) fn update_running_progress(
             progress.first_response_ms,
             encode_json_list(&progress.attempt_details),
             encode_json_list(&progress.sensitive_hits),
+            progress.phase,
+            progress.phase_started_at,
         ],
     )
 }
@@ -558,7 +584,7 @@ pub(super) fn update_running_request(
          duration_ms = ?7, first_response_ms = ?8, attempts = ?9, error = ?10, prompt_tokens = ?11, \
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
-         client_reasoning = ?20, upstream_reasoning = ?21 \
+         client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -590,6 +616,10 @@ pub(super) fn update_running_request(
 ///
 /// 末尾两个 JSON 列由 [`encode_json_list`] 编码；空表写成 `'[]'`，与 DDL 的
 /// 默认值同形（于是「没有数据」在库里只有一种表示，读侧不必分「NULL 还是空数组」）。
+///
+/// **两个阶段列不在这里写**：终态行的阶段恒为空（见 `RequestEntry::phase`），
+/// 而 DDL 的默认值（`''` / `NULL`）就是那个值 —— 走 DEFAULT 比显式写一遍更不容易
+/// 漂移（写入侧将来加字段时不会漏掉这两列）。
 pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \

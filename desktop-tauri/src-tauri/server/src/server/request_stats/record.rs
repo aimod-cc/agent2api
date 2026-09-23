@@ -243,6 +243,34 @@ pub struct RequestEntry {
     /// 模式的原始报文（请求日志的「详情」列）比看那行日志更完整。
     #[serde(rename = "sensitiveHits", default)]
     pub sensitive_hits: Vec<SensitiveHit>,
+    /// **在途请求当前所处的转发阶段**（`connecting` / `waiting` / `streaming` /
+    /// `retrying`；空串 = 不在途 —— 终态行、旧行、转发前就失败的行）。
+    ///
+    /// 取值是 `core::upstream::usage::LogPhase::as_str()` 的字面量，与 OmniProxy
+    /// 的 `LogPhase` 逐字相同；前端按它选文案（连接中 / 等待响应 / 响应中 /
+    /// 重试中）与配色。
+    ///
+    /// ── 为什么与 status=0 同进同退 ──────────────────────────────
+    /// 阶段只在转发期间存在：收尾（成功、失败、断连兜底、僵尸清扫）一律把它
+    /// 清成空串。所以「有没有阶段」可以当「这一行还在跑」的第二个读数，但
+    /// 判据仍是 `status` 那一列（前端 `isRunning`）—— 阶段是**读数**，不是判据：
+    /// 库里万一出现「status=0 而阶段为空」的行（更早的版本写入），展示层回落成
+    /// 通用的「进行中」，不会因此把它当成终态。
+    ///
+    /// ── 为什么在结构体末尾 ──────────────────────────────────────
+    /// 与 `REQUEST_COLUMNS` / `decode_request` 的列序一致：这两个字段是 schema v6
+    /// 加的列，只有排在最后才不牵动前面所有 `row.get(n)` 的序号（那条纪律见
+    /// sql.rs 的列常量说明）。
+    #[serde(default)]
+    pub phase: String,
+    /// **进入当前阶段**的时刻（毫秒时间戳，与 `ts` 同一口径；None = 不在途）。
+    ///
+    /// 本身不直接展示：`/api/stats/requests` 的响应里带的是**派生字段**
+    /// `phaseElapsedMs`（现算「现在 - 这里」，见 `report::entry_json`，
+    /// 与 `providerLabel` 同一手法）—— 让阶段计时与服务端时钟同源，
+    /// 浏览器时钟偏了也不会算出离谱的读数。
+    #[serde(rename = "phaseStartedAt", default)]
+    pub phase_started_at: Option<i64>,
 }
 
 /// 一个被命中的敏感词及其次数（存储契约）。
@@ -531,6 +559,11 @@ impl NewRequestEntry {
                 })
                 .filter(|hit| !hit.word.is_empty())
                 .collect(),
+            // 终态行的两个阶段列恒为空：阶段是**在途**读数（合法值只有
+            // `LogPhase` 的四个字面量），一条已经收尾的行没有「当前阶段」——
+            // 写入侧不给值，读侧也就不必为「终态行带着阶段」写分支
+            phase: String::new(),
+            phase_started_at: None,
         }
     }
 }
@@ -577,6 +610,17 @@ pub struct RunningProgress {
     pub attempts: i64,
     /// 首响：上游首帧到达相对请求开始的毫秒数（None = 首帧还没到）
     pub first_response_ms: Option<i64>,
+    /// 当前阶段（`connecting` / `waiting` / `streaming` / `retrying`，
+    /// 见 `RequestEntry::phase`）—— 转发链路每换一个阶段回写一次。
+    ///
+    /// 为什么回收写**一定**带阶段：阶段是「现在在哪一步」的读数，它必须跟着
+    /// 同一次状态变化一起落库；拆成两次写（先写阶段的几列、再写别的）会让读侧
+    /// 有机会看到「上一轮的数据 + 这一轮的阶段」这种不存在的组合。
+    pub phase: String,
+    /// 进入当前阶段的时刻（毫秒时间戳）。除「连接中」之外，每次换阶段都有值；
+    /// 「连接中」的起点是**请求开始时刻**，由在途回写用记账点的 `started_at`
+    /// 兜底（见 `api::pipeline::live_row_sink`）。
+    pub phase_started_at: Option<i64>,
     /// 到此刻为止的尝试明细（含**还没定局**的那一轮：`status` / `error` 都为空
     /// —— 前端据此把最后一条渲染成「进行中」，见 `ui/request-hover.js`）
     pub attempt_details: Vec<AttemptDetail>,

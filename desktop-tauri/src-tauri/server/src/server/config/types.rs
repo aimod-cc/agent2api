@@ -480,3 +480,100 @@ pub struct RetryPatch {
     pub interval_seconds: Option<i64>,
     pub no_retry_codes: Option<Vec<u16>>,
 }
+
+// ─── 上游请求超时（四个阶段，对应 OmniProxy 的同名设置）──────────────
+
+/// 连接超时：建立上游 TCP/TLS 连接或代理隧道的最大等待时间（秒）
+pub const KEY_TIMEOUT_CONNECT_SECONDS: &str = "connectTimeoutSeconds";
+/// 等待响应超时：请求发出后等待上游响应头的最大时间（秒）
+pub const KEY_TIMEOUT_HEADERS_SECONDS: &str = "headersTimeoutSeconds";
+/// 流式响应空闲超时：流式响应相邻数据之间允许的最大空闲时间（秒），收到新数据后重新计时
+pub const KEY_TIMEOUT_STREAM_IDLE_SECONDS: &str = "streamIdleTimeoutSeconds";
+/// 非流式响应超时：读取完整非流式响应体允许的最大时间（秒）
+pub const KEY_TIMEOUT_BODY_SECONDS: &str = "bodyTimeoutSeconds";
+
+/// 连接超时默认值：30 秒（与 egress 里原先的硬编码值一致）
+pub const DEFAULT_TIMEOUT_CONNECT_SECONDS: i64 = 30;
+/// 等待响应超时默认值：300 秒（与 request.rs 原先的 HEADERS_TIMEOUT_MS 一致）
+pub const DEFAULT_TIMEOUT_HEADERS_SECONDS: i64 = 300;
+/// 流式空闲超时默认值：300 秒（与 OmniProxy 的 stream_idle_timeout 一致）
+pub const DEFAULT_TIMEOUT_STREAM_IDLE_SECONDS: i64 = 300;
+/// 非流式响应超时默认值：300 秒（与 OmniProxy 的 body_timeout 一致）
+pub const DEFAULT_TIMEOUT_BODY_SECONDS: i64 = 300;
+
+/// 四项超时的合法范围（秒）：与 OmniProxy 的 1~3600 逐字一致。
+///
+/// 下限 1 而不是 0：0 在这里没有合理语义（「立即超时」等于禁用转发，
+/// 想禁用某一阶段保护的人其实要的是把它调大到上限）。
+pub const TIMEOUT_MIN_SECONDS: i64 = 1;
+pub const TIMEOUT_MAX_SECONDS: i64 = 3600;
+
+/// 上游请求超时（设置页「通用 → 请求超时」区域）。
+///
+/// 四个阶段各一个值，与 OmniProxy 的 connect / headers / stream_idle / body
+/// 一一对应；转发层逐请求取一次快照（`Copy`，四个 i64）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeoutSettings {
+    /// 建连（含到代理的那一段）
+    pub connect_seconds: i64,
+    /// 请求发出 → 响应头到达
+    pub headers_seconds: i64,
+    /// 流式响应相邻数据之间的最大空闲
+    pub stream_idle_seconds: i64,
+    /// 非流式响应体读完的总预算
+    pub body_seconds: i64,
+}
+
+impl TimeoutSettings {
+    /// 负数 / 0 按最小值兜底（防御性：读侧已由 bounded_int_field 保证范围，
+    /// 转 `u64` 前必须挡住，否则回绕成天文数字）
+    fn ms(seconds: i64) -> u64 {
+        seconds.max(TIMEOUT_MIN_SECONDS) as u64 * 1000
+    }
+
+    pub fn connect_ms(&self) -> u64 {
+        Self::ms(self.connect_seconds)
+    }
+
+    pub fn headers_ms(&self) -> u64 {
+        Self::ms(self.headers_seconds)
+    }
+
+    pub fn stream_idle_ms(&self) -> u64 {
+        Self::ms(self.stream_idle_seconds)
+    }
+
+    pub fn body_ms(&self) -> u64 {
+        Self::ms(self.body_seconds)
+    }
+
+    /// 传输层 read_timeout 的后备上限：取「等响应头」与「流空闲」两者的大者。
+    ///
+    /// reqwest 的 `read_timeout` 作用于每一次读（既覆盖首包前、也覆盖数据块
+    /// 之间），而这两个阶段是分开的旋钮 —— 后备值取大者，保证它**永不**成为
+    /// 哪个旋钮的隐藏天花板（真正的判定在各阶段自己的计时器，见
+    /// `upstream::request` 与 `upstream::ForwardStream`）。
+    pub fn read_timeout_backstop_ms(&self) -> u64 {
+        self.headers_ms().max(self.stream_idle_ms())
+    }
+}
+
+impl Default for TimeoutSettings {
+    fn default() -> Self {
+        Self {
+            connect_seconds: DEFAULT_TIMEOUT_CONNECT_SECONDS,
+            headers_seconds: DEFAULT_TIMEOUT_HEADERS_SECONDS,
+            stream_idle_seconds: DEFAULT_TIMEOUT_STREAM_IDLE_SECONDS,
+            body_seconds: DEFAULT_TIMEOUT_BODY_SECONDS,
+        }
+    }
+}
+
+/// 四项超时的**部分**更新入参（`None` = 该项不动）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimeoutPatch {
+    pub connect_seconds: Option<i64>,
+    pub headers_seconds: Option<i64>,
+    pub stream_idle_seconds: Option<i64>,
+    pub body_seconds: Option<i64>,
+}

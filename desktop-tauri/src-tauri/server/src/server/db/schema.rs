@@ -168,7 +168,12 @@ pub fn is_reserved(key: &str) -> bool {
 /// 见 [`V5_SCHEMA`]。与 v2 完全同一形态（既有表加列，ALTER 两连）：
 /// v1 的 DDL 不回填，两条建库路径（全新库跑 1→5 / 老库从任意版本升上来）
 /// 得到同一份表结构。
-pub const SCHEMA_VERSION: i64 = 5;
+///
+/// ── 版本 6：requests 表加阶段与阶段计时两列 ───────────────────
+/// 见 [`V6_SCHEMA`]。同样是既有表加列（ALTER 两连）。这两列只在**在途**
+/// 期间有值，收尾时一律清空（见 `request_stats::sql` 的各条收尾语句）——
+/// 「有没有阶段」因此就是「这一行还在跑」的第二个读数，与 status=0 同进同退。
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -466,6 +471,41 @@ ALTER TABLE requests ADD COLUMN client_reasoning TEXT NOT NULL DEFAULT '';
 ALTER TABLE requests ADD COLUMN upstream_reasoning TEXT NOT NULL DEFAULT '';
 ";
 
+/// 版本 6：`requests` 补两列（schema v6）—— 在途请求的**阶段**与**阶段计时**。
+///
+/// ── 存什么 ──────────────────────────────────────────────────
+///   - `phase`：该请求当前所处的转发阶段，取值是 `core::upstream::usage::
+///     LogPhase` 的四个字面量（`connecting` 连接中 / `waiting` 等待响应 /
+///     `streaming` 响应中 / `retrying` 重试中）；空串 = 不在途（终态行、
+///     旧行、以及转发前就失败从未插入过在途行的行）。
+///   - `phase_started_at`：**进入当前阶段**的时刻（毫秒时间戳，与 `ts`
+///     同一口径）。阶段计时（请求日志状态列第二行）由它算出来。
+///
+/// ── 为什么两列都只服务「在途」───────────────────────────────
+/// 它们是进行中行的展示字段（列表状态列显示「响应中 1分53秒」这类读数），
+/// 终态行一个字都不读 —— 所以收尾（`update_running_request` /
+/// `finish_stale_running` / `finish_running_request`）一律把两列清回
+/// 空串 / NULL：不清的话，一条已经失败的行会留着「上次看到的阶段」，
+/// 而那个值既不是事实、也没有任何读点。
+///
+/// ── 为什么不像 OmniProxy 那样只存阶段、计时刻现算 ────────────
+/// 那边阶段计时存的是 `phase_started_at`（SQL 里 `julianday('now')` 现减），
+/// 这里同一形态：`phase_started_at` 入库、`phaseElapsedMs` 在 API 序列化时
+/// 现算（见 `request_stats::report::entry_json`）。前端因此拿到的永远是一个
+/// 与服务端时钟同源的读数，不必依赖浏览器本地时钟去减。
+///
+/// 两列都 NOT NULL / 可空的分工：`phase` 跟 `client_model` 那一套「键恒在、
+/// 空串就是没有」的契约（前端少一种「键缺失」形态）；`phase_started_at` 与
+/// `first_response_ms` 一样是**真的可能没有**（不在途的行），所以可空，
+/// 用 NULL 而不是 0 表达「没有这个时刻」。
+/// 加列走 ALTER 的全部理由（为什么不动 v1 的 DDL、为什么不能写
+/// IF NOT EXISTS、幂等靠版本号）与 [`V2_SCHEMA`] 完全相同，不赘述。
+const V6_SCHEMA: &str = "
+-- ── requests 补两列（schema v6）──────────────────────────────
+ALTER TABLE requests ADD COLUMN phase TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN phase_started_at INTEGER;
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -523,6 +563,8 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         4 => conn.execute_batch(V4_SCHEMA),
         // v5：requests 补两个思考等级列（下游指定 / 上游实际发出，见 V5_SCHEMA）
         5 => conn.execute_batch(V5_SCHEMA),
+        // v6：requests 补阶段与阶段计时两列（在途请求的状态列读数，见 V6_SCHEMA）
+        6 => conn.execute_batch(V6_SCHEMA),
         _ => Ok(()),
     }
 }

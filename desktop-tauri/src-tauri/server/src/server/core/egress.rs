@@ -16,18 +16,22 @@
 //!   bodyTimeout:    0       响应体读取**不限时**（SSE 长连接靠调用方的 signal 控制）
 //!
 //! reqwest 只有两个旋钮，且语义不同：
-//!   connect_timeout(30s)    ← 对应 undici 的 connectTimeout（同语义，直接映射）
-//!   read_timeout(600s)      ← 对应 undici 的 headersTimeout + bodyTimeout 的一半：
-//!                             它作用于**每一次** read（收到头、以及之后每一段 body），
-//!                             每次成功读取后重新计时。所以它既覆盖了「等响应头」
-//!                             （30s 建连后最多再等 600s，与 undici 的 headersTimeout 一致），
-//!                             也覆盖了「等 body 数据块」（每次数据间隔 ≤600s）。
-//!   **不用 `.timeout()`（总超时）**：那会让 SSE 长连接在 600 秒时被无条件掐断，
+//!   connect_timeout             ← 对应 undici 的 connectTimeout（同语义，直接映射），
+//!                                 值来自设置页「请求超时 → 连接中超时」
+//!   read_timeout                ← 每个读取操作之间的传输层后备：它作用于**每一次**
+//!                                 read（收到头、以及之后每一段 body），每次成功读取后
+//!                                 重新计时。值取「等待响应超时」与「流式空闲超时」
+//!                                 两者的大者（`TimeoutSettings::read_timeout_backstop_ms`），
+//!                                 保证它不会成为哪个旋钮的隐藏天花板。
+//!   **不用 `.timeout()`（总超时）**：那会让 SSE 长连接在固定时刻被无条件掐断，
 //!   而 Node 版明确是 `bodyTimeout: 0`（不限时）。
-//!   → 与 Node 的差异：body 数据块的间隔被限制在 600 秒内（Node 是完全不限时）。
-//!     这个差异是**有意的**：SSE 心跳通常 15-30 秒一次，600 秒没有任何数据
-//!     说明连接已经僵死，此时断开比无限挂着更有用；而真正的「长思考」
-//!     （上游迟迟不出第一个 token）在 600 秒内不会被打断。
+//!   → 与 Node 的差异：body 数据块的间隔被限制在「流空闲」设置内（Node 是完全不限时）。
+//!     这个差异是**有意的**：SSE 心跳通常 15-30 秒一次，长时间没有任何数据
+//!     说明连接已经僵死，此时断开比无限挂着更有用。
+//!
+//! 四个阶段真正的判定在转发层自己的计时器上（连接除外，它只能用建 Client
+//! 时的旋钮）：等待响应头在 `upstream::request`、流空闲在 `upstream::ForwardStream`、
+//! 非流式总预算在 `upstream::aggregate`。这里的两项只是传输层兜底。
 //!
 //! ── 缓存淘汰 ────────────────────────────────────────────────
 //! Node 版：`MAX_DISPATCHERS = 24`，超出时关掉**最久未用**的那个（Map 保持
@@ -44,13 +48,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::server::config::TimeoutSettings;
 use crate::server::core::proxies::ResolvedProxy;
 use crate::server::logging;
-
-/// 连接超时：TCP 建连（含到代理的那一段）—— 对应 undici 的 connectTimeout
-const CONNECT_TIMEOUT_MS: u64 = 30_000;
-/// 单次读取超时：见模块头部「超时旋钮的映射」—— 对应 undici 的 headersTimeout
-const READ_TIMEOUT_MS: u64 = 600_000;
 
 /// 默认 User-Agent，**必须设置**。
 ///
@@ -110,8 +110,13 @@ const DIRECT_KEY: &str = "__direct__";
 /// 出口的缓存键；端口非法（手工编辑出的脏数据）时返回 None，
 /// 调用方据此回退直连（与 Node 的 `NaN:NaN` 键会产生一个连不上的 dispatcher
 /// 不同 —— 这里更早地放弃，并把原因写进日志）。
-fn cache_key(proxy: Option<&ResolvedProxy>) -> String {
-    match proxy {
+///
+/// `timeouts` 拼在键里：两项传输层超时（连接 / 读取后备）是**建 Client 时**
+/// 固定的（reqwest 没有逐请求改它们的入口），配置一改必须建新 Client ——
+/// 把值放进键里，「改设置 → 下一次取用自动命中新键 → 新客户端」就是自然结果，
+/// 旧值对应的条目由 LRU 淘汰（在途请求仍持着旧 Client 的 Arc 跑完）。
+fn cache_key(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> String {
+    let egress = match proxy {
         None => DIRECT_KEY.to_string(),
         Some(proxy) => format!(
             "{}://{}:{}",
@@ -119,7 +124,13 @@ fn cache_key(proxy: Option<&ResolvedProxy>) -> String {
             proxy.host,
             proxy.port.map(|port| port.to_string()).unwrap_or_else(|| "?".to_string())
         ),
-    }
+    };
+    // 两项传输层超时进键：见上面的说明
+    format!(
+        "{egress}|c{}|r{}",
+        timeouts.connect_ms(),
+        timeouts.read_timeout_backstop_ms()
+    )
 }
 
 /// 构造代理 URI：`协议://[用户名[:密码]@]主机:端口`。
@@ -189,11 +200,13 @@ fn describe_proxy(proxy: &ResolvedProxy) -> &str {
 /// 反过来，构造**直连** Client 时必须显式 `.no_proxy()`：reqwest 默认会去读
 /// 环境变量里的代理设置，不关掉的话用户机器上设了 `HTTPS_PROXY` 就会
 /// 「配置为直连却走了代理」。
-fn build_client(proxy: Option<&ResolvedProxy>) -> Result<reqwest::Client, String> {
+fn build_client(proxy: Option<&ResolvedProxy>, timeouts: &TimeoutSettings) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(CONNECT_TIMEOUT_MS))
-        // 单次读取超时；**没有**设总超时（.timeout()）—— 那会掐断 SSE 长连接
-        .read_timeout(Duration::from_millis(READ_TIMEOUT_MS))
+        .connect_timeout(Duration::from_millis(timeouts.connect_ms()))
+        // 单次读取超时（等响应头 + 数据块间隔的传输层后备，取两项设置的大者）；
+        // **没有**设总超时（.timeout()）—— 那会掐断 SSE 长连接。各阶段真正的
+        // 判定在转发层自己的计时器上（见 egress 头部的旋钮映射与模块头）
+        .read_timeout(Duration::from_millis(timeouts.read_timeout_backstop_ms()))
         // 默认 UA（理由见 DEFAULT_USER_AGENT）：不设会被计费接口判为「请求不合法」
         .user_agent(DEFAULT_USER_AGENT)
         .pool_idle_timeout(Some(Duration::from_secs(90)))
@@ -236,7 +249,9 @@ fn build_client(proxy: Option<&ResolvedProxy>) -> Result<reqwest::Client, String
 /// 并发构造同一个出口时两次都建 Client（各自持自己的连接池），
 /// 后者覆盖前者 —— 最坏结果是多建了一个池，不影响正确性。
 pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
-    let key = cache_key(proxy);
+    // 超时设置逐次取用（配置一改，下一次就命中新键并建新 Client，见 cache_key）
+    let timeouts = crate::server::config::timeout_settings();
+    let key = cache_key(proxy, &timeouts);
     // ① 先查缓存（快速路径）
     {
         let mut guard = lock_clients();
@@ -249,7 +264,7 @@ pub fn client_for(proxy: Option<&ResolvedProxy>) -> Arc<reqwest::Client> {
         }
     }
     // ② 未命中才构造（锁外，可能阻塞）
-    let client = Arc::new(build_client(proxy).unwrap_or_else(|error| {
+    let client = Arc::new(build_client(proxy, &timeouts).unwrap_or_else(|error| {
         // 这条**保留在运行日志**（不像同类的「账号代理不可用」那样进请求日志）：
         // 它每个出口缓存条目最多触发一次 —— 构造失败的兜底 Client 也会被缓存
         // （见下面 ③），后续请求直接命中缓存、不再走到这里，所以条数**不随

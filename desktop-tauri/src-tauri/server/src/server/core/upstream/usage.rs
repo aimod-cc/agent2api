@@ -70,6 +70,54 @@ fn number_field(value: Option<&Value>) -> Option<i64> {
         .or_else(|| value.as_f64().map(|number| number as i64))
 }
 
+/// 在途请求当前所处的**转发阶段**（请求日志状态列的第一个读数）。
+///
+/// ── 四个取值的含义 ──────────────────────────────────────────
+///   - `Connecting` 连接中：请求刚受理，选路 / 取凭证 / 建立连接 / 构造请求体
+///     都在这段里（上游请求还没发出去）；
+///   - `Waiting` 等待响应：本轮上游请求**已发出**，等第一个字节回来
+///     （模型思考的时间也在这一段，与 OmniProxy 的「等待响应（含模型思考）」同义）；
+///   - `Streaming` 响应中：首帧已到、内容正在下发；
+///   - `Retrying` 重试中：本轮失败了，退避等待 / 换号前的过渡（下一轮发出即回到
+///     `Waiting`）。
+///
+/// ── 与 OmniProxy 的对应关系 ─────────────────────────────────
+/// 四个取值与那边的 `LogPhase`（`connecting` / `waiting` / `streaming` /
+/// `retrying`）逐字对应：`as_str()` 的返回值就是落库的字符串，前端按它选文案
+/// （连接中 / 等待响应 / 响应中 / 重试中 —— 同一套文案）。阶段计时的语义也一致：
+/// **进入阶段的时刻**记一次（[`TelemetrySnapshot::phase_started_at`]），
+/// 前端那第二行显示的是「在当前阶段里待了多久」而不是总耗时。
+///
+/// ── 为什么阶段与「首帧」是两个读数 ──────────────────────────
+/// `Streaming` 与 `first_response_at` 在同一次调用里确定（`note_first_frame`），
+/// 但两者不等价：首帧是**一次性事实**（收尾后仍要留着，明细的「首响」列读它），
+/// 阶段是**当前状态**（收尾即清空，只在途有意义）。混用一个字段会让
+/// 「请求结束了但阶段还写着响应中」这种状态有机会出现。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogPhase {
+    /// 请求已受理，还没把上游请求发出去（槽位的初始值）
+    #[default]
+    Connecting,
+    /// 上游请求已发出，等首字节
+    Waiting,
+    /// 首帧已到，内容正在下发
+    Streaming,
+    /// 本轮失败，退避 / 换号过渡中
+    Retrying,
+}
+
+impl LogPhase {
+    /// 落库与 API 透出的字面量（与 OmniProxy 的 `LogPhase` 逐字相同）
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Waiting => "waiting",
+            Self::Streaming => "streaming",
+            Self::Retrying => "retrying",
+        }
+    }
+}
+
 /// 记账点要的最终快照（一次性读走，避免读字段时逐次加锁）
 #[derive(Clone, Debug, Default)]
 pub struct TelemetrySnapshot {
@@ -135,6 +183,27 @@ pub struct TelemetrySnapshot {
     /// 耗时分开 —— 只有 durationMs 时，一个 30 秒的请求看不出是上游慢
     /// 还是内容长。
     pub first_response_at: Option<i64>,
+    /// 当前所处的转发阶段（见 [`LogPhase`]；槽位一建出来就是「连接中」）。
+    ///
+    /// 只在**在途**期间有意义：收尾记账不把它写进明细（终态行的 `phase` 列
+    /// 一律清空，见 `request_stats::sql` 的各条收尾语句），读点只有进行中行的
+    /// 状态列（`phaseElapsedMs` 的起点见下一个字段）。
+    pub phase: LogPhase,
+    /// **进入当前阶段**的绝对时刻（毫秒 Unix 时间戳；None = 还停在槽位的初始
+    /// 阶段「连接中」上，一次都没切换过）。
+    ///
+    /// 与 `first_response_at` 同一手法存绝对值：采集点不知道「请求什么时候
+    /// 开始的」，而展示层要的是「在这个阶段里待了多久」——
+    /// 在那里减一次即可（在途回写把阶段起点写进 `requests.phase_started_at`，
+    /// API 序列化时现算 `phaseElapsedMs`）。
+    ///
+    /// ── 为什么初值是 None 而不是建槽时的 now ────────────────────
+    /// 「连接中」的起点就是**请求开始时刻**（`record_started` 写进行的 `ts`），
+    /// 那个值是记账点带进来的 `started_at`，槽位这里拿不到。None 表达
+    /// 「还没换过阶段」，在途回写用 `started_at` 兜底（见
+    /// `api::pipeline::live_row_sink`）—— 两边算出来的是同一个时刻，
+    /// 不会出现「行说 3 秒、阶段说 2.9 秒」这种对不上的读数。
+    pub phase_started_at: Option<i64>,
     /// 中断 / 异常原因（成功为 None）
     pub error: Option<String>,
     /// **本次请求命中的脱敏规则**（规则标签 + 次数；空表 = 一个都没命中）。
@@ -359,6 +428,12 @@ pub type LiveSink = Arc<dyn Fn(&TelemetrySnapshot) + Send + Sync>;
 /// ── 为什么不含 token 四件套 ─────────────────────────────────
 /// 与 `RunningProgress` 同理：进行中行不显示用量，为一次看不见的更新写库没有意义
 /// （usage 通常只在上游最后一个 chunk 才出现，收尾记账紧接着就会写它）。
+///
+/// ── 为什么含 `phase` 却不含 `phase_started_at` ───────────────
+/// 阶段计时是「现在 - 阶段起点」，它每一拍都在变 —— 放进指纹会让闸门次次打开
+/// （流式路径每帧一次写库，正是指纹要挡掉的东西）。而阶段起点**只在换阶段时
+/// 变**，于是「阶段变了」这一个布尔量就足以覆盖两个字段的变化：比 `phase`
+/// 即可，计时读侧自己算。
 #[derive(Default, PartialEq)]
 struct LiveStamp {
     provider: String,
@@ -369,6 +444,8 @@ struct LiveStamp {
     attempts: i64,
     /// 首响的**绝对时刻**（与快照同形，转换在 api 层做）
     first_response_at: Option<i64>,
+    /// 当前阶段（换阶段必写一次 —— 状态列的徽章与第二行计时都读它）
+    phase: LogPhase,
     /// 尝试明细的条数 + **最后一条**的定局情况（状态码 / 有没有错误 / 退避次数 /
     /// 提示）。只看最后一条：明细是严格串行的，前面的轮次一旦定局就不再变化。
     details: usize,
@@ -390,6 +467,7 @@ impl LiveStamp {
             upstream_reasoning: snapshot.upstream_reasoning.clone(),
             attempts: snapshot.attempts,
             first_response_at: snapshot.first_response_at,
+            phase: snapshot.phase,
             details: snapshot.attempts_detail.len(),
             last_status: last.and_then(|item| item.status),
             last_error: last.map(|item| item.error.is_some()).unwrap_or(false),
@@ -586,6 +664,40 @@ impl RequestTelemetry {
         sink(snapshot);
     }
 
+    /// 切换转发阶段（同阶段重复调用是**无操作**）。
+    ///
+    /// ── 为什么同阶段不重置计时 ──────────────────────────────────
+    /// 阶段计时的语义是「在这个阶段里待了多久」，同一个阶段的多次上报
+    /// （例如流式路径每帧都会走到 `note_first_frame`）绝不能把起点越改越晚 ——
+    /// 否则「响应中」的计时会永远停在 0 秒附近。所以只有**真的换了阶段**
+    /// 才更新起点，这正是与 OmniProxy 的 `updateLogPhase` 唯一的口径差异：
+    /// 那边每次调用都重置 `phase_started_at`，靠调用点保证「只在换阶段时调」，
+    /// 这里把这条不变量钉在函数自己身上。
+    ///
+    /// 调用方必须正持有 `inner` 锁（各 `note_*` 方法的 `guard`）—— 与
+    /// `flush_live` 同一纪律：改状态与「要不要回写」是一次原子判断。
+    fn enter_phase(&self, guard: &mut TelemetrySnapshot, phase: LogPhase) {
+        if guard.phase == phase {
+            return;
+        }
+        guard.phase = phase;
+        guard.phase_started_at = Some(logging::now_ms());
+    }
+
+    /// 把阶段推到 `phase` 并回写（**给转发链的少数几个精确时点用**）。
+    ///
+    /// 与各 `note_*` 内部那几处 `enter_phase` 的分工：那几处把阶段绑在
+    /// 「已发生的事实」上（首帧到达、尝试起头、退避重试），本方法是给
+    /// 「即将发生的事」用的 —— 目前唯一调用点是 `send_with_retry` 里
+    /// **真正发出请求之前**那一下，它覆盖了同账号内的退避重发：那一轮
+    /// 失败后阶段是「重试中」（睡着等退避），睡醒再发时必须回到「等待响应」，
+    /// 否则重试期间的阶段会一直停在「重试中」直到首帧到达。
+    pub fn note_phase(&self, phase: LogPhase) {
+        let mut guard = self.lock();
+        self.enter_phase(&mut guard, phase);
+        self.flush_live(&guard);
+    }
+
     /// 记一次「已向这个账号发出上游请求」（选路循环每轮调一次）。
     ///
     /// 账号取**最后一次**：429 轮换后真正承载请求的是最后那个账号，
@@ -636,6 +748,11 @@ impl RequestTelemetry {
             retries: Vec::new(),
             notice: None,
         });
+        // 阶段：新一轮的请求**即将发出** → 等待响应（含模型思考）。
+        // 位置与 OmniProxy 的「连接已建立、请求即将发出」同一时点：本函数就在
+        // 发送之前被调用（选路与凭证已就绪），所以「连接中」覆盖的是
+        // 排队 / 选路 / 取凭证 / 建连这一段 —— 与那边的分界一致。
+        self.enter_phase(&mut guard, LogPhase::Waiting);
         // 在途回写：新的一轮进了尝试链（换号时这一步就让「重试」列出现）
         self.flush_live(&guard);
     }
@@ -659,6 +776,9 @@ impl RequestTelemetry {
             status,
             delay_ms,
         });
+        // 阶段：同账号的退避重发 —— 接下来是睡一段时间再发，这段等待就是「重试中」
+        // （下一轮 `note_attempt_started` 会把它推回「等待响应」）
+        self.enter_phase(&mut guard, LogPhase::Retrying);
         // 在途回写：退避重试也是「进行中」期间就值得看到的进展
         // （前端那枚标签的判据含重试次数，见 `hasProcessFacts`）
         self.flush_live(&guard);
@@ -713,6 +833,15 @@ impl RequestTelemetry {
         // 那不该渲染成「失败：」后面跟着一片空白
         if let Some(text) = error.filter(|text| !text.is_empty()) {
             last.error = Some(truncate_chars(text, MAX_ATTEMPT_ERROR_CHARS));
+        }
+        // 阶段：这一轮**失败**收场 → 重试中（退避 / 换号前的过渡）。
+        // 紧随其后的三种出口都由下一轮或收尾接管：换号走 `note_attempt_started`
+        // （推回等待响应）、就地重发走 `note_attempt_retry`（留在重试中）、
+        // 整个请求失败则收尾把阶段清空（终态行没有阶段）。
+        // 成功收场（`error` 为空）不动阶段：那一轮的成功就是这条请求的结局，
+        // 收尾紧接着就会到，中间没有可展示的过渡态。
+        if last.error.is_some() {
+            self.enter_phase(&mut guard, LogPhase::Retrying);
         }
         // 在途回写：这一轮定局（成功 / 失败）是「切换路径」上最值得看到的一步
         self.flush_live(&guard);
@@ -770,11 +899,19 @@ impl RequestTelemetry {
     /// 重跑计数只会把「第一个字节什么时候到的」改写成「后来某次调用的时刻」。
     /// 采集点在响应流上（Streaming 的 RecordingStream / 聚合的第一个 chunk），
     /// 同一条流上会被反复调用，幂等性由这里的 None 判断保证。
+    ///
+    /// ── 阶段为什么不受「首次为准」限制 ──────────────────────────
+    /// 首帧事实只有一次（首响那一列），但阶段是**当前状态**：换号重试之后
+    /// 新的一轮同样要回到「响应中」。所以阶段切换在 if **之外** ——
+    /// 第二次及以后的首帧都该把阶段推回来（`enter_phase` 对同阶段是空操作，
+    /// 所以流式路径每帧的调用不会造成重复写库）。
     pub fn note_first_frame(&self) {
         let mut guard = self.lock();
         if guard.first_response_at.is_none() {
             guard.first_response_at = Some(logging::now_ms());
         }
+        // 阶段：首帧到了 → 响应中
+        self.enter_phase(&mut guard, LogPhase::Streaming);
         // 在途回写：首响在转发期间就值得看（一条跑几分钟的流式请求，首响其实
         // 一秒内就有了）。**幂等**，所以每帧调到这里也只会触发一次回写 ——
         // 靠的是指纹闸（`flush_live`），不是这个 if

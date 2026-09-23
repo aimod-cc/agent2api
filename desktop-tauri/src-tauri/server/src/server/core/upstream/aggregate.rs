@@ -83,6 +83,31 @@ pub async fn aggregate_frame_stream(
     telemetry: Arc<RequestTelemetry>,
     model_rewrite: Option<ModelRewrite>,
 ) -> Result<AggregatedCompletion, GatewayError> {
+    // 非流式响应总超时（设置页「请求超时」第四项）：**一次性计时、不重置**
+    // —— 与流式的空闲超时是两种语义（那是「两次数据之间」，这里读完整份
+    // 响应体的总预算，对应 OmniProxy 的 readBodyWithStallGuard）。
+    // 超时中止整个聚合：非流式客户端此时还没收到任何响应，收尾记账不会丢，
+    // 错误原样返回（502 + 明确文案）。
+    let budget = std::time::Duration::from_millis(
+        crate::server::config::timeout_settings().body_ms(),
+    );
+    match tokio::time::timeout(budget, aggregate_frame_stream_inner(stream, telemetry, model_rewrite))
+        .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(GatewayError::with_status(
+            502,
+            format!("上游非流式响应超时（超过 {} 秒）", budget.as_secs()),
+        )),
+    }
+}
+
+/// [`aggregate_frame_stream`] 的主体（总超时由外层套上，见那里的说明）。
+async fn aggregate_frame_stream_inner(
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
+    telemetry: Arc<RequestTelemetry>,
+    model_rewrite: Option<ModelRewrite>,
+) -> Result<AggregatedCompletion, GatewayError> {
     // ── 手动终止的旁路流（与 `ForwardStream::from_translated` 同一手法）──
     // 聚合是 `while let Some(item) = stream.next().await` 的拉取循环：没有
     // 旁路流时，取消要等下一个上游分片（上游停滞时可能等很久）。把令牌的

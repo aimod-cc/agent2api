@@ -668,7 +668,7 @@
                      「全部删除 / 仅清空报文原文」两种删除方式在「清理」弹窗里选。 -->
                 <div class="seg">
                   <button type="button" class="seg-item" id="btn-req-running" aria-pressed="false"
-                    title="只显示正在转发中的请求（状态列显示「进行中」，用时列显示已用时）">仅看进行中</button>
+                    title="只显示正在转发中的请求（状态列按阶段显示：连接中 / 等待响应 / 响应中 / 重试中，用时列显示已用时）">仅看进行中</button>
                 </div>
                 <!-- 提供商 / 模型两个维度：选项由 requests-panel.js 进页面时从
                      `/api/stats/requests/filters` 拉一次填进来（那是「明细里出现过
@@ -761,6 +761,60 @@
                       </label>
                     </div>
                     <div class="settings-state" id="units-state">—</div>
+                  </div>
+                </section>
+
+                <!-- ── 通用：请求超时 ──
+                     四项读写的都是后端配置（经 /api/timeouts，HTTP 桥），
+                     对应转发链路的四个阶段：连接 / 等待响应头 / 流式空闲 /
+                     非流式响应体。默认 30 / 300 / 300 / 300 秒，范围 1~3600，
+                     与 OmniProxy 同类设置保持一致。
+                     行样式复用数据保留那一套（.retention-*，见 page-settings.css）。 -->
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>请求超时</h2>
+                    <span class="tip-q" data-tip="上游请求四个阶段各自的等待上限（秒，1~3600）：①「连接中超时」= 建立 TCP/TLS 连接或代理隧道的最大等待，默认 30 秒；②「等待响应超时」= 请求发出后等上游响应头的最大时间，默认 300 秒 —— 网关请求上游恒带 stream，响应头在 SSE 建立时就到达，与模型思考多久无关；③「流式响应空闲超时」= 流式响应相邻两块数据之间允许的最大空闲，收到新数据即重新计时，默认 300 秒 —— 上游长时间不吐数据即判定连接僵死并断开；④「非流式响应超时」= 读完整份非流式响应体的总预算（一次性计时、不重置），默认 300 秒。四项都是「等待上限」，只要数据还在来，正常的流式回答就一直往下传。保存后对下一个请求立即生效，不用重启。"></span>
+                    <span id="timeouts-badge" class="badge">检测中…</span>
+                    <div class="head-actions">
+                      <button id="btn-timeouts-refresh">刷新</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="retention-list">
+                      <div class="retention-row">
+                        <label for="settings-timeout-connect">连接中超时</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-timeout-connect" min="1" max="3600" step="1" inputmode="numeric">
+                          <span class="unit">秒</span>
+                        </span>
+                        <div class="hint">建立上游 TCP/TLS 连接或代理隧道的最大等待时间（秒），默认 30 秒，范围 1~3600。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="settings-timeout-headers">等待响应超时</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-timeout-headers" min="1" max="3600" step="1" inputmode="numeric">
+                          <span class="unit">秒</span>
+                        </span>
+                        <div class="hint">请求发出后等待上游响应头的最大时间（秒），默认 300 秒，范围 1~3600。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="settings-timeout-stream-idle">流式响应空闲超时</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-timeout-stream-idle" min="1" max="3600" step="1" inputmode="numeric">
+                          <span class="unit">秒</span>
+                        </span>
+                        <div class="hint">流式响应相邻数据之间允许的最大空闲时间（秒），收到新数据后重新计时，默认 300 秒，范围 1~3600。</div>
+                      </div>
+                      <div class="retention-row">
+                        <label for="settings-timeout-body">非流式响应超时</label>
+                        <span class="retention-input">
+                          <input type="number" id="settings-timeout-body" min="1" max="3600" step="1" inputmode="numeric">
+                          <span class="unit">秒</span>
+                        </span>
+                        <div class="hint">读取完整非流式响应体允许的最大时间（秒），默认 300 秒，范围 1~3600。</div>
+                      </div>
+                    </div>
+                    <div class="hint retention-note">保存后立即生效，不用重启；超时按上游失败处理（计入请求日志的「错误」列，并按「请求重试」的设置决定是否重试）。</div>
                   </div>
                 </section>
 
@@ -1698,7 +1752,11 @@
        但先加载让依赖关系一眼可见。 -->
   <script src="confirm-dialog.js"></script>
   <script src="logs-panel.js"></script>
-  <!-- 请求日志的三块「独立小件」，都必须排在 requests-panel.js 之前：
+  <!-- 请求日志的四块「独立小件」，都必须排在 requests-panel.js 之前：
+       · request-phase         进行中请求的**阶段**渲染（连接中 / 等待响应 / 响应中 /
+                                重试中：徽章文案、配色类名、阶段计时）。列表与详情弹窗
+                                渲染的是同一行数据的同一格，两处必须逐字一致，所以
+                                文案集中在这一个小模块里（口径见文件头）。
        · request-hover          列表里重试 / 敏感词两枚标签的悬停面板。requests-panel 在
                                 加载期就调 wbRequestHover.bind 把委托挂到列表上
                                 （走可选链，未就绪时静默跳过 —— 那样整个悬停功能就没了，
@@ -1709,6 +1767,7 @@
                                 在加载期绑弹窗的关闭 / 标签事件，并独占 #req-detail-modal
                                 那组 DOM；requests-panel 只在点「详情」时调它的 open(id, row)。
                                 排在前面是为了让「谁负责哪块 DOM」在文件顺序上也看得出来。 -->
+  <script src="request-phase.js"></script>
   <script src="request-hover.js"></script>
   <script src="conversation-preview.js"></script>
   <script src="request-detail.js"></script>

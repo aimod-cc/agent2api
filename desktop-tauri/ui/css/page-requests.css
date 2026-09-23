@@ -22,6 +22,8 @@
    其余占弹性宽度（都是不定长内容，给固定宽度会互相挤）：
    模型 1.3fr（claude-sonnet-4-5 这类名字要放得下），
    用量 1.6fr（两行读数里 in/out/all 最长），超出由省略号收住、完整值进 title。
+   状态 96px：进行中的行有两行（阶段徽章 + 阶段计时），而徽章最长是
+   「等待响应」四个字（约 76px）—— 68px 那一版会把它压成省略号。
    详情列定宽（只有一个「详情」按钮或一个「-」）。
 
    --req-cols 是用户拖过的列宽（table-columns.js 写在 #req-list 上，靠继承
@@ -33,7 +35,7 @@
 .req-head {
   display: grid;
   grid-template-columns: var(--req-cols,
-    92px minmax(0, 1.1fr) 52px 68px minmax(0, 1.3fr) 96px minmax(0, 1.6fr) minmax(0, 1.2fr) 60px);
+    92px minmax(0, 1.1fr) 52px 96px minmax(0, 1.3fr) 96px minmax(0, 1.6fr) minmax(0, 1.2fr) 60px);
   gap: 12px;
   align-items: center;
   padding: 10px 14px;
@@ -79,17 +81,89 @@
    （见 stats_api::stats_requests）。行本身不加底色 —— 它还没落定，
    红底（.failed）是终态的颜色，进行中的信号交给状态徽章那一格。 */
 
-/* 进行中徽章：info 色系（成功 / 失败都不是，它是中间态）。
-   形制对齐 .badge.tag.ok / .badge.tag.bad（components.css），只换配色 ——
-   那两个类没有「蓝」这个语义值，就地用 --info 组（tokens.css 浅深两套都有）。 */
+/* 进行中行**分阶段**显示（连接中 / 等待响应 / 响应中 / 重试中，本次改造）：
+   文案与类名由 request-phase.js 给（那边是唯一的文案来源），这里只管配色。
+   色相对标 OmniProxy 的 Tag color（cyan / green / orange / processing），
+   落到本项目的语义令牌上：连接中 = info 蓝（与改造前那枚「进行中」同色，
+   语义也是同一档）、等待响应 = 青（就地定色，理由见下）、响应中 = ok 绿、
+   重试中 = warn 琥珀。四个色相在浅深两套主题下都取自 tokens.css 的
+   --x / --x-soft / --x-bd 三件套，所以这里不需要再写主题分支。
+
+   为什么「等待响应」要就地定一个青色而不是复用现有四组之一：它与另外三个
+   语义都不同（不是失败、不是完成、也不是「刚开始」），而等待时长恰恰是用户
+   最常盯着看的一格 —— 借 --ok 会让「等模型出字」（可能很慢）看着像已经成功，
+   借 --info 又与「连接中」分不开。OmniProxy 那边同样是就地给了个 cyan。 */
+
+/* 没有阶段可读的在途行（旧数据、更早版本写入的行，见 request-phase.js 的
+   FALLBACK_CLS）回落成改造前那枚「进行中」：info 蓝，与下面「连接中」同色
+   —— 它们本来就是同一档语义，只是这枚说不出「卡在哪一步」。 */
 .badge.tag.running {
   background: var(--info-soft);
   border: 1px solid var(--info-bd);
   color: var(--info);
 }
 
+.badge.tag.phase-connecting {
+  background: var(--info-soft);
+  border-color: var(--info-bd);
+  color: var(--info);
+}
+
+.badge.tag.phase-waiting {
+  background: oklch(0.62 0.12 200 / 12%);
+  border-color: oklch(0.62 0.12 200 / 32%);
+  color: oklch(0.5 0.13 205);
+}
+
+.badge.tag.phase-streaming {
+  background: var(--ok-soft);
+  border-color: var(--ok-bd);
+  color: var(--ok);
+}
+
+.badge.tag.phase-retrying {
+  background: var(--warn-soft);
+  border-color: var(--warn-bd);
+  color: var(--warn);
+}
+
+@media (prefers-color-scheme: dark) {
+  .badge.tag.phase-waiting {
+    background: oklch(0.72 0.11 200 / 15%);
+    border-color: oklch(0.72 0.11 200 / 34%);
+    color: oklch(0.8 0.1 200);
+  }
+}
+
+/* 状态列两行（徽章 + 阶段计时）——只在进行中的行上出现。
+   与用时列的两行结构同一手法：主读数是徽章，次读数是「这个阶段已经持续了
+   多久」（淡一档、小半号）。这一列原先定宽 68px，而徽章最长是「等待响应」
+   四个字放不下，所以本次加宽到 96px（见下方 grid-template-columns 与
+   table-columns.js 的登记，两处必须同改）。 */
+.req-row .req-status {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+}
+
+.req-row .req-status-badge {
+  display: flex;
+  min-width: 0;
+}
+
+/* 阶段计时：等宽 + tabular-nums，相邻行的秒数竖着能直接比大小 */
+.req-row .req-status-line {
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* 徽章里的呼吸圆点：1.2s 一拍的不透明度脉动 —— 不用进度条，
-   状态列只有 68px 宽塞不下，圆点的「活着」感刚好。currentColor 跟随
+   状态列那点宽度塞不下，圆点的「活着」感刚好。currentColor 跟随
    徽章文字色，深浅主题都由 --info 一处决定。 */
 .req-live-dot {
   flex: 0 0 auto;
@@ -312,7 +386,9 @@
 @media (max-width: 1200px) {
   .req-row,
   .req-head {
-    grid-template-columns: 92px minmax(0, 1fr) 68px 52px;
+    /* 第三格（状态）与宽窗口同一口径取 96px：窄窗口下它同样要放得下
+       「等待响应」四个字（比默认窗口更需要 —— 这里的弹性列只剩模型那一格） */
+    grid-template-columns: 92px minmax(0, 1fr) 96px 52px;
     row-gap: 4px;
   }
   /* 重排成四行之后轨道已经不是那八条了：上面这条声明直接覆盖 --req-cols，

@@ -173,6 +173,11 @@ pub fn build_plan(
 }
 
 /// 发一次上游请求（不读体，交给调用方决定怎么消费）。
+///
+/// 等待响应头有上限：值取设置页「请求超时 → 等待响应超时」（与
+/// `upstream::request::send_chat_request` 同一口径、同一份配置）。Qoder 走的
+/// 是自己的发送函数而不是那个入口（请求形状差异大），这个上限不能只加在
+/// 统一入口上 —— 否则改名成「等待响应超时」的设置对 Qoder 静默失效。
 pub async fn send(
     plan: &ChatPlan,
     proxy: Option<&ResolvedProxy>,
@@ -182,20 +187,28 @@ pub async fn send(
     for (key, value) in &plan.headers {
         builder = builder.header(key, value);
     }
-    builder.send().await.map_err(|error| {
-        GatewayError::with_status(
+    let via = match proxy {
+        Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
+        Some(proxy) => format!("经代理 {}", proxy.host),
+        None => "直连".to_string(),
+    };
+    let budget = std::time::Duration::from_millis(
+        crate::server::config::timeout_settings().headers_ms(),
+    );
+    match tokio::time::timeout(budget, builder.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(GatewayError::with_status(
+            502,
+            format!("Qoder 上游请求失败（{via}）: {}", egress::describe_error_detail(&error)),
+        )),
+        Err(_elapsed) => Err(GatewayError::with_status(
             502,
             format!(
-                "Qoder 上游请求失败（{}）: {}",
-                match proxy {
-                    Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
-                    Some(proxy) => format!("经代理 {}", proxy.host),
-                    None => "直连".to_string(),
-                },
-                egress::describe_error_detail(&error)
+                "Qoder 上游响应超时（等待响应头超过 {} 秒，出口 {via}）",
+                budget.as_secs()
             ),
-        )
-    })
+        )),
+    }
 }
 
 /// 把**失败**的上游响应转成客户端可用的错误。

@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
 use serde_json::{json, Value};
 
-use super::clock::{date_key, hour_floor, hour_key, ms_to_local};
+use super::clock::{date_key, hour_floor, hour_key, ms_to_local, now_ms};
 use super::record::{AccountAccum, DailyEntry, ModelAccum, ProviderAccum, RequestEntry};
 
 /// 未知 provider 的展示名（`id` 为空串的那一组：旧版本写出的明细、
@@ -434,12 +434,27 @@ pub(super) fn build_accounts(totals: &[AccountAccum]) -> Vec<Value> {
         .collect()
 }
 
-/// 明细行 → 响应 JSON：在序列化结果上补一个**派生字段** `providerLabel`。
+/// 明细行 → 响应 JSON：在序列化结果上补两个**派生字段**
+/// `providerLabel` 与 `phaseElapsedMs`。
 ///
+/// ── providerLabel ───────────────────────────────────────────
 /// 为什么不在 `RequestEntry` 上加一个字段：契约里 `providerLabel` 是给前端直接
 /// 显示的（§6「记账展示的 provider 用 label」），它由 id 换算而来、会随注册表
 /// 变化，而 `RequestEntry` 是**落盘格式**——把派生值写进文件会让
 /// 「以后改了 label，历史行仍是旧名字」。
+///
+/// ── phaseElapsedMs（本次新增，与上面同一手法）────────────────
+/// 「在当前阶段里已经待了多久（毫秒）」，只对**在途**行（有 `phase` 的那几行）
+/// 有值；不在途的行给 `null`，前端据此不渲染状态列的第二行。
+///
+/// 为什么现算而不是把耗时落库：耗时的两个端点里，起点（`phase_started_at`）
+/// 是库里的事实、终点（现在）在读取那一刻才知道。落库一个值意味着它从写下去的
+/// 那一刻就开始过期 —— 而状态列第二行的全部意义正是「它还在走」。
+/// 现算还让读数与服务端时钟同源：浏览器时钟偏了也不会算出离谱的秒数
+/// （与 OmniProxy 的 `phase_elapsed_ms` 用 `julianday('now')` 现减同一取向）。
+///
+/// `saturating_sub` + `max(0)`：手改过的库可能给出一个未来时刻，那种值算出来
+/// 的负耗时会渲染成「-5秒」，两条都挡掉。
 ///
 /// 序列化失败理论上不可能（字段全是 i64 / String / Option<String>），但仍然
 /// 不做 unwrap（panic=abort 下会带走整个应用）：退化成一个空对象，
@@ -452,6 +467,13 @@ pub(super) fn entry_json(entry: &RequestEntry) -> Value {
         object.insert(
             "providerLabel".to_string(),
             Value::String(provider_label(&entry.provider)),
+        );
+        object.insert(
+            "phaseElapsedMs".to_string(),
+            match entry.phase_started_at {
+                Some(started) => json!((now_ms() - started).max(0)),
+                None => Value::Null,
+            },
         );
     }
     value

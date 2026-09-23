@@ -64,5 +64,6 @@ pub mod scheduled_tasks;
 pub mod session;
 pub mod stats_api;
 pub mod storage_api;
+pub mod timeouts_api;
 pub mod update;
 pub mod upgrade_api;

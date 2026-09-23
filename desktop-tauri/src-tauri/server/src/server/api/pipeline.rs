@@ -447,6 +447,14 @@ pub fn live_row_sink(
                 // `TelemetrySnapshot::attempts` 的说明
                 attempts: snapshot.attempts.max(1),
                 first_response_ms: snapshot.first_response_at.map(|at| (at - started_at).max(0)),
+                // 阶段与阶段起点：起点为 None 只可能是「还停在初始阶段（连接中）、
+                // 一次都没切换过」——那个阶段的起点就是**请求开始时刻**（下面这个
+                // started_at，与插入在途行时写进 phase_started_at 的值同源），
+                // 所以用 started_at 兜底。不兜的话这一列会写进 NULL，
+                // 而状态列的第二行按它算「连接中已持续多久」会算出个负数或
+                // 干脆没有 —— 两种都不该出现在「已受理但还没发出去」的请求上
+                phase: snapshot.phase.as_str().to_string(),
+                phase_started_at: snapshot.phase_started_at.or(Some(started_at)),
                 attempt_details: stored_attempt_details(&snapshot.attempts_detail),
                 sensitive_hits: stored_sensitive_hits(&snapshot.sensitive_hits),
             },

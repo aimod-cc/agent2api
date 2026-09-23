@@ -441,6 +441,12 @@ const BRIDGE_JS: &str = r#"
     getRetry: () => call('GET', '/api/retry'),
     saveRetry: patch => call('PUT', '/api/retry', patch),
 
+    // ── 上游请求超时（设置页「通用 → 请求超时」）──
+    // 四项秒数（连接 / 等待响应 / 流式空闲 / 非流式响应体），存配置（/api/timeouts）。
+    // 契约同 saveRetry：PUT 允许部分字段，返回生效后的全量值。
+    getTimeouts: () => call('GET', '/api/timeouts'),
+    saveTimeouts: patch => call('PUT', '/api/timeouts', patch),
+
     // ── 调试模式（设置页「通用 → 调试模式」）──
     // 开关存配置（debugMode）：开启后转发层把上游原始报文（凭据类头已脱敏）
     // 落到统一库的 debug_traffic 表，请求日志页的「详情」列据此展示。

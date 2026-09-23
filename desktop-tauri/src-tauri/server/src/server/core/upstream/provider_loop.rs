@@ -88,6 +88,7 @@ use crate::server::logging;
 
 use super::payload::{send_body, ProviderContext, SendBody};
 use super::request::{read_upstream_error, send_chat_request, TransportRequest};
+use super::usage::LogPhase;
 use super::{
     account_display, account_label, cancellation, connections::ConnectionGuard, describe_proxy,
     reset_hint, rotate, ForwardOutcome, InFlightGuard, RouteTarget, UpstreamService,
@@ -1745,6 +1746,12 @@ async fn send_with_retry(
         if telemetry.is_cancelled() {
             return Err(cancelled_failure());
         }
+        // 阶段：这一下就是**真正发出**上游请求的时刻 → 等待响应。
+        // 为什么不能只靠尝试起头那一处（`note_attempt_started`）：同账号内的
+        // 退避重发也走本循环（外面看不见），退避期间阶段是「重试中」，
+        // 睡醒重发时必须推回去 —— 否则那一段等待首字节的时间会被显示成
+        // 「重试中」，而它其实已经在等上游出字了。
+        telemetry.note_phase(LogPhase::Waiting);
         let response = match send_or_cancel(transport, telemetry).await {
             Ok(response) => response,
             Err(error) => {
@@ -1780,7 +1787,20 @@ async fn send_with_retry(
             return Ok(response);
         }
         let status = response.status().as_u16();
-        let detail = read_upstream_error(response, capture).await;
+        // 错误响应体的读取同样受「非流式响应超时」管（对应 OmniProxy
+        // readBodyWithStallGuard 的用法之一）：上游接了错误响应却迟迟不吐完
+        // 出错体时，不能让「读错误」把请求挂住 —— 读不出来就当上游没给细节，
+        // 分类仍按状态码走（classify_error 只看 status 也能给出结论）。
+        let detail = {
+            let budget = Duration::from_millis(config::timeout_settings().body_ms());
+            match tokio::time::timeout(budget, read_upstream_error(response, capture)).await {
+                Ok(detail) => detail,
+                Err(_elapsed) => super::request::UpstreamErrorDetail {
+                    code: None,
+                    message: format!("上游错误响应体读取超时（超过 {} 秒）", budget.as_secs()),
+                },
+            }
+        };
         let body = detail.to_value();
         let class = adapter.classify_error(status, &body);
         // 退避重试：provider 专属判定优先，没声明时对瞬时状态码统一兜底

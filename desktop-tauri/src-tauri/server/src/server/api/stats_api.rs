@@ -39,7 +39,8 @@
 //! （路由层不加工，理由同上）：
 //!   - `/api/stats/requests`：每行含 `provider`（id，旧行/未承载为空串）
 //!     与派生的 `providerLabel`（id → 中文展示名；未知 id 原样回显 id，
-//!     空 id 回显空串，由展示层用「—」占位）。
+//!     空 id 回显空串，由展示层用「—」占位），以及在途行的 `phase` +
+//!     派生 `phaseElapsedMs`（状态列的阶段徽章与阶段计时，见 `ui/request-phase.js`）。
 //!   - `/api/stats/summary`：新增顶层 `providers` 数组
 //!     `[{id,label,requests,success,failures,totalTokens}]`，按 requests 降序，
 //!     统计区间与 `overview` / `topModel` 完全一致；空 id 的组 label 为「未知」。
@@ -151,7 +152,9 @@ pub async fn stats_summary(State(state): State<ServerState>, Query(params): Quer
 /// GET /api/stats/requests?offset=&limit=&model=&provider=&status=&start=&end=
 ///
 /// 每行含 `provider`（id）与 `providerLabel`（展示名），由存储层的 `entry_json`
-/// 在序列化后派生填入。
+/// 在序列化后派生填入；同时派生一个 `phaseElapsedMs`（在途行「当前阶段已持续
+/// 多久」，不在途为 null）—— 与 `phase` 列合起来就是请求日志状态列的
+/// 「阶段徽章 + 阶段计时」两行（见 `ui/request-phase.js`）。
 ///
 /// `provider` 与 `model` 都是**精确匹配**（下拉里选的是明细里出现过的原值，
 /// 不做模糊匹配 —— 模糊匹配会让「筛了 A 却看到 B」变得无法解释）。

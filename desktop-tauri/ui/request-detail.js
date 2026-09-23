@@ -1,5 +1,5 @@
 /* Agent2API · 请求日志的详情弹窗（请求详情 / 预览对话 / 原始报文 · 三标签） */
-/* global workbuddyDesktop, wbApp, wbConversationPreview */
+/* global workbuddyDesktop, wbApp, wbConversationPreview, wbRequestPhase */
 
 /**
  * 「请求日志」页的**详情弹窗**，三个标签（参考 OmniProxy 的
@@ -215,12 +215,22 @@
   // ─── 标签 ①：请求详情（数据全部来自 row）──────
 
   /**
-   * 状态徽章：与列表 statusCell 同款（进行中带呼吸点、2xx 带摘要给 title）。
-   * 判据（isRunning / isOk）是上面那两个镜像函数，文案与结构逐字同源。
+   * 状态徽章：与列表 statusCell 同款 —— 进行中交给 `request-phase.js`
+   * （阶段徽章：连接中 / 等待响应 / 响应中 / 重试中，没有阶段时回落「进行中」，
+   * 后面缀一段当前阶段的计时），2xx 带摘要时给 title 说明失败在响应体阶段。
+   * 判据（isRunning / isOk）是上面那两个镜像函数，结构与列表逐字同源。
    */
   function statusBadgeHtml(row) {
     if (isRunning(row)) {
-      return `<span class="badge tag running"><span class="req-live-dot" aria-hidden="true"></span>进行中</span>`;
+      const phase = window.wbRequestPhase;
+      if (!phase) {
+        return '<span class="badge tag running"'
+          + ' title="请求正在转发中，用时列显示的是已用时">'
+          + '<span class="req-live-dot" aria-hidden="true"></span>进行中</span>';
+      }
+      const elapsed = phase.elapsedLineHtml(row);
+      return `${phase.badgeHtml(row)}`
+        + (elapsed ? `<span class="req-detail-sub">${elapsed}</span>` : '');
     }
     const status = Number(row.status) || 0;
     const ok = isOk(row);

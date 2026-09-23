@@ -1,5 +1,5 @@
 /* Agent2API · 请求日志面板（网关转发明细 · 筛选 / 分页 / 自动刷新） */
-/* global workbuddyDesktop, wbApp, wbRequestHover, wbRequestDetail */
+/* global workbuddyDesktop, wbApp, wbRequestHover, wbRequestDetail, wbRequestPhase */
 
 /**
  * 「请求日志」页的自持面板：网关每次转发到上游的请求日志。
@@ -58,7 +58,7 @@
     { key: 'time', label: '时间', sel: '.req-time', track: '92px' },
     { key: 'target', label: '提供商 / 账号', sel: '.req-target', track: 'minmax(0, 1.1fr)' },
     { key: 'retry', label: '重试', sel: '.req-retry', track: '52px' },
-    { key: 'status', label: '状态', sel: '.req-status', track: '68px' },
+    { key: 'status', label: '状态', sel: '.req-status', track: '96px' },
     { key: 'model', label: '模型', sel: '.req-model', track: 'minmax(0, 1.3fr)' },
     { key: 'dur', label: '用时', sel: '.req-dur', track: '96px', align: 'right' },
     { key: 'usage', label: '用量', sel: '.req-usage', track: 'minmax(0, 1.6fr)' },
@@ -270,13 +270,38 @@
     return (Number(entry?.status) || 0) === 0 && !entry?.error;
   }
 
+  /**
+   * 状态列。
+   *
+   * ── 进行中为什么不是一枚徽章而是「徽章 + 阶段计时」两行（本次改造）──
+   * 改造前这里只有一枚「进行中」：它只回答「跑没跑完」，用户盯着一条卡住的
+   * 请求时真正要问的是**卡在哪一步**（连上游 / 等模型出首字 / 正在刷内容 /
+   * 正在重试换号），四个阶段的排查方向完全不同。现在第一行是阶段徽章
+   * （文案与配色见 `request-phase.js`，对标 OmniProxy 的四个阶段标签），
+   * 第二行是**当前阶段**已经持续了多久（`phaseElapsedMs`，服务端现算）——
+   * 与用时列的「总用时 + 首响」两行结构同一手法，两列各答一个问题。
+   *
+   * 没有阶段可读（旧行、更早版本写入的在途行）时徽章回落成「进行中」、
+   * 第二行整行省掉 —— 那时确实没有更细的事实可说。
+   */
   function statusCell(entry) {
     // 进行中：不走「失败」的红徽章 —— 它不是失败，只是还没收尾。
-    // 徽章带一枚呼吸的圆点（.req-live-dot，动画见 page-requests.css），
-    // 1 秒轮询每拍重绘时已用时也会跟着走，这个徽章就是「活着」的信号。
+    // 1 秒轮询每拍重绘，阶段计时这个数自然一秒一跳（与用时列的「已用时」同一手法）。
     if (isRunning(entry)) {
-      return `<span class="req-status"><span class="badge tag running" title="请求正在转发中，用时列显示的是已用时">`
-        + `<span class="req-live-dot" aria-hidden="true"></span>进行中</span></span>`;
+      // 阶段模块没就绪时回落成改造前的静态徽章（与重试列对 request-hover 的
+      // 可选链同一手法）：加载顺序本就是硬要求，但真出问题时整列不该空着
+      const phase = window.wbRequestPhase;
+      if (!phase) {
+        return '<span class="req-status"><span class="badge tag running"'
+          + ' title="请求正在转发中，用时列显示的是已用时">'
+          + '<span class="req-live-dot" aria-hidden="true"></span>进行中</span></span>';
+      }
+      const badge = phase.badgeHtml(entry);
+      const elapsed = phase.elapsedLineHtml(entry);
+      return '<span class="req-status">'
+        + `<span class="req-status-badge">${badge}</span>`
+        + (elapsed ? `<span class="req-status-line">${elapsed}</span>` : '')
+        + '</span>';
     }
     const status = Number(entry.status) || 0;
     const ok = isOk(entry);

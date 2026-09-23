@@ -613,10 +613,11 @@ impl RequestStats {
             })
         };
         let (total, matched, running, entries) = loaded.unwrap_or((0, 0, 0, Vec::new()));
-        // 每行经 `entry_json` 补一个派生字段 `providerLabel`（id → label 的换算；
-        // 换算处与汇总的 providers 数组同一个函数，两处名字必然一致）。
-        // 汇总是**反序列化回 Value**，不是另一套结构：契约字段仍由 record.rs
-        // 的 serde 注解决定，这里只加不删
+        // 每行经 `entry_json` 补两个派生字段：`providerLabel`（id → label 的换算；
+        // 换算处与汇总的 providers 数组同一个函数，两处名字必然一致）与
+        // `phaseElapsedMs`（在途行「当前阶段已持续多久」，读取那一刻现算 ——
+        // 理由见那个函数的说明）。汇总是**反序列化回 Value**，不是另一套结构：
+        // 契约字段仍由 record.rs 的 serde 注解决定，这里只加不删
         let rows: Vec<Value> = entries.iter().map(entry_json).collect();
         json!({
             "entries": rows,

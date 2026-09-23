@@ -447,7 +447,10 @@ async fn forward_translated(
 /// 协议同一条错误语义。调试采集器在这里采**上游原始字节**（翻译前），
 /// 与 chat 路径「采上游原样吐出的东西」的语义一致。
 struct ProtocolTranslateStream {
-    inner: futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
+    /// 上游字节流。错误在构造时就描述成文案折进 `io::Error`（与
+    /// `ForwardStream::new` 同一手法）：空闲守卫的入参就是这个类型，
+    /// 两个消费层（ForwardStream / 聚合器）拿到的也是同一形态。
+    inner: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     machine: TranslateMachine,
     /// 已翻译待下发的帧（一个上游 chunk 可能产出多帧）
     pending: std::collections::VecDeque<bytes::Bytes>,
@@ -485,8 +488,22 @@ impl ProtocolTranslateStream {
         response: reqwest::Response,
         telemetry: &Arc<RequestTelemetry>,
     ) -> Self {
+        use futures::StreamExt;
+        // 上游字节 → io::Error（描述成文案）→ 空闲守卫（设置页「请求超时」
+        // 的「流式响应空闲超时」，与 chat 路径同一份口径、同一个实现）
+        let described = response.bytes_stream().map(|item| {
+            item.map_err(|error| {
+                std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+            })
+        });
+        let guarded = crate::server::core::upstream::stall::idle_guard(
+            Box::pin(described),
+            std::time::Duration::from_millis(
+                crate::server::config::timeout_settings().stream_idle_ms(),
+            ),
+        );
         Self {
-            inner: Box::pin(response.bytes_stream()),
+            inner: guarded,
             machine: match kind {
                 OutboundKind::Responses => TranslateMachine::Responses(
                     responses_outbound::ChatFromResponsesStream::new(model),
@@ -537,11 +554,9 @@ impl futures::Stream for ProtocolTranslateStream {
                 }
                 std::task::Poll::Ready(Some(Err(error))) => {
                     self.upstream_done = true;
-                    // 描述成文案上抛（`describe_error_detail` 只认 reqwest 错误，
-                    // 这也是它与「转换层自己产生的 io::Error」的分界）
-                    return std::task::Poll::Ready(Some(Err(std::io::Error::other(
-                        crate::server::core::egress::describe_error_detail(&error),
-                    ))));
+                    // 文案已在构造时描述好（见 inner 字段说明）：reqwest 错误的
+                    // 描述、空闲守卫的超时原文，原样上抛
+                    return std::task::Poll::Ready(Some(Err(error)));
                 }
             }
         }
