@@ -352,8 +352,9 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         // 两个地区走**同一份实现**、按地区参数化（`autoclaw::region`）：账号集合
         // 按 provider 隔离，因此这里的 kind → region 必须逐字对应，不能让国际版
         // 落进国内版的记录里（那会让两家的账号在同一分组里混着，选路也按错误的
-        // 域名发请求）。`importDesktop` 只对国内版有意义 —— 那个文件没有地区
-        // 标记，国际版分支会在存储层明确拒绝（见 `import_autoclaw_desktop_account`）。
+        // 域名发请求）。`importDesktop` 两地都给：桌面端那个 auth.json 没有地区
+        // 标记、两个构建共用，**地区由用户选的那一项决定**（见
+        // `import_autoclaw_desktop_account` 与 `region.rs` 的完整讨论）。
         Some(kind @ (crate::server::core::providers::ProviderKind::AutoClaw
             | crate::server::core::providers::ProviderKind::AutoClawIntl)) => {
             let region = crate::server::core::providers::autoclaw::Region::from_kind(kind)

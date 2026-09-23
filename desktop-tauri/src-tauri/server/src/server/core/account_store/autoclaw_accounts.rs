@@ -103,6 +103,22 @@ fn desktop_account_id(region: Region) -> &'static str {
     }
 }
 
+/// 桌面端账号的备注名**是不是自动生成的那一版**（用户没改过）。
+///
+/// 用来决定「这次导入要不要把名字更新成新的默认值」：
+///   - 两个历史/当前的自动名形态：`桌面端登录账号`、`桌面端登录账号（<userId>）`；
+///   - 含 `@` 的一律视为自动生成 —— 现在的默认名就是邮箱，而桌面端记录按设计
+///     代表「客户端此刻登录的那个号」，用户在客户端换号后名字要跟着走，
+///     否则一条记录上会同时出现新旧两个邮箱（名字是旧的、副标题是新的）。
+///
+/// 用户自己起的备注名（不含 `@`、也不是上面两种形态）一律保留 ——
+/// 与另外几家的 `add_*` 路径「不覆盖用户改过的备注名」同一纪律。
+fn is_generated_desktop_name(name: &str, user_id: &str) -> bool {
+    name == "桌面端登录账号"
+        || (!user_id.is_empty() && name == format!("桌面端登录账号（{user_id}）"))
+        || name.contains('@')
+}
+
 /// 备注名长度上限（原项目 `name.trim().slice(0, 100)`）
 const MAX_NAME_LENGTH: usize = 100;
 
@@ -255,6 +271,20 @@ impl AccountStore {
         if !device_id.is_empty() {
             record.insert("deviceId".to_string(), Value::String(device_id));
         }
+        // 邮箱：由调用方在建账号前补进 payload —— 网页登录（OAuth）换码后查一次
+        // 用户资料，`providers::autoclaw::profile` 负责查（token 里没有邮箱）。
+        // 手填凭证那条链没有这个字段，之后由余额查询顺带回填
+        // （见 `set_autoclaw_account_email`）；payload 没带时下面那轮
+        // 「未知字段全量保留」会把记录里已有的邮箱留着，不会被这次更新抹掉。
+        if let Some(email) = object
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_chars(value, MAX_IDENTITY_LENGTH))
+        {
+            record.insert("email".to_string(), Value::String(email));
+        }
         record.insert(
             "accessToken".to_string(),
             Value::String(parsed.token.clone()),
@@ -371,6 +401,14 @@ impl AccountStore {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        // 邮箱：auth.json 的 `userInfo.email`（明文，本地读，不联网）。
+        // 它是这个账号在界面上的主要标识 —— 见 `providers::autoclaw::profile`
+        let email = summary
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let _guard = self.guard();
         let id = desktop_account_id(region).to_string();
         let existing = self.record_by_id(&_guard, &id);
@@ -385,15 +423,54 @@ impl AccountStore {
                 ));
             }
         }
-        let default_name = if user_id.is_empty() {
+        // ── 同一地区、同一个账号只留一条记录（本次新增的判断）──────────
+        // 桌面端记录（固定 id `autoclaw-desktop` / `autoclaw-intl-desktop`）与
+        // 手动 / OAuth 账号（id `user-<userId>` / `intl-user-<userId>`）是**两条
+        // 不同 id 的记录，却指向同一个上游账号**：两条并存时选路会把它当成两个
+        // 账号用（同一个人的额度被并发消耗、报表里也数成两个），用户看着也像
+        // 重复。因此新建之前先看本地区有没有别的记录已经是这个 userId：有就明确
+        // 拒绝，把「留哪一条」的决定交回用户（删掉旧的再导入，或不导入）。
+        //
+        // 只在**新建**时查（`existing.is_none()`）：桌面记录已在的那次是幂等
+        // 更新（刷新展示字段），不能被挡住 —— 那正是「两条都在」的历史数据
+        // 还能继续刷新的唯一路径。userId 为空时（登录态里读不到）也无从比对，
+        // 直接放行。
+        if existing.is_none() && !user_id.is_empty() {
+            let siblings = self.with_conn(&_guard, |conn| sql::load_by_provider(conn, autoclaw))?;
+            let duplicate = siblings
+                .iter()
+                .find(|record| record.id() != id && record.user_id() == user_id);
+            if let Some(duplicate) = duplicate {
+                return Err(AccountStoreError::new(
+                    format!(
+                        "账号已存在：同一账号（userId {user_id}）已在列表中（{}「{}」）。\
+                         如需改用桌面端实时登录态，请先删除那条账号再导入",
+                        duplicate.name(),
+                        duplicate.id()
+                    ),
+                    409,
+                ));
+            }
+        }
+        // 默认名用**邮箱**：它才认得出来是谁的号（国际版的 OAuth 账号尤其如此，
+        // token 里没有邮箱、上游 user_name 又可能只是昵称）。读不到邮箱时退回
+        // 原来的「桌面端登录账号（userId）」。
+        let default_name = if !email.is_empty() {
+            email.clone()
+        } else if user_id.is_empty() {
             "桌面端登录账号".to_string()
         } else {
             format!("桌面端登录账号（{user_id}）")
         };
+        // 备注名沿用既有记录 —— 但名字**还是自动生成的那一版**时跟着更新成新的
+        // 默认名（老版本的默认名是「桌面端登录账号（userId）」，现在默认名是邮箱；
+        // 客户端换了登录账号时记录名也要跟着走，见 `is_generated_desktop_name`）。
+        // 用户自己改过的备注名一律保留，与另外几家的 `add_*` 同一纪律。
         let record_name = existing
             .as_ref()
             .map(StoredAccount::name)
             .filter(|value| !value.is_empty())
+            .filter(|name| !is_generated_desktop_name(name, &user_id))
             .unwrap_or_else(|| default_name.clone());
         let priority = match existing.as_ref() {
             Some(record) => record.priority(),
@@ -411,6 +488,11 @@ impl AccountStore {
         record.insert("provider".to_string(), Value::String(autoclaw.to_string()));
         record.insert("name".to_string(), Value::String(record_name.clone()));
         record.insert("userId".to_string(), Value::String(user_id));
+        // 邮箱（auth.json 的 `userInfo.email`，明文）：空串不入库 —— 界面按
+        // 「有 email 才渲染副标题」判断，存空串只会让那条判断多一次 trim
+        if !email.is_empty() {
+            record.insert("email".to_string(), Value::String(email.clone()));
+        }
         for (target, key) in [
             ("deviceId", "deviceId"),
             ("tokenTail", "tokenTail"),
@@ -464,6 +546,56 @@ impl AccountStore {
             ),
         );
         Ok(self.to_autoclaw_public_account(&saved))
+    }
+
+    /// 补写账号邮箱（只在记录里**还没有**邮箱时写）—— 返回是否真的写了。
+    ///
+    /// ── 为什么要有它 ────────────────────────────────────────────
+    /// 邮箱是展示字段（界面拿它做账号副标题），而它只能**带着 token 向上游查**
+    /// （`providers::autoclaw::profile`）。建账号时能查的两条链（网页登录换码后、
+    /// 桌面端导入读本地文件）已经在创建时就写进去了；**此前建的**账号 ——
+    /// 网页登录之前建的、手填凭证建的、老版本建的 —— 记录里没有邮箱，
+    /// 只能等下一次带着凭证的动作顺手补上：余额查询是最自然的那一处
+    /// （它每 10 分钟对每个账号跑一次，且本来就要求凭证可用）。
+    ///
+    /// ── 三条纪律 ────────────────────────────────────────────────
+    ///   1. **只补空**：已有邮箱就不写 —— 不做无谓写盘，也不覆盖任何值；
+    ///   2. **只改这一个字段**：读-改-写在账号锁内一次完成，其余字段原样带过
+    ///      （`put` 是整行替换，少带一个字段就是一次静默的数据丢失）；
+    ///   3. **调用方按 best-effort 处理**：写不进去只是少一行副标题，
+    ///      不该让一次余额查询变红（见 `balance::query_usage` 的调用点）。
+    pub fn set_autoclaw_account_email(
+        &self,
+        id: &str,
+        email: &str,
+    ) -> Result<bool, AccountStoreError> {
+        let email = truncate_chars(email.trim(), MAX_IDENTITY_LENGTH);
+        if email.is_empty() {
+            return Ok(false);
+        }
+        let _guard = self.guard();
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
+            return Ok(false);
+        };
+        // 只认 AutoClaw 系（这个字段是它家的，别家记录不该被它写）
+        if !is_autoclaw_family(&record.provider()) {
+            return Ok(false);
+        }
+        let has_email = record
+            .get("email")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_email {
+            return Ok(false);
+        }
+        record
+            .fields_mut()
+            .insert("email".to_string(), Value::String(email));
+        record
+            .fields_mut()
+            .insert("updatedAt".to_string(), Value::from(logging::now_ms()));
+        self.with_conn(&_guard, |conn| sql::put(conn, &record))?;
+        Ok(true)
     }
 
     /// AutoClaw 账号刷新成功后回写新 token（适配器的 `persist_refresh` 调用）。
@@ -579,9 +711,14 @@ impl AccountStore {
 
     /// AutoClaw 账号的公开形态（架构文档 §5 与 §10.2；对照原项目 `toPublicAccount`）。
     ///
-    /// 字段：`id` / `provider` / `name` / `userId` / `deviceId` / `tokenTail` /
-    /// `tokenExpiresAt` / `hasRefreshToken` / `desktop` / `source` / `priority` /
-    /// `enabled` / `addedAt` / `updatedAt` / `proxy` / `rateLimits` / `available`。
+    /// 字段：`id` / `provider` / `name` / `userId` / `email` / `deviceId` /
+    /// `tokenTail` / `tokenExpiresAt` / `hasRefreshToken` / `desktop` / `source` /
+    /// `priority` / `enabled` / `addedAt` / `updatedAt` / `proxy` / `rateLimits` /
+    /// `available`。
+    ///
+    /// `email` 是**展示用**字段（界面拿它当副标题，见 `providers::autoclaw::profile`）：
+    /// 桌面端记录实时取 auth.json 的 `userInfo.email`，其余取记录里存的那份；
+    /// 两处都读不到时**不写这个键**（而不是写空串）。
     ///
     /// `deviceId` 是 **AutoClaw 特有字段**（刷新接口的 `device_id` 与上游的设备
     /// 维度都靠它），因此公开形态带出 —— 前端展示与排障都要能看见它。
@@ -604,6 +741,15 @@ impl AccountStore {
             .unwrap_or("")
             .to_string();
         let stored_expires = record.expires_at().or_else(|| record.token_expires_at());
+        // 邮箱：桌面端记录优先用**实时**摘要里的（auth.json 的 `userInfo.email`，
+        // 客户端换号后跟着变），否则用记录里存的那一份（网页登录 / 手填凭证
+        // 建的账号在创建时或余额查询时补写过，见 `set_autoclaw_account_email`）
+        let mut email = record
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let mut user_id = record.user_id();
         let mut device_id = record
             .get("deviceId")
@@ -612,10 +758,9 @@ impl AccountStore {
             .to_string();
         let mut available = true;
         let mut reason = String::new();
-        // 桌面端实时登录态只存在于**国内版**（那个文件没有地区标记，见
-        // `providers::autoclaw::credentials::local_credentials`），因此这里只对
-        // 国内版记录去读实时摘要 —— 国际版记录不可能来自那条来源，读它只会
-        // 白跑一次 DPAPI 解密。
+        // 桌面端实时登录态两个地区都有（那个文件没有地区标记、两地共用，见
+        // `providers::autoclaw::credentials::local_credentials`）：只要这条记录
+        // 是 AutoClaw 系的桌面账号，就按它自己的 provider 去读实时摘要。
         let (token_tail, expires_at, has_refresh) = if record.is_desktop()
             && is_autoclaw_family(&record.provider())
         {
@@ -656,6 +801,14 @@ impl AccountStore {
                         .get("hasRefreshToken")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
+                    if let Some(live_email) = summary
+                        .get("email")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        email = live_email.to_string();
+                    }
                     (live_tail, live_expires, can_refresh)
                 }
                 Err(reason_text) => {
@@ -681,6 +834,12 @@ impl AccountStore {
         public.insert("provider".to_string(), Value::String(record.provider()));
         public.insert("name".to_string(), Value::String(record.name()));
         public.insert("userId".to_string(), Value::String(user_id));
+        // 邮箱：界面拿它做账号的副标题（国际版的 OAuth 账号靠它认人）。
+        // 空串**不写这个键**：读不到邮箱的账号（国内版的手机号账号等）界面上
+        // 就没有那一行，而不是显示一个空行
+        if !email.is_empty() {
+            public.insert("email".to_string(), Value::String(email));
+        }
         public.insert("deviceId".to_string(), Value::String(device_id));
         public.insert("tokenTail".to_string(), Value::String(token_tail));
         public.insert(

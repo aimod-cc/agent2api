@@ -165,6 +165,16 @@ impl LineBuffer {
         }
         Vec::new()
     }
+
+    /// 取走尚未凑成完整行的缓冲字节（**不**当作一行解析）。
+    ///
+    /// 供首帧预读（`piping::prefetch_stream_head`）移交用：预读消费了缓冲，
+    /// `tail` 里可能留着下一条帧的前半（`data: {"statusCodeValue"...` 被
+    /// 网络分片截断的那半）。接管的 `drive_stream` 会新建自己的 LineBuffer，
+    /// 没有这段字节那一条帧就永远拼不回来 —— 调用方把它拼回流头即可无缝续传。
+    pub fn take_tail(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.tail)
+    }
 }
 
 /// 拆解产出的一段内容

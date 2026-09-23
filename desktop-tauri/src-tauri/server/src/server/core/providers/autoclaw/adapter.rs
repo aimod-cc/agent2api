@@ -548,8 +548,8 @@ fn passthrough_session_headers(client_headers: &HeaderMap) -> Vec<(String, Strin
 /// 顺序：
 ///   1. `account_id` 非空 → 该 AutoClaw 账号的记录（桌面端账号实时读 auth.json）；
 ///   2. `account_id` 为空 → **本地区**组内的当前账号（若有）；
-///   3. 都没有 → 桌面端实时登录态（**仅国内版**，见
-///      `credentials::local_credentials` 的地区说明）；
+///   3. 都没有 → 桌面端实时登录态（两个地区都读那个共用文件，按 `region`
+///      解释，见 `credentials::local_credentials` 的地区说明）；
 ///   4. 桌面端也读不到 → 本地区的 `{prefix}TOKEN` 环境变量。
 ///
 /// 2→3→4 的兜底链在 `credentials::snapshot_for(None, region)` 里（它是凭证层的

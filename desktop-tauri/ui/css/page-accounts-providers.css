@@ -56,17 +56,6 @@
 .acct-group-title.sub { margin-top: -4px; font-size: 10px; color: var(--text-3); }
 .acct-group-title.sub::after { background: var(--hairline); }
 
-/* 桌面端实时登录态徽标：品牌浅底（中性偏冷色）。它表达的是一项**属性**
-   （凭证不落盘、实时读客户端文件），既不是故障也不是健康状态，所以既不用红黄
-   也不用绿。禁用卡片的既有压灰规则会一并命中它 —— 符合预期：停用的账号连
-   属性标记一起变灰，读起来才是「整块已停用」。 */
-.card-state .badge.desktop-tag {
-  background: var(--primary-soft);
-  border-color: var(--primary-bd);
-  color: var(--primary-fg);
-  font-weight: 500;
-}
-
 /* ⋯ 菜单里的置灰项（桌面端账号的「删除账号」）：保留可见但不可点，把「不可删除」
    显式呈现出来（悬浮有 title 说明原因），而不是让这一项凭空消失 —— 入口消失只会
    让人以为菜单坏了或功能丢了。 */

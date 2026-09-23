@@ -95,6 +95,7 @@ pub mod credentials;
 pub mod login;
 pub mod models;
 pub mod oauth;
+pub mod profile;
 pub mod prompt;
 pub mod refresh;
 pub mod region;

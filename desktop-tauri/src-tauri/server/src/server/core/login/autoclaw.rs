@@ -29,7 +29,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::server::core::providers::autoclaw::oauth::{self, Vendor};
-use crate::server::core::providers::autoclaw::Region;
+use crate::server::core::providers::autoclaw::{credentials, profile, Region};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 
@@ -274,6 +274,19 @@ impl LoginService {
             .get("userName")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // ── 邮箱：换回来的 token 里**没有**它（JWT 只有 user_id / device_id /
+        // guid…），而账号在列表上得认得出是谁（上游 user_name 可能只是个昵称，
+        // 如「Lucas Ou」）。这里立刻查一次用户资料补进凭证 —— best-effort：
+        // 查不到照常建账号，只是少一行副标题（见 `autoclaw::profile` 的模块头）。
+        let mut credentials = credentials;
+        if let Ok(parsed) = credentials::credentials_from_record(&credentials, pending.region) {
+            let email = profile::email_or_empty(&parsed, "网页登录").await;
+            if !email.is_empty() {
+                if let Some(object) = credentials.as_object_mut() {
+                    object.insert("email".to_string(), Value::String(email));
+                }
+            }
+        }
         match self
             .store
             .add_autoclaw_account(pending.region, &credentials, name.as_deref())

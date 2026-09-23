@@ -340,9 +340,11 @@
    * 表头已经收窄成「重试」（见 headHtml 的说明），这一列只有 52px 宽：
    * 「敏感词」三个字会把标签撑得比「重试 N」还宽，两枚标签竖排时右边留一大块
    * 空白、列也容易被挤到换行。命中是**有没有**的问题，不是**几个字**的问题，
-   * 所以缩成一个「敏」字，完整含义交给两个既有出口：`title` 悬停提示与
-   * 点击/聚焦弹出的富文本面板（那里面仍然逐词列出命中明细，一个字都没少）。
+   * 所以缩成一个「敏」字，完整含义交给点击/聚焦弹出的富文本面板
+   * （那里面仍然逐词列出命中明细，一个字都没少）。
    * `aria-label` 补上完整说法，读屏软件不会只念出一个孤零零的「敏」。
+   * 两枚标签都不挂 `title`：面板已经给出完整明细，原生提示会与它叠在一起
+   * 重复一层（同一处同时冒出两个说明框）。
    *
    * ── 为什么标签是 button ──────────────────────────────────────
    * `cursor: help` 只对鼠标有意义；做成 button 之后键盘能 Tab 到、聚焦即弹出
@@ -366,8 +368,7 @@
       // 那个数字来自重试链（两者都读不到时退回不带次数）。
       const count = attempts > 1 ? attempts : countRetries(entry);
       tags.push(`<button type="button" class="badge tag warn req-hover-tag"`
-        + ` data-req-hover="chain" data-req-id="${esc(key)}"`
-        + ` title="查看每次尝试的提供商、账号与重试原因">`
+        + ` data-req-hover="chain" data-req-id="${esc(key)}">`
         + `重试${count > 1 ? ` ${count}` : ''}</button>`);
     }
     // 敏感词命中：判据是「命中表非空」（后端 sensitiveHits 字段）。
@@ -376,7 +377,7 @@
     if (Array.isArray(entry.sensitiveHits) && entry.sensitiveHits.length) {
       tags.push(`<button type="button" class="badge tag req-hover-tag sensitive"`
         + ` data-req-hover="sensitive" data-req-id="${esc(key)}"`
-        + ` title="命中了敏感词，点击查看明细" aria-label="命中了敏感词">敏</button>`);
+        + ` aria-label="命中了敏感词">敏</button>`);
     }
     if (!tags.length) return '<span class="req-none">-</span>';
     return `<span class="req-retry">${tags.join('')}</span>`;

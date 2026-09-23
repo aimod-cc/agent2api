@@ -280,6 +280,18 @@
 
 .acct-sub > span { flex: 0 0 auto; }
 
+/* 副标题里的邮箱（accounts-table.js 的 accountCell）：可收缩 + 省略号。
+   上面那条 `flex: 0 0 auto` 是为短徽标写的（不压缩），邮箱动辄二三十字符，
+   照它来会直接溢出、被 .acct-sub 的 overflow: hidden 从中间裁断 ——
+   长邮箱要的是「省略号收尾」，不是「无声截断」。 */
+.acct-sub .acct-email {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ─── 代理列（本次新增）───
    整格是一颗按钮（点击打开账号设置里的代理表单，见 accounts-table.js 的 proxyCell）。
    做成「chip」而不是实心按钮：这一列绝大多数时候是**读数**（走哪个出口），

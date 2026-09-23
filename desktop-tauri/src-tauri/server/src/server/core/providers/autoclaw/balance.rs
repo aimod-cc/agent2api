@@ -156,6 +156,26 @@ pub(super) async fn query_usage(
     if !subscription_error.is_null() {
         raw.insert("subscriptionError".to_string(), subscription_error);
     }
+    // ── 邮箱回填（顺手做，与余额结果无关）────────────────────────
+    // 记录里还没有邮箱的账号（网页登录之前建的、手填凭证建的、老版本建的）
+    // 在这里补一次：余额查询本来就要求凭证可用，而界面上那行副标题只有
+    // 带着凭证向上游查才拿得到（见 `autoclaw::profile`）。放在结果算完之后：
+    // 它失败或超时都不影响本次余额结果，写库也只在「还没有邮箱」时发生一次。
+    if let Some(record) = record.as_ref() {
+        let missing = record
+            .get("email")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_none_or(str::is_empty);
+        if missing {
+            let email = super::profile::email_or_empty(&credentials, "余额查询").await;
+            if !email.is_empty() {
+                if let Some(id) = record.get("id").and_then(Value::as_str) {
+                    let _ = store.set_autoclaw_account_email(id, &email);
+                }
+            }
+        }
+    }
     Ok(json!({
         "available": available,
         // AutoClaw 的资产口径就是它自己的「积分」

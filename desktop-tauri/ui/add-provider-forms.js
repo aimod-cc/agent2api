@@ -172,8 +172,9 @@
       //
       // 两地的差别有三处，其余配置逐字相同：
       //   1. 域名（后端 `autoclaw::region` 里，前端不体现）；
-      //   2. **桌面端导入两个地区都给** —— auth.json 没有地区标记，只归国内版
-      //      （见 src-tauri/.../autoclaw/credentials.rs 的 `local_credentials`）；
+      //   2. **桌面端导入两个地区都给** —— auth.json 两地共用、没有地区标记，
+      //      地区由用户在哪一项下点导入决定（见 src-tauri/.../autoclaw/region.rs
+      //      与 credentials.rs 的 `local_credentials`）；
       //   3. **登录方式完全不同**：国内版只有手机验证码；国际版只有
       //      Zai / Google OAuth 网页登录（本次把它的手机验证码入口移除，
       //      理由见下面国际版那一项）。
@@ -788,6 +789,27 @@
 
   // ─── 账号添加（数据驱动，配置见 ADD_FORMS）─────────
 
+  /**
+   * 取可读的错误文案。
+   *
+   * ── 为什么不能直接写 `error.message`（真实踩过）────────────────
+   * 壳侧命令签名是 `Result<Value, String>`，Tauri 把 `Err` 里的 String
+   * **原样序列化**给 JS —— rejection 携带的是一个**字符串**而不是 Error 对象，
+   * 于是 `error.message` 是 `undefined`，界面显示成「导入失败：undefined」。
+   * 真实发生过：AutoClaw 国际版导入被后端拒绝时，那句说明原因的文案被整条
+   * 吃掉，用户只看到一个 undefined（后端日志里才有真正的原因）。
+   *
+   * 桥接层（`window.workbuddyDesktop`）的错误已由 asError 归一化，但本文件的
+   * `postAccount` 是直连 `internals.invoke` 的（POST /api/accounts 在桥里没有
+   * 对应具名方法），因此这一层兜底必须有 —— 与 sms-login.js /
+   * autoclaw-oauth.js 的同名函数是一回事。
+   */
+  const describeError = error => {
+    if (error instanceof Error && error.message) return error.message;
+    const text = String(error ?? '').trim();
+    return text || '未知错误';
+  };
+
   /** 统一提交入口：POST /api/accounts，保留各提供商自己的凭证字段。 */
   async function postAccount(payload) {
     const internals = window.__TAURI_INTERNALS__;
@@ -859,7 +881,7 @@
         clearProviderForms(config);
         await afterAdd(addedLabelOf(data?.account), config.label);
       } catch (error) {
-        toast(`添加失败：${error.message}`, 'err');
+        toast(`添加失败：${describeError(error)}`, 'err');
       }
     });
   }
@@ -873,7 +895,7 @@
         await afterAdd(data?.account?.name || '', config.label);
       } catch (error) {
         // 读不到客户端登录态时后端给 400 + 明确原因，原样透出即可
-        toast(`导入失败：${error.message}`, 'err');
+        toast(`导入失败：${describeError(error)}`, 'err');
       }
     });
   }

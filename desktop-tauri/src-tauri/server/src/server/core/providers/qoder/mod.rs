@@ -39,6 +39,7 @@
 //!   models.rs      模型目录（两地区缓存 + 静态兜底 + 远程刷新）
 //!   protocol.rs    OpenAI ↔ Qoder 协议转换（消息/tools/思考档位/上游信封）
 //!   stream.rs      上游 SSE 信封解包 + 思考标签拆解（跨分片）
+//!   piping.rs      流式首帧预读 + 流式透传（issue #8 的换号修复在这）
 //!   chat.rs        转发编排（构造 → 发送 → 翻译）与 delta 翻译器
 //!
 //! ── panic=abort ────────────────────────────────────────────
@@ -53,6 +54,7 @@ pub mod endpoints;
 mod machine;
 pub mod models;
 pub mod oauth;
+mod piping;
 pub mod protocol;
 mod refresh;
 pub mod stream;
@@ -472,17 +474,26 @@ impl ProviderAdapter for QoderAdapter {
                 store: store.clone(),
                 account_id: account_id.clone(),
                 model: model_name.clone(),
-                account_label: account_label_for(store, &account_id),
             };
             if stream {
+                // ── 首帧预读（issue #8 的修复，见 piping 模块头）────────
+                // 拿到 HTTP 200 不能直接返回：Qoder 的额度错误恰恰写在 200
+                // 的 SSE 信封里，改造前这里直接 Ok(Stream)，编排层退出后
+                // 流内错误只能透传给客户端、换号无从谈起。预读把首个事件拦
+                // 在返回之前 —— 业务错误转成带状态码的 Err 交回编排层换号
+                // （此刻还没有任何字节下发，客户端的 200 头也没发出，换号
+                // 无损）；拿到内容帧才返回 Ok(Stream)，预读帧随后补发。
+                let (prefetched, source) =
+                    piping::prefetch_stream_head(response, &limit_ctx, &telemetry).await?;
                 let (sender, receiver) =
                     tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
                 let telemetry = telemetry.clone();
                 // 上游流必须被**拉到底**（源实现同样读完整条流再 cancel）：
                 // 客户端断开时 tokio 的 channel 发送端会失败，循环随即退出，
-                // drop 掉 response 就等价于断开上游连接。
+                // drop 掉 source 就等价于断开上游连接。
                 crate::spawn_task(async move {
-                    drive_stream(response, translator, telemetry, limit_ctx, sender).await;
+                    piping::drive_stream(source, translator, telemetry, limit_ctx, sender, prefetched)
+                        .await;
                 });
                 return Ok(crate::server::core::upstream::ForwardOutcome::Stream {
                     status: 200,
@@ -501,201 +512,13 @@ impl ProviderAdapter for QoderAdapter {
     }
 }
 
-/// 流式收尾时要用的限额记账素材（`drive_stream` 在 handler 返回之后才跑，
-/// 那些标识必须随任务一起带走）。
+/// 流式链路的限额记账素材：预读的首帧错误（`piping::prefetch_stream_head`，
+/// handler 返回前）与 `piping::drive_stream` 的中途错误都在错误现场落冷却；
+/// 后者在 handler 返回之后才跑，那些标识必须随任务一起带走。
 struct LimitContext {
     store: AccountStore,
     account_id: String,
     model: String,
-    account_label: String,
-}
-
-/// 账号展示名（限额日志用；取不到就回落到 id）
-fn account_label_for(store: &AccountStore, account_id: &str) -> String {
-    store
-        .qoder_account_record(account_id)
-        .and_then(|record| {
-            record
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| account_id.to_string())
-}
-
-/// 流式：把上游字节 → OpenAI SSE 帧写进通道。
-///
-/// 错误处理分两段（与通用层同一形态）：
-///   - **首帧之前**的错误：还没有任何内容下发，直接补一帧 error + `[DONE]` 收尾
-///     （HTTP 头已经发出去了，只能这样告诉客户端）—— 同时写 telemetry，
-///     让请求日志能解释「为什么这条是失败的」；
-///   - 中途断流：同上，且把已累积的内容留在前面（不丢用户已经看到的部分）。
-async fn drive_stream(
-    response: reqwest::Response,
-    mut translator: Translator,
-    telemetry: std::sync::Arc<crate::server::core::upstream::usage::RequestTelemetry>,
-    limit: LimitContext,
-    sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
-) {
-    use futures::StreamExt;
-
-    let mut lines = stream::LineBuffer::new();
-    let mut source = response.bytes_stream();
-    let mut failed: Option<String> = None;
-    // 调试模式的采集器（在解析之前旁路原始字节 —— 采的是上游原样吐出的内容）
-    let capture = telemetry.capture();
-
-    'outer: while let Some(item) = source.next().await {
-        let chunk = match item {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                failed = Some(format!(
-                    "上游流中断: {}",
-                    crate::server::core::egress::describe_error_detail(&error)
-                ));
-                break;
-            }
-        };
-        if let Some(capture) = capture.as_deref() {
-            capture.push(&chunk);
-        }
-        for data in lines.push(&chunk) {
-            match stream::parse_sse_line(&data) {
-                SseEvent::Skip => {}
-                SseEvent::Done => break 'outer,
-                SseEvent::Error { status, kind, raw, message, pricing_url, .. } => {
-                    // 上游的业务错误（HTTP 200 里的信封错误）：转成带状态码的
-                    // 文案写进流，形态与通用层的收尾一致。额度类在这里落冷却 ——
-                    // 编排层看不到流内的错误，只有这一处知道该给账号打标记。
-                    record_limited(
-                        &limit.store,
-                        &limit.account_id,
-                        &limit.model,
-                        status,
-                        kind,
-                        &message,
-                    );
-                    if matches!(kind, protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate)
-                    {
-                        logging::log(
-                            "[Qoder]",
-                            &format!(
-                                "⚠️ 账号「{}」对模型 {} 已限额，按队列顺延",
-                                limit.account_label, limit.model
-                            ),
-                        );
-                    }
-                    let error = chat::business_error(
-                        status,
-                        kind,
-                        &raw,
-                        &message,
-                        pricing_url.as_deref(),
-                    );
-                    failed = Some(error.message);
-                    break 'outer;
-                }
-                SseEvent::Chunk(chunk) => {
-                    let deltas = translator.consume(&chunk, Some(&telemetry));
-                    if deltas.is_empty() {
-                        continue;
-                    }
-                    // 第一次产出内容前补一帧 role（OpenAI 的既有形态）
-                    if translator.take_role_frame() {
-                        let frame = translator.chunk_frame(
-                            serde_json::json!({ "role": "assistant", "content": "" }),
-                            None,
-                        );
-                        if send_frame(&sender, &frame).await.is_err() {
-                            return;
-                        }
-                    }
-                    for delta in &deltas {
-                        let frame = translator.chunk_frame(chat::delta_json(delta), None);
-                        if send_frame(&sender, &frame).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // 尾行（上游没以换行收尾时）
-    if failed.is_none() {
-        for data in lines.finish() {
-            match stream::parse_sse_line(&data) {
-                SseEvent::Chunk(chunk) => {
-                    let deltas = translator.consume(&chunk, Some(&telemetry));
-                    for delta in &deltas {
-                        let frame = translator.chunk_frame(chat::delta_json(delta), None);
-                        if send_frame(&sender, &frame).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                SseEvent::Error { status, kind, raw, message, pricing_url, .. } => {
-                    record_limited(
-                        &limit.store,
-                        &limit.account_id,
-                        &limit.model,
-                        status,
-                        kind,
-                        &message,
-                    );
-                    let error = chat::business_error(
-                        status,
-                        kind,
-                        &raw,
-                        &message,
-                        pricing_url.as_deref(),
-                    );
-                    failed = Some(error.message);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    if let Some(message) = failed {
-        telemetry.note_error(&message);
-        logging::log("[Qoder]", &format!("❌ {message}"));
-        // 失败前先把拆解器缓冲里已确定的内容冲刷出去（用户已经看到的部分不丢）
-        for delta in translator.finish() {
-            let frame = translator.chunk_frame(chat::delta_json(&delta), None);
-            if send_frame(&sender, &frame).await.is_err() {
-                return;
-            }
-        }
-        let _ = sender
-            .send(Ok(bytes::Bytes::from(stream::sse_frame(
-                &serde_json::json!({
-                    "error": { "message": message, "type": "proxy_error" }
-                }),
-            ))))
-            .await;
-        let _ = sender
-            .send(Ok(bytes::Bytes::from(stream::sse_done())))
-            .await;
-        return;
-    }
-
-    // 正常收尾：先把拆解器的缓冲冲刷出来，再发 finish 帧
-    // （工具调用已按 delta 逐片下发，这里不重复补）
-    for delta in translator.finish() {
-        let frame = translator.chunk_frame(chat::delta_json(&delta), None);
-        if send_frame(&sender, &frame).await.is_err() {
-            return;
-        }
-    }
-    let finish = translator.final_finish();
-    let frame = translator.chunk_frame(serde_json::json!({}), Some(&finish));
-    let _ = send_frame(&sender, &frame).await;
-    if translator.usage.is_some() {
-        let usage = translator.usage_frame();
-        let _ = send_frame(&sender, &usage).await;
-    }
-    let _ = sender.send(Ok(bytes::Bytes::from(stream::sse_done()))).await;
 }
 
 /// 非流式：拉完整条上游流，聚合成一个完整 `chat.completion`。
@@ -773,13 +596,4 @@ async fn drive_aggregate(
     // 冲刷拆解器的尾巴，再成形（少了这一步，回答末尾会少几个字符）
     translator.finish();
     Ok(translator.completion_body())
-}
-
-/// 一帧 SSE 写进通道；客户端断开时返回 Err（由调用方结束循环）
-async fn send_frame(
-    sender: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
-    value: &Value,
-) -> Result<(), ()> {
-    let frame = stream::sse_frame(value);
-    sender.send(Ok(bytes::Bytes::from(frame))).await.map_err(|_| ())
 }

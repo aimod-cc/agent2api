@@ -127,6 +127,15 @@ pub struct AutoClawCredentials {
     pub device_id: String,
     /// 用户 id（JWT 的 `user_id` 声明）
     pub user_id: String,
+    /// 账号邮箱（AutoClaw 的用户资料里有；桌面端来源取 auth.json 的
+    /// `userInfo.email`，账号来源取记录里的 `email` 字段）。
+    ///
+    /// 为什么要有它：国际版的主登录方式是 Zai / Google OAuth，而那条链换回来
+    /// 的 token 里**没有邮箱**（JWT 只有 `user_id` / `device_id` / `guid`…），
+    /// 账号列表上就只剩一个上游用户名（如 `Lucas Ou`）—— 同一个人在两地的账号、
+    /// 或几个同类账号之间分不清。邮箱是最好认的那个标识，所以跟着凭证一起带出来
+    /// （取不到时的补法见 `profile` 模块）。
+    pub email: String,
     /// 过期时间（毫秒）；JWT 解不出 exp 时为 None
     pub expires_at: Option<f64>,
     /// 凭证来源：决定刷新结果往哪回写（本期一律不回写，见模块头）
@@ -539,7 +548,7 @@ fn from_auth_file(region: Region) -> Result<AutoClawCredentials, String> {
         return Err("AutoClaw auth.json token 解密结果为空".to_string());
     }
     let claims = crypto::decode_jwt_claims(&token);
-    let credentials = credentials_from_claims(
+    let mut credentials = credentials_from_claims(
         DESKTOP_ACCOUNT_ID.to_string(),
         region,
         token,
@@ -549,6 +558,17 @@ fn from_auth_file(region: Region) -> Result<AutoClawCredentials, String> {
         CredentialOrigin::DesktopAuthFile,
         Some(cache_key.clone()),
     );
+    // 邮箱随凭证一起带出来：auth.json 的 `userInfo` 是**明文**（只有 token /
+    // refreshToken 是 safeStorage 密文），因此这一步不额外解密。
+    // 它是桌面端导入建账号时的默认名与副标题来源（见 `profile` 模块的说明）。
+    credentials.email = snapshot
+        .json
+        .get("userInfo")
+        .and_then(|info| info.get("email"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     // 解密结果进缓存：下一次同一 mtime 的请求不再做 DPAPI + AES-GCM
     store_cached(region, &cache_key, &credentials);
     Ok(credentials)
@@ -660,6 +680,10 @@ pub(crate) fn credentials_from_claims(
         refresh_token,
         device_id,
         user_id,
+        // 邮箱不在 JWT 里（见字段说明）：由各来源的调用方在构造后补上
+        // （`from_auth_file` 取 auth.json 的 userInfo，`credentials_from_record`
+        // 取记录字段，网页登录那条在换码后查一次用户资料）
+        email: String::new(),
         expires_at,
         origin,
         cache_key,
@@ -695,26 +719,26 @@ pub(crate) fn number_value(value: &Value) -> Option<f64> {
 /// 同步函数：解密链（读文件 / DPAPI / AES-GCM）全是同步的，没有 await 点，
 /// 所以调用它的 async 链路不会因此持有非 Send 状态。
 ///
-/// ── 为什么只有国内版能用（本次新增地区时的硬判断）─────────────
+/// ── 两个地区都读它，地区由调用方决定（不在这里猜）────────────
 /// 两个构建的 Electron 应用名都是 `autoclaw`、userData 都落在
 /// `%APPDATA%/AutoClaw`（Windows 大小写不敏感，实测是同一个目录），而
 /// `auth.json` 里**没有任何地区标记**。也就是说这个文件属于哪个地区，
 /// 只取决于用户装的是哪个构建 —— 本机无法判断。
 ///
-/// 处置是**不猜**：这个文件归国内版（历史行为，`autoclaw` 一直读它），
-/// 国际版明确报错并指路（手机验证码登录 / 填写凭证，那两条把凭证落在账号
-/// 记录里，与桌面端文件无关，因此两地可以并存）。反过来若让国际版也读它，
-/// 一个只装了国际版客户端的用户会得到一个「国际版」账号却拿着国内版的域名
-/// 去请求 —— 上游 401，而错误信息会把排查方向带偏到「token 过期」上。
-/// 见 `region.rs` 模块头的完整讨论。
+/// 处置是**不猜**：`region` 由调用方给出 —— 手动导入时是用户在界面里选的那
+/// 一项（见 `import_autoclaw_desktop_account`），转发时是该账号记录自己的
+/// `provider`。**两个地区都能读**，因此一个只装了国际版客户端、用 Zai /
+/// Google 登录的用户照样能「从客户端导入」（国际版客户端的官方主登录方式
+/// 是 OAuth，那条链要过一次风控验证码，导入是不需要验证码的另一条路）。
+///
+/// 猜错的后果是**可见的**：凭证与域名不匹配时上游直接 401，换一项重导即可
+/// —— 这比在本机替用户拒绝要好，见 `region.rs` 模块头的完整讨论
+/// （那里同时记着「只给国内版」那版做法为什么被推翻）。
+///
+/// 缓存键带地区（见 `credentials_cache`）：两地的文件与 mtime 完全相同，
+/// 键里不带地区会让先解析的一家把凭证连同自己的域名缓存进去、另一家读到时
+/// 拿着对方的凭证去打错误的站点。
 pub fn local_credentials(region: Region) -> Result<AutoClawCredentials, GatewayError> {
-    if region != Region::Cn {
-        return Err(GatewayError::with_status(
-            401,
-            "AutoClaw 桌面端登录态文件（auth.json）没有地区标记，只归国内版使用；\
-             国际版请用「手机验证码登录」或「填写凭证」添加账号",
-        ));
-    }
     match from_auth_file(region) {
         Ok(credentials) => Ok(credentials),
         Err(auth_file_error) => match from_gateway_config(region) {
@@ -863,6 +887,14 @@ pub fn credentials_from_record(
     if let Some(expires_at) = record.get("tokenExpiresAt").and_then(number_value) {
         credentials.expires_at = Some(expires_at);
     }
+    // 邮箱同理：记录里存过就用记录里的（网页登录 / 手填凭证建的账号在创建时
+    // 或余额查询时补写过，见 `profile` 模块）
+    credentials.email = record
+        .get("email")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     Ok(credentials)
 }
 
@@ -917,6 +949,9 @@ pub fn local_summary(region: Region) -> Result<Value, String> {
         "id": DESKTOP_ACCOUNT_ID,
         "region": region.provider_id(),
         "userId": credentials.user_id,
+        // 邮箱：桌面端来源是 auth.json 的 `userInfo.email`（明文，本地读）。
+        // 界面用它做账号的副标题（国际版的 OAuth 账号靠它认人，见 `profile`）。
+        "email": credentials.email,
         "tokenTail": token_tail(&credentials.token),
         "tokenExpiresAt": credentials
             .expires_at

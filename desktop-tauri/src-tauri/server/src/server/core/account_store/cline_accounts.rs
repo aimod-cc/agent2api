@@ -175,7 +175,7 @@ impl AccountStore {
     ///   - `accessToken` / `access_token` / `token`（任一非空即可）；
     ///   - `refreshToken` / `refresh_token`（可选，没有则无法自动续期）；
     ///   - `expiresAt`（可选，缺失时从 JWT 的 `exp` 推）；
-    ///   - `account` / `userId`（可选，展示用；缺失时从 JWT 的 email 推）；
+    ///   - `account` / `userId`（可选；缺失时从 JWT 推，`usr-…` 优先）；
     ///   - `name`（可选，备注名）。
     ///
     /// ── 校验口径（刻意薄）─────────────────────────────────────
@@ -221,8 +221,8 @@ impl AccountStore {
             .get("expiresAt")
             .and_then(number)
             .or_else(|| credentials::expires_at_from_jwt(&access));
-        // 展示名（姓名优先，见 `identity_from_jwt`）与**账号 id**（usr-…）分开：
-        // 前者给人看，后者进 URL（`PATCH /api/accounts/<id>`）。
+        // 展示名（**email 优先**，见 `identity_from_jwt`）与**账号 id**（usr-…）
+        // 分开：前者给人看，后者进 URL（`PATCH /api/accounts/<id>`）。
         let (display, jwt_account) = credentials::identity_from_jwt(&access);
         // 账号标识的来源顺序：payload 显式给的 → JWT 的 external_id（`usr-…`）
         // → 展示名。**优先 usr- 形态**是刻意的：它是 URL 安全的、也是上游
@@ -261,9 +261,10 @@ impl AccountStore {
             }
         }
         let now = logging::now_ms();
-        // 备注名的兜底链：调用方给的 → 记录里原有的 → **姓名** → account id
-        // → token 尾号。姓名排在 account 前面：`usr-…` 那串 id 对人不友好，
-        // 而姓名是这一家唯一「用户认得出」的东西（见 credentials 的说明）。
+        // 备注名的兜底链：调用方给的 → 记录里原有的 → **展示名（email 优先）**
+        // → account id → token 尾号。展示名排在 account 前面：`usr-…` 那串 id
+        // 对人不友好，而 email 是这一家「用户认得出」的标识（见 credentials
+        // 的说明 —— 界面要求 Cline 显示邮箱而不是姓名）。
         let record_name = name
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -422,8 +423,8 @@ impl AccountStore {
             }
         }
         let now = logging::now_ms();
-        // 备注名兜底链：调用方给的 → 记录里原有的 → **姓名**（`credentials.name`
-        // 已按「用户名优先」解析，见 credentials 模块）→ 账号标识。
+        // 备注名兜底链：调用方给的 → 记录里原有的 → **展示名**（`credentials.name`
+        // 已按「email 优先」解析，见 credentials 模块）→ 账号标识。
         let record_name = name
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -474,7 +475,7 @@ impl AccountStore {
                 Value::String(truncate_chars(&credentials.account, MAX_IDENTITY_LENGTH)),
             );
         }
-        // 姓名落盘（同 `add_cline_account`）：桌面端账号不落 token，
+        // 展示名落盘（同 `add_cline_account`）：桌面端账号不落 token，
         // 展示名是唯一能从记录里读出「这是谁」的字段
         if !credentials.name.is_empty() {
             fields.insert(
@@ -601,11 +602,16 @@ impl AccountStore {
     /// 哪个池，再回一个 `pool` 只会变成第二处事实（两处不一致时界面信哪个？）。
     ///
     /// ── 账号名为什么可能是「推导」出来的 ─────────────────────────
-    /// 早先的版本把账号名直接写成 `usr-…` 那串 id（用户完全认不出是谁的号）。
-    /// 现在**在读取时补一次推导**，于是老记录不必重新添加就能显示成人名：
-    ///   - `displayName`：记录里存的 → 从 JWT 现解（姓名 → email → 账号 id）；
-    ///   - 公开形态的 `name`：记录名与 `account` **逐字相同**（即当初是自动
-    ///     生成的、用户没改过）时，改用 `displayName`；用户改过备注名就尊重它。
+    /// 早先的版本把账号名直接写成 `usr-…` 那串 id（用户完全认不出是谁的号），
+    /// 后来改成在读取时补一次推导，于是老记录不必重新添加就能显示成人名。
+    /// 现在**展示口径是 email 优先**（界面要求 Cline 显示邮箱而不是姓名）：
+    ///   - `displayName`：优先从记录里的 accessToken 现解（email → 姓名 →
+    ///     账号 id，与 `identity_from_jwt` 同口径）—— 记录里存的 `displayName`
+    ///     是落盘当时的口径（老记录是姓名），现解能跟上口径变化；
+    ///     解不出（桌面端账号不落 token）才回落到存的 `displayName`；
+    ///   - 公开形态的 `name`：记录名是**自动生成的**（为空、与 `account`
+    ///     同字、或与落盘时的 `displayName` 同字 —— 三者都说明用户没改过
+    ///     备注名）时，跟随上面的推导；用户改过备注名就尊重它。
     /// 只影响展示，不改盘 —— 写入仍只发生在添加 / 续期那两条既有路径上。
     pub fn to_cline_public_account(&self, record: &StoredAccount) -> Value {
         let value = record.to_value();
@@ -623,38 +629,43 @@ impl AccountStore {
             .unwrap_or("")
             .trim()
             .to_string();
-        // 姓名：存的优先，没有就从 token 现解（老记录 / 手填 token 的账号）
+        // 展示名：token 能现解就现解（email 优先），解不出再回落到存的
+        // （老记录 / 手填 token 的账号 / 桌面端账号）
+        let stored_display = value
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
         let display = {
-            let stored = value
-                .get("displayName")
+            let from_token = value
+                .get("accessToken")
                 .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if !stored.is_empty() {
-                stored
+                .map(|token| credentials::identity_from_jwt(token).0)
+                .unwrap_or_default();
+            if !from_token.is_empty() {
+                from_token
             } else {
-                value
-                    .get("accessToken")
-                    .and_then(Value::as_str)
-                    .map(|token| credentials::identity_from_jwt(token).0)
-                    .unwrap_or_default()
+                stored_display.clone()
             }
         };
-        // 账号名：自动生成的那个（与 account 同字）换成姓名
-        let stored_name = record.name();
-        let name = if !display.is_empty()
-            && (stored_name.trim().is_empty() || stored_name.trim() == account)
-        {
+        // 账号名：自动生成的（为空 / 与 account 同字 / 与落盘时的展示名同字）
+        // 换成上面的推导值；用户改过备注名就尊重它
+        let stored_name_value = record.name();
+        let stored_name = stored_name_value.trim();
+        let auto_name = stored_name.is_empty()
+            || stored_name == account
+            || (!stored_display.is_empty() && stored_name == stored_display.as_str());
+        let name = if auto_name && !display.is_empty() {
             display.clone()
         } else {
-            stored_name
+            stored_name_value.clone()
         };
         out.insert("name".to_string(), Value::String(name));
         if !account.is_empty() {
             out.insert("account".to_string(), Value::String(account));
         }
-        // 姓名单独一个字段：界面拿它做展示（账号名之外的第二标识），
+        // 展示名单独一个字段：界面拿它做展示（账号名之外的第二标识），
         // 也让「备注名被用户改过」时仍能看到这到底是谁的账号
         if !display.is_empty() {
             out.insert("displayName".to_string(), Value::String(display));

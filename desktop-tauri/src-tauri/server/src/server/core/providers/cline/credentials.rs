@@ -126,9 +126,9 @@ pub struct ClineCredentials {
     pub refresh_token: String,
     /// 过期时间（毫秒时间戳；None = 无从判断）
     pub expires_at: Option<f64>,
-    /// 显示用账号标识（email 优先，其次 accountId）
+    /// 账号 id（`usr-…` 形态，余额接口路径认的那个；payload 显式给的除外）
     pub account: String,
-    /// 备注名（用户可改；空则用 account）
+    /// 展示名（**email 优先**，其次姓名；用户显式给的备注名优先于它）
     pub name: String,
     /// **内部用**：桌面端登录态的内存刷新覆盖键（`providers:<文件 mtime>`）。
     /// 账号记录来源为 None —— 那条来源的刷新结果直接回写账号库，不走缓存。
@@ -223,14 +223,15 @@ pub fn account_id_from_jwt(token: &str) -> Option<String> {
     Some(text.to_string())
 }
 
-/// 从 JWT 里解出用户标识（**用户名优先**，其次 email，最后账号 id）。
+/// 从 JWT 里解出用户标识（**email 优先**，其次姓名，最后账号 id）。
 ///
 /// 只用于**展示与去重**，不参与鉴权判定。
 ///
 /// 返回 `(展示名, 账号 id)`：
-///   - 展示名：`lastName+firstName`（中文姓名习惯，实测 JWT 里是
-///     `firstName:"亮"` / `lastName:"欧阳"`，拼成「欧阳亮」）→ email → 账号 id。
-///     用户认得出的是自己的名字，其次是邮箱，最次才是 `usr-…` 那串 id；
+///   - 展示名：email → `lastName+firstName`（中文姓名习惯，实测 JWT 里是
+///     `firstName:"亮"` / `lastName:"欧阳"`，拼成「欧阳亮」）→ 账号 id。
+///     展示口径是**邮箱优先**（界面要求 Cline 显示邮箱而不是姓名 —— 用户
+///     认得出的是自己注册用的邮箱；姓名只是邮箱取不到时的兜底）；
 ///   - 账号 id 优先 `external_id`（`usr-…`，余额路径要的那个），
 ///     其次 `clineUserId`、最后 `sub`。
 pub fn identity_from_jwt(token: &str) -> (String, String) {
@@ -258,12 +259,13 @@ pub fn identity_from_jwt(token: &str) -> (String, String) {
         sub
     };
     // 姓名：中文习惯是「姓+名」（lastName 在前），但上游可能只给其一。
-    // 两者都空时留空串，交给下面的 email 兜底 —— 不拼出一个只有空格的假名。
+    // 两者都空时留空串，交给上面的 email 兜底 —— 不拼出一个只有空格的假名。
+    // email 在前（见返回值说明）：取得到就不再用姓名。
     let person = person_name(&text("lastName"), &text("firstName"));
-    let display = if !person.is_empty() {
-        person
-    } else if !email.is_empty() {
+    let display = if !email.is_empty() {
         email
+    } else if !person.is_empty() {
+        person
     } else {
         account.clone()
     };
@@ -404,12 +406,13 @@ pub(crate) fn unknown_exp_refresh_due(account_id: &str, now_ms: i64) -> bool {
 /// 口径一致），读取侧同时兼容上游 providers.json 的原名（`accessToken` 同名，
 /// refresh 的 snake_case 变体 `refresh_token` 也认）。
 ///
-/// ── 展示名的来源顺序（用户名优先）────────────────────────────
-/// 记录里没有 token 的 JWT 时（桌面端账号的凭证在客户端文件里）也要能拿到
-/// 展示名，所以顺序是：记录里的 `displayName`（续期/登录时从 userInfo 抽出来
-/// 落下的）→ JWT 的姓名 → 记录里的 `account`（email 或 `usr-…`）。
-/// 桌面端那条链另外在 [`credentials_from_desktop_settings`] 里读
-/// `metadata.userInfo.name`，见那里。
+    /// ── 展示名的来源顺序（email 优先）──────────────────────────
+    /// 记录里没有 token 的 JWT 时（桌面端账号的凭证在客户端文件里）也要能拿到
+    /// 展示名，所以顺序是：记录里的 `displayName`（登录/续期时按「email 优先」
+    /// 抽出来落下的）→ JWT 的展示名（email → 姓名）→ 记录里的 `account`
+    /// （`usr-…` 或 email）。
+    /// 桌面端那条链另外在 [`credentials_from_desktop_settings`] 里读
+    /// `metadata.userInfo`，见那里。
 pub fn credentials_from_record(record: &Value) -> Result<ClineCredentials, GatewayError> {
     let access = pick_string(record, &["accessToken", "access_token", "token"]);
     if access.is_empty() {
@@ -470,11 +473,12 @@ pub fn credentials_from_record(record: &Value) -> Result<ClineCredentials, Gatew
 /// 两级，时间字段是毫秒 `expiresAt`，标识在 `metadata.userInfo` 里），
 /// 硬塞进 `credentials_from_record` 的候选键只会让那个函数变成两套格式的混合体。
 ///
-/// ── 展示名从 `metadata.userInfo` 取（用户名优先）──────────────
+/// ── 展示名从 `metadata.userInfo` 取（email 优先）──────────────
 /// 桌面端登录态里有一份完整的 `userInfo`（实测字段：`firstName` / `lastName`
 /// / `email` / `name` / `subject` / `clineUserId`），比 JWT 声明还全 ——
 /// 而且**桌面端账号的记录里不落 token**，解析凭证时读的正是这份文件，
-/// 顺手把姓名带出来最省事。顺序：`firstName`+`lastName` 拼 → `name` → email。
+/// 顺手把展示名带出来最省事。顺序：`email` → `firstName`+`lastName` 拼
+/// → `name`（与 `identity_from_jwt` 的「email 优先」同一口径）。
 pub fn credentials_from_desktop_settings(root: &Value) -> Result<ClineCredentials, GatewayError> {
     let auth = root
         .get("providers")
@@ -493,16 +497,22 @@ pub fn credentials_from_desktop_settings(root: &Value) -> Result<ClineCredential
         .and_then(|metadata| metadata.get("userInfo"))
     {
         let display = {
-            let person = person_name(
-                info.get("lastName").and_then(Value::as_str).unwrap_or(""),
-                info.get("firstName").and_then(Value::as_str).unwrap_or(""),
-            );
-            if !person.is_empty() {
-                person
+            let email = pick_string(info, &["email"]);
+            if !email.is_empty() {
+                email
             } else {
-                // 上游的 `name` 是「名 姓」写法（实测「亮 欧阳」），只在拼不出
-                // 姓名时兜底 —— 直接用它会让同一个人的名字在界面上换个写法
-                pick_string(info, &["name", "email"])
+                let person = person_name(
+                    info.get("lastName").and_then(Value::as_str).unwrap_or(""),
+                    info.get("firstName").and_then(Value::as_str).unwrap_or(""),
+                );
+                if !person.is_empty() {
+                    person
+                } else {
+                    // 上游的 `name` 是「名 姓」写法（实测「亮 欧阳」），只在
+                    // 前两级都取不到时兜底 —— 直接用它会让同一个账号在界面
+                    // 上多出一种写法
+                    pick_string(info, &["name"])
+                }
             }
         };
         if !display.is_empty() {

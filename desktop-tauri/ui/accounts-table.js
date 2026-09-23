@@ -346,8 +346,12 @@
   }
 
   /**
-   * 账号：第一行名称，第二行「桌面端」标记，第三行只在异常时出现
-   * （代理不可用原因 / 账号不可用）。
+   * 账号：第一行名称，第二行邮箱（有才渲染），第三行只在异常时出现
+   * （代理不可用原因）。
+   *
+   * 「账号当前不可用」那行红字不再渲染：`available` 把「手动禁用」也算进去
+   * （后端 `available = enabled && has_credentials`），手动关掉的账号被标成
+   * 「不可用」是把同一件事说两遍 —— 启用状态开关自己已经表达了。
    *
    * 标识（UID / userId）与 Token 尾号**不再上屏**：它们对「这条账号能不能用」没有
    * 信息量，却把副标题占掉大半 —— 同一屏里账号名和状态才是要一眼扫到的东西。
@@ -358,12 +362,15 @@
    * 账号列是唯一随窗口与列宽变化伸缩的一列，长文案在这里才读得到。
    * 限流的恢复时间不再出现在这里 —— 限额按模型记，它有自己的列（见 limitsCell）。
    *
-   * ── 代理那一段本次搬走了 ────────────────────────────────────
-   * 它原先在这里的第二行（「桌面端 · 代理 Clash 混合端口 7890」），现在有独立的
-   * 代理列（见 proxyCell）。两处显示同一个事实只会让人怀疑它们会不会不一致，
-   * 而代理是**线路**（决定请求从哪出去、出问题先看哪），与「这条账号是不是
-   * 桌面端登录态」不是同一类信息。第二行因此只剩桌面端标记，
-   * 普通账号（非桌面端、无代理）的副标识行整个不渲染（见 sub 的判空）。
+   * ── 第二行现在放**邮箱**（本次修正）────────────────────────────
+   * 原先第二行是一枚「桌面端」标签：它说的是「这条记录的凭证从哪来」（实现细节），
+   * 而这一列要回答的是「这是谁的号」。邮箱才是那个答案 —— 尤其是 AutoClaw
+   * 国际版：网页登录（Zai / Google）建出来的账号，名字只是上游 `user_name`
+   * （可能是个昵称，如「Lucas Ou」），光看名字分不清是同一个人还是两个人。
+   * 「桌面端实时登录态」这条信息没有丢，挪进了账号名的悬停提示。
+   *
+   * 名字本身就是邮箱时（桌面端导入的默认名就是邮箱）不重复渲染 ——
+   * 见后端 `import_autoclaw_desktop_account` 的默认名规则。
    */
   function accountCell(account) {
     const ident = identifierOf(account);
@@ -371,13 +378,20 @@
     const name = account.nickname || account.name || ident || '未命名账号';
     const title = [
       ident ? `${features.identifier} ${ident}` : '',
+      // 桌面端实时登录态从标签挪到这里（见上方说明）：信息还在，只是不再占一行
+      isDesktopAccount(account) ? '桌面端实时登录态（凭证每次从客户端登录态文件读取）' : '',
       account.tokenTail ? `Token 尾号 ${account.tokenTail}` : '',
       account.updatedAt ? `更新于 ${formatTime(account.updatedAt)}` : '',
       account.source ? `来源 ${account.source === 'imported' ? '旧数据导入' : '手动添加'}` : '',
     ].filter(Boolean).join('；');
 
-    const desktop = isDesktopAccount(account)
-      ? '<span class="badge desktop-tag" title="桌面端实时登录态：凭证每次从客户端登录态文件读取">桌面端</span>'
+    const email = String(account.email || '').trim();
+    const showEmail = email && email !== name;
+    // 隐藏账号名开关打开时邮箱一起打码：它同样能认出「这是谁的号」，
+    // 只遮名字等于没遮（掩码按原值取长，见 maskName 的说明）
+    const sub = showEmail
+      ? `<div class="acct-sub"><span class="acct-email" title="账号邮箱">`
+        + `${esc(namesHidden ? maskName(email) : email)}</span></div>`
       : '';
     // 明细行为空时整行不渲染：一个空的 .acct-sub 仍占一行行高（margin + line-height），
     // 在没有任何副标识的账号上会白留一道空隙，而它恰恰是「这行没什么可说的」那种账号
@@ -387,7 +401,7 @@
     const shown = namesHidden ? maskName(name) : name;
     return `<td class="cell-account"><div class="acct-name"${title ? ` title="${esc(title)}"` : ''}>`
       + `<span class="name">${esc(shown)}</span></div>`
-      + (desktop ? `<div class="acct-sub">${desktop}</div>` : '')
+      + sub
       + note
       + '</td>';
   }
@@ -437,14 +451,13 @@
   }
 
   /**
-   * 异常说明（第三行）。只覆盖「不随请求变化」的故障（代理 / 不可用）；
+   * 异常说明（第三行）。只覆盖「不随请求变化」的代理故障；
    * 限流是按模型的、会自动解除，它的展示与操作都在「限流」列里。
    * 没有异常时返回空串 —— 不能给正常账号留一行占位，那一行的高度会白送给整张表。
    */
   function healthNote(account) {
     const notes = [];
     if (account.proxy?.error) notes.push(`代理不可用：${account.proxy.error}`);
-    if (account.available === false) notes.push(account.reason || '账号当前不可用');
     if (!notes.length) return '';
     return `<div class="acct-note bad" title="${esc(notes.join('；'))}">${esc(notes.join('；'))}</div>`;
   }
@@ -487,7 +500,7 @@
    *
    * 开关直接落 `PATCH { enabled }`（与「⋯」菜单里的启用/禁用是同一条链，语义一致），
    * 不做二次确认 —— 这个动作可逆，且关掉后账号记录仍在列表里（不是删除）。
-   * 徽章沿用 accounts-model 的 accountTags：代理异常 / 不可用 / 仅账号管理；
+   * 徽章沿用 accounts-model 的 accountTags：代理异常 / 仅账号管理；
    * 一切正常时它返回空串，这里就**不渲染徽章那一行** —— 启用状态由开关的
    * 轨道位置与滑块表达，再补一枚「启用」是同一格里的第二次说明。
    */

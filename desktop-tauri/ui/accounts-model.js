@@ -70,6 +70,10 @@
    * **只标「需要关注的状态」，一切正常时返回空串** ——
    * 启用 / 禁用由开关自身表达（轨道位置 + 滑块），再补一枚「启用」徽章
    * 是在同一格里说第二遍同一件事，所以不补。
+   *
+   * 「不可用」徽章不再渲染：`available` 把「手动禁用」也算进去
+   * （后端 `available = enabled && has_credentials`），禁用的账号开关明明
+   * 是关着的，底下再标一枚「不可用」是把同一件事说两遍。
    */
   function accountTags(account) {
     const tags = [
@@ -82,7 +86,6 @@
         ? '' : statusTag('仅账号管理', 'plain', '该提供商的推理转发尚未接入，账号不参与转发'),
       // 代理配了解析不出来时明确标出：转发会回退直连，属于需要留意的情况
       account.proxy?.error ? statusTag('代理异常', 'bad', `${account.proxy.error}（转发时会回退直连）`) : '',
-      account.available === false ? statusTag('不可用', 'bad', account.reason || '账号不可用') : '',
     ].filter(Boolean);
     // 已禁用的账号这里也不再补「禁用」徽章：开关是关着的，那本身就是标识。
     return tags.join('');

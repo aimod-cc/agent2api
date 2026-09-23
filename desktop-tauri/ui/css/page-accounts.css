@@ -40,7 +40,15 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* 这里只需要「按圆角裁掉子内容」，不是滚动：hidden 会把面板变成滚动容器，
+     账号表整表重建（tbody.innerHTML 整体替换，见 accounts-view.js 的 render）时，
+     浏览器的滚动补偿会把面板卷走一大截 —— 工具栏 / 批量栏 / 吸顶表头全被裁出
+     视野，看起来像整页坍缩；hidden 没有滚动条、也没有代码复位它，用户滚不回来。
+     layout.css 给 .panel 的 overflow: clip 在本元素上会被下面这条 hidden 覆盖
+     （本文件排在 layout.css 之后），所以必须在这里自己补上 clip。
+     clip 是纯裁剪、不可滚动；老内核不认识 clip 时回退到 hidden，行为同旧版。 */
   overflow: hidden;
+  overflow: clip;
 }
 
 .acct-scroll {
@@ -51,6 +59,12 @@
      更窄时按列宽原样横滚，而不是把列压窄 —— 压缩会把操作列里的按钮折成两行。
      卡片时代这里是 overflow-x: hidden（卡片网格自己会换行，不需要横滚）。 */
   overflow-x: auto;
+  /* 整表重建时不做滚动锚定补偿：overflow-anchor 不继承，
+     .page.active 上的 none 管不到这个滚动容器自己（后代滚动容器会为自己的
+     滚动盒重新开启锚定）—— 与 .page.active / .models-table-wrap 的处理对齐。
+     这条只保列表自身的滚动位置；外层面板不跳靠的是 .account-table 的 clip，
+     单靠这条防不住（面板会被整体卷走）。 */
+  overflow-anchor: none;
   /* 常驻预留滚动条槽：有无滚动条时列表区宽度一致，列数不会跳变 */
   scrollbar-gutter: stable;
   /* 列表区与所在卡片同色（--table-bg）：表格不再自成一层暗底。

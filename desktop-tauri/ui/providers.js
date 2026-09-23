@@ -99,7 +99,11 @@
    * 调一次管理 API。既有数据源（providers 摘要）走桥接的具名方法，但自定义
    * 提供商是后端新加的接口、桥（bridge.rs 已定稿）没给它留具名方法，因此与
    * add-provider-forms.js 的 postAccount 走同一条通用链：壳的 api_request 命令。
-   * 失败值由壳归一成 Error（后端 400 的 error 文案在里面），调用方照常 catch。
+   *
+   * 注意这条链**绕开了桥接层的 asError**：壳命令是 `Result<_, String>`，失败值
+   * 到 JS 是**裸字符串**而不是 Error（`error.message` 为 undefined）。本文件
+   * 的调用方全部只记日志 / 静默保留旧值，因此不取文案；将来若要展示失败原因，
+   * 照 add-provider-forms.js 的 describeError 那样先归一化。
    */
   function customRequest(method, path, body) {
     const internals = window.__TAURI_INTERNALS__;
