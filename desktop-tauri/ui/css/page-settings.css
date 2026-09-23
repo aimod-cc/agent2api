@@ -198,6 +198,18 @@
 }
 
 /* ─── 软件更新 ─── */
+/* 更新源切换（GitHub / Gitee 镜像）：切完立即重新检查，样式沿用全局 .seg */
+.update-source {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.update-source-label { color: var(--text-3); font-size: 12px; }
+
+.update-source .seg-item { font-size: 12px; }
+
 .update-version {
   display: flex;
   align-items: center;

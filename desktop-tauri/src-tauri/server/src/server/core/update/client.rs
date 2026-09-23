@@ -87,19 +87,20 @@ fn resolve_egress_candidates() -> Vec<(String, Option<ResolvedProxy>)> {
 pub async fn fetch_with_egress(
     url: &str,
     headers: &[(String, String)],
-    timeout_ms: u64,
+    timeout_ms: Option<u64>,
 ) -> Result<reqwest::Response, UpdateError> {
     let candidates = resolve_egress_candidates();
     let multiple = candidates.len() > 1;
     let mut last_error: Option<reqwest::Error> = None;
     for (label, proxy) in &candidates {
         let client = egress::client_for(proxy.as_ref());
-        let mut builder = client
-            .get(url)
-            // 单请求总超时：只覆盖到「拿到响应头」，流式下载由调用方继续读
-            // （reqwest 的总超时对已开始的 body 读取不生效，与 Node 的
-            //  AbortSignal + bodyTimeout:0 语义一致）
-            .timeout(Duration::from_millis(timeout_ms));
+        let mut builder = client.get(url);
+        // 请求级总超时只给 API 探测用（响应是小 JSON）。reqwest 0.12 的
+        // `.timeout()` 覆盖到 body 读完为止 —— 下载传 None，安装包几十上百 MB
+        // 不可能 30 秒内下完；卡死场景由 egress 客户端的 read_timeout 兜底
+        if let Some(timeout_ms) = timeout_ms {
+            builder = builder.timeout(Duration::from_millis(timeout_ms));
+        }
         for (name, value) in headers {
             builder = builder.header(name.as_str(), value.as_str());
         }

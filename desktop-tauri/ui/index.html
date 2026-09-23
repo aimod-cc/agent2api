@@ -1070,7 +1070,7 @@
                 <section class="panel">
                   <div class="panel-head">
                     <h2>软件更新</h2>
-                    <span class="tip-q" data-tip="更新包从项目的 GitHub Release 下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。若网络访问 GitHub 较慢，会自动尝试通过 Clash Verge 的混合端口重试一次。"></span>
+                    <span class="tip-q" data-tip="更新包从所选的发布源下载（GitHub 或 Gitee 镜像），下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。国内网络建议选 Gitee，直连可达；选 GitHub 时若访问较慢，会自动尝试通过 Clash Verge 的混合端口重试一次。"></span>
                     <span id="update-badge" class="badge">未检查</span>
                     <div class="head-actions">
                       <button id="btn-update-check">检查更新</button>
@@ -1078,6 +1078,13 @@
                     </div>
                   </div>
                   <div class="panel-body">
+                    <div class="update-source">
+                      <span class="update-source-label">更新源</span>
+                      <div class="seg" id="update-source-switch" role="tablist" aria-label="软件更新源">
+                        <button type="button" class="seg-item active" data-source="github">GitHub</button>
+                        <button type="button" class="seg-item" data-source="gitee" title="国内镜像，直连可达，检查与下载都更快">Gitee</button>
+                      </div>
+                    </div>
                     <div class="update-version">
                       <span class="version-pill">
                         <span class="k">当前版本</span><span class="v" id="update-current">—</span>
@@ -1088,7 +1095,7 @@
                       </span>
                     </div>
 
-                    <div class="detail" id="update-state">点击「检查更新」查询 GitHub 上的最新发布版本。</div>
+                    <div class="detail" id="update-state">点击「检查更新」查询最新发布版本。</div>
                     <div class="progress" id="update-progress" hidden><div class="bar"></div></div>
 
                     <!-- 关于作者 + 收藏项目：作者主页与仓库地址都从接口返回的 repository 现拼

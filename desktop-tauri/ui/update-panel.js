@@ -36,6 +36,7 @@
 
   let repository = '';      // owner/repo，来自接口：作者主页与仓库地址由它拼出来，不写死
   let checkedAt = 0;        // 上次检查更新的时刻
+  let updateSource = 'github';  // 更新源（github / gitee）：以后端配置为准，切换写回 /api/config
 
   // ─── 平台文案 ─────────────────────────────────
   //
@@ -97,6 +98,22 @@
   function safeExternal(value) {
     const url = String(value || '').trim();
     return /^https?:\/\//i.test(url) ? url : '';
+  }
+
+  // ─── 更新源 ───────────────────────────────────
+  //
+  // GitHub 是上游（ releases 数据最全），Gitee 是国内裸连可达的镜像。
+  // 源存后端 config（updateSource），检查与下载都走所选源 —— 这里只负责
+  // 高亮与切换，判断逻辑全在后端（面板不感知各源的 API 差异）。
+
+  const sourceLabel = () => (updateSource === 'gitee' ? 'Gitee' : 'GitHub');
+
+  /** 把源的高亮铺到切换按钮上（info.source 与配置接口的值都是后端权威口径） */
+  function applySource(value) {
+    updateSource = value === 'gitee' ? 'gitee' : 'github';
+    document.querySelectorAll('#update-source-switch .seg-item').forEach(item => {
+      item.classList.toggle('active', item.dataset.source === updateSource);
+    });
   }
 
   // ─── 面板状态 ─────────────────────────────────
@@ -339,7 +356,7 @@
       + `<div class="rel-note-body"><div class="md-body">${html || '<p class="md-body-empty">这个版本没有填写发布说明。</p>'}</div>`
       + (pageUrl
         ? `<div class="rel-foot"><a href="${esc(pageUrl)}" data-external="${esc(pageUrl)}"`
-          + ' target="_blank" rel="noopener">在 GitHub 查看完整说明</a></div>'
+          + ` target="_blank" rel="noopener">在 ${sourceLabel()} 查看完整说明</a></div>`
         : '')
       + '</div></div>';
   }
@@ -369,6 +386,25 @@
     void openExternal(trigger.dataset.external);
   }
 
+  /**
+   * 切换更新源：写回后端（/api/config 落盘，下一次检查与下载就用新源），
+   * 然后**立刻用新源重查一次** —— 源换了，最新版本与更新日志都要跟着换，
+   * 留着旧源的结果会让人看到「Gitee 源配着 GitHub 的日志」这种错位。
+   *
+   * 下载进行中也允许切：在跑的任务用的是开始时的 URL，不受影响。
+   */
+  async function switchSource(source) {
+    if (source === updateSource || busy) return;
+    try {
+      const saved = await api.saveConfig({ updateSource: source });
+      applySource(saved?.updateSource || source);
+    } catch (error) {
+      toast(`切换更新源失败：${error.message}`, 'err');
+      return;
+    }
+    await check();
+  }
+
   async function check() {
     if (busy) return null;
     busy = true;
@@ -376,11 +412,13 @@
     const original = button?.textContent;
     if (button) { button.disabled = true; button.textContent = '检查中…'; }
     setBadge('检查中', 'warn');
-    setState('正在查询 GitHub 上的最新发布版本…');
+    setState(`正在查询 ${sourceLabel()} 上的最新发布版本…`);
     try {
       info = await api.checkUpdate();
       checkedAt = Date.now();
       if (info?.repository) applyRepository(info.repository);
+      // 源以后端返回为准（多开的面板 / 手改的配置都能被纠正回来）
+      if (info?.source) applySource(info.source);
       renderCheckResult();
       // 更新日志与上面那段同源（都是这次 checkUpdate 的结果），一起重绘即可
       renderChangelog();
@@ -454,6 +492,13 @@
 
   /** 面板数据入口（切入设置页时调用） */
   async function load() {
+    // 更新源的高亮以后端配置为准：页面重开时恢复用户上次的选择
+    //（失败按默认 github 处理，与后端「非法回落」同一取向）
+    try {
+      const config = await api.getConfig();
+      if (config?.updateSource) applySource(config.updateSource);
+    } catch { /* 后端未就绪：保持默认 github */ }
+
     // 日志与版本号同源，所以先按当前结果铺一次（含启动时那次自动检查）：
     // 切回来时不会白着一块等接口
     renderChangelog();
@@ -481,7 +526,7 @@
     if (info) { renderCheckResult(); return; }
 
     setBadge('未检查');
-    setState('点击「检查更新」查询 GitHub 上的最新发布版本。');
+    setState(`点击「检查更新」查询 ${sourceLabel()} 上的最新发布版本。`);
   }
 
   /**
@@ -528,6 +573,11 @@
 
   $('btn-update-check')?.addEventListener('click', check);
   $('btn-update-download')?.addEventListener('click', downloadOrCancel);
+
+  // 更新源切换：一段控件两个按钮，点了写回后端并立即重查
+  document.querySelectorAll('#update-source-switch .seg-item').forEach(item => {
+    item.addEventListener('click', () => { void switchSource(item.dataset.source); });
+  });
 
   // 面板内的外链统一走委托（含「关于作者」与日志正文里的链接）
   $('update-notes')?.closest('.panel')?.addEventListener('click', onPanelClick);

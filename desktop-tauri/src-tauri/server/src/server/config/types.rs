@@ -96,6 +96,13 @@ pub const KEY_PROMPT_MODE: &str = "promptMode";
 /// `passthrough` 不读文件。
 pub const KEY_PROMPT_FILE: &str = "promptFile";
 
+/// 软件更新源的键（config.json 键，设置页「通用 → 软件更新」）。
+///
+/// 取值 `github` / `gitee`，**默认 `github`**（上游仓库在 GitHub，Gitee 只是
+/// 镜像）：检查更新与安装包下载都走所选源 —— 国内直连 GitHub 不稳，Gitee
+/// 镜像让检查与下载都能裸连。检查更新逐次读快照，改完下一次检查立即生效。
+pub const KEY_UPDATE_SOURCE: &str = "updateSource";
+
 /// 系统提示词设置（设置页「通用 → 系统提示词」）。
 ///
 /// 与 `RetrySettings` 同一取舍：几个值总是一起用（转发层逐请求取一次、

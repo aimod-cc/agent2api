@@ -13,13 +13,21 @@ pub const DEFAULT_REPO: &str = "aimod-cc/agent2api";
 /// GitHub API 根（Node 版 GITHUB_API）
 pub const GITHUB_API: &str = "https://api.github.com";
 
+/// Gitee API 根（软件更新源的 Gitee 镜像走它）
+pub const GITEE_API: &str = "https://gitee.com/api/v5";
+
+/// Gitee 镜像仓库。**账号名与 GitHub 不同**（GitHub 是 `aimod-cc`，
+/// Gitee 是 `aimodcc`），两边仓库路径不能共用一个常量
+pub const DEFAULT_REPO_GITEE: &str = "aimodcc/agent2api";
+
 /// 允许下载的域名：Release 资产实际会落在 github.com 或 *.githubusercontent.com
-/// （Node 版 ALLOWED_HOSTS）
+/// （Node 版 ALLOWED_HOSTS）；Gitee 源的附件落在 gitee.com 名下
 pub const ALLOWED_HOSTS: &[&str] = &[
     "github.com",
     "www.github.com",
     "objects.githubusercontent.com",
     "codeload.github.com",
+    "gitee.com",
 ];
 
 /// 允许下载的域名后缀（Node 版 ALLOWED_HOST_SUFFIX）
