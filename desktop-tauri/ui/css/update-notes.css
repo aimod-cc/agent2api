@@ -81,10 +81,9 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* 列表区：不再自带滚动条。
-   折叠态每版只占一行，20 个版本远不到「非限高不可」的程度；而设置页右栏
-   （.settings-panes）本来就是滚动容器，这里再套一层就会变成「框里框外都能滚」——
-   滚到底部时继续滚会带着外层的设置项一起跳。整条时间轴直接铺开，只留一个滚动条。 */
+/* 外壳本身不滚，也不限高：滚动收在下面的版本正文（.rel-note-body）里，
+   这样「更新日志」标题与版本卡头保持可见，正文再长也只在框内滚，
+   不会把整张设置页撑长、把上方的更新设置项推出一屏。 */
 .update-log-body {
   display: flex;
   flex-direction: column;
@@ -146,7 +145,14 @@
   white-space: nowrap;
 }
 
-.rel-note-body { padding: 10px 12px 12px; }
+/* 正文滚动区：限高与「检测到更新」弹窗的 .update-modal-notes 一致取 46vh；
+   overscroll-behavior 拦住滚动链 —— 正文滚到底后继续滚，不会带动外层设置页一起跳 */
+.rel-note-body {
+  padding: 10px 12px 12px;
+  max-height: 46vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 
 /* 「在 GitHub 查看完整说明」：与正文里的链接同一套观感 */
 .rel-foot { margin-top: 10px; }
