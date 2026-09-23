@@ -1,0 +1,50 @@
+name: sync-gitee
+
+# 推送后自动镜像同步到 Gitee（https://gitee.com/aimodcc/agent2api）。
+# Gitee 仓库是只读镜像：CI 与 Release 仍在 GitHub，Gitee 只承担国内
+# clone / 浏览提速。任何在 Gitee 侧的手动改动都会被这里强制覆盖。
+#
+# ── 同步范围 ─────────────────────────────────────────────────
+# main 分支 + 全部 tag。当前仓库只有 main 一条分支，直接显式推这两样；
+# 以后若增开分支，把 HEAD:refs/heads/main 换成
+# "refs/remotes/origin/*:refs/heads/*" 的全量 refspec 即可。
+#
+# ── 认证 ─────────────────────────────────────────────────────
+# secret GITEE_TOKEN：Gitee 私人令牌（个人设置 → 安全设置 → 私人令牌），
+# 勾 projects 权限即可。走 HTTPS 推送，不用配 SSH key。
+#
+# ── 触发 ─────────────────────────────────────────────────────
+# main 更新或推 v* tag 后自动跑；也可在 Actions 页手动 dispatch 补同步。
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+# 推 main 与推 tag 一起发生时串行执行，避免两个运行互相踩
+concurrency:
+  group: sync-gitee
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        # 全量历史：tag 打在旧提交上时也要能一并推过去
+        with:
+          fetch-depth: 0
+
+      - name: 同步到 Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: |
+          git remote add gitee "https://aimodcc:${GITEE_TOKEN}@gitee.com/aimodcc/agent2api.git"
+          git push gitee "HEAD:refs/heads/main" --force
+          git push gitee --tags --force
