@@ -29,9 +29,14 @@
 //! 这里查不到就如实说「不在进行中」—— 比伪造一个「已受理」诚实）。
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::task::{Context, Poll};
 
+use bytes::Bytes;
+use futures::stream::BoxStream;
+use futures::{Future, Stream};
 use tokio::sync::Notify;
 
 use crate::server::errors::GatewayError;
@@ -95,6 +100,75 @@ impl CancelToken {
             return;
         }
         notified.await;
+    }
+}
+
+/// 把一条上游字节流与取消令牌合成为「可手动终止」的流。
+///
+/// 令牌为 None 时原样返回入参（未接线的调用点零开销）。
+///
+/// ── 为什么不用 `futures::stream::select`（本次修复）─────────────
+/// `select` 的收尾语义是「**两条都结束**才算结束」。旁路信号只在收到取消时
+/// 才产出一项，上游正常结束时它仍在 pending —— 于是合成流的 `poll_next`
+/// 永远拿不到 `Ready(None)`，两条转发路径同时卡死：
+///   - 流式（`ForwardStream`）：客户端已经收全所有帧（含 `data: [DONE]`），
+///     但响应体不结束、连接不关闭，连 `chunked` 的收尾块都不发 ——
+///     客户端一直等，请求日志停在「响应中」，直到它自己超时断开；
+///   - 非流式（`aggregate_frame_stream_inner`）：`while let Some(..) = next()`
+///     永不退出，一直空转到非流式总超时（默认 300 秒）才报 502。
+/// 两者都不是「上游有问题」，纯粹是合成器的收尾语义选错了。
+///
+/// 所以这里手写合成器，判据只有两条：
+///   - **上游结束即以 None 收尾**，不等取消信号（这正是 select 缺的那半边）；
+///   - 上游还在 pending 时才看取消 —— 且取消**优先**于上游分片，
+///     这样置位后下一次 poll 立刻拿到错误项，不必等下一个分片到达
+///     （上游停滞时正是这个场景，见模块头）。
+///
+/// 形状与 `upstream::stall::idle_guard` 一致（同样的 `done` 短路 + 盒装内部流），
+/// 两处读起来是同一套写法。
+pub fn cancellable(
+    inner: BoxStream<'static, Result<Bytes, std::io::Error>>,
+    cancel: Option<Arc<CancelToken>>,
+) -> BoxStream<'static, Result<Bytes, std::io::Error>> {
+    let Some(token) = cancel else {
+        return inner;
+    };
+    Box::pin(CancellableStream {
+        inner,
+        // 等待就在这条 future 里：置位即就绪（`cancelled()` 自带
+        // 「先登记、再查标志」的顺序保证，见它的说明）
+        wait: Box::pin(async move { token.cancelled().await }),
+        done: false,
+    })
+}
+
+struct CancellableStream {
+    inner: BoxStream<'static, Result<Bytes, std::io::Error>>,
+    wait: Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// 已收尾（上游结束或取消已触发）—— 之后的 poll 一律返回 None
+    done: bool,
+}
+
+impl Stream for CancellableStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        // 取消优先：置位后立刻给出错误项，不等上游下一个分片
+        if self.wait.as_mut().poll(cx).is_ready() {
+            self.done = true;
+            return Poll::Ready(Some(Err(std::io::Error::other(MANUAL_TERMINATED))));
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            // 上游结束：立刻收尾（**不**去看旁路信号，见 `cancellable` 的说明）
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
     }
 }
 

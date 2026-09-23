@@ -496,25 +496,19 @@ impl ForwardStream {
         model_rewrite: Option<ModelRewrite>,
     ) -> Self {
         // ── 手动终止的旁路流（本次新增）────────────────────────────
-        // 把令牌的等待挂成一条「只产出一个错误项」的旁路流，与上游流 select
-        // 合并：置位后 poll 立刻拿到 Err，**不必等下一个上游分片**（上游停滞
-        // 时正是这个场景，光靠轮询顶部的同步检查会拖到下一片数据才反应）。
-        // 不额外起任务 —— 旁路流随本流一起被丢弃，没有「唤醒谁来收尾」的
+        // 把令牌的等待挂成一条「只产出一个错误项」的旁路：置位后 poll 立刻
+        // 拿到 Err，**不必等下一个上游分片**（上游停滞时正是这个场景，光靠
+        // 轮询顶部的同步检查会拖到下一片数据才反应）。
+        // 不额外起任务 —— 合成器随本流一起被丢弃，没有「唤醒谁来收尾」的
         // 悬空问题（对比：spawn 一个等待任务需要 Weak 反查防止任务泄漏）。
         // 错误项的文案就是手动终止原文，poll_next 的错误分支据此不加
         // 「上游流中断」前缀（那会把它说成上游的问题）。
-        let inner = match telemetry.cancel_token() {
-            Some(token) => {
-                let signal = futures::stream::once(async move {
-                    token.cancelled().await;
-                    Err::<Bytes, std::io::Error>(std::io::Error::other(
-                        cancellation::MANUAL_TERMINATED,
-                    ))
-                });
-                Box::pin(futures::stream::select(inner, signal))
-            }
-            None => inner,
-        };
+        //
+        // 合成器是 `cancellation::cancellable` 而**不是** `stream::select`：
+        // 后者的收尾判据是「两条都结束」，旁路流在上游正常结束时永不产出，
+        // 于是本流的 `poll_next` 拿不到 `Ready(None)` —— 客户端收全帧后
+        // 连接不关闭、一直等在那里（详见 `cancellable` 的说明）。
+        let inner = cancellation::cancellable(inner, telemetry.cancel_token());
         // 采集器在构造时取一次（见字段说明）
         let capture = telemetry.capture();
         Self {

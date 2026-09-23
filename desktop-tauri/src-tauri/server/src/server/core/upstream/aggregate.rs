@@ -111,24 +111,16 @@ async fn aggregate_frame_stream_inner(
     // ── 手动终止的旁路流（与 `ForwardStream::from_translated` 同一手法）──
     // 聚合是 `while let Some(item) = stream.next().await` 的拉取循环：没有
     // 旁路流时，取消要等下一个上游分片（上游停滞时可能等很久）。把令牌的
-    // 等待挂成一条只产出一个错误项的流与上游 select 合并，置位后下一轮
-    // await 立刻拿到 Err，由下面的 map_err 折成 408 的网关错误（非流式
-    // 客户端此时还没收到任何响应，收尾记账会把它记成「请求已被手动终止」）。
-    // 放在本函数而不是 `aggregate_sse_completion`：自定义家的翻译协议流
-    // 也走这里（聚合规则共用），两处都要覆盖。
-    let mut stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> =
-        match telemetry.cancel_token() {
-            Some(token) => {
-                let signal = futures::stream::once(async move {
-                    token.cancelled().await;
-                    Err::<bytes::Bytes, std::io::Error>(std::io::Error::other(
-                        cancellation::MANUAL_TERMINATED,
-                    ))
-                });
-                Box::pin(futures::stream::select(stream, signal))
-            }
-            None => stream,
-        };
+    // 等待合进流里，置位后下一轮 await 立刻拿到 Err，由下面的 map_err 折成
+    // 408 的网关错误（非流式客户端此时还没收到任何响应，收尾记账会把它记成
+    // 「请求已被手动终止」）。放在本函数而不是 `aggregate_sse_completion`：
+    // 自定义家的翻译协议流也走这里（聚合规则共用），两处都要覆盖。
+    //
+    // 合成器用 `cancellation::cancellable` 而**不是** `stream::select`：
+    // 后者的收尾判据是「两条都结束」，旁路流在上游正常结束时永不产出，于是
+    // 下面这个 `while let` 永不退出 —— 聚合明明已经读到上游 EOF，却要空转到
+    // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
+    let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
     let mut buffer = String::new();
     let mut acc = CompletionAccumulator { rewrite: model_rewrite, ..Default::default() };
     // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
