@@ -31,8 +31,9 @@ jobs:
             curl -sf -X DELETE -H "$AUTH" "$API/releases/$OLD_ID"
           fi
 
-          # 建发行版（打印原始响应便于排障）
-          jq -n --arg tag "$TAG" '{tag_name:$tag, name:$tag, body:"CI API 连通性测试，稍后自动删除"}' > /tmp/rel.json
+          # 建发行版（打印原始响应便于排障）。target_commitish 实测必传，
+          # 文档写可选不可信
+          jq -n --arg tag "$TAG" '{tag_name:$tag, name:$tag, target_commitish:"main", body:"CI API 连通性测试，稍后自动删除"}' > /tmp/rel.json
           HTTP_CODE=$(curl -s -o /tmp/create-resp.json -w "%{http_code}" -X POST -H "$AUTH" \
             -H "Content-Type: application/json" -d @/tmp/rel.json "$API/releases")
           echo "建发行版: HTTP $HTTP_CODE"
