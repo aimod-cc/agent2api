@@ -60,7 +60,28 @@ pub async fn aggregate_sse_completion(
     telemetry: Arc<RequestTelemetry>,
     model_rewrite: Option<ModelRewrite>,
 ) -> Result<AggregatedCompletion, GatewayError> {
-    let mut stream = response.bytes_stream();
+    // 与 `ForwardStream::new` 同款：reqwest 错误在这里就地描述成文案折进
+    // io::Error（`describe_error_detail` 只认 reqwest::Error）
+    let stream = response.bytes_stream().map(|item| {
+        item.map_err(|error| {
+            std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+        })
+    });
+    aggregate_frame_stream(Box::pin(stream), telemetry, model_rewrite).await
+}
+
+/// 聚合一条**标准 chat SSE** 字节流（不限定来源）。
+///
+/// 自定义家的翻译协议（responses / anthropic 上游）在进入本函数前先过
+/// `providers::custom` 的 `ProtocolTranslateStream` —— 本函数与
+/// [`aggregate_sse_completion`] 共用同一套聚合规则，只是输入从
+/// reqwest::Response 换成已翻译的帧流。telemetry / model_rewrite 的语义
+/// 与那个函数完全一致（见它的说明）。
+pub async fn aggregate_frame_stream(
+    mut stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
+    telemetry: Arc<RequestTelemetry>,
+    model_rewrite: Option<ModelRewrite>,
+) -> Result<AggregatedCompletion, GatewayError> {
     let mut buffer = String::new();
     let mut acc = CompletionAccumulator { rewrite: model_rewrite, ..Default::default() };
     // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
@@ -70,10 +91,9 @@ pub async fn aggregate_sse_completion(
     let mut first_chunk_seen = false;
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(|error| {
-            GatewayError::with_status(
-                502,
-                format!("上游流中断: {}", crate::server::core::egress::describe_error_detail(&error)),
-            )
+            // 错误描述已在构造时折进 io::Error（reqwest 直连在
+            // `aggregate_sse_completion`、翻译流在 `ProtocolTranslateStream`）
+            GatewayError::with_status(502, format!("上游流中断: {error}"))
         })?;
         if !first_chunk_seen {
             first_chunk_seen = true;

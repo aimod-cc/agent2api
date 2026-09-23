@@ -1,7 +1,7 @@
 //! 账号选路与 429 轮换（从 mod.rs 拆出，单文件行数约定）。
 //!
 //! 对应 Node 版 workbuddy-upstream-client.mjs 的这几段：
-//!   selectTargetAccount   三级选路（优先级挑 → 全限额时恢复最早 → 全禁用报 503）
+//!   selectTargetAccount   三级选路（优先级挑 → 全限额/全忙时恢复最早或按余量挤占 → 全禁用报 503）
 //!   withProxyNotice       代理解析失败时记日志并回退直连
 //!   requireSession        无可用登录态时报 401
 //!   markAccountLimited    限额标记落盘 + 恢复时间文案
@@ -38,6 +38,8 @@
 //! `providers::workbuddy::retry_advice`；**重试循环**留在编排层
 //! （`provider_loop::send_with_retry`），因为「重试几次、打什么日志」
 //! 是编排职责（架构文档 §4.3）。
+
+use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
@@ -84,9 +86,11 @@ pub(super) async fn session_for(
 
 /// 本次请求使用的账号（对照 Node 的 selectTargetAccount，三级顺序）。
 ///
-///   1. 按**全局**优先级选（跳过禁用与限额冷却中的账号），逐个向前找——
-///      跳过没有可用凭证的记录（避免选到空账号）；
-///   2. 启用中的账号都在该模型限额期内 → 挑恢复最早的一个试一次，
+///   1. 按**全局**优先级选（跳过禁用、限额冷却中与已达并发上限的账号），
+///      逐个向前找——跳过没有可用凭证的记录（避免选到空账号）；
+///   2. 剩下的启用账号都在限额冷却期 / 已达并发上限 → 先在「未达并发上限」
+///      的账号里挑恢复最早的一个试一次；一个都没有（全部达到并发上限）→
+///      按**余量**挤占账号强塞（取舍见下方代码处的说明），
 ///      把上游真实的 429（含恢复时间）返回给客户端；
 ///   3. 全部禁用 → 明确报 503，绝不回退到已禁用账号。
 ///
@@ -114,10 +118,13 @@ pub(super) async fn select_target_account(
         });
     }
 
+    // 在途计数快照取一次（锁是纳秒级的内存操作，见 connections.rs）：
+    // 第一级与第二级共用同一份，两级看到的「谁在忙」是同一时刻的事实。
+    let counts = connection_counts(service);
     let mut excluded: Vec<String> = tried_ids.to_vec();
     let now = logging::now_ms();
     loop {
-        let picked = routing::pick_account_by_priority(&accounts, keys, &excluded, now);
+        let picked = routing::pick_account_by_priority(&accounts, keys, &counts, &excluded, now);
         let Some(picked) = picked else {
             break;
         };
@@ -142,8 +149,21 @@ pub(super) async fn select_target_account(
         ));
     }
 
-    // 启用中的账号都在限额冷却期内：仍用恢复最早的那个试一次，
-    // 上游若已实际解除限额可直接成功，否则把真实 429 与恢复时间返回给客户端
+    // ── 第二级兜底（并发感知）──────────────────────────────────
+    // 启用中的账号都在限额冷却期内 / 已达并发上限时，仍挑一个试一次：
+    //   ① 先在「启用 + 未尝试 + 未达并发上限」的账号里挑**恢复最早**的
+    //      —— 上游若已实际解除限额可直接成功，否则把真实 429 与恢复时间
+    //      返回给客户端（与改造前同一条路，只多了并发这一道闸）；
+    //   ② 一个都没有（未尝试的账号**全部**达到并发上限）→ 挑**余量最大**
+    //      的账号强塞。
+    //
+    // ── 为什么 ② 强塞而不是报 503（本级的取舍）──────────────────
+    // 限流是「等得起」的：冷却有明确恢复时间，到点账号自然回来；并发挤占
+    // 则是**即刻自愈**的 —— 在途请求一轮对话结束后计数立刻回落（见
+    // connections.rs 的 Drop）。全部账号都忙时拒绝请求（503）只会把本可
+    // 服务的请求直接挡在门外，而强塞只意味着短暂超载 1-2 个（软上限口径见
+    // `routing::max_concurrent_of`）。所以：能等就等（①），等不了就挤（②），
+    // 永不因并发上限直接 503。
     let mut best_effort: Option<Value> = None;
     let mut best_reset = f64::INFINITY;
     for account in &enabled {
@@ -153,11 +173,27 @@ pub(super) async fn select_target_account(
         if tried_ids.iter().any(|tried| tried == id) {
             continue;
         }
+        // 已达并发上限的账号不进「正常兜底」候选 —— 它们是 ② 的原料
+        let limit = routing::max_concurrent_of(account);
+        if limit > 0 && counts.get(id).copied().unwrap_or(0) >= limit as usize {
+            continue;
+        }
         let reset = routing::rate_limit_reset_at(account, keys, now);
         let reset = if reset > 0 { reset as f64 } else { f64::INFINITY };
         if reset < best_reset {
             best_reset = reset;
             best_effort = Some(account.clone());
+        }
+    }
+    if best_effort.is_none() {
+        // ① 无果：在「全部达到并发上限」（或没有未尝试账号）时按余量挤占。
+        // 挑出的账号走与 ① 同一条收尾（取会话 → 组装选路结果）。
+        if let Some(account) = squeeze_by_headroom(&enabled, &counts, tried_ids, keys, now) {
+            if let Some(id) = routing::account_id(&account).map(str::to_string) {
+                if let Some(entry) = service.store.get_session_by_id(&id) {
+                    return Ok(with_proxy_notice(account, entry.proxy, entry.proxy_error, id));
+                }
+            }
         }
     }
     if let Some(account) = best_effort {
@@ -308,9 +344,74 @@ pub(super) fn account_limit_reset_at(service: &UpstreamService, account_id: &str
         .unwrap_or(0)
 }
 
+/// 全部账号达到并发上限时的**挤占**挑选：余量（`limit - count`）最大者优先。
+///
+/// ── 排序口径（任务约定，改动前先读）──────────────────────────
+///   · **不限（maxConcurrent == 0）= 无穷大余量**，永远排在有限上限之前 ——
+///     用 `i64::MAX` 近似：任何真实的 `limit - count` 都比它小；
+///   · 同余量挑**恢复最早**的（与 ① 的「恢复最早试一次」同一偏好：优先选
+///     「最可能马上恢复额度」的账号多打一个）；
+///   · `>` 严格比较保持候选顺序稳定（同余量同恢复时间时先见者优先）。
+///
+/// 挑中即打一行 verbose（verbose 级别不进运行日志页，只在终端/调试时可见
+/// —— 这是逐请求的事件，info 级会刷屏，但排障时必须找得到「为什么明明
+/// 设了上限还打到这个账号」的答案）。没有可挤的账号（全部已尝试过）时
+/// 返回 None，由调用方落到尾部的「无账号」兜底。
+fn squeeze_by_headroom(
+    enabled: &[Value],
+    counts: &HashMap<String, usize>,
+    tried_ids: &[String],
+    keys: &routing::CooldownKeys<'_>,
+    now: i64,
+) -> Option<Value> {
+    let mut squeezed: Option<Value> = None;
+    let mut best_headroom = i64::MIN;
+    let mut best_reset = f64::INFINITY;
+    for account in enabled {
+        let Some(id) = routing::account_id(account) else {
+            continue;
+        };
+        if tried_ids.iter().any(|tried| tried == id) {
+            continue;
+        }
+        let count = counts.get(id).copied().unwrap_or(0) as i64;
+        let limit = routing::max_concurrent_of(account) as i64;
+        let headroom = if limit > 0 { limit - count } else { i64::MAX };
+        let reset = routing::rate_limit_reset_at(account, keys, now);
+        let reset = if reset > 0 { reset as f64 } else { f64::INFINITY };
+        if headroom > best_headroom || (headroom == best_headroom && reset < best_reset) {
+            best_headroom = headroom;
+            best_reset = reset;
+            squeezed = Some(account.clone());
+        }
+    }
+    if let Some(account) = &squeezed {
+        logging::verbose(
+            "[Upstream]",
+            &format!(
+                "全部账号达到并发上限，按余量挤占账号「{}」",
+                account_display(account)
+            ),
+        );
+    }
+    squeezed
+}
+
+/// 当前在途请求计数的快照（账号 id → 请求数），选路的并发过滤用。
+///
+/// 从 `Connections` 的表里一次读出（`snapshot` 锁内克隆，纳秒级）。
+/// 拿不到运行时句柄的调用方传**空表** = 不做并发过滤（`pick_for_model`
+/// 的调用点 `api::session` 有句柄，正常传真值；`describe_route_decision`
+/// 属排障快照，传空表）。
+pub(super) fn connection_counts(service: &UpstreamService) -> HashMap<String, usize> {
+    service.connections().snapshot().into_iter().collect()
+}
+
 /// 下一个可用账号（全局队列，限定在 `providers` 各家的账号里，跳过已尝试的）。
 ///
 /// `keys` 见 [`select_target_account`]：冷却按各家真名判定。
+/// 走与第一级选路同一个 `pick_account_by_priority`，并发上限的过滤
+/// （与软上限口径）由此自动获得 —— 换号顺延不会把请求塞回一个已达上限的账号。
 pub(super) fn pick_next_account(
     service: &UpstreamService,
     providers: &[&str],
@@ -318,7 +419,8 @@ pub(super) fn pick_next_account(
     tried_ids: &[String],
 ) -> Option<Value> {
     let accounts = accounts_in_providers(service, providers);
-    routing::pick_account_by_priority(&accounts, keys, tried_ids, logging::now_ms())
+    let counts = connection_counts(service);
+    routing::pick_account_by_priority(&accounts, keys, &counts, tried_ids, logging::now_ms())
 }
 
 /// 该账号对该模型此前是否处于限额状态（用于「已恢复可用」日志的去噪）。

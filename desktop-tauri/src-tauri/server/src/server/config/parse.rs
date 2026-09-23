@@ -54,6 +54,17 @@ pub(super) fn env_text(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// 登录页人机验证组件环境变量，默认为1开启，0为关闭。
+///
+/// 只有配置里**没有** `captchaEnabled`（设置页从未改过）时才兜底 —— 优先级
+/// 「配置里的值 > 环境变量 > 内置默认」见模块头。除字面 `0` 之外一律按开启
+/// 处理：它是登录 / 注册的防爆破开关，写坏了宁可多一道校验。
+pub(super) fn env_captcha_enabled() -> bool {
+    std::env::var("AGENT2API_CAPTCHA_ENABLED")
+        .map(|value| value.trim() != "0")
+        .unwrap_or(true)
+}
+
 /// 从原始 JSON 里取非空字符串字段
 pub(super) fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
     map.get(key)

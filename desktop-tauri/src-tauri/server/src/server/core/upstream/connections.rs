@@ -142,7 +142,12 @@ impl ConnectionGuard {
     /// 的栈帧早就退出了 —— 凭证必须被 move 进流对象。**不是** clone：同一个账号
     /// 被两份凭证各 +1 会让计数翻倍，所以这里用 `take()` 转移所有权，
     /// 本对象的 `Drop` 随即变成空操作。
-    pub(super) fn handoff(&mut self) -> Self {
+    ///
+    /// 可见性是 `pub(in crate::server::core)`（而非 `pub(super)`）：自定义
+    /// 提供商的转发入口（`providers::custom::forward`）在成功转流式时同样要
+    /// 移交计数 —— 它在 `core` 的后代模块里，`pub(super)`（只到 `upstream`
+    /// 子树）够不到。调用面与 `attempt_queue` 的无状态路径逐字同构。
+    pub(in crate::server::core) fn handoff(&mut self) -> Self {
         Self {
             connections: self.connections.clone(),
             account_id: self.account_id.take(),

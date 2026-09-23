@@ -59,7 +59,9 @@ use crate::server::core::account_store::priority::next_free_priority;
 use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
-use crate::server::core::account_store::store_util::{pick_token, token_tail_of, truncate_chars};
+use crate::server::core::account_store::store_util::{
+    max_concurrent_public, pick_token, token_tail_of, truncate_chars,
+};
 use crate::server::core::account_store::{is_autoclaw_family, CredentialWrite, MAX_TOKEN_LENGTH};
 use crate::server::core::providers::autoclaw::{credentials, crypto, Region};
 use crate::server::logging;
@@ -709,6 +711,12 @@ impl AccountStore {
         if !reason.is_empty() {
             public.insert("reason".to_string(), Value::String(reason));
         }
+        // 单账号并发上限（所有家通用，兜底共用 `max_concurrent_public`）：
+        // 0 = 不限，缺键同样输出 0
+        public.insert(
+            "maxConcurrent".to_string(),
+            Value::from(max_concurrent_public(record.get("maxConcurrent"))),
+        );
         Value::Object(public)
     }
 }

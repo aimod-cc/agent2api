@@ -163,6 +163,11 @@ pub fn run() {
             commands::run_installer,
             commands::set_window_theme,
             commands::open_release_page,
+            // 自定义标题栏的窗口三键（窗口已 decorations(false)，见建窗处）
+            commands::window_minimize,
+            commands::window_toggle_maximize,
+            commands::window_close,
+            commands::window_is_maximized,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -263,8 +268,24 @@ pub fn run() {
             // 界面不会因为等待 node 启动而白屏。
             // 开机自启时不显示窗口（visible(false) 比先显示再隐藏更干净，
             // 不会在任务栏闪一下）。
+            //
+            // ── decorations(false)：去掉系统标题栏，换界面自绘的标题栏 ──
+            // 参考 OmniProxy 的 TitleBar：32px 高、左标题右三键，与界面
+            // 同一套配色（titlebar.js 动态创建）。无装饰之后三项原生行为
+            // 的恢复方式（Tauri 2 内建，无需额外代码）：
+            //   · 拖动 / 双击最大化：前端给标题栏元素声明 `data-tauri-drag-region`
+            //     属性 —— Tauri 的 core 脚本监听 mousedown，目标元素带该属性
+            //     才拖动（子元素不带不拖），双击（连击）切最大化；
+            //   · 边缘拖拽缩放：`resizable(true)`（默认即开）下，Windows 端
+            //     的 tao 对无装饰窗口做命中测试，边缘仍可拖拽缩放；
+            //   · 关闭：界面的 ✕ 走 window_close 命令 → CloseRequested，
+            //     与系统关闭按钮同一条事件路径，托盘拦截逻辑不变。
+            // 注：macOS 上这会一并去掉「红绿灯」，本项目面向 Windows
+            // （NSIS 安装包），macOS 如需保留要用 titleBarStyle: Overlay
+            // 另行适配，此处不做特殊处理。
             WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
                 .title("Agent2API · 多提供商本地网关")
+                .decorations(false)
                 .inner_size(WIN_WIDTH, WIN_HEIGHT)
                 .min_inner_size(WIN_MIN_WIDTH, WIN_MIN_HEIGHT)
                 .center()

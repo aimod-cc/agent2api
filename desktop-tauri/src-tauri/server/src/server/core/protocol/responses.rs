@@ -625,7 +625,10 @@ fn text_blocks_of(blocks: Option<&Value>) -> Option<String> {
 }
 
 /// 工具输出 → 文本（Chat 的 tool 消息 content 只接受字符串）
-fn tool_output_text(output: Option<&Value>) -> String {
+///
+/// `pub(super)`：出站方向（`responses_outbound`）把 chat 的 tool 消息折回
+/// `function_call_output` 时用同一口径，两处各写一份迟早分叉。
+pub(super) fn tool_output_text(output: Option<&Value>) -> String {
     let Some(output) = output else {
         return "(empty)".to_string();
     };
@@ -703,7 +706,10 @@ fn content_to_chat(content: &Value, role: &str) -> Value {
 }
 
 /// 图片块的 url（`image_url` 可以是字符串或 `{url}` 对象）
-fn image_url_of(part: &Value) -> String {
+///
+/// `pub(super)`：出站方向（`responses_outbound`）把 chat 的 image_url 块折成
+/// `input_image` 时取的是同一个值，口径共用一处。
+pub(super) fn image_url_of(part: &Value) -> String {
     let source = part.get("image_url").unwrap_or(part);
     match source {
         Value::String(url) => url.clone(),

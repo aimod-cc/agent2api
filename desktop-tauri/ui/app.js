@@ -156,6 +156,9 @@ function showPage(name, { persist = true } = {}) {
   // 导航项上的内容随页面变：日志未读徽标交给日志面板，更新提示在这里重画
   // （校验更新提示的可见性与所在页面有关，见 syncUpdateBadge）
   syncUpdateBadge();
+  // 请求日志徽标跟着换页立即重画：离开该页时进行中的请求要在 5 秒轮询之前
+  // 就位（进页时则由 paintRequestsBadge 收起 —— 页内有自己的读数）
+  paintRequestsBadge();
 }
 
 // ─── 顶栏状态 ─────────────────────────────────
@@ -321,22 +324,26 @@ async function syncLogsBadge() {
   }
 }
 
-// ─── 请求日志未读徽标（只提示失败请求） ─────────
+// ─── 请求日志导航徽标（进行中优先，其次未读失败） ─────────
 
 /**
- * 与日志徽标同一套水位机制，但口径换成**失败的请求**：
- * 数字含义是「已读水位之后新增的失败请求数」。
+ * 这颗徽标先后承载过两种数字，现在两种共存、按优先级画：
+ *   1. **进行中的请求数**（5 秒轻量轮询）：转发是否卡住在哪个页面都该第一眼看到，
+ *      不必等用户进请求日志页 —— 进行中的事是「现在」的，优先于历史的失败；
+ *   2. **未读失败数**（20 秒全局轮询 + 水位）：running 归零后，历史失败还有提示在。
  *
- * 请求日志没有日志那样的自增 id（按 ts 升序、用时间分页），水位只能取
- * 毫秒时间戳：进过一次请求日志页就把水位推到当下，之后的失败才算未读。
+ * 未读失败沿用水位机制：请求日志没有日志那样的自增 id（按 ts 升序、用时间分页），
+ * 水位只能取毫秒时间戳：进过一次请求日志页就把水位推到当下，之后的失败才算未读。
  * 「请求发起」与「设置水位」落在同一毫秒这种碰撞按未读算（start 是含边界）——
  * 宁可多提示一条，不冒漏提示的险；多提示的代价是进一次页面就清掉。
- *
- * 未读条数直接复用请求日志接口：`status=error&start=<水位>` 的 matched
- * 正是水位之后的失败数（与面板/报表同一个成功口径：非 2xx 或带错误摘要），
- * limit 压到 1 只为拿计数，明细不走网络之外的额外路径。
+ * 未读条数复用请求日志接口：`status=error&start=<水位>` 的 matched 正是水位之后的
+ * 失败数（与面板/报表同一个成功口径：非 2xx 或带错误摘要），limit 压到 1 只为拿计数。
  */
 let lastSeenReqTs = readSeenReqTs();
+/** 最近一次查到的进行中请求数（5 秒轻量轮询维护；0 = 没有） */
+let runningRequests = 0;
+/** 最近一次查到的未读失败数（20 秒全局轮询维护；0 = 没有） */
+let unreadFailures = 0;
 
 /** 读回持久化的水位；无值 / 值被改坏一律当作「还没有水位」（首次运行） */
 function readSeenReqTs() {
@@ -364,21 +371,56 @@ function clearRequestsBadge() {
   const badge = $('nav-count-requests');
   if (badge) badge.style.display = 'none';
   markRequestsSeen(Date.now());
+  // 水位推到当下 = 在此之前的失败都算已读：把内存里的计数一并归零，
+  // 否则离开页面后 paintRequestsBadge 会拿旧数把角标重新点亮
+  unreadFailures = 0;
+}
+
+/**
+ * 重画请求日志导航徽标。两种数字共用一颗徽标（都不亮就收起），
+ * 写法上收口到这一个函数：两条轮询各自只更新自己的计数，谁也不直接碰 DOM，
+ * 避免「20 秒一拍的失败查询把刚亮出的进行中数字又改回去」这种互相覆盖。
+ */
+function paintRequestsBadge() {
+  const badge = $('nav-count-requests');
+  if (!badge) return;
+  // 人就在请求日志页：页内已有「· M 进行中」读数，导航徽标不再重复
+  if (currentPage === 'requests') {
+    badge.style.display = 'none';
+    return;
+  }
+  if (runningRequests > 0) {
+    badge.textContent = runningRequests > 99 ? '99+' : String(runningRequests);
+    badge.title = `${runningRequests} 个请求正在转发中，点开「请求日志」查看`;
+    badge.style.display = '';
+    // 类名用 is-running 而不是 live：layout.css 里 .live 是**侧栏状态灯**
+    // （7px 圆点 + 绿底 + 光晕），加上它会把这颗数字角标压成小圆点 ——
+    // 两个组件恰好都叫「live 状态」，但一个是灯、一个是数字，样式不可共用。
+    badge.classList.add('is-running');
+    return;
+  }
+  badge.classList.remove('is-running');
+  if (unreadFailures > 0) {
+    badge.textContent = unreadFailures > 99 ? '99+' : String(unreadFailures);
+    badge.title = `${unreadFailures} 条失败请求未读，点开「请求日志」查看`;
+    badge.style.display = '';
+    return;
+  }
+  badge.style.display = 'none';
 }
 
 /** 查水位之后的失败请求数并重画徽标：挂在 20 秒全局轮询上 */
 async function syncRequestsBadge() {
-  const badge = $('nav-count-requests');
-  if (!badge) return;
   // 首次运行：把当下记为已读，否则一装上就挂着历史失败
   if (lastSeenReqTs === null) {
     markRequestsSeen(Date.now());
+    paintRequestsBadge();
     return;
   }
   // 人就在请求日志页：等于已经看到，水位推进到当下
   if (currentPage === 'requests') {
     markRequestsSeen(Date.now());
-    badge.style.display = 'none';
+    paintRequestsBadge();
     return;
   }
   try {
@@ -389,18 +431,42 @@ async function syncRequestsBadge() {
     });
     // 等待期间进了请求日志页：这次结果已过期，别拿旧数把刚清掉的角标又点亮
     if (currentPage === 'requests') return;
-    const unread = Number(result?.matched) || 0;
-    if (!unread) {
-      badge.style.display = 'none';
-      return;
-    }
-    badge.textContent = unread > 99 ? '99+' : String(unread);
-    badge.title = `${unread} 条失败请求未读，点开「请求日志」查看`;
-    badge.style.display = '';
+    unreadFailures = Number(result?.matched) || 0;
   } catch {
-    // 保持上一次的显示：查询偶尔失败不该反过来抹掉已有提示
+    return; // 保持上一次的显示：查询偶尔失败不该反过来抹掉已有提示
   }
+  paintRequestsBadge();
 }
+
+// ── 进行中请求的轻量轮询（5 秒）────────────────
+//
+// 单独起一条 5 秒定时器而不是搭 20 秒全局轮询：进行中的请求通常几秒就收尾，
+// 20 秒一拍会整段错过，徽标就永远等不到亮出的机会。查询压到 limit=1，
+// 只要 matched（计数），不拉明细。列表自身的 1 秒轮询只在请求日志页跑
+// （见 requests-panel.js 的 startAuto），人不在那页时，推进徽标的只有这里。
+let runningQueryBusy = false;
+
+async function syncRunningRequests() {
+  if (runningQueryBusy) return;
+  // 人已在请求日志页：不发查询（页内读数更准），徽标也由页面接管而不亮
+  if (currentPage === 'requests') return;
+  runningQueryBusy = true;
+  try {
+    const result = await api.getStatsRequests({ status: 'running', limit: 1 });
+    runningRequests = Number(result?.matched) || 0;
+  } catch {
+    return; // 保持上一次的显示：查询偶尔失败不该反过来抹掉已有提示
+  } finally {
+    runningQueryBusy = false;
+  }
+  paintRequestsBadge();
+}
+
+// 窗口隐藏时暂停（与 20 秒全局轮询同一取向）：后台页没有「第一眼」可言
+setInterval(() => {
+  if (document.hidden) return;
+  void syncRunningRequests();
+}, 5_000);
 
 // ─── 新版本可用提示 ───────────────────────────
 

@@ -142,6 +142,18 @@ pub(super) fn pick_token(payload: &Map<String, Value>, keys: &[&str]) -> String 
     String::new()
 }
 
+/// 公开形态的 `maxConcurrent`（单账号并发上限）读数：记录里没有该键 = 未设置
+/// = **不限**，统一输出数字 0。
+///
+/// 「缺键 → 0」的兜底**只写这一份**：七处公开形态（workbuddy 兜底形状 /
+/// custom / 小浣熊 / CatPaw / AutoClaw / Qoder / Cline）都经它取值 ——
+/// 消费方（选路 `routing::max_concurrent_of` 与前端账号菜单）按「0 = 不限」
+/// 解释，所以缺键与显式 0 在语义上等价；公开形态统一成恒有的数字键,
+/// 前端不必再判「字段存不存在」。
+pub(crate) fn max_concurrent_public(value: Option<&Value>) -> u64 {
+    value.and_then(Value::as_u64).unwrap_or(0)
+}
+
 /// 取对象成员；非对象（含数组）一律当空表 —— 对 `payload.auth` / `payload.account`
 /// 这类访问而言，与 Node 读出 undefined 的结果等价。
 pub(super) fn object_or_empty(value: Option<&Value>) -> Map<String, Value> {

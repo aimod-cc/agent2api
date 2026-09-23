@@ -46,7 +46,6 @@
     checkedInToday,
     checkinableAccounts,
     matchProvider,
-    matchEdition,
     matchEnabled,
     matchLimit,
     visibleAccounts,
@@ -213,8 +212,9 @@
    *
    * 菜单按「对转发的影响面」从大到小排：启用/禁用会改变这个账号是否参与转发，
    * 是最重的一项，故放在最前；「设为首选」只改队列顺序（不改启用状态），
-   * 排在它之后；删除账号同样是最重的改动，排在最后并由 <hr> 隔开。
-   * 首尾两项都标 danger：它们会立刻改变转发可用性。
+   * 排在它之后；「并发上限」是账号属性（标签里带当前值，0 = 不限），点击弹
+   * 小对话框（见 accounts-view.js）；删除账号同样是最重的改动，排在最后
+   * 并由 <hr> 隔开。首尾两项都标 danger：它们会立刻改变转发可用性。
    *
    * ── 「设为首选」本次从行上搬进来 ──────────────────────────────
    * 它原先在操作列里占一颗 62px 的按钮（四颗里最宽的一颗），而它回答的
@@ -253,6 +253,16 @@
       label: '设为首选',
       disabled: atFront,
       title: atFront ? '已在全局队列第一位' : '仅将优先级调整到全局第一位，不改变启用状态',
+    });
+    // 并发上限：**所有家通用**的账号属性（内置 + custom 都渲染这一项），
+    // 标签里带当前值 —— 0（含后端缺键，公开形态恒输出 0）显示「不限」，
+    // >0 显示具体数字。点击弹小对话框（处理在 accounts-view.js）。
+    // 判定口径与后端选路一致：`Number(x) || 0`，非数字脏值一律按不限算。
+    const maxConcurrent = Number(account.maxConcurrent) || 0;
+    items.push({
+      action: 'maxConcurrent',
+      label: maxConcurrent > 0 ? `并发上限：${maxConcurrent}` : '并发上限：不限',
+      title: '设置该账号同时最多处理的请求数（0 = 不限制）',
     });
     if (account.hasRefreshToken) {
       items.push({ action: 'refresh', label: '刷新 Token' });
@@ -327,7 +337,6 @@
     checkinableAccounts,
     // 筛选与队列
     matchProvider,
-    matchEdition,
     matchEnabled,
     matchLimit,
     visibleAccounts,

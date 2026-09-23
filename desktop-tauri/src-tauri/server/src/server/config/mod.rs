@@ -122,7 +122,8 @@ pub struct RuntimeConfig {
     /// 面板机器人校验开关（设置页「通用 → 机器人校验」，ALTCHA proof-of-work）。
     ///
     /// 与 `debug_mode` 同一理由：登录 / 注册端点逐请求判一次（改完开关下一个
-    /// 请求就生效），解析一次存下来最省事。默认 `true`，见 `KEY_CAPTCHA_ENABLED`。
+    /// 请求就生效），解析一次存下来最省事。默认 `true`，见 `KEY_CAPTCHA_ENABLED`；
+    /// 配置项缺失时可由环境变量 `AGENT2API_CAPTCHA_ENABLED` 兜底（默认 1 开、0 关）。
     captcha_enabled: bool,
     /// 系统提示词设置（设置页「通用 → 系统提示词」）。
     ///
@@ -378,11 +379,13 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .and_then(Value::as_bool)
             .unwrap_or(true),
         // 只有字面 `false` 算关闭：**默认开**。登录 / 注册的暴破与抢注防护
-        // 宁可多一道不可少一道（见 KEY_CAPTCHA_ENABLED 的说明）
+        // 宁可多一道不可少一道（见 KEY_CAPTCHA_ENABLED 的说明）。配置项缺失
+        // 时环境变量兜底：登录页人机验证组件环境变量，默认为1开启，0为关闭
+        // （见 env_captcha_enabled）
         captcha_enabled: raw
             .get(KEY_CAPTCHA_ENABLED)
             .and_then(Value::as_bool)
-            .unwrap_or(true),
+            .unwrap_or_else(env_captcha_enabled),
         // 系统提示词：模式非法/缺失 → passthrough（默认），文件读不到 → 内置默认
         // + 一条原因（见 `prompt_from`）
         prompt: prompt_from(&raw),

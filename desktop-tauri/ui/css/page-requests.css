@@ -74,6 +74,103 @@
 /* 无值占位（重试 / 错误列的「-」）：比正文淡一档，空着会被当成渲染缺失 */
 .req-none { color: var(--text-3); }
 
+/* ─── 进行中的行（status=0，转发还没收尾）─────────────────────
+   后端契约：转发一开始就插一条 status=0 的行，收尾后由终态记账覆盖
+   （见 stats_api::stats_requests）。行本身不加底色 —— 它还没落定，
+   红底（.failed）是终态的颜色，进行中的信号交给状态徽章那一格。 */
+
+/* 进行中徽章：info 色系（成功 / 失败都不是，它是中间态）。
+   形制对齐 .badge.tag.ok / .badge.tag.bad（components.css），只换配色 ——
+   那两个类没有「蓝」这个语义值，就地用 --info 组（tokens.css 浅深两套都有）。 */
+.badge.tag.running {
+  background: var(--info-soft);
+  border: 1px solid var(--info-bd);
+  color: var(--info);
+}
+
+/* 徽章里的呼吸圆点：1.2s 一拍的不透明度脉动 —— 不用进度条，
+   状态列只有 68px 宽塞不下，圆点的「活着」感刚好。currentColor 跟随
+   徽章文字色，深浅主题都由 --info 一处决定。 */
+.req-live-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: req-live-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes req-live-pulse {
+  0%, 100% { opacity: .3; transform: scale(.75); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
+/* 系统开了「减少动态效果」就停在常亮：信息还在，动效退场 */
+@media (prefers-reduced-motion: reduce) {
+  .req-live-dot { animation: none; opacity: .8; }
+}
+
+/* ─── 导航徽标的「进行中」态 ──────────────────────────────────
+   #nav-count-requests 两种数字共用一颗：进行中走 info 蓝（.is-running），
+   未读失败维持 layout.css 的既有红。用 ID 选择器是为了稳定压过
+   .nav-item .count:not(.muted) 的红色（与 update-notes.css 同一手法）。
+
+   类名**刻意不叫 live**：layout.css 的 .live 是侧栏状态灯（7px 圆点、
+   绿底、光晕），同一个类名会把角标压成小圆点（数字挤在 7px 高度里）。
+   两颗组件都表达「活着」，但一个是灯、一个是数字，样式不能共用。 */
+#nav-count-requests.is-running {
+  border-color: var(--info-bd);
+  background: var(--info-soft);
+  color: var(--info);
+}
+
+/* 选中态导航项底色更深，保持同样的分离度（对齐 layout.css 的 active 覆盖） */
+.nav-item.active #nav-count-requests.is-running { background: var(--surface); }
+
+/* ─── 清理请求日志弹窗（request-clear-modal.js）───────────────
+   两种清理方式做成单选卡片而不是 seg：两种方式的差别（删不删统计行、
+   动不动日报）必须写在选择的当下 —— seg 只放得下名字，放不下后果说明。 */
+
+.clear-modes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.clear-mode {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  cursor: pointer;
+  transition: border-color .15s ease, background .15s ease;
+}
+
+/* 单选钮独占左列竖向居中；标题与说明右列上下两行 */
+.clear-mode input[type="radio"] {
+  grid-row: 1 / 3;
+  align-self: center;
+  margin: 0;
+}
+
+.clear-mode .t { color: var(--text); font-size: 13px; font-weight: 600; }
+.clear-mode .d { color: var(--text-3); font-size: 11.5px; line-height: 1.55; }
+
+.clear-mode:hover { border-color: var(--border-strong, var(--border)); }
+
+/* 选中卡片走品牌浅底（与 .seg-item.active 同一观感），JS 负责切换 .active
+   （不依赖 :has —— 选择器支持面比 WebView 版本预期更挑） */
+.clear-mode.active {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+.clear-mode.active .t { color: var(--primary-fg); }
+
+/* 预览统计一行：贴在方式卡片下面，随每次 clear-preview 刷新 */
+.rcm-preview { margin-top: 10px; }
+
 /* 时间列：日期 + 时刻两行，等宽避免每一行的冒号错位。
    数据格与表头格共用同一个类名（窄窗口要按列重排，见文件末尾的媒体查询），
    所以每一条排版声明都带 .req-row 前缀限定在数据行上 —— 否则表头会被一并
@@ -390,15 +487,19 @@
 /* 敏感词命中：紫色（OmniProxy 的 Tag color="purple"）。
    tokens.css 没有紫色语义变量，这里就地取一个色相的固定值而不是新加一个
    token —— 全站只有这一处需要紫色，进 tokens.css 会让人以为它是通用语义色。
-   浅深两套各写一份：同一组紫在浅底与深底上需要的明度不同。 */
-.req-hover-tag.sensitive {
+   浅深两套各写一份：同一组紫在浅底与深底上需要的明度不同。
+   .badge.tag.sensitive 是详情弹窗「请求详情」网格里的展开形态（词 × 次数），
+   与列表的悬停标签共用同一套紫（见 request-detail.js 的 sensitiveHtml）。 */
+.req-hover-tag.sensitive,
+.badge.tag.sensitive {
   background: oklch(0.55 0.18 305 / 14%);
   border: 1px solid oklch(0.55 0.18 305 / 32%);
   color: oklch(0.45 0.18 305);
 }
 
 @media (prefers-color-scheme: dark) {
-  .req-hover-tag.sensitive {
+  .req-hover-tag.sensitive,
+  .badge.tag.sensitive {
     background: oklch(0.7 0.16 305 / 16%);
     border-color: oklch(0.7 0.16 305 / 34%);
     color: oklch(0.82 0.12 305);
@@ -551,3 +652,174 @@
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+
+/* ─── 详情弹窗的三标签版（本次改造）：请求详情网格 / 预览对话气泡 ───
+   三个标签本体复用 .seg / .seg-item（与时间档位同一套）；「原始报文」标签
+   内的四段由原来的分段切换改为竖排（每段一个 .req-detail-pre，内部滚动），
+   所以这里补了段落之间的上边距。下方是请求详情网格与对话气泡两块新样式，
+   都只用现有 CSS 变量，深浅两套主题自动跟随。 */
+
+/* 原始报文：四块竖排之间的分隔（pre 自带 max-height 与滚动，见上） */
+.req-detail-pane h3:not(:first-child) { margin-top: 16px; }
+
+/* ① 请求详情：两列网格（label 列 + value 列）。整体不描边、只画行分隔线 ——
+   弹窗里内容已经分层，再包一层边框会显得过重（形制对齐 .req-detail-meta）。 */
+.req-detail-grid {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.req-detail-grid th,
+.req-detail-grid td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--hairline);
+  text-align: left;
+  vertical-align: top;
+}
+
+.req-detail-grid tr:last-child th,
+.req-detail-grid tr:last-child td { border-bottom: 0; }
+
+.req-detail-grid th {
+  width: 76px;
+  color: var(--text-3);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.req-detail-grid td { color: var(--text-2); word-break: break-word; }
+
+/* 网格里的辅助小字（账号括注、耗时注解等） */
+.req-detail-sub { color: var(--text-3); font-size: 11.5px; }
+
+/* 错误值：与列表错误列同一语义色 */
+.req-detail-error { color: var(--danger); }
+
+/* 模型两行：⬆️ 上游 / ⬇️ 下游（与列表模型列同构，字号随网格） */
+.req-detail-model-split { display: flex; flex-direction: column; gap: 2px; }
+.req-detail-model-split .sub { color: var(--text-3); }
+
+/* 尝试明细小表格（每次上游尝试一行） */
+.req-attempt-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.req-attempt-table th,
+.req-attempt-table td {
+  padding: 4px 8px;
+  border: 1px solid var(--hairline);
+  text-align: left;
+  vertical-align: top;
+  word-break: break-word;
+}
+
+.req-attempt-table th {
+  color: var(--text-3);
+  font-weight: 600;
+  white-space: nowrap;
+  background: var(--surface-2, var(--surface));
+}
+
+/* 结果的三态配色与 request-hover 的尝试行同源：成功绿、失败红、未定论灰 */
+.req-attempt-ok { color: var(--ok); }
+.req-attempt-bad { color: var(--danger); overflow-wrap: anywhere; }
+.req-attempt-more td { color: var(--text-3); }
+
+/* ② 预览对话：气泡流（形态照 OmniProxy 的 ConversationPreview，
+   配色换算到本项目的 tokens）。滚动收在 .cv 内，弹窗自身不被长对话撑破。 */
+.cv {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 480px;
+  padding: 2px;
+  overflow-y: auto;
+}
+
+/* 一行的落位：user 靠右、assistant 靠左、system 居中 */
+.cv-row { display: flex; justify-content: flex-start; }
+.cv-row.user { justify-content: flex-end; }
+.cv-row.sys { justify-content: center; }
+
+/* 气泡本体：最大宽度 75%（system 90%），长单词强制断行 */
+.cv-msg {
+  max-width: 75%;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  line-height: 1.65;
+  overflow-wrap: break-word;
+}
+
+/* user 气泡：主色底白字，输入是纯文本（不做 markdown，见 conversation-preview
+   的 userInner 说明），保留原有换行与空白 */
+.cv-msg.user { background: var(--primary); color: #fff; }
+.cv-plain { white-space: pre-wrap; }
+
+/* assistant 气泡：抬升表面色 + 细描边 */
+.cv-msg.assistant { background: var(--surface-2); border: 1px solid var(--hairline); }
+
+/* system（提示词）/ 错误条：全宽灰条，淡一档 */
+.cv-msg.sys {
+  max-width: 90%;
+  background: var(--surface-inset);
+  color: var(--text-2);
+  font-size: 12px;
+  border-radius: 8px;
+}
+
+.cv-msg.cv-error { background: var(--danger-soft); color: var(--danger); }
+
+/* markdown 正文（.md-body 排版来自 update-notes.css）：收紧首尾与段间距，
+   不让弹窗里留出面板级的大边距 */
+.cv-msg.md-body > :first-child { margin-top: 0; }
+.cv-msg.md-body > :last-child { margin-bottom: 0; }
+.cv-msg.md-body p { margin: 6px 0; }
+.cv-msg.md-body .md-pre { max-height: 240px; overflow: auto; }
+
+/* 气泡内的图片（请求里的多模态段 / 工具结果） */
+.cv-img {
+  display: block;
+  max-width: min(280px, 100%);
+  max-height: 220px;
+  margin: 6px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+/* 折叠块：思考过程 / 工具结果 / 解析降级的原文 */
+.cv-details { margin-top: 6px; min-width: 0; }
+.cv-details > summary {
+  cursor: pointer;
+  color: var(--text-3);
+  font-size: 11.5px;
+  user-select: none;
+}
+.cv-details[open] > summary { margin-bottom: 4px; }
+.cv-reasoning { color: var(--text-2); font-size: 12px; }
+
+/* 工具结果：全宽虚线框，与对话气泡在视觉上区分开 */
+details.cv-tool {
+  max-width: 88%;
+  padding: 6px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+}
+
+details.cv-tool > summary { cursor: pointer; color: var(--text-3); }
+
+/* 工具调用块（助手气泡内）：标题 + 参数原文 */
+.cv-toolcall { margin-top: 8px; }
+.cv-toolcall-name { margin-bottom: 3px; color: var(--text-3); font-size: 11.5px; }
+.cv-pre { max-height: 220px; font-size: 11px; }
+
+/* 解析失败的说明行（原文折叠跟在它后面）/ 读取侧的截断提示 */
+.cv-parse-empty { color: var(--text-3); font-size: 12px; }
+.cv-truncated { margin-bottom: 8px; color: var(--warn); font-size: 11.5px; }

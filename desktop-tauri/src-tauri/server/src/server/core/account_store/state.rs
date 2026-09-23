@@ -298,8 +298,23 @@ impl StoredAccount {
     ///
     /// workbuddy 账号与其它 provider 的普通账号不受影响（它们的 `desktop`
     /// 字段不存在 → 判据退化成 `has_token()`，与改造前逐字相同）。
+    ///
+    /// 第三条判据是自定义提供商账号（`account_store::custom_accounts`）：它
+    /// 的凭证键是 `apiKey` 而不是 `accessToken` —— 不加这一条，自定义账号会
+    /// 在「当前账号派生」「账号列表的 hasCredentials」两处被判成无凭证而
+    /// 静默消失。判据只看「记录里有没有非空 `apiKey`」，不判 provider：
+    /// 内置八家的记录里没有这个键，判定天然不受影响（也就不必在这里回头
+    /// 依赖 `custom_providers`）。
     pub fn has_credentials(&self) -> bool {
-        self.has_token() || self.is_desktop()
+        self.has_token() || self.is_desktop() || self.has_api_key()
+    }
+
+    /// 记录里是否有**非空**的 `apiKey`（自定义提供商账号的凭证键，见上）
+    pub fn has_api_key(&self) -> bool {
+        self.fields
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.trim().is_empty())
     }
 
     /// 小浣熊账号的用户 ID（`userId`；workbuddy 侧对应 `uid`）

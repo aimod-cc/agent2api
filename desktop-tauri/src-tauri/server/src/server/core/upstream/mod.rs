@@ -124,7 +124,12 @@ impl InFlight {
 /// 因此这里把「槽位」从选路函数里延长到流本身：流式分支把本凭证交给
 /// `ForwardStream`，流跑完（或客户端断开、流被 drop）时凭证析构，
 /// 槽位才释放。非流式分支的凭证在 `forward()` 返回时析构 —— 与 Node 一致。
-pub(super) struct InFlightGuard {
+///
+/// 可见性是 `pub(crate)`（而非 `pub(super)`）：自定义提供商的转发入口
+/// （`providers::custom::forward`，pub 函数）的签名里带着它 —— 类型比
+/// 调用面窄会触发 `private_interfaces` 告警；持凭证的永远是 `upstream`
+/// 内部的编排层，这个类型本身没有更多暴露面。
+pub(crate) struct InFlightGuard {
     table: Arc<Mutex<HashMap<String, Arc<InFlight>>>>,
     key: String,
     signal: Arc<InFlight>,
@@ -377,8 +382,14 @@ fn lock_table<'a>(
 /// server.mjs 551-554）。这里做同一件事：把两帧塞进流再正常结束 ——
 /// 对 OpenAI SDK 来说，这比「连接被截断」更容易识别成一次失败的补全。
 pub struct ForwardStream {
-    /// 上游字节流（已 consume 掉 Response，流自身是 'static）
-    inner: futures::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    /// 上游字节流（已 consume 掉 Response，流自身是 'static）。
+    ///
+    /// 错误统一成 `io::Error`：`new`（reqwest 直连）在 map 时就把错误用
+    /// `describe_error_detail` 描述成文案折进去（那个函数只认 reqwest::Error，
+    /// 转换后 poll_next 只拿得到文案）；`from_translated`（翻译协议）的转换层
+    /// 同样上抛 io::Error。两个来源在 poll_next 里共用同一条「错误帧 + [DONE]」
+    /// 收尾，描述口径也一致。
+    inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
     coalescer: ReasoningCoalescer,
     /// 上游已结束（不再 poll 上游，只把 pending 吐完）
     upstream_done: bool,
@@ -412,10 +423,34 @@ impl ForwardStream {
         telemetry: Arc<usage::RequestTelemetry>,
         model_rewrite: Option<ModelRewrite>,
     ) -> Self {
+        use futures::StreamExt;
+        // reqwest 错误在这里就地描述成文案（`describe_error_detail` 认的是
+        // reqwest::Error；折进 io::Error 之后 poll_next 只能拿到文本）
+        let inner = response.bytes_stream().map(|item| {
+            item.map_err(|error| {
+                std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
+            })
+        });
+        Self::from_translated(Box::pin(inner), slot, connection, telemetry, model_rewrite)
+    }
+
+    /// 翻译协议的构造入口：`inner` 已经是**标准 chat SSE** 帧流。
+    ///
+    /// 自定义家的 responses / anthropic 上游先过 `providers::custom` 的
+    /// `ProtocolTranslateStream`（上游协议事件 → chat 帧），再进本流的
+    /// reasoning 合并 / usage 提取 / model 回写 —— 那三层只认 chat 帧，
+    /// 不需要知道上游原本是什么协议。
+    pub(super) fn from_translated(
+        inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
+        slot: Option<InFlightGuard>,
+        connection: ConnectionGuard,
+        telemetry: Arc<usage::RequestTelemetry>,
+        model_rewrite: Option<ModelRewrite>,
+    ) -> Self {
         // 采集器在构造时取一次（见字段说明）
         let capture = telemetry.capture();
         Self {
-            inner: Box::pin(response.bytes_stream()),
+            inner,
             coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone())
                 .with_model_rewrite(model_rewrite),
             upstream_done: false,
@@ -470,8 +505,8 @@ impl Stream for ForwardStream {
                     for frame in self.coalescer.finish() {
                         self.pending.push_back(frame);
                     }
-                    let detail = crate::server::core::egress::describe_error_detail(&error);
-                    let message = format!("上游流中断: {detail}");
+                    // 错误描述已在构造时折进 io::Error（见 inner 字段说明）
+                    let message = format!("上游流中断: {error}");
                     // 只在终端：这条原因由下面的 `note_error` 进请求日志
                     // （客户端此时已收到部分内容，HTTP 状态早就是 200，
                     // 只有请求日志的「错误」列能解释「为什么这条是失败的」）。

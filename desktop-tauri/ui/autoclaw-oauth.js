@@ -476,6 +476,16 @@
     let busy = false;
     /** 最近一次发起的 state（仅用于日志与「有没有发起过」的判断） */
     let activeState = '';
+    /**
+     * 流程代际号：cancel() 把它 +1 作废当前一轮，旧 start() 里各处异步落定
+     * （迟到的验证码结果、壳侧登录返回）对照它发现过期就**不再碰 UI**。
+     *
+     * 没有它的话，cancel() 里「立即复位界面」与旧 start() 的 finally 复位会
+     * 互相踩：用户关弹窗后马上重开再点按钮，旧一轮此时才从壳侧返回 canceled，
+     * 它的 finally 会把新一轮刚画上去的「请完成验证…」复位掉，busy 也被清零，
+     * 第三次点击就放进来了。
+     */
+    let flowGeneration = 0;
 
     const setHint = text => {
       const node = hint();
@@ -506,19 +516,17 @@
     }
 
     /**
-     * 「取消等待」按钮的显隐。
+     * 「取消」按钮的显隐。
      *
-     * ── 为什么要有这个按钮（曾经没有）──────────────────────────
-     * 这条链在拿到授权地址之后才进入「等登录」那一段，而那一段分两种打开方式：
-     *   · 内嵌窗口：取消由窗口承担（关窗即取消，壳侧立刻结束等待）；
-     *   · 系统浏览器：**没有窗口可关** —— 关掉浏览器不影响等待（登录可能已经
-     *     完成，壳侧照旧轮询），用户想放弃时只剩「关掉整个弹窗」这一条路，
-     *     而那是个语义更重、也更难被发现的操作。
-     * 因此这里给一个显式的取消入口，与另外四家网页登录的「取消等待」同款。
+     * ── 为什么全程显示（曾经只在「拿到授权地址之后」）──────────
+     * 这条链在拿到授权地址之前还有一段**滑块验证**，而那段恰恰是用户最想
+     * 反悔的时候：滑块面板右上角的关闭 SDK 不回调（我们无从感知），此前
+     * 又没有显式的取消入口，界面就停在「请完成验证…」干等 120 秒超时。
+     * 因此按钮从发起那一刻就挂出来 —— 验证码阶段点它 = 作废滑块等待；
+     * 拿到地址后的等待登录阶段点它 = 撤掉壳侧那一轮（两种语义 cancel()
+     * 里按进度自动分流，按钮本身不需要变）。
      *
-     * 只在**已进入等待**（拿到授权地址、`activeState` 有值）时显示：验证码
-     * 那一段在弹窗里，取消就是关掉弹窗或重来，给按钮反而说不清它取消的是
-     * 「验证码」还是「登录」。
+     * 系统浏览器模式下没有窗口可关，这个按钮更是唯一的取消出口。
      */
     function paintCancel(visible) {
       const node = cancelButton();
@@ -537,13 +545,17 @@
     async function start(vendor) {
       if (busy) return;
       const bridge = window.workbuddyDesktop;
-      if (!bridge?.startAutoclawOauth || !bridge?.getAutoclawOauthCaptchaConfig) {
+      if (!bridge?.startAutoclawOauth || !bridge?.getAutoclawOauthCaptchaConfig
+        || !bridge?.startAutoclawOauthLogin) {
         window.wbApp.toast('当前壳版本不支持 AutoClaw 网页登录，请更新应用', 'err');
         return;
       }
       busy = true;
+      const flow = ++flowGeneration;
       paintBusy(true, '准备验证…');
       setHint('');
+      // 取消按钮从发起那一刻就挂着（理由见 paintCancel 的说明）
+      paintCancel(true);
       try {
         // ① 风控配置。`enabled: false` = 这一家没有这条登录方式（国内版就是这个值）
         const captchaConfig = await bridge.getAutoclawOauthCaptchaConfig(prefix);
@@ -553,66 +565,78 @@
         if (!captchaConfig.prefix || !captchaConfig.sceneId) {
           throw new CaptchaError('风控验证配置不完整，请稍后重试');
         }
-        // ② 跑验证码。`request` 就是第 ③ 步 —— SDK 拿到验证串后会调它
+        // ②③ 跑验证码 → 拿验证串 → 换授权地址。**到此为止，不再多走一步**：
+        // `request` 一返回 SDK 就收起滑块（bizResult=true），120 秒的验证码超时
+        // 也只包着「拖滑块 + 换地址」。等登录动辄几分钟，塞在这里面会被验证码
+        // 超时误杀 —— 前端报「验证码校验超时」复位，壳与网关却还在等回调，
+        // 用户随后真完成登录时账号加了、界面却毫无反应（三方状态错乱）。
         paintBusy(true, '请完成验证…');
         setHint('请在弹出的滑块中完成验证（官方要求的风控步骤）');
-        const result = await requestAliyunPopupCaptcha(
+        const started = await requestAliyunPopupCaptcha(
           {
             region: captchaConfig.region || 'ga',
             prefix: captchaConfig.prefix,
             sceneId: captchaConfig.sceneId,
           },
           async captchaVerifyParam => {
-            paintBusy(true, '正在打开登录页…');
-            setHint('验证通过，正在获取授权地址…');
-            const started = await bridge.startAutoclawOauth(prefix, vendor, captchaVerifyParam);
-            // 上游是否给了授权地址 = 我们的「业务结果」
-            const authUrl = String(started?.authUrl || '').trim();
+            const answer = await bridge.startAutoclawOauth(prefix, vendor, captchaVerifyParam);
+            const authUrl = String(answer?.authUrl || '').trim();
             if (!authUrl) {
               throw new CaptchaError('未能获取授权地址，请重试');
             }
-            activeState = String(started?.state || '');
-            // 打开方式在这里**现读**（用户在跑验证码期间也可能切了那一级），
-            // 并且文案随它分叉：系统浏览器下没有「窗口」可关，说「窗口中」
-            // 会让用户去找一个不存在的窗口
-            const mode = modeOf();
-            setHint(mode === 'external'
-              ? '已用系统默认浏览器打开登录页，请在浏览器中完成登录…'
-              : '已打开官方登录页，请在窗口中完成登录…');
-            paintCancel(true);
-            // ④ 交给壳开窗口 / 打开浏览器（阻塞到登录完成/取消/超时）
-            const outcome = await bridge.startAutoclawOauthLogin(activeState, authUrl, mode);
-            return {
-              captchaResult: true,
-              bizResult: Boolean(outcome?.ok),
-              // 把壳的结果透出去（下面用它决定成功与否）
-              outcome,
-            };
+            // bizResult 的语义 = 上游给没给授权地址（见文件头）——给了就算过，
+            // SDK 收起滑块；地址与 state 由返回值带给 start()（started.answer）
+            return { captchaResult: true, bizResult: true, answer };
           },
         );
+        // 等待期间可能已被取消（点取消 / 关弹窗）：迟到的结果不得再碰 UI
+        if (flow !== flowGeneration) return;
+        const authUrl = String(started?.answer?.authUrl || '').trim();
+        activeState = String(started?.answer?.state || '');
+        // 打开方式在这里**现读**（用户在跑验证码期间也可能切了那一级），
+        // 并且文案随它分叉：系统浏览器下没有「窗口」可关，说「窗口中」
+        // 会让用户去找一个不存在的窗口
+        const mode = modeOf();
+        paintBusy(true, '等待登录完成…');
+        setHint(mode === 'external'
+          ? '已用系统默认浏览器打开登录页，请在浏览器中完成登录…'
+          : '已打开官方登录页，请在窗口中完成登录…');
+        // ④ 交给壳开窗口 / 打开浏览器（阻塞到登录完成/取消/超时）。壳侧自带
+        // 5 分钟兜底，不受上面 120 秒验证码超时的约束。
+        const outcome = await bridge.startAutoclawOauthLogin(activeState, authUrl, mode);
+        if (flow !== flowGeneration) return;
         activeState = '';
-        if (!result?.outcome?.ok) {
+        if (!outcome?.ok) {
           // 用户取消（关窗 / 点取消 / 关弹窗）：不报错，只提示
           window.wbApp.toast('已取消登录等待');
           return;
         }
-        await config.onSuccess?.(result.outcome);
+        await config.onSuccess?.(outcome);
       } catch (error) {
+        // 已被作废的轮次：UI 由 cancel() 复位过，这里什么都不做（含不报错）
+        if (flow !== flowGeneration) return;
         if (error instanceof CaptchaCancelledError) {
           window.wbApp.toast('已取消验证码');
           return;
         }
+        // 换地址失败（风控没过 / 上游拒绝）：滑块面板还停在「验证中」，作废实例
+        // 让它收起 —— 否则面板与报错同时在场，用户不知道该信哪一个
+        invalidateInitialization();
         const reason = describeError(error);
         setHint(`登录失败：${reason}`);
         window.wbApp.toast(`登录失败：${reason}`, 'err');
       } finally {
-        activeState = '';
-        busy = false;
-        paintBusy(false, '');
-        paintCancel(false);
-        // 恢复空闲提示（不是清空）：那一行同时承担「打开方式是什么、会怎么打开」
-        // 的说明职责，清掉之后用户切回来看到的是一片空白
-        setHint(idleHint());
+        // 只复位「仍是当前这一轮」的流程；被 cancel 作废的轮次由 cancel 自己
+        // 复位，迟到的落定不得覆盖新一轮刚画上去的状态
+        if (flow === flowGeneration) {
+          activeState = '';
+          busy = false;
+          paintBusy(false, '');
+          paintCancel(false);
+          // 恢复空闲提示（不是清空）：那一行同时承担「打开方式是什么、会怎么打开」
+          // 的说明职责，清掉之后用户切回来看到的是一片空白
+          setHint(idleHint());
+        }
       }
     }
 
@@ -634,24 +658,29 @@
         if (!busy) setHint(idleHint());
       },
       /**
-       * 取消等待中的登录（「取消等待」按钮与弹窗关闭时都由它）。
+       * 取消（「取消」按钮与弹窗关闭时都由它）。
        *
-       * 两件事都要做：作废本地验证码等待（用户可能正拖滑块），以及通知网关
-       * 把那个登录任务从表里清掉（否则它会留到 5 分钟超时）。
+       * 三件事：
+       *   1. **先作废流程代际并立即复位 UI** —— 旧 start() 此刻多半还挂在
+       *      `startAutoclawOauthLogin` 上（壳侧要等 IPC 往返才返回 canceled），
+       *      不能指望它的 finally；不复位的话，关掉弹窗重开看到的还是转圈按钮。
+       *   2. 作废本地验证码等待（用户可能正拖滑块）。
+       *   3. 通知壳撤掉那一轮登录 —— 否则壳侧的等待循环要空转到 5 分钟超时。
        *
        * `cancelLogin` 是按「当前活动登录」取消的（壳侧只记一个），因此不需要
        * 把 state 传过去 —— 这也正是 `activeState` 只用于「有没有发起过」的
-       * 判断、不参与取消的原因。
-       *
-       * 只在「确实有东西在等」时通知网关：没发起过就调 `cancelLogin` 会去问
-       * 一个不存在的登录任务（壳侧 `current_login` 返回 None，它自己会早退，
-       * 但白打一次 IPC 没有意义）。
+       * 判断、不参与取消的原因。没发起过登录任务就不打这次 IPC（壳侧会早退，
+       * 但白打一次没有意义）。
        */
       cancel() {
-        const wasWaiting = Boolean(activeState);
+        flowGeneration += 1;
         const cancelledCaptcha = cancelAliyunPopupCaptcha();
+        const wasWaiting = Boolean(activeState);
         activeState = '';
+        busy = false;
+        paintBusy(false, '');
         paintCancel(false);
+        setHint(idleHint());
         if (wasWaiting || cancelledCaptcha) {
           window.workbuddyDesktop?.cancelLogin?.().catch(() => {});
         }

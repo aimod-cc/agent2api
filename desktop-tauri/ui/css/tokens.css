@@ -104,6 +104,10 @@
   /* 尺寸 */
   --sidebar-w: 216px;
   --topbar-h: 50px;
+  /* 自定义标题栏高度（桌面端）：主窗口去掉了系统装饰（src-tauri 建窗处
+     decorations(false)），界面自绘 32px 标题条补上三键与拖动区（titlebar.js）。
+     网页端不创建标题栏，该变量只在 body.has-titlebar 的规则里被引用。 */
+  --titlebar-h: 32px;
   --pad: 20px;
   /* 内容区最大宽度（不含侧边栏）。用 vw 而不是 %：
      % 相对的是「已排除侧边栏和内边距」的可用宽度，那样任何窗口下都会被限制成 80%，

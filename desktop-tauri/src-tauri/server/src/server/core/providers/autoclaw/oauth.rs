@@ -171,7 +171,7 @@ pub const CALLBACK_PATH_PREFIX: &str = "/auth/callback-";
 /// 是 `localhost`（理由见 [`CALLBACK_PATH_PREFIX`] 的说明）。
 pub fn navigate_uri(callback_base: &str, vendor: Vendor) -> String {
     format!(
-        "{}{}/{}",
+        "{}{}{}",
         callback_base.trim_end_matches('/'),
         CALLBACK_PATH_PREFIX,
         vendor.id()

@@ -134,6 +134,27 @@ pub async fn chat_completions(
     // 原始请求体**的哈希，与「某一家是否被处理」无关。
     let dedupe_key = pipeline::sha256_hex(&body);
     let telemetry = Arc::new(RequestTelemetry::with_id());
+    // 「进行中」行：模型解析已成功、转发即将开始 —— 先插一条 status=0 的明细，
+    // 让请求日志在响应还没跑完时就能看到这条请求（收尾时由 `record` 的 UPDATE
+    // 补全终态字段，生命周期见 `RequestStats::record_started`）。早失败路径
+    // （record_early_failure）没有 id，不插。id 取 telemetry 里刚生成的那个
+    // —— 它与调试报文、收尾记账用的是同一个。
+    let telemetry_id = telemetry.snapshot().id;
+    state
+        .request_stats()
+        .record_started(&telemetry_id, started_at, &requested_model, &client_model);
+    // 在途回写：选路一定就把「谁在承载」、发送体一定稿就把「上游真名」写进这条
+    // 进行中行（连同尝试链、首响、脱敏命中）—— 列表页 1 秒轮询，于是这些读数在
+    // 转发期间就能看到，不必等收尾。接线在这里、core 只持有闭包，理由见
+    // `pipeline::live_row_sink`
+    telemetry.set_live_sink(pipeline::live_row_sink(
+        state.request_stats(),
+        telemetry_id,
+        started_at,
+    ));
+    // 下游原始请求体在此刻抄一份（request_raw 表的请求侧，见 `raw_body_text`）：
+    // body 还是客户端发来的原值；送进转发层后 payload 会被就地改写（默认模型注入）
+    let raw_request = pipeline::raw_body_text(&body);
     let outcome = state
         .upstream()
         .forward(ForwardRequest {
@@ -161,6 +182,9 @@ pub async fn chat_completions(
                 model: requested_model.clone(),
                 client_model: client_model.clone(),
                 status: i64::from(status.as_u16()),
+                // 请求侧正文已抄好；响应侧由 RecordingStream 在流结束时定稿
+                raw_request,
+                raw_response: None,
             };
             // 收尾帧特征取 Chat 的：客户端读到 `data: [DONE]` 就停是常态写法，
             // 那时连接会被立刻关掉、`Drop` 不会被拉到 EOF（见 `RecordingStream`）
@@ -175,6 +199,9 @@ pub async fn chat_completions(
             .into_response()
         }
         Ok(ForwardOutcome::Completion { body }) => {
+            // 响应正文在记账前抄一份（完整 JSON 文本；序列化失败给 None，
+            // 那一侧少存一份正文不影响明细）
+            let raw_response = serde_json::to_string(&body).ok();
             record_entry(
                 &RecordContext {
                     stats,
@@ -183,6 +210,8 @@ pub async fn chat_completions(
                     model: requested_model.clone(),
                     client_model: client_model.clone(),
                     status: 200,
+                    raw_request,
+                    raw_response,
                 },
                 None,
             );
@@ -205,6 +234,10 @@ pub async fn chat_completions(
                     model: requested_model.clone(),
                     client_model: client_model.clone(),
                     status,
+                    // 请求侧正文照存（失败请求的请求体同样是排障材料）；
+                    // 响应体由网关自己生成（error 摘要已在明细里），不另存
+                    raw_request,
+                    raw_response: None,
                 },
                 Some(message),
             );

@@ -115,13 +115,19 @@ const BRIDGE_JS: &str = r#"
   /**
    * 订阅后端事件。Tauri 的 listen 是异步的，这里同步返回取消函数，
    * 与原 preload 的用法（返回值即 unsubscribe）保持一致。
+   *
+   * target 缺省为 Any —— 后端 `emit` 的应用事件（login:state 等）对任何
+   * 监听 target 都投递。但窗口**内置**事件（tauri://resize 等）不一样：
+   * 壳侧按窗口 label 定向投递（Tauri 的 emit_to_window 只放行 Window /
+   * WebviewWindow 两种监听 target，对 Any 一律不投），订阅它们必须传
+   * 当前窗口的 target —— 见 onWindowResize。
    */
-  const on = (event, callback) => {
+  const on = (event, callback, target) => {
     let unlisten = null;
     let disposed = false;
     invoke('plugin:event|listen', {
       event,
-      target: { kind: 'Any' },
+      target: target || { kind: 'Any' },
       handler: window.__TAURI_INTERNALS__.transformCallback(evt => callback(evt && evt.payload)),
     })
       .then(fn => {
@@ -208,20 +214,23 @@ const BRIDGE_JS: &str = r#"
     // —— **带刷新后的聚合清单**，界面就地重绘、不必再拉一次 /api/session
     // （理由见后端 `api::models` 的模块头）。不传 body：这条无入参
     refreshModels: () => call('POST', '/api/models/refresh', {}),
-    // 模型管理（启停 / 删除隐藏 / 映射）：写接口都返回最新 {models, mappings, reasoningLevels}
+    // 模型管理（启停 / 映射）：写接口都返回最新 {models, mappings, reasoningLevels}
     // 映射照抄 OmniProxy 语义：对外名自由命名（允许与上游 id 同名），同一对外名
     // 可在不同提供商各建一条（主备）；provider 为空 = 旧版全局语义
     //
     // 第 4 个参数是**思考等级绑定**（照抄 OmniProxy 的手动绑定列表，见
     // 模型管理页的下拉）：省略 = 不动已有等级（旧调用点的行为），
     // '' / null = 清成「不覆盖」，其它字符串 = 设成该等级。
-    // 后端按「请求体里有没有这个键」区分这三态，所以这里展开成条件键 ——
+    // 第 5 个参数是**映射开关**（chip 上的小滑块）：省略 = 不动，bool = 显式开 / 关。
+    // 后端按「请求体里有没有这个键」区分三态，所以两个可选参数都展开成条件键 ——
     // 直接塞 `reasoning: reasoning || ''` 会把「不改」也变成「清空」，
     // 那是一次静默的数据丢失。
     getModelManage: () => call('GET', '/api/models/manage'),
     setModelState: payload => call('POST', '/api/models/state', payload),
-    addModelMapping: (alias, target, provider, reasoning) => call('POST', '/api/models/mappings', {
-      alias, target, provider, ...(reasoning === undefined ? {} : { reasoning }),
+    addModelMapping: (alias, target, provider, reasoning, enabled) => call('POST', '/api/models/mappings', {
+      alias, target, provider,
+      ...(reasoning === undefined ? {} : { reasoning }),
+      ...(enabled === undefined ? {} : { enabled }),
     }),
     removeModelMapping: (alias, target, provider) => call('POST', '/api/models/mappings/remove', { alias, target, provider }),
     // 自定义模型（手动登记上游目录里没有的模型）。「移除」而不是「隐藏」——
@@ -393,6 +402,17 @@ const BRIDGE_JS: &str = r#"
     getStatsRequestFilters: () => call('GET', '/api/stats/requests/filters'),
     // 清空同样支持筛选条件（带条件 = 只删命中的明细，不传 = 全部清空）
     clearStatsRequests: query => call('DELETE', '/api/stats/requests' + toQuery(query)),
+    // 按 id 取单条请求的原始正文 `{id, requestBody, responseBody, truncated}`
+    // （详情弹窗「预览对话」的数据源；列表接口不回正文，行保持轻）。
+    // 找不到给 404，前端据此提示「没有保存原始报文」。
+    getStatsRequestRaw: id => call('GET', '/api/stats/requests/raw' + toQuery({ id })),
+    // 清理弹窗的预览统计 `{all, raw, dbBytes, vacuumRunning, lastVacuum}`：
+    // 与 DELETE 共用同一份筛选解析（后端 filter_from_params），预览说删 N 条、
+    // 确认删掉的就是 N 条 —— 预览与执行必须同源，否则就是新的「清空事故」
+    getStatsClearPreview: query => call('GET', '/api/stats/requests/clear-preview' + toQuery(query)),
+    // 后台压缩数据库（checkpoint + VACUUM）：已受理 {started:true}；重复触发 409，
+    // 进度靠 getStatsClearPreview 的 vacuumRunning / lastVacuum 轮询
+    compactStatsDb: () => call('POST', '/api/stats/requests/compact'),
     getRetention: () => call('GET', '/api/retention'),
     // PUT 是后端已定契约（允许部分字段 + 立即清理）。
     // gateway.rs 的 request_builder 支持 GET/POST/PUT/PATCH/DELETE，
@@ -457,6 +477,33 @@ const BRIDGE_JS: &str = r#"
     setWindowTheme: theme => invoke('set_window_theme', {
       theme: theme === 'dark' || theme === 'light' ? theme : null,
     }),
+
+    // ── 本壳特有：自定义标题栏的窗口三键 ──
+    // 主窗口去掉了系统装饰（lib.rs 建窗处 decorations(false)），最小化 /
+    // 最大化 / 关闭改由界面标题栏承担（titlebar.js）。这四个方法是对壳命令
+    // 的薄映射，与其它命令一样统一走 invoke（错误归一成 Error）。
+    // 网页版 shim 里对应给出拒绝 / 空实现（浏览器没有应用窗口）——
+    // 标题栏在网页端根本不渲染（titlebar.js 的 platform 守卫），这里只是兜底。
+    windowMinimize: () => invoke('window_minimize'),
+    // 切换最大化 / 还原。「当前是否最大化」的事实来源是 windowIsMaximized
+    // 的查询结果：双击标题栏的切换走 data-tauri-drag-region 的原生行为，
+    // 不经这里，界面靠 onWindowResize 重查来同步图标
+    windowToggleMaximize: () => invoke('window_toggle_maximize'),
+    // 关闭 = 发出 CloseRequested，与点系统关闭按钮同语义：「关闭到托盘」
+    // 开启时被壳拦成隐藏（托盘继续转发），否则正常退出
+    windowClose: () => invoke('window_close'),
+    windowIsMaximized: () => invoke('window_is_maximized'),
+    // 窗口尺寸变化（含最大化 / 还原 / 拖拽缩放）。Tauri 的内置窗口事件
+    // `tauri://resize` 每次变化都会发出，界面订阅后重查 windowIsMaximized
+    // 即可让标题栏图标保持同步（事件名收在桥里，界面不出现 Tauri 字样）。
+    // 注意 target 不能用缺省的 Any：窗口内置事件按窗口 label 定向投递
+    // （见 on 的注释），这里用 Tauri 注入的 metadata 拿当前窗口 label ——
+    // 与 invoke 一样是调用时才取值，不依赖桥接脚本的注入时序
+    onWindowResize: callback =>
+      on('tauri://resize', callback, {
+        kind: 'WebviewWindow',
+        label: window.__TAURI_INTERNALS__.metadata.currentWebview.label,
+      }),
 
     // ── 本壳特有：应用设置与账号导入导出 ──
     // 这四项不走 api_request：设置存在桌面端本地（与后端无关），

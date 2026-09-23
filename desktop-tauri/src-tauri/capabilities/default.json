@@ -5,6 +5,7 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "dialog:default"

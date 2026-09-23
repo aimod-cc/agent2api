@@ -606,6 +606,75 @@ pub fn set_window_theme(app: AppHandle, theme: Option<String>) -> Result<(), Str
     window.set_theme(theme).map_err(|error| format!("设置窗口主题失败: {error}"))
 }
 
+// ── 自定义标题栏的窗口三键 ─────────────────────────────────────
+// 主窗口已去掉系统装饰（见 lib.rs 建窗处的 `.decorations(false)`，参考
+// OmniProxy 的自定义标题栏），最小化 / 最大化 / 关闭改由界面自绘的标题栏
+// 承担。这四个命令是 `WebviewWindow` 同名方法的薄封装：界面经桥接层
+// （bridge.rs）调用，不直接感知 Tauri —— 与本文件其余命令同一取向。
+//
+// ── 关闭为什么可以直接给 window.close ─────────────────────────
+// 它触发的是 CloseRequested，与点系统标题栏的 ✕ 走**同一条事件路径**：
+// lib.rs 里「关闭到托盘」的拦截逻辑（prevent_close + hide）对两者一视同仁，
+// 关闭行为不因标题栏的引入而改变。
+//
+// 拖动与双击最大化不在这里：那是 `data-tauri-drag-region` 的内建行为
+// （Tauri 2 core 脚本监听 mousedown），前端只声明属性，无需命令参与。
+
+/// 最小化主窗口（标题栏「最小化」按钮）。
+#[tauri::command]
+pub fn window_minimize(app: AppHandle) -> Result<(), String> {
+    let window = main_window(&app)?;
+    window.minimize().map_err(|error| format!("最小化窗口失败: {error}"))
+}
+
+/// 切换主窗口最大化 / 还原（标题栏「最大化」按钮）。
+///
+/// Tauri 2.11 的 `WebviewWindow` 没有 toggle_maximize（那是 JS 侧 API 的名字），
+/// 壳侧只有 maximize / unmaximize / is_maximized —— 所以这里「先查再切」：
+/// 已最大化就还原，否则最大化。切换后的实际状态由界面再查
+/// [`window_is_maximized`] 获取（窗口尺寸变化也会触发它重查），命令本身
+/// 不返回状态 —— 让「图标显示什么」只有一份事实来源。
+#[tauri::command]
+pub fn window_toggle_maximize(app: AppHandle) -> Result<(), String> {
+    let window = main_window(&app)?;
+    let result = if window
+        .is_maximized()
+        .map_err(|error| format!("查询窗口状态失败: {error}"))?
+    {
+        window.unmaximize()
+    } else {
+        window.maximize()
+    };
+    result.map_err(|error| format!("切换窗口最大化失败: {error}"))
+}
+
+/// 关闭主窗口（标题栏 ✕）。
+///
+/// 与系统关闭按钮同语义：发出 CloseRequested，「关闭到托盘」开启时被
+/// lib.rs 拦成隐藏（托盘继续转发），否则正常退出 —— 注释理由见上组说明。
+#[tauri::command]
+pub fn window_close(app: AppHandle) -> Result<(), String> {
+    let window = main_window(&app)?;
+    window.close().map_err(|error| format!("关闭窗口失败: {error}"))
+}
+
+/// 查询主窗口是否处于最大化（标题栏据此切换最大化 / 还原图标）。
+///
+/// 界面在初始化时查一次，此后订阅 `tauri://resize`（见 bridge.rs 的
+/// onWindowResize）：最大化 / 还原 / 拖拽缩放都会改变窗口尺寸，每次
+/// 变化后重查一次即可让图标保持同步，不需要壳再发明一个专用事件。
+#[tauri::command]
+pub fn window_is_maximized(app: AppHandle) -> Result<bool, String> {
+    let window = main_window(&app)?;
+    window.is_maximized().map_err(|error| format!("查询窗口状态失败: {error}"))
+}
+
+/// 取主窗口句柄：四个窗口命令共用的一步查找（不存在时报可读错误）。
+fn main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
+    app.get_webview_window(crate::MAIN_WINDOW_LABEL)
+        .ok_or_else(|| "主窗口不存在".to_string())
+}
+
 /// 最小化的 query 转义：版本号只含数字与点，做一层保险即可
 fn urlencoding(text: &str) -> String {
     text.chars()

@@ -12,7 +12,7 @@ use super::priority::next_free_priority;
 use super::sql;
 use super::state::StoredAccount;
 use super::store::{AccountStore, AccountStoreError};
-use super::store_util::{token_tail_of, truncate_chars};
+use super::store_util::{max_concurrent_public, token_tail_of, truncate_chars};
 use super::CredentialWrite;
 
 const PROVIDER: &str = kind_id(ProviderKind::Qoder);
@@ -176,6 +176,12 @@ impl AccountStore {
         public.insert("rateLimits".to_string(), record.get("rateLimits").cloned().unwrap_or_else(|| json!({})));
         public.insert("desktop".to_string(), Value::Bool(false));
         public.insert("available".to_string(), Value::Bool(available));
+        // 单账号并发上限（所有家通用，兜底共用 `max_concurrent_public`）：
+        // 0 = 不限，缺键同样输出 0
+        public.insert(
+            "maxConcurrent".to_string(),
+            Value::from(max_concurrent_public(record.get("maxConcurrent"))),
+        );
         // `chatSupported` **刻意不在这里写**：它是跨家的统一事实，由
         // `store.rs::public_account` 在分派点按适配器的 `supports_chat()` 注入。
         // 本函数早先硬编码过 `false`（Qoder 只有账号管理能力那会儿），

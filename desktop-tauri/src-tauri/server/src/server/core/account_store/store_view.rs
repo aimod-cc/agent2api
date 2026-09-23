@@ -20,7 +20,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::core::account_store::state::{AccountState, StoredAccount};
 use crate::server::core::account_store::store::{forwards_requests, AccountStore};
-use crate::server::core::account_store::store_util::{js_truthy, value_or, value_or_nullish};
+use crate::server::core::account_store::store_util::{js_truthy, max_concurrent_public, value_or, value_or_nullish};
 use crate::server::core::endpoints::{resolve_edition, EditionInfo};
 use crate::server::core::proxies::describe_account_proxy;
 
@@ -120,6 +120,13 @@ impl AccountStore {
         );
         // 本切片所有账号都视为可用（限额/可用性判定属切片 3 的转发层）
         public.insert("available".to_string(), Value::Bool(true));
+        // 单账号并发上限（所有家通用的账号属性）：0 = 不限，记录里没有该键
+        // （旧数据 / 从未设置过）同样输出 0 —— 兜底在 `max_concurrent_public`
+        // 一处实现，其余各家的公开形态同用它（选路消费方按 0 解释为不限）
+        public.insert(
+            "maxConcurrent".to_string(),
+            Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
+        );
         Value::Object(public)
     }
 
@@ -218,6 +225,16 @@ impl AccountStore {
         } else if super::is_cline_family(&record.provider()) {
             // 两个池（`cline-free` / `cline-pass`）共用这一份公开形态
             self.to_cline_public_account(record)
+        } else if record
+            .provider()
+            .starts_with(crate::server::core::custom_providers::ID_PREFIX)
+        {
+            // 自定义提供商的账号。判据用**前缀**而不是 `custom_providers::
+            // is_custom_provider_id`（后者还要求提供商仍在配置里）：形状分派
+            // 是纯展示决定，提供商被删后残留的账号（迁移/手改残留）也应如实
+            // 显示出来，而不是退化成 workbuddy 形状让界面出现 uid/edition 等
+            // 与它无关的字段
+            self.to_custom_public_account(record)
         } else {
             self.to_public_account(record)
         };
@@ -308,5 +325,53 @@ impl AccountStore {
             .iter()
             .map(|record| self.public_account(record))
             .collect()
+    }
+
+    /// 自定义提供商账号的公开形态（`custom_accounts` 写入的记录 → 界面形状）。
+    ///
+    /// ── 为什么不是 workbuddy 兜底形状 ────────────────────────────
+    /// 兜底形状（`to_public_account`）会补 uid / nickname / edition /
+    /// enterprise 这些**只对 WorkBuddy 有意义**的字段 —— 自定义账号拿到它们
+    /// 只会在界面上渲染出一排空值，还会诱导前端去读一个不存在的 edition。
+    /// 独立形状让「这条账号有什么」如实反映「这条记录存了什么」。
+    ///
+    /// ── `baseUrl` 的缺省语义 ────────────────────────────────────
+    /// 记录里的 `baseUrl` 是**覆盖项**（缺省时转发回落到提供商的 baseUrl），
+    /// 因此记录里没有这个键时公开形态也不带它 —— 前端据「键是否存在」区分
+    /// 「未覆盖（跟随提供商）」与「覆盖成了某个值」，不能把空串/null 塞进来
+    /// 让两种语义混在一起。
+    ///
+    /// `hasCredentials` / `chatSupported` / `checkinAt` 由 [`Self::public_account`]
+    /// 统一注入（跨家事实，见那里的说明）；自定义账号的 `hasCredentials`
+    /// 判据是 `apiKey` 非空（见 `state::has_credentials` 的第三条）。
+    pub(crate) fn to_custom_public_account(&self, record: &StoredAccount) -> Value {
+        let fields = record.fields();
+        let mut public = Map::new();
+        public.insert("id".to_string(), Value::String(record.id().to_string()));
+        public.insert("provider".to_string(), Value::String(record.provider()));
+        public.insert("name".to_string(), Value::String(record.name()));
+        // apiKey 的尾号（与各家的 tokenTail 同一展示语义；空 key 时是空串）
+        public.insert(
+            "tokenTail".to_string(),
+            value_or(fields.get("tokenTail"), Value::String(String::new())),
+        );
+        // 覆盖项：记录里**写了键**才透出（缺键 = 未覆盖，语义见函数头）
+        if let Some(base_url) = fields.get("baseUrl") {
+            public.insert("baseUrl".to_string(), base_url.clone());
+        }
+        public.insert("source".to_string(), Value::String(record.source()));
+        public.insert("priority".to_string(), Value::from(record.priority()));
+        public.insert("enabled".to_string(), Value::Bool(record.enabled()));
+        public.insert("addedAt".to_string(), Value::from(record.added_at()));
+        public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
+        public.insert("proxy".to_string(), describe_account_proxy(Some(&record.proxy())));
+        public.insert("available".to_string(), Value::Bool(true));
+        // 单账号并发上限（与 to_public_account 同口径，兜底共用
+        // `max_concurrent_public`）：0 = 不限，缺键同样输出 0
+        public.insert(
+            "maxConcurrent".to_string(),
+            Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
+        );
+        Value::Object(public)
     }
 }

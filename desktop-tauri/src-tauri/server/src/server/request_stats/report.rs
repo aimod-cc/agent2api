@@ -645,12 +645,30 @@ pub(super) fn safe_rate(hit: i64, input: i64) -> f64 {
     }
 }
 
-/// status 过滤归一：`"ok"` → 只看 2xx，`"error"` → 只看非 2xx，
+/// status 过滤归一的**结果**：三种取值各自对应一个 SQL 条件（见
+/// `sql::FilterPlan::of` 里逐个的写法）。
+///
+/// 为什么从「`Option<bool>`」扩成枚举：原来只有 ok / error 两个值，bool 够用；
+/// 「进行中」（running，status=0）加入后是第三种互斥状态 —— 硬塞 bool 要么
+/// 让调用方先判字符串再判 bool，要么把 running 混进 error 的取反里。
+/// 三分支枚举让「漏处理新分支」在编译期就暴露。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StatusFilter {
+    /// 只看成功（2xx 且无错误摘要）
+    Ok,
+    /// 只看失败（成功条件的取反；**不含**进行中行，见 `sql::FilterPlan::of`）
+    Error,
+    /// 只看进行中（status = 0，见 `request_stats::record_started`）
+    Running,
+}
+
+/// status 过滤归一：`"ok"` → 成功，`"error"` → 失败，`"running"` → 进行中，
 /// 其余（含 None 与拼错的值）不过滤。大小写不敏感、容忍前后空白。
-pub(super) fn normalize_status_filter(value: Option<&str>) -> Option<bool> {
+pub(super) fn normalize_status_filter(value: Option<&str>) -> Option<StatusFilter> {
     match value.map(str::trim).map(str::to_lowercase).as_deref() {
-        Some("ok") => Some(true),
-        Some("error") => Some(false),
+        Some("ok") => Some(StatusFilter::Ok),
+        Some("error") => Some(StatusFilter::Error),
+        Some("running") => Some(StatusFilter::Running),
         _ => None,
     }
 }

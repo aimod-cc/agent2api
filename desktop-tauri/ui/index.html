@@ -302,17 +302,8 @@
           </div>
 
           <section class="panel account-table">
-            <!-- 工具条：提供商（动态注入）+ 三段筛选 + 主操作，收在一行 -->
+            <!-- 工具条：提供商（动态注入）+ 两段筛选 + 主操作，收在一行 -->
             <div class="toolbar">
-              <div class="group">
-                <span class="label">版本</span>
-                <div class="seg" id="account-edition-filter" role="tablist" aria-label="账号版本">
-                  <button class="seg-item active" data-edition="all">全部 <span class="seg-count" data-count="editionAll">0</span></button>
-                  <button class="seg-item" data-edition="cn">国内 <span class="seg-count" data-count="cn">0</span></button>
-                  <button class="seg-item" data-edition="intl">国际 <span class="seg-count" data-count="intl">0</span></button>
-                </div>
-              </div>
-
               <div class="group">
                 <span class="label">状态</span>
                 <div class="seg" id="account-enabled-filter" role="tablist" aria-label="启用状态">
@@ -334,6 +325,7 @@
               <div class="actions">
                 <button id="btn-query-usage">查询积分</button>
                 <button id="btn-checkin-all">全部签到</button>
+                <button id="btn-manage-custom-providers" title="管理自定义提供商：模型清单与映射、编辑、删除">自定义提供商</button>
                 <button id="btn-add-account-2" class="primary">添加账号</button>
               </div>
             </div>
@@ -370,7 +362,7 @@
         <section class="page" data-page="gateway">
           <div class="page-head">
             <h2>模型管理</h2>
-            <p class="intro">下游请求什么模型就转发什么模型；这里可以禁用、删除不需要的模型，或为上游模型起一个对外的映射名。</p>
+            <p class="intro">内置提供商的模型管理：原始模型 ID 作为默认绑定，与新增别名一起在「模型映射」列独立开关。关闭某个名称后，下游不能用它请求，模型列表也不再返回它。</p>
           </div>
 
           <section class="panel">
@@ -392,7 +384,6 @@
                 <button class="seg-item" data-state="enabled">已启用</button>
                 <button class="seg-item" data-state="disabled">已禁用</button>
                 <button class="seg-item" data-state="mapped">有映射</button>
-                <button class="seg-item" data-state="hidden">已删除</button>
               </div>
               <div class="spacer"></div>
               <span class="input-affix" style="width:240px;flex:0 0 auto">
@@ -404,11 +395,11 @@
               <table class="models-table">
                 <!-- data-col：列宽拖动（table-columns.js）靠它把 <col>、<th> 与列绑定，
                      不依赖列序 —— 以后在中间插一列，存过的列宽不会错位 -->
-                <colgroup><col class="c-model" data-col="model"><col class="c-rate" data-col="rate"><col class="c-source" data-col="source"><col class="c-alias" data-col="alias"><col class="c-state" data-col="state"><col class="c-act" data-col="act"></colgroup>
+                <colgroup><col class="c-model" data-col="model"><col class="c-rate" data-col="rate"><col class="c-source" data-col="source"><col class="c-alias" data-col="alias"><col class="c-act" data-col="act"></colgroup>
                 <thead><tr>
-                  <th data-col="model">上游模型</th><th data-col="rate">倍率</th><th data-col="source">来源</th><th data-col="alias">对外映射名（下游可用这些名字请求）</th><th data-col="state">启用</th><th class="r" data-col="act">操作</th>
+                  <th data-col="model">上游模型</th><th data-col="rate">倍率</th><th data-col="source">来源</th><th data-col="alias">模型映射（原始 ID 与别名独立开关）</th><th class="r" data-col="act">操作</th>
                 </tr></thead>
-                <tbody id="models"><tr><td colspan="6" class="empty">暂无模型</td></tr></tbody>
+                <tbody id="models"><tr><td colspan="5" class="empty">暂无模型</td></tr></tbody>
               </table>
             </div>
             <div class="panel-body" style="padding-top:8px">
@@ -416,7 +407,7 @@
               <div class="models-refresh-note" id="models-refresh-note"></div>
             </div>
             <div class="panel-foot">
-              <span>禁用的模型不会出现在 <code>/v1/models</code>，请求它会返回 404 · 映射名与上游 ID 同时可用，同一映射名只能指向一个上游模型 · 删除只是从清单隐藏，可在「已删除」筛选里恢复 · 「来源」列标注该家清单是远程目录拉取的还是内置静态表（后者在上游目录拉不到时兜底，点「刷新模型清单」可重试） · 挂不到任何一行的映射会集中在表尾「未挂载的映射」里（右上角标出原因：名字不存在，或该家当前没广告它），可在那里删除</span>
+              <span>「默认」绑定就是原始模型 ID，只可开关、不可删除。原始 ID 与每个别名独立生效：关闭的名称不出现在 <code>/v1/models</code>，下游请求返回 404；其他开启的名称不受影响。</span>
             </div>
           </section>
         </section>
@@ -661,7 +652,9 @@
               <span id="req-badge" class="badge">—</span>
               <span class="panel-sub">按时间倒序，保留期在设置页可调</span>
               <div class="head-actions">
-                <button id="btn-req-clear" class="danger">清空</button>
+                <!-- 打开的是清理弹窗（request-clear-modal.js）：全部删除 / 仅清空报文原文
+                     两种方式 + 预览统计 + 压缩数据库入口，都在弹窗里选 -->
+                <button id="btn-req-clear" class="danger">清理</button>
               </div>
             </div>
 
@@ -681,6 +674,14 @@
                   <option value="ok">成功</option>
                   <option value="error">失败</option>
                 </select>
+                <!-- 仅看进行中：单颗分段开关（复用时间档位同一套 .seg 形制）。
+                     开启时 status 过滤固定发 running，与提供商 / 模型 / 时间并存，
+                     状态下拉随即停用（同一维度的互斥取值，见 requests-panel.js）；
+                     「全部删除 / 仅清空报文原文」两种删除方式在「清理」弹窗里选。 -->
+                <div class="seg">
+                  <button type="button" class="seg-item" id="btn-req-running" aria-pressed="false"
+                    title="只显示正在转发中的请求（状态列显示「进行中」，用时列显示已用时）">仅看进行中</button>
+                </div>
                 <!-- 提供商 / 模型两个维度：选项由 requests-panel.js 进页面时从
                      `/api/stats/requests/filters` 拉一次填进来（那是「明细里出现过
                      的值」，不是当前配置清单 —— 已删除账号所属的提供商、历史请求
@@ -1318,11 +1319,12 @@
        （用户没点过任何东西，程序在搬数据时必须让他知道文件还在）。 -->
 
   <!-- ─── 请求详情弹窗（requests-panel.js）───
-       展示调试模式保存的**上游原始报文**：请求头（凭据类已脱敏）、请求体、
-       响应头、响应体。四段用弹窗内的分段选择器切换（`.seg` 那一套），
-       不是平铺 —— 响应体常是几百行 SSE，平铺会把其余三段挤到屏幕外。
-       报文由 /api/debug/traffic?id= 按需拉取（列表接口不带报文，
-       见后端 debug_api 的模块头）；四段内容一次拿回，切换不发请求。 -->
+       三个标签：请求详情（列表行数据的完整展开）、预览对话（下游原文
+       /api/stats/requests/raw 解析出的对话气泡）、原始报文（调试模式保存的
+       上游原始报文：请求头（凭据类已脱敏）/ 请求体 / 响应头 / 响应体四块，
+       调试模式没开时整个标签隐藏）。报文由 /api/debug/traffic?id= 按需拉取
+       （列表接口不带报文，见后端 debug_api 的模块头）；三个标签的数据在
+       打开时并行拉取，切换不发请求。 -->
   <div id="req-detail-modal" class="modal-mask" role="dialog" aria-modal="true" aria-labelledby="req-detail-title">
     <div class="modal modal-wide">
       <div class="modal-head">
@@ -1600,6 +1602,13 @@
        设置页的开关写它，所以排在所有业务脚本之前，它们执行时就能用上。 -->
   <script src="units.js"></script>
   <script src="app.js"></script>
+  <!-- 自定义标题栏（桌面端）：主窗口去掉了系统装饰（src-tauri/lib.rs 建窗处
+       decorations(false)），这里动态补一条 32px 的标题栏（左标题右三键，
+       拖动与双击最大化靠 data-tauri-drag-region）。网页端没有应用窗口，
+       脚本内部按 platform 守卫直接不渲染，body 布局因此不受影响。
+       它只依赖 workbuddyDesktop 与 icons.js，不依赖 wbApp；排在 app.js
+       之后仅为读取顺序整洁。 -->
+  <script src="titlebar.js"></script>
   <!-- 端口状态面板：侧栏那两条状态（网关进程 / 可用账号）与端口冲突时的两个出口。
        必须在 app.js 之后：它通过 window.wbApp 读状态、调 toast 与顶栏重画
        （app.js 的 render() 也会反过来委托它，用可选链，谁先就绪都不报错）。 -->
@@ -1666,24 +1675,34 @@
        请求日志的表头是整块重绘的，它自己用 MutationObserver 补把手，不依赖面板脚本。 -->
   <script src="table-columns.js"></script>
   <script src="accounts-filters.js"></script>
+  <!-- 并发上限小对话框：⋯ 菜单的「并发上限」项点开（open 在点击时才用，
+       先于 accounts-view 加载让依赖关系一眼可见 —— 分支在那里）。 -->
+  <script src="account-conc-dialog.js"></script>
   <script src="accounts-view.js"></script>
   <!-- 通用确认弹窗：替代原生 confirm（Tauri WebView 里原生 confirm 不弹窗直接放行）。
        排在所有可能调它的面板之前 —— 它只暴露 wbConfirm.ask，点击时才用，
        但先加载让依赖关系一眼可见。 -->
   <script src="confirm-dialog.js"></script>
   <script src="logs-panel.js"></script>
-  <!-- 请求日志的两块「独立小件」，都必须排在 requests-panel.js 之前：
-       · request-hover    列表里重试 / 敏感词两枚标签的悬停面板。requests-panel 在
-                          加载期就调 wbRequestHover.bind 把委托挂到列表上
-                          （走可选链，未就绪时静默跳过 —— 那样整个悬停功能就没了，
-                          所以这个顺序是硬要求，与 tooltip.js 的自动增强不同）。
-       · request-detail   详情弹窗（上游原始报文 + 分段切换）。它**自己**在加载期
-                          绑弹窗的关闭 / 分段事件，并独占 #req-detail-modal 那组 DOM；
-                          requests-panel 只在点「详情」时调它的 open(id)。
-                          排在前面是为了让「谁负责哪块 DOM」在文件顺序上也看得出来。 -->
+  <!-- 请求日志的三块「独立小件」，都必须排在 requests-panel.js 之前：
+       · request-hover          列表里重试 / 敏感词两枚标签的悬停面板。requests-panel 在
+                                加载期就调 wbRequestHover.bind 把委托挂到列表上
+                                （走可选链，未就绪时静默跳过 —— 那样整个悬停功能就没了，
+                                所以这个顺序是硬要求，与 tooltip.js 的自动增强不同）。
+       · conversation-preview   「预览对话」的纯渲染（原文 → 气泡 HTML），没有加载期
+                                行为，放这里只是让「request-detail 依赖谁」在顺序上可见。
+       · request-detail         详情弹窗（请求详情 / 预览对话 / 原始报文三标签）。它**自己**
+                                在加载期绑弹窗的关闭 / 标签事件，并独占 #req-detail-modal
+                                那组 DOM；requests-panel 只在点「详情」时调它的 open(id, row)。
+                                排在前面是为了让「谁负责哪块 DOM」在文件顺序上也看得出来。 -->
   <script src="request-hover.js"></script>
+  <script src="conversation-preview.js"></script>
   <script src="request-detail.js"></script>
   <script src="requests-panel.js"></script>
+  <!-- 请求日志的「清理」弹窗：排在 requests-panel.js 之后（不是硬要求 —— 它只在
+       点「清理」时通过 wbRequestClearModal.open 打开，且筛选参数走
+       wbRequestsPanel.clearParams 的可选链），放后面与「谁依赖谁」的阅读顺序一致。 -->
+  <script src="request-clear-modal.js"></script>
   <!-- 定时任务面板：读写两条接口（/api/scheduled-tasks 与 /api/auto-checkin）。
        排在 logs-panel / requests-panel 之后：它保存成功后要把新间隔推给那两个面板
        （走可选链，未就绪时静默跳过），放在它们之后更符合「谁依赖谁」的阅读顺序；
@@ -1702,6 +1721,17 @@
   <script src="add-qoder.js"></script>
   <script src="add-cline.js"></script>
   <script src="add-provider-forms.js"></script>
+  <!-- 自定义提供商（custom- 前缀）的三块界面。add-custom-provider.js 要向
+       add-provider-forms.js 注册「自定义提供商」表单块，custom-provider-ui.js
+       在加载期只绑工具栏按钮（脚本都在 body 末尾，DOM 已解析），三者的其余
+       交互都在点击时才消费全局对象（wbCustomModelsModal / wbProviders），
+       没有别的加载期依赖。 -->
+  <script src="add-custom-provider.js"></script>
+  <script src="custom-provider-ui.js"></script>
+  <!-- 自定义提供商的「模型管理」弹窗本体（管理弹窗里那颗按钮点击时才消费
+       wbCustomModelsModal，见 custom-provider-ui.js 的 handleAction）；
+       它的兜底思考等级表来自上面的 models-reasoning.js（更早加载，已满足） -->
+  <script src="custom-models-modal.js"></script>
   <script src="account-panel.js"></script>
   <!-- Markdown 渲染器：更新日志用。纯函数、无依赖，只认白名单语法（见文件头说明）；
        必须在 update-panel.js 之前加载 -->

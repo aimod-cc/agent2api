@@ -322,6 +322,83 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     out
 }
 
+/// 在途回写钩子：把当前快照交给存储层写进「进行中」行（见
+/// [`RequestTelemetry::set_live_sink`]）。
+///
+/// 类型是 `Arc<dyn Fn>` 而不是某个具体存储类型：本模块在 `core::upstream` 下，
+/// **不认识** `request_stats`（依赖方向见 `core/mod.rs` 的约定）。接线在 api 层
+/// （`api::pipeline::live_row_sink`），这里只负责在状态变化时调用它。
+pub type LiveSink = Arc<dyn Fn(&TelemetrySnapshot) + Send + Sync>;
+
+/// 在途回写的**内容指纹**（见 [`RequestTelemetry::flush_live`]）。
+///
+/// 字段是「进行中行会显示的那些」的一对一摘要：值本身，或「有没有 / 有几条」。
+///
+/// ── 为什么「先整份构造、再比较」而不是「先逐字段比对」─────────
+/// 构造一份指纹要克隆四个短字符串，而流式路径每收一帧都会调一次 `flush_live`
+/// （`note_first_frame` 挂在透传流的每个分片上）—— 看似该省。省的办法是再写一个
+/// 逐字段比对函数，但那会多出**第二份字段清单**：加字段时漏改一处，闸门要么永不
+/// 打开（界面不再实时）、要么次次打开（每帧一次写库），两种都很难发现。这里选
+/// 「一份清单」：比同一条路径上每帧拷贝响应正文缓冲便宜得多，不值得为它换一个
+/// 静默失效的风险。
+///
+/// ── 为什么不含 `error` ──────────────────────────────────────
+/// 那一列一旦有值，前端就不再把这一行当「进行中」（判据见 `ui/requests-panel.js`
+/// 的 `isRunning`），而转发中途的失败往往只是换号前的一次尝试失败 —— 让它提前
+/// 把整行标成失败，正是「进行中」这个状态要避免的误读。失败原因由尝试明细
+/// （`last_error`）如实带出，不必借 error 列。
+///
+/// ── 为什么不含 token 四件套 ─────────────────────────────────
+/// 与 `RunningProgress` 同理：进行中行不显示用量，为一次看不见的更新写库没有意义
+/// （usage 通常只在上游最后一个 chunk 才出现，收尾记账紧接着就会写它）。
+#[derive(Default, PartialEq)]
+struct LiveStamp {
+    provider: String,
+    account_id: String,
+    account_name: String,
+    upstream_model: String,
+    attempts: i64,
+    /// 首响的**绝对时刻**（与快照同形，转换在 api 层做）
+    first_response_at: Option<i64>,
+    /// 尝试明细的条数 + **最后一条**的定局情况（状态码 / 有没有错误 / 退避次数 /
+    /// 提示）。只看最后一条：明细是严格串行的，前面的轮次一旦定局就不再变化。
+    details: usize,
+    last_status: Option<i64>,
+    last_error: bool,
+    last_retries: usize,
+    last_notice: bool,
+    sensitive: usize,
+}
+
+impl LiveStamp {
+    fn of(snapshot: &TelemetrySnapshot) -> Self {
+        let last = snapshot.attempts_detail.last();
+        Self {
+            provider: snapshot.provider.clone().unwrap_or_default(),
+            account_id: snapshot.account_id.clone(),
+            account_name: snapshot.account_name.clone(),
+            upstream_model: snapshot.upstream_model.clone(),
+            attempts: snapshot.attempts,
+            first_response_at: snapshot.first_response_at,
+            details: snapshot.attempts_detail.len(),
+            last_status: last.and_then(|item| item.status),
+            last_error: last.map(|item| item.error.is_some()).unwrap_or(false),
+            last_retries: last.map(|item| item.retries.len()).unwrap_or(0),
+            last_notice: last.map(|item| item.notice.is_some()).unwrap_or(false),
+            sensitive: snapshot.sensitive_hits.len(),
+        }
+    }
+}
+
+/// 在途回写的接线状态（钩子为空 = 不启用，例如转发前就失败的记账路径 ——
+/// 那些请求没有进行中行，回写无处可写）。
+#[derive(Default)]
+struct LiveWrite {
+    sink: Option<LiveSink>,
+    /// 上一次**已经回写**的那份指纹（首次回写前是全空：任何真实状态都与之不同）
+    stamp: LiveStamp,
+}
+
 /// usage 上报槽：转发链路往里写，记账点在收尾时读。
 ///
 /// 为什么用共享槽位而不是把数据一路 return 出来：流式转发的收尾发生在
@@ -338,6 +415,8 @@ pub struct RequestTelemetry {
     /// 独立一把锁（不与 `inner` 共用）：采集器的读写都在转发热路径上，
     /// 与「记账字段」的锁分开可以避免两处互不相关的写互相等待。
     capture: Mutex<Option<Arc<super::super::debug_traffic::TrafficCapture>>>,
+    /// 在途回写（钩子 + 上一次已回写的指纹；见 [`Self::set_live_sink`]）
+    live: Mutex<LiveWrite>,
 }
 
 impl Default for RequestTelemetry {
@@ -351,6 +430,7 @@ impl RequestTelemetry {
         Self {
             inner: Mutex::new(TelemetrySnapshot::default()),
             capture: Mutex::new(None),
+            live: Mutex::new(LiveWrite::default()),
         }
     }
 
@@ -404,6 +484,62 @@ impl RequestTelemetry {
         self.lock().id.clone()
     }
 
+    /// 装入在途回写钩子（**转发开始前**由调用方装一次；见 `LiveSink`）。
+    ///
+    /// ── 它解决什么 ──────────────────────────────────────────────
+    /// 「进行中」行（`RequestStats::record_started` 插的那条）只有 id / ts / 模型名：
+    /// 选路与发送体定稿都发生在它之后，于是整段转发期间列表里那一行看不出**谁在
+    /// 承载、转发的是哪个模型、已经试了几轮**。这些读数在本槽位里本来就有，钩子
+    /// 把它们实时回写进那一行。
+    ///
+    /// ── 为什么由调用方装，而不是本模块自己建 ────────────────────
+    /// 本模块在 core 下、不认识存储层（理由见 `LiveSink`）；调用方
+    /// （`api::chat` / `api::protocol`）手里既有 `Arc<RequestStats>` 又有本条请求
+    /// 的 id 与开始时刻，正好在 `record_started` 之后装。**不装**的路径：转发前就
+    /// 失败的记账（`record_early_failure`）—— 那些请求没有进行中行，回写无处可写。
+    pub fn set_live_sink(&self, sink: impl Fn(&TelemetrySnapshot) + Send + Sync + 'static) {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        live.sink = Some(Arc::new(sink));
+    }
+
+    /// 状态**真的变了**才把快照交给在途回写钩子（每个会改状态的方法收尾处调一次）。
+    ///
+    /// ── 为什么是「内容指纹」而不是时间节流 ──────────────────────
+    /// 流式路径每收到一帧都会 `note_first_frame`（幂等），时间节流会把「窗口内
+    /// 真实发生的变化」丢掉 —— 而进行中行的全部价值就在实时性上。指纹是精确的：
+    /// 同一份状态重复上报只写一次，真变了立刻写。于是库上的写入次数等于**状态
+    /// 变化次数**（一条普通请求 3~4 次），而不是上报次数（流式可达每帧一次）。
+    ///
+    /// ── 调用时机在持 `inner` 锁期间 ─────────────────────────────
+    /// 各方法刚改完就调：这样「读快照 → 比指纹 → 回写」不会被另一处上报插进来，
+    /// 写进库的必然是某个真实状态，而不是两次修改拼出来的中间态。回写本身是
+    /// 一次单行 UPDATE（在途字段那几列），与收尾记账同一条纪律。
+    fn flush_live(&self, snapshot: &TelemetrySnapshot) {
+        // 钩子与指纹同锁：取钩子、比指纹、记新指纹必须是一次原子判断，否则两次
+        // 上报可能都判「变了」而各写一遍（无害，但没必要）。`live` 这把锁在调用
+        // 钩子**之前**就放掉 —— 它保护的是「要不要写」，而写库的等待不该占着它
+        // （`inner` 仍由调用方持有，见上面「调用时机」那段）。
+        let sink = {
+            let mut live = self
+                .live
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(sink) = live.sink.clone() else {
+                return;
+            };
+            let next = LiveStamp::of(snapshot);
+            if next == live.stamp {
+                return;
+            }
+            live.stamp = next;
+            sink
+        };
+        sink(snapshot);
+    }
+
     /// 记一次「已向这个账号发出上游请求」（选路循环每轮调一次）。
     ///
     /// 账号取**最后一次**：429 轮换后真正承载请求的是最后那个账号，
@@ -419,6 +555,8 @@ impl RequestTelemetry {
         if !provider.is_empty() {
             guard.provider = Some(provider.to_string());
         }
+        // 在途回写：选路一确定，进行中行就该显示「谁在承载」
+        self.flush_live(&guard);
     }
 
     /// 追加一条**尝试明细**（这一轮发给了谁；结果稍后由
@@ -452,6 +590,8 @@ impl RequestTelemetry {
             retries: Vec::new(),
             notice: None,
         });
+        // 在途回写：新的一轮进了尝试链（换号时这一步就让「重试」列出现）
+        self.flush_live(&guard);
     }
 
     /// 给**最后一条**尝试明细追加一次内部退避重试（`send_with_retry` 每退避
@@ -473,6 +613,9 @@ impl RequestTelemetry {
             status,
             delay_ms,
         });
+        // 在途回写：退避重试也是「进行中」期间就值得看到的进展
+        // （前端那枚标签的判据含重试次数，见 `hasProcessFacts`）
+        self.flush_live(&guard);
     }
 
     /// 给**最后一条**尝试明细记一条提示（目前只有代理回退直连）。
@@ -492,6 +635,8 @@ impl RequestTelemetry {
         if last.notice.is_none() {
             last.notice = Some(truncate_chars(notice, MAX_ATTEMPT_NOTICE_CHARS));
         }
+        // 在途回写：提示同样是「这一轮怎么走的」的一部分
+        self.flush_live(&guard);
     }
 
     /// 给**最后一条**尝试明细补上结果（成功也要调，此时 `status` 有值、
@@ -523,6 +668,8 @@ impl RequestTelemetry {
         if let Some(text) = error.filter(|text| !text.is_empty()) {
             last.error = Some(truncate_chars(text, MAX_ATTEMPT_ERROR_CHARS));
         }
+        // 在途回写：这一轮定局（成功 / 失败）是「切换路径」上最值得看到的一步
+        self.flush_live(&guard);
     }
 
     /// 记录「这一次尝试实际发给上游的模型名」（覆盖式，最后一次为准）。
@@ -536,9 +683,15 @@ impl RequestTelemetry {
         }
         let mut guard = self.lock();
         guard.upstream_model = model.to_string();
+        // 在途回写：上游真名是发送体定稿那一刻就确定的，比请求真正发出去还早
+        // —— 模型列因此能在转发期间就显示「⬆️ 上游 / ⬇️ 下游」两行
+        self.flush_live(&guard);
     }
 
     /// 上报一次 usage（覆盖式，最后一次为准；字段名兼容见 `extract_usage`）。
+    ///
+    /// **不做在途回写**：进行中行在前端不显示用量（`usageCell` 对进行中的行给空），
+    /// 而 usage 通常只在上游最后一个 chunk 才出现 —— 收尾记账紧接着就会写它。
     pub fn report_usage(&self, usage: &Value) {
         let Some(tokens) = extract_usage(usage) else {
             return;
@@ -561,6 +714,10 @@ impl RequestTelemetry {
         if guard.first_response_at.is_none() {
             guard.first_response_at = Some(logging::now_ms());
         }
+        // 在途回写：首响在转发期间就值得看（一条跑几分钟的流式请求，首响其实
+        // 一秒内就有了）。**幂等**，所以每帧调到这里也只会触发一次回写 ——
+        // 靠的是指纹闸（`flush_live`），不是这个 if
+        self.flush_live(&guard);
     }
 
     /// 记一条中断 / 异常原因（成功请求不会被调用）。
@@ -568,6 +725,10 @@ impl RequestTelemetry {
     /// **首次为准**（与 usage 的「最后一次为准」相反）：先到的那条是根因，
     /// 之后到达的多半是它的连带现象（例如断流后客户端断开又触发一次收尾），
     /// 覆盖掉反而把根因埋了。
+    ///
+    /// **不做在途回写**：error 列一旦有值，前端就不再把这一行当「进行中」
+    /// （判据见 `ui/requests-panel.js` 的 `isRunning`），而转发中途的失败往往只是
+    /// 换号前的一次尝试失败 —— 那次失败由尝试明细如实带出，整行仍应是「进行中」。
     pub fn note_error(&self, message: &str) {
         if message.is_empty() {
             return;
@@ -611,6 +772,9 @@ impl RequestTelemetry {
                 }),
             }
         }
+        // 在途回写：脱敏命中在发送体处理那一刻就有值，不必等收尾
+        // （「敏」那枚标签因此能在转发期间就出现）
+        self.flush_live(&guard);
     }
 
     /// 取当前快照（记账点收尾时调一次）

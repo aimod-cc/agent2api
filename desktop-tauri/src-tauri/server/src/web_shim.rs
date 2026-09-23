@@ -445,11 +445,13 @@ pub fn shim_js() -> &'static str {
     refreshModels: function () { return call('POST', '/api/models/refresh', {}); },
     getModelManage: function () { return call('GET', '/api/models/manage'); },
     setModelState: function (payload) { return call('POST', '/api/models/state', payload); },
-    addModelMapping: function (alias, target, provider, reasoning) {
-      return call('POST', '/api/models/mappings', {
-        alias: alias, target: target, provider: provider,
-        reasoning: reasoning === undefined ? undefined : reasoning,
-      });
+    // 第 4 / 第 5 个参数（思考等级 / 映射开关）都按「有没有传」决定是否进请求体：
+    // 后端按「请求体里有没有这个键」区分三态，undefined 的键不会进 JSON
+    addModelMapping: function (alias, target, provider, reasoning, enabled) {
+      var payload = { alias: alias, target: target, provider: provider };
+      if (reasoning !== undefined) payload.reasoning = reasoning;
+      if (enabled !== undefined) payload.enabled = enabled;
+      return call('POST', '/api/models/mappings', payload);
     },
     removeModelMapping: function (alias, target, provider) {
       return call('POST', '/api/models/mappings/remove', { alias: alias, target: target, provider: provider });
@@ -586,6 +588,16 @@ pub fn shim_js() -> &'static str {
     getStatsRequests: function (query) { return call('GET', '/api/stats/requests' + toQuery(query)); },
     getStatsRequestFilters: function () { return call('GET', '/api/stats/requests/filters'); },
     clearStatsRequests: function (query) { return call('DELETE', '/api/stats/requests' + toQuery(query)); },
+    // 按 id 取单条请求的原始正文（详情弹窗「预览对话」的数据源；找不到给 404）
+    getStatsRequestRaw: function (id) {
+      return call('GET', '/api/stats/requests/raw' + toQuery({ id: id }));
+    },
+    // 清理弹窗的预览统计（与 DELETE 共用同一份筛选解析，预览与执行必须同源）
+    getStatsClearPreview: function (query) {
+      return call('GET', '/api/stats/requests/clear-preview' + toQuery(query));
+    },
+    // 后台压缩数据库：重复触发 409，进度看 clear-preview 的 vacuumRunning
+    compactStatsDb: function () { return call('POST', '/api/stats/requests/compact'); },
     getRetention: function () { return call('GET', '/api/retention'); },
     saveRetention: function (patch) { return call('PUT', '/api/retention', patch); },
 
@@ -641,6 +653,24 @@ pub fn shim_js() -> &'static str {
 
     // ── 窗口主题：没有窗口主题可钉，交给系统/浏览器偏好 ──
     setWindowTheme: function () { return Promise.resolve(); },
+
+    // ── 自定义标题栏的窗口三键：网页端没有应用窗口 ──
+    // 按「能映射则映射，不能则明确拒绝」的惯例处理：三个动作明确拒绝，
+    // isMaximized 是查询而非动作，照 backend_status 的口径返回常态 false；
+    // 事件订阅照 onAutoMaintained 的口径返回空操作。
+    // 实际上标题栏在网页端根本不渲染（titlebar.js 的 platform 守卫：
+    // 本 shim 注入 platform='web'），这组方法只是兜底防误调。
+    windowMinimize: function () {
+      return Promise.reject(new Error(SHELL_UNAVAILABLE + '：浏览器里没有应用窗口'));
+    },
+    windowToggleMaximize: function () {
+      return Promise.reject(new Error(SHELL_UNAVAILABLE + '：浏览器里没有应用窗口'));
+    },
+    windowClose: function () {
+      return Promise.reject(new Error(SHELL_UNAVAILABLE + '：浏览器里没有应用窗口'));
+    },
+    windowIsMaximized: function () { return Promise.resolve(false); },
+    onWindowResize: function () { return function () {}; },
 
     // ── 应用设置与账号导入导出 ──
     getAppSettings: function () { return invokeShell('get_app_settings'); },

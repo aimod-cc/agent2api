@@ -10,6 +10,118 @@
   overflow: hidden;
 }
 
+/* 桌面端自定义标题栏占掉一行 32px，外框只吃剩余高度。
+   has-titlebar 由 titlebar.js 在创建标题栏时挂到 body 上 —— 网页端
+   （headless 托管面板）不创建标题栏，也就没有这个 class，布局保持 100vh 不变。 */
+body.has-titlebar .shell {
+  height: calc(100vh - var(--titlebar-h));
+}
+
+/* ─────────────────────────────
+   自定义标题栏（桌面端，titlebar.js 动态创建）
+   主窗口去掉了系统装饰（src-tauri 建窗处 decorations(false)），这里补一条
+   32px 的标题条：左侧标题、右侧最小化 / 最大化(还原) / 关闭三键。
+   形态参考 OmniProxy 的 TitleBar（Electron 版）。拖动与双击最大化用
+   Tauri 的 data-tauri-drag-region 内建支持，不用 Electron 的
+   -webkit-app-region；配色全部走 token，深浅两套主题自动适配。
+   ───────────────────────────── */
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--titlebar-h);
+  min-height: var(--titlebar-h);
+  width: 100%;
+  overflow: hidden;
+  padding-left: 12px;
+  /* 整条是拖动区：Tauri 只在「按下目标元素自身带 data-tauri-drag-region」
+     时才拖动（属性由 titlebar.js 声明在本条上），品牌区整体关掉事件
+     （见下），按下时的 target 始终落回本条 */
+  background: var(--sidebar-bg);
+  border-bottom: 1px solid var(--sidebar-border);
+  user-select: none;
+}
+
+/* 品牌区：图标 + 标题文案（与窗口 title 同一份文案）。纯展示，整体不吃
+   鼠标事件 —— mousedown 的 target 因此始终是 .titlebar（带拖动属性），
+   图标与文字不会挡住拖动（Tauri 的拖动判定只认按下时的目标元素）。 */
+.titlebar-brand,
+.titlebar-brand * {
+  pointer-events: none;
+}
+
+.titlebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--sidebar-fg);
+  font-size: 12.5px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.titlebar-brand svg { display: block; flex: 0 0 auto; }
+
+.titlebar-brand .txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 三键：满高 44px 宽（Windows 标题栏惯例），不做圆角卡片 ——
+   它们贴着窗口右上角，形状就是标题栏本身的一块 */
+.titlebar-actions {
+  margin-left: auto;
+  display: flex;
+  flex: 0 0 auto;
+  align-self: stretch;
+}
+
+.titlebar-btn {
+  width: 44px;
+  min-width: 44px;
+  height: 100%;
+  padding: 0;
+  flex: 0 0 44px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  /* 清掉通用 button 的投影与悬停位移：标题栏三键是平贴的一块色区，
+     只有底色变化（与 .nav-item / .theme-switch button 同款处理） */
+  box-shadow: none;
+  color: var(--sidebar-fg);
+  transition: background .12s ease, color .12s ease;
+}
+
+.titlebar-btn:hover:not(:disabled) {
+  background: var(--nav-hover);
+  color: var(--text);
+  border-color: transparent;
+}
+
+.titlebar-btn:active:not(:disabled) { transform: none; }
+
+/* 关闭键悬停红底白叉（Windows 11 标题栏的惯例语义色） */
+.titlebar-btn.close:hover:not(:disabled) {
+  background: var(--danger);
+  color: #fff;
+}
+
+/* 还原图标的「前一块」矩形要能遮住后面那块：填充本条底色（两套主题
+   各取各自的 --sidebar-bg，内联 SVG 里的 fill 跟着 CSS 变量走） */
+.titlebar-btn.is-maximized .fg { fill: var(--sidebar-bg); }
+.titlebar-btn.is-maximized:hover .fg { fill: var(--nav-hover); }
+.titlebar-btn svg { display: block; width: 14px; height: 14px; pointer-events: none; }
+
+/* 窄窗口：文案可能挤到三键，只留品牌图标（与侧栏 900px 收起文字同档） */
+@media (max-width: 900px) {
+  .titlebar { padding-left: 10px; }
+  .titlebar-brand .txt { display: none; }
+}
+
 /* 窄窗口（最小 820px）收起侧栏文字，只留图标 */
 @media (max-width: 900px) {
   :root { --sidebar-w: 68px; }

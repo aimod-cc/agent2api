@@ -39,7 +39,8 @@
 (() => {
   const api = workbuddyDesktop;
   const $ = id => document.getElementById(id);
-  const { esc, toast } = wbApp;
+  // toast 不再被本文件使用（清理动作的提示都移去了 request-clear-modal.js）
+  const { esc } = wbApp;
 
   // ─── 列设置（显示 / 隐藏、顺序、对齐）──────────
   //
@@ -88,7 +89,9 @@
   /**
    * 自动刷新间隔兜底值（毫秒）= 后端的默认间隔
    * （`DEFAULT_REQUESTS_AUTO_REFRESH_SECONDS`）：读不到配置时与用户没改过时一致。
-   * 实际值由「定时任务」页决定（见模块头）。
+   * 实际值由「定时任务」页决定（见模块头）。默认提到 1s 是为了进行中请求的
+   * 实时性 —— 转发中的行（status=0）靠这一拍拍轮询把「已用时」与终态刷出来；
+   * 这条查询按当前筛选走索引、行数以十计，对后端是轻请求。
    */
   const DEFAULT_AUTO_REFRESH_MS = 1_000;
   let autoRefreshMs = DEFAULT_AUTO_REFRESH_MS;
@@ -113,7 +116,6 @@
    * 只挡轮询：用户翻页 / 换筛选是有意操作，不该被上一次自动刷新挡掉。
    */
   let polling = false;
-  let panelBusy = false;
 
   /** 每页条数：与后端 DEFAULT_LIMIT 一致 */
   const PAGE_SIZE = 50;
@@ -148,6 +150,14 @@
   let entries = [];
   let total = 0;      // 明细总量（未过滤）
   let matched = 0;    // 命中筛选条件的条数
+  /** 同一筛选下进行中（status=0）的条数：响应的 running 字段，页头读数与导航徽标共用 */
+  let runningCount = 0;
+  /**
+   * 「仅看进行中」开关（进行中的行 = status=0，转发还没收尾）。
+   * 只在会话内有效：不持久化 —— 它描述的是「此刻在盯转发」，不是偏好设置，
+   * 下次打开默认回到全量视图比停在「可能早已为空」的进行中视图更合理。
+   */
+  let runningOnly = false;
   let offset = 0;
   let seq = 0;        // 请求序号：连点翻页时只认最新一次响应
   let timer = null;
@@ -214,6 +224,15 @@
     return (Number(value) || 0).toLocaleString('zh-CN');
   }
 
+  /**
+   * 进行中行的「已用时」：now - ts 取整秒（进行中不足 1 秒也显示 1 秒 ——
+   * 「0秒」读起来像没动）。1 秒轮询每拍重绘，这个数自然一秒一跳。
+   */
+  function formatElapsed(ts) {
+    const elapsed = Math.max(0, Date.now() - (Number(ts) || 0));
+    return `${Math.max(1, Math.floor(elapsed / 1000))}秒`;
+  }
+
   /** 缓存命中率：命中读取 / 输入，分母为 0 时无意义，给「-」 */
   function cacheRate(entry) {
     const prompt = Number(entry.promptTokens) || 0;
@@ -230,11 +249,30 @@
     return status >= 200 && status < 300 && !entry.error;
   }
 
+  /**
+   * 是否「仍在转发中」。后端契约：转发一开始就插一条 status=0 的行，
+   * 收尾后由终态记账覆盖（见 stats_api::stats_requests 的模块注释）。
+   * 分界线画在 error 上：status=0 **且**没有错误摘要才是进行中 ——
+   * status=0 却带摘要的行是旧口径里「还没发出请求就失败」的历史数据，
+   * 仍按失败渲染（那次失败已经落定，不该被画成还在跑）。
+   */
+  function isRunning(entry) {
+    return (Number(entry?.status) || 0) === 0 && !entry?.error;
+  }
+
   function statusCell(entry) {
+    // 进行中：不走「失败」的红徽章 —— 它不是失败，只是还没收尾。
+    // 徽章带一枚呼吸的圆点（.req-live-dot，动画见 page-requests.css），
+    // 1 秒轮询每拍重绘时已用时也会跟着走，这个徽章就是「活着」的信号。
+    if (isRunning(entry)) {
+      return `<span class="req-status"><span class="badge tag running" title="请求正在转发中，用时列显示的是已用时">`
+        + `<span class="req-live-dot" aria-hidden="true"></span>进行中</span></span>`;
+    }
     const status = Number(entry.status) || 0;
     const ok = isOk(entry);
-    // status 为 0 是后端契约里的「还没发出请求就失败」，直接写 0 会被读成 HTTP 状态码，
-    // 所以退成「失败」两个字。
+    // 走到这里 status=0 的只剩「还没发出请求就失败」的历史行（进行中的已在
+    // 上面分流，新口径里那种失败落定后仍记 status=0 + 错误摘要）：直接写 0
+    // 会被读成 HTTP 状态码，所以退成「失败」两个字。
     // 2xx 却带错误摘要时（流式请求在响应体阶段失败）单看数字会以为成功，
     // 给 title 说明「状态码是 2xx，失败在响应体阶段」。
     const title = !ok && status >= 200 && status < 300
@@ -361,6 +399,9 @@
    * 写「0」会让人以为真的消耗了这些量，照 OmniProxy 的口径退成「-」。
    */
   function usageCell(entry) {
+    // 进行中：用量要等收尾才记账，此刻没有任何读数可给 —— 留空比「-」更准确
+    //（「-」在这里会被读成「没有用量」，而进行中的真实含义是「还没有」）
+    if (isRunning(entry)) return '<span class="req-usage"></span>';
     if (!isOk(entry)) {
       return `<span class="req-usage" title="失败请求不记录用量">`
         + `<span class="req-usage-line">in: - / out: - / all: -</span>`
@@ -423,14 +464,28 @@
     retry: entry => retryCell(entry),
     status: entry => statusCell(entry),
     model: entry => modelCell(entry),
-    dur: entry => '<span class="req-num req-dur">'
-      + `<span class="req-dur-line">${esc(formatDuration(entry.durationMs))}</span>`
-      + `<span class="req-dur-line sub" title="首响：上游首帧到达的耗时">首响 ${esc(formatFirstResponse(entry.firstResponseMs))}</span></span>`,
+    // 进行中行没有 durationMs（收尾才记账）：主行显示已用时（每拍轮询在走）。
+    // 次行（首响）**有值就显示**：首响在上游第一帧到达时就有了，而且转发期间
+    // 就回写进了这一行（见后端 `live_row_sink`）—— 一条跑几分钟的流式请求，
+    // 首响其实一秒内就定了，藏到收尾才显示等于白采。没有值时才整行省掉：
+    // 写「-」会被读成「首响失败」，而真实含义是「还没到首帧」。
+    dur: entry => (isRunning(entry)
+      ? `<span class="req-num req-dur">`
+        + `<span class="req-dur-line" title="已用时（请求仍在转发中）">${esc(formatElapsed(entry.ts))}</span>`
+        + runningFirstLine(entry)
+        + '</span>'
+      : '<span class="req-num req-dur">'
+        + `<span class="req-dur-line">${esc(formatDuration(entry.durationMs))}</span>`
+        + `<span class="req-dur-line sub" title="首响：上游首帧到达的耗时">首响 ${esc(formatFirstResponse(entry.firstResponseMs))}</span></span>`),
     usage: entry => usageCell(entry),
-    // 没有错误时用「-」占位（空着会被当成渲染缺失，与重试列同一手法）
-    error: entry => (entry.error
-      ? `<span class="req-error" title="${esc(String(entry.error))}">${esc(String(entry.error))}</span>`
-      : '<span class="req-none req-error-cell">-</span>'),
+    // 没有错误时用「-」占位（空着会被当成渲染缺失，与重试列同一手法）；
+    // 进行中行例外：错误还没有发生，留空 —— 「-」会说成「没出错」，
+    // 留空才是「还没到有错误的时刻」
+    error: entry => (isRunning(entry)
+      ? '<span class="req-error-cell"></span>'
+      : entry.error
+        ? `<span class="req-error" title="${esc(String(entry.error))}">${esc(String(entry.error))}</span>`
+        : '<span class="req-none req-error-cell">-</span>'),
     detail: entry => detailCell(entry),
   };
 
@@ -441,15 +496,31 @@
   }
 
   /**
+   * 进行中行的「首响」次行：**有值才渲染**（空串 = 首帧还没到，整行省掉）。
+   *
+   * 与收尾行的写法只差这一层判断：那边 `formatFirstResponse` 用「-」兜住
+   * 缺失值（那里缺失确实等于「全程没有帧到达」= 失败），而进行中的缺失只是
+   * 「还没到」—— 同一列上两种含义不能共用同一个占位符。
+   */
+  function runningFirstLine(entry) {
+    const value = Number(entry.firstResponseMs);
+    if (!Number.isFinite(value) || value <= 0) return '';
+    return `<span class="req-dur-line sub" title="首响：上游首帧到达的耗时（请求仍在转发中）">`
+      + `首响 ${esc(formatDuration(value))}</span>`;
+  }
+
+  /**
    * 一行：按**可见列**逐格产出，顺序与表头一致（两处都走 visibleColumns）。
    * 每个格子仍是带 `.req-xxx` 的网格项，只是多一个用户选的对齐类。
    */
   function rowHtml(entry) {
     const ok = isOk(entry);
+    // 进行中行不吃失败行的红底（.failed）：它还没落定，红底是终态的颜色
+    const running = isRunning(entry);
     const cells = visibleColumns()
       .map(column => withAlign(CELLS[column.key]?.(entry) || '', column.align))
       .join('');
-    return `<div class="req-row${ok ? '' : ' failed'}">${cells}</div>`;
+    return `<div class="req-row${running ? ' running' : ok ? '' : ' failed'}">${cells}</div>`;
   }
 
   // ─── 整块渲染 ────────────────────────────────
@@ -494,9 +565,11 @@
     const box = $('req-summary');
     if (!box) return;
     const parts = [RANGE_LABEL[range] || '全部'];
-    const status = $('req-status')?.value;
-    if (status === 'ok') parts.push('只看成功');
-    else if (status === 'error') parts.push('只看失败');
+    // 仅看进行中开着时，状态维度的实际取值是 running（状态下拉已停用），
+    // 读数按**生效中的条件**写，不写下拉的残留值
+    if (runningOnly) parts.push('只看进行中');
+    else if ($('req-status')?.value === 'ok') parts.push('只看成功');
+    else if ($('req-status')?.value === 'error') parts.push('只看失败');
     const provider = $('req-provider')?.value;
     if (provider) parts.push(window.wbProviders?.labelOf?.(provider) || provider);
     const model = $('req-model')?.value;
@@ -507,8 +580,12 @@
   function renderBadge() {
     const badge = $('req-badge');
     if (!badge) return;
+    const base = matched === total ? `${total} 条` : `${matched} / ${total} 条`;
+    // 进行中读数来自同一次响应的 running 字段（同筛选下 status=0 的条数）。
+    // 「仅看进行中」开着时整页都是进行中，再缀一遍就成了复读，省掉
+    const live = !runningOnly && runningCount > 0 ? ` · ${runningCount} 进行中` : '';
     badge.className = 'badge';
-    badge.textContent = matched === total ? `${total} 条` : `${matched} / ${total} 条`;
+    badge.textContent = base + live;
   }
 
   function renderPager() {
@@ -626,7 +703,10 @@
     const params = new URLSearchParams();
     const start = rangeStart(range);
     if (start !== null) params.set('start', String(start));
-    const status = $('req-status')?.value;
+    // 「仅看进行中」开启时状态固定发 running（后端 status 过滤认的伪状态值），
+    // 覆盖状态下拉 —— 「成功 / 失败」与「进行中」是同一维度的互斥取值，
+    // 并存只会打架；下拉此刻已被停用（见按钮绑定处），这里只是兜住取值
+    const status = runningOnly ? 'running' : ($('req-status')?.value || '');
     if (status) params.set('status', status);
     const provider = $('req-provider')?.value;
     if (provider) params.set('provider', provider);
@@ -659,6 +739,7 @@
       entries = Array.isArray(result?.entries) ? result.entries : [];
       total = Number(result?.total) || 0;
       matched = Number(result?.matched) || 0;
+      runningCount = Number(result?.running) || 0;
       // 明细被清空或被保留期裁掉后，停在第 5 页会看到一片空白：
       // 先把 offset 夹回最后一页再取一次。夹完必然落在合法页（lastOffset 是
       // 本次响应算出来的），所以不会来回递归；用 return 把这次重取并进同一个 Promise，
@@ -755,7 +836,7 @@
       // 请求成功就标记同步过（哪怕这一条不在清单里 —— 那是后端版本旧）
       autoSynced = Array.isArray(list?.tasks);
     } catch (error) {
-      console.warn('读取请求日志自动刷新间隔失败，按默认 10 秒:', error.message);
+      console.warn('读取请求日志自动刷新间隔失败，按默认 1 秒:', error.message);
       applyAutoRefresh(null);
     }
   }
@@ -773,61 +854,20 @@
     void load();
   }
 
-  /** 统一忙碌守卫：按钮禁用 + 文案切换，避免重复点击（与 logs-panel 的 guard 同一写法） */
-  async function guard(button, label, action) {
-    if (panelBusy) return;
-    panelBusy = true;
-    const original = button?.textContent;
-    if (button) { button.disabled = true; if (label) button.textContent = label; }
-    try {
-      await action();
-    } catch (error) {
-      toast(`操作失败：${error.message}`, 'err');
-    } finally {
-      panelBusy = false;
-      if (button) { button.disabled = false; if (label) button.textContent = original; }
-    }
-  }
-
   /**
-   * 清空用的筛选参数：与 `queryParams` 同一套条件（不含 offset/limit，两者都从
-   * `filterParams` 来）。带条件 = 只删命中的明细（受影响日期的按天聚合由后端重算）；
-   * 不带条件 = 全部清空，此时调用方要显式带 `all=1`（后端护栏，见 clearRequests）。
+   * 清理弹窗用的筛选参数：与 `queryParams` 同一套条件（不含 offset/limit，两者都从
+   * `filterParams` 来）。带条件 = 只删命中的明细；不带条件 = 全部清空，此时调用方
+   * 要显式带 `all=1`（后端护栏，mode=raw / mode=all 一视同仁，拼串在 request-clear-modal.js）。
    *
    * 返回**查询串**（与 queryParams 一致）而不是 URLSearchParams 对象：
    * 桥接层的 toQuery 只认字符串 / 普通对象，传对象会静默变成「没有参数」，
    * 那样筛选清空就变成了全清 —— 这个 bug 已经踩过一次，别再踩。
+   *
+   * 供 request-clear-modal.js 取用（预览与 DELETE 都用它）—— 本文件不再直接
+   * 打清理接口，删除方式的选择（全部删除 / 仅清空报文原文）与压缩入口都收进弹窗。
    */
   function clearParams() {
     return filterParams().toString();
-  }
-
-  async function clearRequests() {
-    const query = clearParams();
-    const hasFilters = query.length > 0;
-    const message = hasFilters
-      ? `确定清空当前筛选出的 <strong>${matched}</strong> 条请求？按天聚合会随删除重算，此操作无法恢复。`
-      : '确定清空<strong>全部</strong>请求日志？按天聚合会一并清空，此操作无法恢复。';
-    // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认），
-    // 危险确认一律走自绘弹窗（wbConfirm，见 confirm-dialog.js）
-    if (!(await window.wbConfirm?.ask?.({
-      title: '清空请求日志',
-      html: message,
-      okText: '清空',
-      okClass: 'danger',
-    }))) return;
-    await guard($('btn-req-clear'), '清空中…', async () => {
-      // 无筛选时显式带 all=1：后端要求「清空全部」必须显式声明，
-      // 免得哪天参数漏传又被当成全清（前端写错一次就是全部数据没了）
-      await api.clearStatsRequests(hasFilters ? query : 'all=1');
-      // 清单跟着明细一起变（可能整批模型名都没了）：把节流计时清零强制重拉一次。
-      // 不重拉的话，清空后下拉里还列着已经不存在的值 —— 选中它得到空列表，
-      // 而用户刚清空过日志，这个空列表看不出是「被清掉了」还是「筛错了」
-      filterOptionsAt = 0;
-      // 清空后没有「当前页」可言：回到第 1 页并把滚动位置一起归零
-      await load({ resetPage: true });
-      toast('请求日志已清空');
-    });
   }
 
   // ─── 事件绑定 ──────────────────────────────
@@ -850,9 +890,36 @@
     void load({ resetPage: true });
   });
 
-  $('btn-req-clear').addEventListener('click', clearRequests);
+  // 「清理」打开清理弹窗（request-clear-modal.js：两种删除方式 + 预览统计 +
+  // 压缩数据库都在那边；本文件只负责把当前筛选参数给它，见 clearParams）
+  $('btn-req-clear').addEventListener('click', () => {
+    void window.wbRequestClearModal?.open?.();
+  });
   $('btn-req-prev').addEventListener('click', () => gotoPage(Math.floor(offset / PAGE_SIZE)));
   $('btn-req-next').addEventListener('click', () => gotoPage(Math.floor(offset / PAGE_SIZE) + 2));
+
+  // ─── 仅看进行中 ────────────────────────────
+  //
+  // 进行中的请求（status=0）默认混在全量列表里，转发一卡住不容易第一时间看到。
+  // 开关与其它筛选并存（提供商 / 模型 / 时间照常生效），唯独与状态下拉互斥 ——
+  // 「成功 / 失败」和「进行中」是 status 维度上的并列取值，同时发两个只会打架；
+  // 开启时把下拉停用（视觉上说明条件已被接管），关闭时还原。
+  const runningButton = $('btn-req-running');
+  runningButton?.addEventListener('click', () => {
+    runningOnly = !runningOnly;
+    runningButton.classList.toggle('active', runningOnly);
+    runningButton.setAttribute('aria-pressed', String(runningOnly));
+    const statusSelect = $('req-status');
+    if (statusSelect) {
+      statusSelect.disabled = runningOnly;
+      statusSelect.title = runningOnly
+        ? '「仅看进行中」开启时，状态固定为进行中'
+        : '按请求结果筛选';
+    }
+    // 筛选换结果集，回到第 1 页（与三个下拉同一取向）
+    void load({ resetPage: true });
+  });
+
   // 四个筛选维度都会换掉结果集，页码必须回到第 1 页，否则停的位置没有意义。
   // 三个下拉共用一条绑定（它们的语义完全一致，逐个写三遍只会多三处要同步的地方）
   for (const id of ['req-status', 'req-provider', 'req-model']) {
@@ -868,13 +935,21 @@
   // 拆出、request-hover.js 与本文件的分工）。
   //
   // 本文件只留两件事：
-  //   ① 列表里的「详情」按钮 → wbRequestDetail.open(id)（下面那个委托）；
-  //   ② 弹窗自己的关闭/分段事件全在那边绑（它独占 #req-detail-modal 那组 DOM），
+  //   ① 列表里的「详情」按钮 → wbRequestDetail.open(id, row)（下面那个委托，
+  //      row 是从当前一屏数据里反查出的行对象，弹窗的「请求详情」标签要吃它）；
+  //   ② 弹窗自己的关闭/标签事件全在那边绑（它独占 #req-detail-modal 那组 DOM），
   //      本文件不再碰那些节点。
   $('req-list')?.addEventListener('click', event => {
     const button = event.target.closest('[data-detail]');
     if (!button) return;
-    void window.wbRequestDetail?.open?.(button.dataset.detail);
+    const id = button.dataset.detail;
+    // 当前行对象一并传过去（详情弹窗的「请求详情」标签要吃行上的完整字段）：
+    // 与 wbRequestHover.entryOf 同一套反查口径 —— id 优先、无 id 的旧行退回 ts，
+    // 都查不到（列表在点开前恰好刷新过）传 null，弹窗里显示「请重试」的空态
+    const row = entries.find(item => String(item?.id || '') === id)
+      || entries.find(item => String(item?.ts || '') === id)
+      || null;
+    void window.wbRequestDetail?.open?.(id, row);
   });
 
   // ─── 重试列 / 敏感词的悬停面板 ───────────────
@@ -907,6 +982,18 @@
     // 当前可见列（顺序即配置顺序）：table-columns.js 拼 `--req-cols` 轨道时
     // 读它 —— 轨道条数与顺序必须与渲染出的格子一一对应，两处同源才不会错位
     visibleColumns,
+    // 当前筛选参数（查询串形态）：清理弹窗的预览与 DELETE 用同一份条件，
+    // 「预览说删 N 条」与「确认删掉的那批」才能对上（后端三条路由共用同一份
+    // FilterPlan，前端这里也不能第二套口径）
+    clearParams,
+    /**
+     * 清理完成后的收口刷新：筛选清单的节流计时清零（明细被清后可能整批
+     * 模型名 / 提供商都消失了，下拉里不该再列着），并回到第 1 页重拉。
+     */
+    notifyCleared() {
+      filterOptionsAt = 0;
+      return load({ resetPage: true });
+    },
   };
 
   // 首屏自持加载：即便 app.js 的 refresh 失败，本页也能独立显示真实状态。

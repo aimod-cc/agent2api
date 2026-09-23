@@ -37,7 +37,10 @@ use super::responses::ConvertError;
 ///
 /// Anthropic 官方**要求**这个字段必填；客户端漏填时给一个保守值而不是报错
 /// （报错会让「只差一个字段」的请求整个失败，而 8192 对绝大多数对话够用）。
-const DEFAULT_MAX_TOKENS: i64 = 8192;
+///
+/// `pub(super)`：出站方向（`anthropic_outbound`）补同一个缺省值 —— 两处
+/// 各定义一份迟早漂移。
+pub(super) const DEFAULT_MAX_TOKENS: i64 = 8192;
 
 // ─── 请求：Anthropic → Chat ─────────────────────────────────
 
@@ -232,7 +235,10 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
 }
 
 /// 工具结果内容 → 文本（Chat 的 tool 消息 content 只接受字符串）
-fn tool_result_text(content: &Value) -> String {
+///
+/// `pub(super)`：出站方向（`anthropic_outbound`）把 chat 的 tool 消息折回
+/// user 消息里的 tool_result 块时用同一口径。
+pub(super) fn tool_result_text(content: &Value) -> String {
     match content {
         Value::String(text) => {
             if text.is_empty() { "(empty)".to_string() } else { text.clone() }
@@ -476,7 +482,10 @@ pub fn anthropic_from_chat(chat: &Value, model: &str) -> Value {
 }
 
 /// 把工具参数（字符串或对象）解析成对象
-fn parse_json_object(value: &Value) -> Value {
+///
+/// `pub(super)`：出站方向（`anthropic_outbound`）的 tool_use 块 input 也要
+/// 「保证是对象」这同一归一（上游对非对象 input 会直接 400）。
+pub(super) fn parse_json_object(value: &Value) -> Value {
     if value.is_object() {
         return value.clone();
     }

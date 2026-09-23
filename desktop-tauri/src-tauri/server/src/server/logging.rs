@@ -107,6 +107,16 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// 本进程的启动时刻（毫秒 Unix 时间戳；首次取用时钉住）。
+///
+/// 请求日志用它区分「本进程正在跑的请求」与「上一次运行遗留的孤儿行」：
+/// 早于本时刻的进行中行不可能再收到收尾通知（见 `request_stats` 的
+/// `sweep_stale_running`）。
+pub fn process_started_at() -> i64 {
+    static STARTED: OnceLock<i64> = OnceLock::new();
+    *STARTED.get_or_init(now_ms)
+}
+
 /// 控制台时间前缀：`[HH:mm:ss.SSS]`，**UTC**（对齐 Node 的 toISOString）。
 fn timestamp_prefix() -> String {
     match Utc.timestamp_millis_opt(now_ms()).single() {

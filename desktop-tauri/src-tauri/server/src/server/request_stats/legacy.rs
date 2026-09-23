@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 
 use super::record::{DailyEntry, RequestEntry, Retention, MAX_DAILY_DAYS, MAX_ENTRIES};
 use super::report::{push_account_accum, push_model_accum, push_provider_accum};
+use super::daily;
 use super::{backfill, sql, RetentionBounds};
 
 /// 逐行解析明细旧文件（`requests.jsonl`），坏行跳过。
@@ -252,16 +253,16 @@ pub(crate) fn import_legacy_daily(
 ) -> rusqlite::Result<(usize, Vec<String>)> {
     let tx = conn.unchecked_transaction()?;
     for day in daily.values() {
-        sql::upsert_daily(&tx, day)?;
+        daily::upsert_daily(&tx, day)?;
     }
-    sql::delete_daily_before(&tx, &bounds.daily_key)?;
+    daily::delete_daily_before(&tx, &bounds.daily_key)?;
     // 聚合的天数上限（与运行期同一个函数 —— 它自己先判行数再决定删不删）。
     // 明细的保留期与容量不在这里管：那是 `import_legacy_requests` 的事，
     // 而它按注册表顺序排在前面 —— 这边只是读它导进来的明细做回填。
-    sql::trim_daily_capacity(&tx, MAX_DAILY_DAYS)?;
+    daily::trim_daily_capacity(&tx, MAX_DAILY_DAYS)?;
     // 裁剪之后再回填：已经超期被删掉的日子不必再花一次重算
     //（顺序与旧 `load()` 一致：先裁聚合、再回填）
-    let mut stored = sql::select_daily_map(&tx)?;
+    let mut stored = daily::select_daily_map(&tx)?;
     let entries = match (sql::min_ts(&tx)?, sql::max_ts(&tx)?) {
         // 明细在这两个时间之间全取 —— 回填的判据要看「某天有多少条明细」，
         // 只取候选日会需要先知道候选日（那正是 backfill 内部算的），
@@ -272,7 +273,7 @@ pub(crate) fn import_legacy_daily(
     let changed = backfill::rebuild_legacy_days(&mut stored, &entries);
     for key in &changed {
         if let Some(day) = stored.get(key) {
-            sql::upsert_daily(&tx, day)?;
+            daily::upsert_daily(&tx, day)?;
         }
     }
     // 标记与数据同事务提交（本项幂等的全部依据）

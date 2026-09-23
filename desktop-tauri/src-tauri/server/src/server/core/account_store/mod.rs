@@ -79,12 +79,16 @@
 //!                续期回写、Cline 公开形态
 //!   qoder_accounts.rs    Qoder 账号（地区 + userId 识别）：添加、凭证刷新回写、
 //!                Qoder 公开形态
+//!   custom_accounts.rs   自定义提供商账号（`custom-` 前缀的 provider）：手动
+//!                添加（apiKey + baseUrl 覆盖项）、级联删除、custom 公开形态；
+//!                存储与校验的架构说明见 `core::custom_providers`
 
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
 pub mod catpaw_import;
 pub mod cline_accounts;
+pub mod custom_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;

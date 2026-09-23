@@ -19,12 +19,24 @@
 //! 「新在前」对应 `ORDER BY ts DESC, row_id DESC`（同 ts 时 row_id 大的就是后
 //! 写入的那条，与原实现「升序数组反转」的次序逐位一致）。
 //!
+//! ── request_raw 表与「进行中」行（本次新增的两件事）────────────
+//!   - `request_raw`：下游原始正文（预览对话的地基），与 requests 同 id 关联。
+//!     它的写入（`upsert_raw`）由上层在明细记账后单独调；**删除必须挂在
+//!     requests 明细的每一个删除点之后/之前同步做**（见各删除函数的注释），
+//!     否则明细没了正文还在，既占容量闸的名额又永远读不出来。
+//!   - status=0 的行：转发开始前由 `insert_started_request` 先插的「进行中」
+//!     行，收尾时由 `update_running_request` 补全终态字段（先 UPDATE 后
+//!     INSERT 的理由见 `update_running_request`）。这类行**不进日报**
+//!     （`fold_into_daily` 按 status=0 跳过），且会被 `delete_stale_running`
+//!     按时间清理（网关崩溃留下的僵尸行）。
+//!
 //! ── 过滤条件为什么能全部下推给 SQL ──────────────────────────
 //! 这里没有「只能在 Rust 侧算」的条件：`model` 是精确匹配、`status` 是两列的
 //! 复合判定、`start`/`end` 是数值区间，都能表达成 WHERE。`query_requests` 与
-//! `clear_where` 共用同一份 [`FilterPlan`] ——「页面上筛出来的 N 条」与「清空
-//! 删掉的那批」因此必然是同一个集合（事件日志那边的 keyword 不能下推是因为
-//! SQLite 的 LIKE 只折叠 ASCII 大小写；本模块没有关键词过滤，也就没有那个约束）。
+//! 清理（`clear_where` / `clear_raw_where` / 预览计数）共用同一份
+//! [`FilterPlan`] ——「页面上筛出来的 N 条」与「清空删掉的那批」因此必然是
+//! 同一个集合（事件日志那边的 keyword 不能下推是因为 SQLite 的 LIKE 只折叠
+//! ASCII 大小写；本模块没有关键词过滤，也就没有那个约束）。
 //!
 //! ── 聚合行的读-改-写 ────────────────────────────────────────
 //! `request_daily` 一天一行，三个 `*Stats` 列是 JSON 数组文本。累计它们必须
@@ -33,6 +45,8 @@
 //! 会让「各维之和 = 当天总量」这条对账前提变成两处维护（见 `fold_into_daily`）。
 //! 一天只有一行、三个数组通常几十个条目，读-改-写在**一个事务**里完成，代价可接受
 //! （这是连接池 / 增量 UPDATE 都换不来的东西：口径只有一处）。
+//! 这一支的语句（含列常量与编解码）住在 `daily.rs` —— 两张表分文件后各自
+//! 演化，本文件专注 `requests` 明细表与跨表共用的 [`FilterPlan`]。
 //!
 //! ── 并发：本层不加锁 ────────────────────────────────────────
 //! 所有函数取裸 `&Connection`，串行化由 `Db` 那把 Mutex 负责（上层每个公开方法
@@ -40,15 +54,10 @@
 //! **硬约束**：持这把锁期间绝不能再调 `logging::log` —— 日志要写同一个库，
 //! `std::sync::Mutex` 不可重入，会当场死锁（`request_stats.rs` 模块头也记了这条）。
 
-use std::collections::BTreeMap;
-
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{params, params_from_iter, Connection};
 
-use super::record::{
-    AccountAccum, AttemptDetail, DailyEntry, ModelAccum, ProviderAccum, RequestEntry, RequestQuery,
-    SensitiveHit,
-};
+use super::record::{AttemptDetail, RequestEntry, RequestQuery, RunningProgress, SensitiveHit};
 use super::report::normalize_status_filter;
 
 /// `requests` 的列顺序（所有 SELECT 都按这个顺序取，`decode_request` 依赖它；
@@ -62,9 +71,8 @@ const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, 
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits";
 
-/// `request_daily` 的列顺序（同上）
-const DAILY_COLUMNS: &str = "date, requests, successful, tokens, cache_hit_tokens, \
-     cache_input_tokens, model_tokens, provider_stats, account_stats";
+// `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
+// `daily.rs` —— 两张表的语句分文件后各自独立演化。
 
 // ─── 行解码 ─────────────────────────────────────────────────
 
@@ -107,51 +115,18 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
 /// JSON 数组文本 → `Vec<T>`（明细行的两个附属列）。解析失败或内容不是数组时
 /// 退化成空表。
 ///
-/// 与 `decode_accum`（聚合行那三个列）同一取向：这两个列是**补充信息**，
-/// 一个坏值不该让整条请求明细读不出来 —— 退化成空表只是少了重试链 / 命中表，
-/// 而状态、模型、用量、错误全都还在。反过来，若在这里报错，一条手改坏的
+/// 与 `decode_accum`（聚合行那三个列，已拆到 `daily.rs`）同一取向：这两个列是
+/// **补充信息**，一个坏值不该让整条明细读不出来 —— 退化成空表只是少了重试链 /
+/// 命中表，而状态、模型、用量、错误全都还在。反过来，若在这里报错，一条手改坏的
 /// JSON 就能让请求日志整页拉不出来（`select_page_desc` 会因为一个 `?` 直接失败）。
 fn decode_json_list<T: serde::de::DeserializeOwned>(text: &str) -> Vec<T> {
     serde_json::from_str(text).unwrap_or_default()
 }
 
-/// JSON 数组 ← `Vec<T>`。序列化失败给 `'[]'`（与 DDL 的默认值同一形态，
+/// JSON 数组文本 ← `Vec<T>`。序列化失败给 `'[]'`（与 DDL 的默认值同一形态，
 /// 于是「这一列没有数据」在库里只有一种表示）。
 fn encode_json_list<T: serde::Serialize>(items: &[T]) -> String {
     serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
-}
-
-/// JSON 数组列 → `Vec<T>`。解析失败或内容不是数组时退化成空表。
-///
-/// 与旧实现读文件时的取向一致（坏行跳过、坏字段回落）：这三个列是**整体读写**
-/// 的补充维度，一个坏值不该让整天的报表读不出来 —— 退化成空表只是那一维少一段，
-/// 而总量列还在。
-fn decode_accum<T: serde::de::DeserializeOwned>(text: &str) -> Vec<T> {
-    serde_json::from_str(text).unwrap_or_default()
-}
-
-/// JSON 数组列 ← `Vec<T>`。序列化失败给 `'[]'`（与 DDL 的默认值同一形态，
-/// 于是「这一列没有数据」在库里只有一种表示）。
-fn encode_accum<T: serde::Serialize>(items: &[T]) -> String {
-    serde_json::to_string(items).unwrap_or_else(|_| "[]".to_string())
-}
-
-/// 行 → `DailyEntry`
-fn decode_daily(row: &rusqlite::Row<'_>) -> rusqlite::Result<DailyEntry> {
-    let model_tokens: String = row.get(6)?;
-    let provider_stats: String = row.get(7)?;
-    let account_stats: String = row.get(8)?;
-    Ok(DailyEntry {
-        date: row.get(0)?,
-        requests: row.get(1)?,
-        successful: row.get(2)?,
-        tokens: row.get(3)?,
-        cache_hit_tokens: row.get(4)?,
-        cache_input_tokens: row.get(5)?,
-        model_tokens: decode_accum::<ModelAccum>(&model_tokens),
-        provider_stats: decode_accum::<ProviderAccum>(&provider_stats),
-        account_stats: decode_accum::<AccountAccum>(&account_stats),
-    })
 }
 
 // ─── 过滤条件 → SQL ─────────────────────────────────────────
@@ -200,14 +175,22 @@ impl FilterPlan {
             binds.push(SqlValue::Text(want.to_string()));
         }
 
-        // ② 成功 / 失败：与 `RequestEntry::is_success` **逐字等价**的复合条件。
+        // ② 成功 / 失败 / 进行中：与 `RequestEntry::is_success` **逐字等价**的
+        // 复合条件（成功与失败），加上进行中行的专属条件。
         //
         // 成功的判据是「2xx **且**没有错误摘要」（两列合起来才算一个条件，见
         // record.rs 里那条注释：流式请求的 200 是响应头阶段就发出去的，之后
         // 上游断流只能靠 error 表达）。所以：
-        //   成功 → `status >= 200 AND status < 300 AND error IS NULL`
-        //   失败 → 上面整条的取反（**不是** `status NOT BETWEEN`，那会漏掉
-        //          「2xx 但带错误摘要」这一类 —— 它们必须是失败）
+        //   成功   → `status >= 200 AND status < 300 AND error IS NULL`
+        //   失败   → 上面整条的取反（**不是** `status NOT BETWEEN`，那会漏掉
+        //            「2xx 但带错误摘要」这一类 —— 它们必须是失败）
+        //   进行中 → `status = 0`（转发开始时插的行，还没收尾；见
+        //            `insert_started_request`）
+        //
+        // 失败条件**额外排除** status=0：取反会把「还没收尾」的进行中行也判成
+        // 失败 —— 那是种草效应最差的一类误报（用户看到一排失败，其实只是
+        // 还在跑）。status=0 在旧数据里从未被用过（schema 注释），这个排除
+        // 只影响新语义的行。
         //
         // `error IS NULL` 与 `is_none()` 的等价性对**两种写入路径**都成立：
         //   - 运行期写入的行走 `normalize`，它把空串摘要收敛成 `None`
@@ -216,13 +199,14 @@ impl FilterPlan {
         //     `"error": ""` 的行会落成空串。此时 SQL 判它是「有错误」（`IS NULL`
         //     为假）、Rust 的 `is_success()` 也判它有错误（`Some("")` 不是 `None`）
         //     —— 两边仍然一致。所以这个条件不需要额外的 `error <> ''` 分支。
-        if let Some(want_ok) = normalize_status_filter(filter.status.as_deref()) {
+        if let Some(want) = normalize_status_filter(filter.status.as_deref()) {
             let success = "status >= 200 AND status < 300 AND error IS NULL";
-            fragments.push(if want_ok {
-                format!("({success})")
-            } else {
-                format!("NOT ({success})")
-            });
+            let fragment = match want {
+                super::report::StatusFilter::Ok => format!("({success})"),
+                super::report::StatusFilter::Error => format!("(NOT ({success}) AND status <> 0)"),
+                super::report::StatusFilter::Running => "status = 0".to_string(),
+            };
+            fragments.push(fragment);
         }
 
         // ③ / ④ 时间区间：闭开 [start, end)。`end` 是开区间，与分页口径一致
@@ -260,6 +244,23 @@ pub(super) fn count_matching(
     plan: &FilterPlan,
 ) -> rusqlite::Result<usize> {
     let sql = format!("SELECT COUNT(*) FROM requests{}", plan.where_sql);
+    let count: i64 = conn.query_row(&sql, params_from_iter(plan.binds.iter()), |row| row.get(0))?;
+    Ok(count.max(0) as usize)
+}
+
+/// 命中筛选条件的**进行中**行数（`QueryResult.running`）。
+///
+/// 一条 COUNT：在筛选计划上追加 `status = 0` —— 与列表共用同一份 WHERE，
+/// 「这批筛选里还有几条没跑完」才是列表页徽标要的口径。
+pub(super) fn count_running(
+    conn: &Connection,
+    plan: &FilterPlan,
+) -> rusqlite::Result<usize> {
+    let sql = if plan.where_sql.is_empty() {
+        "SELECT COUNT(*) FROM requests WHERE status = 0".to_string()
+    } else {
+        format!("SELECT COUNT(*) FROM requests{} AND status = 0", plan.where_sql)
+    };
     let count: i64 = conn.query_row(&sql, params_from_iter(plan.binds.iter()), |row| row.get(0))?;
     Ok(count.max(0) as usize)
 }
@@ -381,7 +382,7 @@ pub(super) fn select_page_desc(
 ///
 /// 两个用途，都是「要按时间顺序逐条过一遍」的场景：
 ///   - 报表的缓存窗口（10 分钟 / 1 小时 / 24 小时 / 7 天）与近 24 小时趋势；
-///   - `clear_where` 重算某天聚合时取那一天的剩余明细。
+///   - `rebuild_day` 重算某天聚合时取那一天的剩余明细。
 /// 顺序取升序（而不是报表本身需要的顺序）是为了让重算与 `record` 的累加次序
 /// 一致 —— 三个维度数组里条目的先后只影响视觉，但没必要制造差异。
 pub(super) fn select_between(
@@ -402,25 +403,146 @@ pub(super) fn select_between(
     Ok(out)
 }
 
-/// 命中筛选的时间戳（`clear_where` 用它反推「哪些天的聚合要重算」）。
+/// 插一条**进行中**的明细（status=0，转发开始前调用；见 `RequestStats::record_started`）。
 ///
-/// 为什么不在 SQL 里 `SELECT DISTINCT date(ts)`：SQLite 的 `date()` 默认按
-/// **UTC** 切分，而本模块的「一天」是**本地时区**的自然日（`clock::day_of` 是
-/// 全模块唯一的切分口径，`schema.rs` 也明确写了聚合表的 date 是本地时区）。
-/// 用 SQL 的 date() 会让 UTC+8 的凌晨落进前一天，重算的日期集合整体偏一格。
-/// 所以这里只取回数值，日期键一律在 Rust 侧用 `date_key(day_of(_))` 算。
-pub(super) fn select_matching_ts(
+/// 幂等：同 id 已有进行中行时跳过（重复调用不产生第二行 —— 收尾的
+/// `update_running_request` 只按「id + status=0」匹配，多一行会让终态字段
+/// 补到错误的行上）。「已有终态行」不算重复：同 id 多行记账是存量语义
+/// （重试、去重排队），新一次转发仍该有自己的进行中行。
+///
+/// 只写四列，其余列走 DDL 的 DEFAULT：与「验收路径不预填字段」的取向一致 ——
+/// 进行中行只承诺「这条请求开始了、它叫什么名字」，终态字段一律等收尾时补。
+/// 返回是否真的插入了新行（调用方目前不需要区分，但测试与日志可能想看）。
+pub(super) fn insert_started_request(
     conn: &Connection,
-    plan: &FilterPlan,
-) -> rusqlite::Result<Vec<i64>> {
-    let sql = format!("SELECT ts FROM requests{}", plan.where_sql);
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params_from_iter(plan.binds.iter()))?;
-    let mut out = Vec::new();
-    while let Some(row) = rows.next()? {
-        out.push(row.get(0)?);
+    id: &str,
+    ts: i64,
+    model: &str,
+    client_model: &str,
+) -> rusqlite::Result<bool> {
+    let existing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM requests WHERE id = ?1 AND status = 0",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if existing > 0 {
+        return Ok(false);
     }
-    Ok(out)
+    conn.execute(
+        "INSERT INTO requests (id, ts, model, client_model, status) VALUES (?1, ?2, ?3, ?4, 0)",
+        params![id, ts, model, client_model],
+    )?;
+    Ok(true)
+}
+
+/// 收尾**陈旧的进行中行**：status=0 且开始时刻早于 cutoff 的行没有机会再收到
+/// 收尾 UPDATE（进程崩溃 / 流任务泄漏），把它就地补一个明确的失败终态。
+///
+/// 为什么是「补终态」而不是删除：界面上的进行中 → 结束是用户会一直盯着看的状态
+/// 流转。删掉一行等于让请求凭空消失，用户会以为平台漏记；补 408 则如实回答
+/// 「这次没跑完」。OmniProxy 的 `applyInterruptedLogs`（requestLogLifecycle.ts）
+/// 走的是同一条语义。`duration_ms` 与 `ts` 一并补齐，避免列出 0 耗时的假象。
+pub(super) fn finish_stale_running(
+    conn: &Connection,
+    cutoff: i64,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE requests SET status = 408, error = '网关重启或流中断，请求未能完成', \
+         duration_ms = MAX(?2 - ts, 0), attempts = 1, \
+         attempt_details = '[]', sensitive_hits = '[]' \
+         WHERE status = 0 AND ts < ?1",
+        params![cutoff, now],
+    )
+}
+
+/// 回写一条**进行中**明细的**在途**字段（转发期间每次状态真的变化时调一次；
+/// 见 `RequestStats::update_running`）。
+///
+/// ── 匹配条件与收尾**完全一致**（`id + status = 0`）────────────
+/// 收尾之后这一条必然打空 —— 那正是想要的：终态字段由收尾统一写，在途回写
+/// 晚到一步不该把终态覆盖回去（把一个已经收尾的行改回「还在飞」的样子）。
+/// 同一条请求写多少次都只是覆盖同一行的同几列，所以不需要幂等之外的判据。
+///
+/// ── 为什么不动这几列 ────────────────────────────────────────
+///   - `status` / `error`：它们决定前端认不认这行是「进行中」（有 error 就不再是，
+///     见 `ui/requests-panel.js` 的 isRunning）—— 转发中途的失败可能只是换号前的
+///     一次尝试失败，不该让列表里的行提前变成失败；
+///   - `ts` / `model` / `client_model`：请求发起时就定稿了，在途没有新值；
+///   - `duration_ms` / 四个 token 列：只有收尾才有值（用量在途中不显示）。
+pub(super) fn update_running_progress(
+    conn: &Connection,
+    id: &str,
+    progress: &RunningProgress,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE requests SET provider = ?2, account_id = ?3, account_name = ?4, \
+         upstream_model = ?5, attempts = ?6, first_response_ms = ?7, attempt_details = ?8, \
+         sensitive_hits = ?9 WHERE id = ?1 AND status = 0",
+        params![
+            id,
+            progress.provider,
+            progress.account_id,
+            progress.account_name,
+            progress.upstream_model,
+            progress.attempts,
+            progress.first_response_ms,
+            encode_json_list(&progress.attempt_details),
+            encode_json_list(&progress.sensitive_hits),
+        ],
+    )
+}
+
+/// 收尾一条进行中的明细：按 `id + status=0` 匹配，**补齐全部终态字段**。
+///
+/// ── 为什么是「先 UPDATE 后 INSERT」而不是唯一索引 + UPSERT ──────
+/// `requests.id` 上**不能**建唯一索引：存量数据里同 id 可能有多行
+/// （重试 / 去重排队等路径产生的重复记账，见 schema 的 id 列注释），
+/// 建索引会直接撞唯一约束、丢数据。而没有唯一约束就没有 UPSERT 的冲突目标
+/// —— `ON CONFLICT(id) DO UPDATE` 在没有对应唯一索引时会报语法错误。
+/// 所以收尾走两步：先 UPDATE 进行中行（有就补全），影响 0 行再 INSERT
+/// （转发前就失败等没有进行中行的路径维持原样）。两步在同一个事务里，
+/// 不存在「UPDATE 完、INSERT 前」被读到的中间态。
+///
+/// 更新**不动 row_id**：进行中行已经占住的物理行号不变，列表顺序稳定
+/// （行在「进行中」期间就出现在页面上，收尾后不该跳到别处）。`id` 为空的行
+/// 直接返回 0（不 UPDATE 任何行）：空 id 的 started 行不存在，早期失败路径
+/// 也没有 id 可匹配 —— 交给 INSERT。
+pub(super) fn update_running_request(
+    conn: &Connection,
+    entry: &RequestEntry,
+) -> rusqlite::Result<usize> {
+    if entry.id.is_empty() {
+        return Ok(0);
+    }
+    conn.execute(
+        "UPDATE requests SET ts = ?2, model = ?3, account_id = ?4, account_name = ?5, status = ?6, \
+         duration_ms = ?7, first_response_ms = ?8, attempts = ?9, error = ?10, prompt_tokens = ?11, \
+         completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
+         client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19 \
+         WHERE id = ?1 AND status = 0",
+        params![
+            entry.id,
+            entry.ts,
+            entry.model,
+            entry.account_id,
+            entry.account_name,
+            entry.status,
+            entry.duration_ms,
+            entry.first_response_ms,
+            entry.attempts,
+            entry.error,
+            entry.prompt_tokens,
+            entry.completion_tokens,
+            entry.total_tokens,
+            entry.cache_read_tokens,
+            entry.provider,
+            entry.client_model,
+            entry.upstream_model,
+            encode_json_list(&entry.attempt_details),
+            encode_json_list(&entry.sensitive_hits),
+        ],
+    )
 }
 
 /// 插入一条明细（`row_id` 由库自增，调用方不必也不该给）
@@ -462,7 +584,10 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
 
 // ─── 明细：删除与裁剪 ───────────────────────────────────────
 
-/// 删除命中筛选的明细，返回删除条数（`clear_where` 的 `removed`）
+/// 删除命中筛选的明细，返回删除条数（`clear_where` 的 `removed`）。
+///
+/// **调用方必须先删对应的 request_raw 行**（`delete_raw_matching`，同一份
+/// 筛选计划）—— 明细删完就再也找不到要陪葬的正文 id 了。
 pub(super) fn delete_matching(
     conn: &Connection,
     plan: &FilterPlan,
@@ -471,13 +596,42 @@ pub(super) fn delete_matching(
     conn.execute(&sql, params_from_iter(plan.binds.iter()))
 }
 
-/// 清空全部明细（`clear()` 用）
+/// 按筛选条件删除 request_raw 中「命中的明细 id」对应的正文行。
+///
+/// 同一个函数服务两个调用方，语义不同：
+///   - `mode=raw` 清理：它就是**全部动作**（只删正文，明细与日报不动）；
+///   - `mode=all` 带筛选的清理：它在 `delete_matching` **之前**跑（先删正文
+///     再删明细，顺序不能反）。
+///
+/// `IN (SELECT id FROM requests …)` 直接下推给 SQLite：不把命中 id 拉回
+/// Rust 再逐个绑定（筛选命中的可能是几千行，两万参数的 SQL 既慢又难看）。
+pub(super) fn delete_raw_matching(
+    conn: &Connection,
+    plan: &FilterPlan,
+) -> rusqlite::Result<usize> {
+    let sql = format!(
+        "DELETE FROM request_raw WHERE id IN (SELECT id FROM requests{})",
+        plan.where_sql
+    );
+    conn.execute(&sql, params_from_iter(plan.binds.iter()))
+}
+
+/// 清空全部明细（`clear()` 用）。调用方必须同时清 request_raw（`delete_all_raw`）。
 pub(super) fn delete_all_requests(conn: &Connection) -> rusqlite::Result<usize> {
     conn.execute("DELETE FROM requests", [])
 }
 
-/// 删掉 `ts < cutoff` 的明细（时间维度保留）
+/// 删掉 `ts < cutoff` 的明细（时间维度保留）。
+///
+/// **先删**这批明细对应的 request_raw 行再删明细本身（顺序理由同上）：
+/// 过期行通常为 0～少量，`ts` 索引让子查询的代价可以忽略 —— 记账热路径上
+/// 多一条带子查询的 DELETE，与原有的逐次裁剪同量级。
 pub(super) fn delete_expired_requests(conn: &Connection, cutoff: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM request_raw WHERE id IN \
+         (SELECT id FROM requests WHERE ts < ?1 AND id <> '')",
+        params![cutoff],
+    )?;
     conn.execute("DELETE FROM requests WHERE ts < ?1", params![cutoff])
 }
 
@@ -495,10 +649,24 @@ pub(super) fn delete_expired_requests(conn: &Connection, cutoff: i64) -> rusqlit
 /// 所以先 `COUNT(*)`（走最小的索引，比物化子查询便宜得多），未超限直接返回 0。
 /// **与改造前的判定同形**：旧 `insert_sorted` 也是 `if entries.len() > MAX_ENTRIES`
 /// 才 drain。
+///
+/// ── request_raw 的同步删除（淘汰点接上）──────────────────────
+/// 超限时**先**删将被淘汰明细的正文、再删明细：正文与明细同 id 关联，
+/// 明细一删，`id IN (SELECT ...)` 就再也找不到要删的正文行了。子查询与
+/// 下面的明细 DELETE 用同一个「保留集合」，两步必然删中同一批 id。
+/// 同 id 多行的边缘情形（淘汰其一、留下其一）：正文只有一行（UPSERT 覆盖），
+/// 删掉它会让留下的那条明细失去详情正文 —— 两个明细行共享一个 id 本来就是
+/// 模糊地带，这里取「正文跟着被淘汰的行走」，不再为它单独记状态。
 pub(super) fn trim_requests_capacity(conn: &Connection, max: usize) -> rusqlite::Result<usize> {
     if count_all(conn)? <= max {
         return Ok(0);
     }
+    conn.execute(
+        "DELETE FROM request_raw WHERE id IN (\
+           SELECT id FROM requests WHERE row_id NOT IN \
+           (SELECT row_id FROM requests ORDER BY ts DESC, row_id DESC LIMIT ?1) AND id <> '')",
+        params![max as i64],
+    )?;
     conn.execute(
         "DELETE FROM requests WHERE row_id NOT IN \
          (SELECT row_id FROM requests ORDER BY ts DESC, row_id DESC LIMIT ?1)",
@@ -506,98 +674,90 @@ pub(super) fn trim_requests_capacity(conn: &Connection, max: usize) -> rusqlite:
     )
 }
 
-// ─── 聚合：读-改-写 ─────────────────────────────────────────
+// ─── 原始报文：request_raw ──────────────────────────────────
 
-/// 全部聚合行 → `BTreeMap`（报表的纯函数要的就是这个形状）。
+/// 写一条原始正文（存在即覆盖；`id` 为空由调用方拦下）。
 ///
-/// 「聚合寿命独立于明细」这条契约在这里成立：报表的区间统计只读这张表，
-/// 明细被保留期裁掉之后历史曲线不会出现空洞。
-pub(super) fn select_daily_map(conn: &Connection) -> rusqlite::Result<BTreeMap<String, DailyEntry>> {
-    let sql = format!("SELECT {DAILY_COLUMNS} FROM request_daily ORDER BY date ASC");
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query([])?;
-    let mut out = BTreeMap::new();
-    while let Some(row) = rows.next()? {
-        let day = decode_daily(row)?;
-        out.insert(day.date.clone(), day);
-    }
-    Ok(out)
-}
-
-/// 取某一天的聚合行（`record` 的读-改-写的「读」）
-pub(super) fn select_daily_row(
+/// `size` 是**两侧字节长度合计**（截断后的落库体积，与 debug_traffic 的
+/// size 口径同理：闸门守的是「这张表实际占多大」）。UPSERT 而不是先查后写：
+/// `id` 是主键，`ON CONFLICT` 一条语句完成「新建 / 覆盖」，同 id 重写
+/// （理论上不该发生，防手改库与重复请求）不会撞约束。
+pub(super) fn upsert_raw(
     conn: &Connection,
-    date: &str,
-) -> rusqlite::Result<Option<DailyEntry>> {
-    let sql = format!("SELECT {DAILY_COLUMNS} FROM request_daily WHERE date = ?1");
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params![date])?;
-    match rows.next()? {
-        Some(row) => Ok(Some(decode_daily(row)?)),
-        None => Ok(None),
-    }
-}
-
-/// 整行写入（存在即覆盖）。
-///
-/// `date` 是主键，所以「同一天重复记账」天然是覆盖而不是插入两行 ——
-/// 这正是选它当主键的理由（见 `schema.rs`）。三个 JSON 列由
-/// [`encode_accum`] 编码，总量列直接取 `DailyEntry` 的字段值。
-pub(super) fn upsert_daily(conn: &Connection, day: &DailyEntry) -> rusqlite::Result<()> {
+    id: &str,
+    ts: i64,
+    request_body: &str,
+    response_body: &str,
+    size: i64,
+) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO request_daily (date, requests, successful, tokens, cache_hit_tokens, \
-         cache_input_tokens, model_tokens, provider_stats, account_stats) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
-         ON CONFLICT(date) DO UPDATE SET requests = excluded.requests, \
-         successful = excluded.successful, tokens = excluded.tokens, \
-         cache_hit_tokens = excluded.cache_hit_tokens, \
-         cache_input_tokens = excluded.cache_input_tokens, \
-         model_tokens = excluded.model_tokens, provider_stats = excluded.provider_stats, \
-         account_stats = excluded.account_stats",
-        params![
-            day.date,
-            day.requests,
-            day.successful,
-            day.tokens,
-            day.cache_hit_tokens,
-            day.cache_input_tokens,
-            encode_accum(&day.model_tokens),
-            encode_accum(&day.provider_stats),
-            encode_accum(&day.account_stats),
-        ],
+        "INSERT INTO request_raw (id, ts, request_body, response_body, size) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(id) DO UPDATE SET ts = excluded.ts, request_body = excluded.request_body, \
+         response_body = excluded.response_body, size = excluded.size",
+        params![id, ts, request_body, response_body, size],
     )?;
     Ok(())
 }
 
-/// 删掉某一天的聚合行（`clear_where` 重算后发现那天一条明细都不剩）
-pub(super) fn delete_daily(conn: &Connection, date: &str) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM request_daily WHERE date = ?1", params![date])
+/// 按 id 取一条原始正文（详情弹窗用）。无行返回 None（调用方给 404）。
+pub(super) fn select_raw(
+    conn: &Connection,
+    id: &str,
+) -> rusqlite::Result<Option<(String, String, String)>> {
+    let mut stmt = conn.prepare("SELECT id, request_body, response_body FROM request_raw WHERE id = ?1")?;
+    let mut rows = stmt.query(params![id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
+        None => Ok(None),
+    }
 }
 
-/// 删掉 `date < cutoff_key` 的聚合行（时间维度保留；定长日期串字典序即时间序）
-pub(super) fn delete_daily_before(conn: &Connection, cutoff_key: &str) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM request_daily WHERE date < ?1", params![cutoff_key])
-}
-
-/// 聚合行数与容量裁剪（兜底：手改库塞进十万行时不至于把报表撑爆）
-pub(super) fn count_daily(conn: &Connection) -> rusqlite::Result<usize> {
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM request_daily", [], |row| row.get(0))?;
+/// request_raw 行数（容量判定）
+pub(super) fn count_raw(conn: &Connection) -> rusqlite::Result<usize> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM request_raw", [], |row| row.get(0))?;
     Ok(count.max(0) as usize)
 }
 
-/// 只保留日期最新的 `max` 行（先判行数再删，理由见 [`trim_requests_capacity`]）
-pub(super) fn trim_daily_capacity(conn: &Connection, max: usize) -> rusqlite::Result<usize> {
-    if count_daily(conn)? <= max {
+/// 容量裁剪：只保留 **ts 最新的** `max` 行（先判条数再删，理由同
+/// [`trim_requests_capacity`]）。
+///
+/// 按 ts 丢最旧：正文的价值随时间衰减（「预览最近的对话」），明细行的
+/// 淘汰另有自己的口径 —— 两边各自守闸，孤儿行（明细已删、正文还在）由
+/// 各删除点的同步清理兜住。
+pub(super) fn trim_raw_capacity(conn: &Connection, max: usize) -> rusqlite::Result<usize> {
+    if count_raw(conn)? <= max {
         return Ok(0);
     }
     conn.execute(
-        "DELETE FROM request_daily WHERE date NOT IN \
-         (SELECT date FROM request_daily ORDER BY date DESC LIMIT ?1)",
+        "DELETE FROM request_raw WHERE id NOT IN \
+         (SELECT id FROM request_raw ORDER BY ts DESC LIMIT ?1)",
         params![max as i64],
     )
 }
 
-/// 清空全部聚合行（`clear()` 用）
-pub(super) fn delete_all_daily(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute("DELETE FROM request_daily", [])
+/// 命中筛选的明细里**仍带正文**的条数（清理预览的 `raw`）。
+///
+/// 「带正文」= request_raw 里有对应行 —— 表的约定是「有行 ⇔ 有正文」
+/// （写入侧两侧全空时不写行），所以不需要逐列判空。
+pub(super) fn count_raw_matching(
+    conn: &Connection,
+    plan: &FilterPlan,
+) -> rusqlite::Result<usize> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM request_raw WHERE id IN (SELECT id FROM requests{})",
+        plan.where_sql
+    );
+    let count: i64 = conn.query_row(&sql, params_from_iter(plan.binds.iter()), |row| row.get(0))?;
+    Ok(count.max(0) as usize)
 }
+
+/// 清空全部原始正文（`clear()` / `mode=all` 全清时与明细一起清）
+pub(super) fn delete_all_raw(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute("DELETE FROM request_raw", [])
+}
+
+// ─── 聚合：读-改-写 ─────────────────────────────────────────
+//
+// `request_daily` 的全部语句已拆到 `daily.rs`（列常量、编解码与
+// select / upsert / delete / trim），拆分理由见该文件的模块头。

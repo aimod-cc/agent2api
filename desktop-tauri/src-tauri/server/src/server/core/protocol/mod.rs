@@ -23,17 +23,27 @@
 //! 的 `gatewayProtocol*.ts`，并按本项目的口径收敛。
 //!
 //! ── 文件分工 ────────────────────────────────────────────────
-//!   mod.rs        本文件：共享原语（取值/转义/随机 id/SSE 编解码/行缓冲）
-//!   responses.rs  Responses ↔ Chat（请求、非流式响应、流式 SSE）
-//!   anthropic.rs  Anthropic Messages ↔ Chat（同上）
+//!   mod.rs               本文件：共享原语（取值/转义/随机 id/SSE 编解码/行缓冲）
+//!   responses.rs         Responses ↔ Chat（下游 Responses 入口的回程翻译）
+//!   anthropic.rs         Anthropic Messages ↔ Chat（同上）
+//!   responses_outbound.rs chat → Responses 上游的出站翻译（自定义提供商转发）
+//!   anthropic_outbound.rs chat → Anthropic 上游的出站翻译（同上）
+//!
+//! 出站两个文件与回程两个文件方向相反：回程服务「下游说 X」的入口
+//! （`api::protocol`），出站服务「上游说 X」的自定义家转发
+//! （`providers::custom::forward`）。单开文件而不是塞回原文件：两个
+//! 回程文件早已超过项目约定的单文件行数（各自 1000+ 行），出站方向
+//! 又是完整独立的一套（请求转换 + SSE 状态机），分开后各自内聚。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本模块零 unwrap/expect/panic，取值一律走 Option 链；
 //! 不做网络、不碰文件、不认识 axum（纯函数 + 状态机，便于单独推演）。
 
 pub mod anthropic;
+pub mod anthropic_outbound;
 pub mod freeform;
 pub mod responses;
+pub mod responses_outbound;
 pub mod tool_plan;
 
 use serde_json::Value;
@@ -145,6 +155,38 @@ pub fn content_parts(content: &Value) -> &[Value] {
 pub fn event_frame(event: &str, value: &Value) -> bytes::Bytes {
     let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
     bytes::Bytes::from(format!("event: {event}\ndata: {text}\n\n"))
+}
+
+/// 组装一条 **chat** SSE 帧（`data: <JSON>\n\n`，不带 `event:` 行 ——
+/// Chat 协议的 SSE 只有 data 行）。
+///
+/// 与 `upstream::sse::sse_frame` 同形；转换模块刻意不依赖 upstream 模块树
+/// （`core::protocol` 的定位是纯函数 + 状态机），这里留一份同口径实现。
+/// 出站转换器（`*_outbound`）折出的 chat 帧全部走这里，帧形状才能保证
+/// 是下游既有消费层（`ForwardStream` / 聚合器 / 出口翻译器）认得的样子。
+pub fn chat_frame(value: &Value) -> bytes::Bytes {
+    let text = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    bytes::Bytes::from(format!("data: {text}\n\n"))
+}
+
+/// 按候选键顺序从对象里读一个整数（都取不到给 0）。
+///
+/// usage 字段在各家协议里命名不一（Chat 是 `prompt_tokens`、Responses 是
+/// `input_tokens`），两个出站转换器折 usage 时统一走这里，避免各写各的
+/// 取值链。先试整数、再放宽到有限小数（部分上游把 token 数发成浮点）。
+pub fn json_number_of(value: &Value, keys: &[&str]) -> i64 {
+    for key in keys {
+        let Some(field) = value.get(*key) else {
+            continue;
+        };
+        if let Some(number) = field.as_i64() {
+            return number;
+        }
+        if let Some(number) = field.as_f64().filter(|number| number.is_finite()) {
+            return number as i64;
+        }
+    }
+    0
 }
 /// 把一段文本按 SSE 规范拆成一个个 `data:` 载荷。
 ///

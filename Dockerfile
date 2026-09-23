@@ -82,9 +82,11 @@ COPY desktop-tauri/ui /app/ui
 # 容器内的默认形态：全网卡监听 + 数据落卷 + 自托管面板。
 # 鉴权：面板需要管理员（登录页注册或 env 预置）；未配置任何 API Key 时
 # /v1/* 处于 fail-closed（登录面板创建第一把后自动恢复）。
+# AGENT2API_CAPTCHA_ENABLED：登录页人机验证组件环境变量，默认为1开启，0为关闭。
 ENV AGENT2API_HOST=0.0.0.0 \
     AGENT2API_PROXY_HOME=/data \
-    AGENT2API_UI_DIR=/app/ui
+    AGENT2API_UI_DIR=/app/ui \
+    AGENT2API_CAPTCHA_ENABLED=1
 VOLUME ["/data"]
 EXPOSE 3065
 WORKDIR /app

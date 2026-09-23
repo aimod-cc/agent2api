@@ -72,6 +72,12 @@ pub const KEY_SANITIZE_FINGERPRINTS: &str = "sanitizeBlacklistFingerprints";
 /// 抢注管理员）；ALTCHA 让每个请求先花一次算力，配合失败锁定把批量攻击
 /// 打得没性价比。对真人无感 —— 登录页在后台把题算完才允许提交。
 /// 只影响面板的 login / setup 两个端点，与 `/v1/*` 的 API Key 鉴权无关。
+///
+/// 部署级兜底：配置里没有这个键时读环境变量 `AGENT2API_CAPTCHA_ENABLED`
+/// （登录页人机验证组件环境变量，默认为1开启，0为关闭，见
+/// `parse::env_captcha_enabled`）—— Docker 想从第一次启动就关掉校验的，
+/// 在 compose / `.env` 里设它即可；设置页改过一次之后以库里的值为准
+/// （优先级「配置里的值 > 环境变量」）。
 pub const KEY_CAPTCHA_ENABLED: &str = "captchaEnabled";
 
 /// 系统提示词模式的键（config.json 键，对应 workbuddy2api 的 `prompt.mode`）。

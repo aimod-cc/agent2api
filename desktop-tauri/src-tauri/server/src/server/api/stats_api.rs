@@ -4,7 +4,10 @@
 //! GET    /api/stats/summary            报表聚合（概览 / 热力图 / 缓存命中率 / 趋势）
 //! GET    /api/stats/requests           请求日志（分页 + 模型 / 提供商 / 状态 / 时间区间过滤）
 //! GET    /api/stats/requests/filters   请求日志筛选下拉的候选清单（出现过的模型 / 提供商）
-//! DELETE /api/stats/requests           清空明细与按天聚合
+//! GET    /api/stats/requests/raw       单条请求的原始正文（预览对话详情弹窗的数据源）
+//! GET    /api/stats/requests/clear-preview  清理弹窗的预览统计（将删明细数 / 带正文数 / 库占用 / 压缩状态）
+//! DELETE /api/stats/requests           清理（mode=raw 只删原始正文 / mode=all 删明细，默认 all）
+//! POST   /api/stats/requests/compact   压缩数据库（checkpoint + VACUUM，后台执行）
 //! GET    /api/retention                三档保留天数（事件日志 / 请求日志 / 按天聚合）
 //! PUT    /api/retention                更新保留天数并**立即**触发清理
 //! ```
@@ -152,21 +155,31 @@ pub async fn stats_summary(State(state): State<ServerState>, Query(params): Quer
 ///
 /// `provider` 与 `model` 都是**精确匹配**（下拉里选的是明细里出现过的原值，
 /// 不做模糊匹配 —— 模糊匹配会让「筛了 A 却看到 B」变得无法解释）。
+///
+/// 响应额外带 `running`：同一筛选条件下仍在进行中（status=0）的条数 ——
+/// 转发开始时就会插一条这样的行（见 `RequestStats::record_started`），
+/// 收尾后由终态记账覆盖。status 过滤也认 `running` 值（只看进行中）。
 pub async fn stats_requests(State(state): State<ServerState>, Query(params): Query<Params>) -> Response {
-    let filter = RequestQuery {
+    ok_json(state.request_stats().query_requests(&filter_from_params(&params)))
+}
+
+/// 从查询串解析筛选条件 —— GET / DELETE / clear-preview 三条路由共用同一份
+/// 解析：筛选口径一旦漂了，三个端点就各说各话（「筛出的 N 条」与「删掉的
+/// 那批」「预览的 N 条」必须是同一个集合）。
+fn filter_from_params(params: &Params) -> RequestQuery {
+    RequestQuery {
         offset: parse_offset(params.get("offset")),
         limit: parse_limit(params.get("limit")),
         // 模型名精确匹配；空串（输入框清空）当没筛
         model: text_of(&params, "model"),
         // provider id 精确匹配；空串当没筛（见 RequestQuery::provider）
         provider: text_of(&params, "provider"),
-        // 只认 ok / error，其余值在存储层被忽略（不在这里重复实现归一）
+        // 只认 ok / error / running，其余值在存储层被忽略（不在这里重复实现归一）
         status: text_of(&params, "status"),
         // 闭开区间 [start, end)：翻页时上一页末尾的 ts 可直接当下页的 end
         start: parse_query_ms(params.get("start")),
         end: parse_query_ms(params.get("end")),
-    };
-    ok_json(state.request_stats().query_requests(&filter))
+    }
 }
 
 /// GET /api/stats/requests/filters —— 筛选下拉的候选清单。
@@ -181,27 +194,37 @@ pub async fn stats_request_filters(State(state): State<ServerState>) -> Response
     ok_json(state.request_stats().filter_options())
 }
 
-/// DELETE /api/stats/requests?model=&provider=&status=&start=&end=&all=
+/// DELETE /api/stats/requests?mode=raw|all&model=&provider=&status=&start=&end=&all=
 ///
-/// 带筛选参数时**只删命中的明细**并重算受影响日期的聚合（「清空筛选结果」，
-/// 与 GET 同一份过滤链 —— 界面上「当前筛选出 N 条」与这里删掉的那批必然是
-/// 同一个集合）；清空全部必须**显式**带 `all=1`（不带的空请求给 400）——
-/// 与 `logs_api::clear_logs` 同一道护栏（理由见那边的注释：筛选清空漏传参数
-/// 的代价是全部明细没了）。响应带删除后的存储概况，有删除时另带 `removed`。
-/// 清空**不动**保留期设置。
+/// `mode`（本次新增）决定删什么：
+///   - `raw`：**只删原始正文**（`request_raw` 表中按当前筛选命中的行）。
+///     明细与按天聚合一律不动 —— 报表数字全部保留，抹掉的只是「预览对话」
+///     用的正文（对照 OmniProxy 的同名 mode）。
+///   - `all`（默认）：删明细。不带筛选时为**全量清空**（显式 `all=1` 护栏）：
+///     明细 + 按天聚合 + 原始正文 + 调试报文一起清；带筛选时只删命中的明细
+///     与对应正文，**不动日报** —— 日报是全量聚合，无法按筛选部分重算
+///     （完整取舍见 `RequestStats::clear_where` 的说明），后果由响应里的
+///     `note` 字段如实说明。
+///
+/// 不带筛选时必须显式带 `all=1`（护栏对两种 mode 都生效：`mode=raw` 不带
+/// 筛选同样会把正文清光，漏传参数的代价一样不可逆 —— 与 `logs_api::clear_logs`
+/// 同一道护栏）。响应统一 `{success, mode, deleted}`（deleted = 实际删除条数）。
 pub async fn clear_stats_requests(
     State(state): State<ServerState>,
     Query(params): Query<Params>,
 ) -> Response {
-    let filter = RequestQuery {
-        offset: 0,
-        limit: None,
-        model: text_of(&params, "model"),
-        provider: text_of(&params, "provider"),
-        status: text_of(&params, "status"),
-        start: parse_query_ms(params.get("start")),
-        end: parse_query_ms(params.get("end")),
+    let mode = match params.get("mode").map(|value| value.trim()) {
+        Some("raw") => "raw",
+        // 缺省按 all：与「不带 mode 的旧调用方」行为兼容
+        Some("all") | None => "all",
+        Some(other) => {
+            return errors::management_error(
+                400,
+                format!("mode 取值非法: {other}（合法值: raw、all）"),
+            )
+        }
     };
+    let filter = filter_from_params(&params);
     let has_filters = filter.model.is_some()
         || filter.provider.is_some()
         || filter.status.is_some()
@@ -215,32 +238,99 @@ pub async fn clear_stats_requests(
         if !explicit_all {
             return errors::management_error(
                 400,
-                "未指定筛选条件：要清空全部请求日志请显式带 all=1",
+                "未指定筛选条件：要清空全部请求数据请显式带 all=1",
             );
         }
     }
-    let stats = if has_filters {
-        state.request_stats().clear_where(&filter)
+    let stats = state.request_stats();
+    let (deleted, note) = if mode == "raw" {
+        (stats.clear_raw_where(&filter), None)
+    } else if has_filters {
+        (
+            stats.clear_where(&filter),
+            Some("已删除命中的请求明细与对应原始报文；按天聚合是全量数据，未按筛选重算，报表数字仍包含已删除的请求".to_string()),
+        )
     } else {
-        state.request_stats().clear()
+        (stats.clear(), None)
     };
     // 全量清空时连调试模式的原始报文一起清：那些报文是按 id 关联到明细的，
     // 明细没了它们就成了永远取不到的孤儿，白占磁盘。
-    // **按筛选条件清空时不动**：筛选清的是部分明细，报文可能还对应着留下的行，
-    // 且筛选语义（模型 / 提供商 / 状态 / 时间）在报文侧没有对应字段可判。
-    if !has_filters {
+    // **带筛选时不动**（mode=raw 同理）：筛选清的是部分明细，报文可能还
+    // 对应着留下的行（取舍见 `debug_traffic` 的说明）。
+    if mode == "all" && !has_filters {
         crate::server::core::debug_traffic::clear();
     }
-    let removed = stats.get("removed").and_then(Value::as_u64);
-    match removed {
-        Some(count) => {
-            logging::log("[Stats]", &format!("已按筛选条件清空 {count} 条请求明细（受影响日期的聚合已重算）"));
+    match (mode, has_filters, deleted) {
+        ("raw", _, count) => {
+            logging::log("[Stats]", &format!("已清空 {count} 条原始报文（明细与按天聚合不受影响）"));
         }
-        None => {
-            logging::log("[Stats]", "请求统计已清空（明细 + 按天聚合）");
+        ("all", true, count) => {
+            logging::log("[Stats]", &format!("已按筛选条件清空 {count} 条请求明细（原始报文同步清空；按天聚合未重算）"));
+        }
+        _ => {
+            logging::log("[Stats]", "请求统计已清空（明细 + 按天聚合 + 原始报文）");
         }
     }
-    ok_json(stats)
+    let mut body = json!({ "success": true, "mode": mode, "deleted": deleted });
+    if let Some(note) = note {
+        if let Some(object) = body.as_object_mut() {
+            object.insert("note".to_string(), Value::String(note));
+        }
+    }
+    ok_json(body)
+}
+
+/// GET /api/stats/requests/raw?id=... —— 单条请求的原始正文。
+///
+/// 详情弹窗（预览对话）的数据源：`{id, requestBody, responseBody, truncated}`，
+/// 两个文本字段原样返回（两侧各截断到存储层的采集上限，`truncated` 提示
+/// 前端正文可能不完整）。不存在给 404 —— 正文有自己的容量闸（按 ts 丢最旧），
+/// 「明细还在、正文已被挤掉」是正常状态，不是错误。
+pub async fn stats_request_raw(
+    State(state): State<ServerState>,
+    Query(params): Query<Params>,
+) -> Response {
+    let Some(id) = text_of(&params, "id") else {
+        return errors::management_error(400, "缺少 id 参数");
+    };
+    match state.request_stats().raw_body(&id) {
+        Some(value) => ok_json(value),
+        None => errors::management_error(404, format!("未找到该请求的原始报文（id: {id}）")),
+    }
+}
+
+/// GET /api/stats/requests/clear-preview —— 清理弹窗的预览统计。
+///
+/// 与 DELETE **共用同一份筛选解析与 FilterPlan**：预览说删 N 条，点确认删掉的
+/// 就是 N 条。响应 `{all, raw, dbBytes, vacuumRunning, lastVacuum}`：
+/// `all` = 当前筛选下将删除的明细数；`raw` = 其中仍带原始报文的条数
+/// （mode=raw 实际会清空的量）；`dbBytes` = 库文件 + WAL 的磁盘占用（全量，
+/// 不按筛选计算 —— 库文件没有「这部分属于这批筛选」的边界）。
+pub async fn stats_clear_preview(
+    State(state): State<ServerState>,
+    Query(params): Query<Params>,
+) -> Response {
+    ok_json(state.request_stats().clear_preview(&filter_from_params(&params)))
+}
+
+/// POST /api/stats/requests/compact —— 压缩数据库（checkpoint + VACUUM）。
+///
+/// 后台线程执行（理由见 `RequestStats::compact`），响应只表示「是否受理」：
+/// 已受理给 `{success, started:true}`，前端靠 clear-preview 的 `vacuumRunning`
+/// / `lastVacuum` 轮询进度；重复触发给 409（同一时间只允许一个压缩任务）；
+/// 库不可用如实报错，不谎报「已启动」。
+pub async fn compact_stats_db(State(state): State<ServerState>) -> Response {
+    match state.request_stats().compact() {
+        crate::server::request_stats::CompactStart::Started => {
+            ok_json(json!({ "success": true, "started": true }))
+        }
+        crate::server::request_stats::CompactStart::AlreadyRunning => {
+            errors::management_error(409, "数据库压缩正在进行中，请稍后再试")
+        }
+        crate::server::request_stats::CompactStart::Unavailable => {
+            errors::management_error(500, "数据库不可用，无法压缩")
+        }
+    }
 }
 
 /// GET /api/retention

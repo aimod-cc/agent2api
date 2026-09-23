@@ -11,7 +11,7 @@
 //!   `public`    免鉴权：/health、/api/endpoints（/api/session 已挪 protected）
 //!               （Node 版这三条确实都没调 checkApiKey）
 //!   `protected` 需鉴权：/api/config、/api/logs*、/api/stats*、/api/retention、
-//!               /api/accounts*、/api/proxies*、
+//!               /api/accounts*、/api/proxies*、/api/custom-providers*、
 //!               /api/usage、/api/checkin*、/api/activity/*、/api/sanitize、
 //!               /api/auto-checkin*、/api/update/*、
 //!               /api/session/login/*、/api/session/refresh|logout、/auth/*
@@ -161,6 +161,21 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/stats/requests/filters",
             get(api::stats_api::stats_request_filters),
         )
+        // 单条请求的原始正文（预览对话详情弹窗的数据源）。同样要排在通配之前
+        .route(
+            "/api/stats/requests/raw",
+            get(api::stats_api::stats_request_raw),
+        )
+        // 清理弹窗的预览统计（将删明细数 / 带报文数 / 库占用 / 压缩状态）
+        .route(
+            "/api/stats/requests/clear-preview",
+            get(api::stats_api::stats_clear_preview),
+        )
+        // 压缩数据库（checkpoint + VACUUM，后台线程执行；重复触发 409）
+        .route(
+            "/api/stats/requests/compact",
+            post(api::stats_api::compact_stats_db),
+        )
         // 无尾段的 `/api/stats` 也登记成管理信封 404：这个前缀下没有「列表」端点
         // （报表有三条子路径），但同一前缀下的 404 形状必须一致 ——
         // 前端拼错路径时拿到的若是 OpenAI 形状，会误以为是转发链路的问题
@@ -290,6 +305,35 @@ pub fn panel_router(state: ServerState) -> Router {
         // 自定义模型（手动登记上游目录里没有的模型）
         .route("/api/models/custom", post(api::model_manage::add_custom))
         .route("/api/models/custom/remove", post(api::model_manage::remove_custom))
+        // ── 自定义提供商（用户自建上游端点：存储 + 管理）──
+        // 与 /api/models/manage 同级敏感：写配置（customProviders 键）且「新建」
+        // 会顺带写账号库，挂 protected。账号侧不经这里 —— 客户端走
+        // /api/accounts（其 add 分派认 custom- 前缀的 provider id），
+        // 两条入口最终都落在 `account_store::custom_accounts` 上。
+        .route(
+            "/api/custom-providers",
+            get(api::custom_providers::get_custom_providers)
+                .post(api::custom_providers::create_custom_provider),
+        )
+        .route(
+            "/api/custom-providers/update",
+            post(api::custom_providers::update_custom_provider),
+        )
+        .route(
+            "/api/custom-providers/remove",
+            post(api::custom_providers::remove_custom_provider),
+        )
+        // 模型清单的两条（第二阶段）：整表保存 / 服务端代理拉取上游清单。
+        // 挂 protected 的理由与上面的管理四条相同；fetch-models 还会真打上游
+        // （一次 GET {baseUrl}/models），与 /api/models/refresh 同级敏感。
+        .route(
+            "/api/custom-providers/models",
+            post(api::custom_providers::set_custom_models),
+        )
+        .route(
+            "/api/custom-providers/fetch-models",
+            post(api::custom_providers::fetch_custom_models),
+        )
         .route("/api/keys", get(api::keys_api::list_keys).post(api::keys_api::create_key))
         .route("/api/keys/{id}", patch(api::keys_api::update_key).delete(api::keys_api::delete_key))
         // ── 出站指纹脱敏开关 ──

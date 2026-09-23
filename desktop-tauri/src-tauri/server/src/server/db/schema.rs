@@ -147,7 +147,23 @@ pub fn is_reserved(key: &str) -> bool {
 /// 由 v2 的 ALTER 加上），所以「全新库」与「从 v1 升上来的库」最终形态一致 ——
 /// 这也是为什么 v1 的 DDL **不**回填这两列：那里改了会让两条路径分叉
 /// （新库有列、老库经 ALTER 也有列，但列的定义来源变成两处，下次改动容易漏一处）。
-pub const SCHEMA_VERSION: i64 = 2;
+///
+/// ── 版本 3：request_raw 表（原始报文，预览对话功能的地基）───────
+/// 见 [`V3_SCHEMA`]。与 v2 的差别：这次是**新表**而不是加列，所以走
+/// `CREATE TABLE IF NOT EXISTS`（不需要 ALTER，也就不需要「v1 不建、v2 补」
+/// 那种两段式）。老库（user_version=2）与全新库都会跑 v3 —— 老库靠这一步
+/// 建出表，全新库在 v1 里**也不建**它（定义只有 v3 一处，与 v2 那条
+/// 「不要把列塞回 v1」的纪律同理）。
+///
+/// ── 版本 4：把 v3 的建表语句**再幂等地跑一遍**（存量库修复）──────
+/// 见 [`V4_SCHEMA`]。这不是一次结构变更，而是对「版本号写着 3、表却不在」
+/// 这类存量库的修复：实测有库 `user_version=3` 却没有 `request_raw`（早期
+/// 二进制曾在这个版本号下放过别的 DDL，撞号了）。后果是记账收尾事务里那句
+/// `DELETE FROM request_raw` 报「no such table」→ **整个事务回滚** → 明细的
+/// 进行中行永远收不了尾（界面上表现为「只有进行中、没有结束」）。
+/// v3 的 DDL 本身是 `CREATE TABLE IF NOT EXISTS`，重跑一次零成本：
+/// 表在就跳过，表不在就补上，两种库的最终形态一致。
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -377,6 +393,52 @@ ALTER TABLE requests ADD COLUMN attempt_details TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE requests ADD COLUMN sensitive_hits TEXT NOT NULL DEFAULT '[]';
 ";
 
+/// 版本 3：`request_raw` 表 —— 请求/响应的**下游侧**原始正文（预览对话功能的地基）。
+///
+/// ── 它和 debug_traffic 表是什么关系 ──────────────────────────
+/// `debug_traffic`（调试报文）是**调试模式专用**的上游侧报文（头部脱敏、
+/// 有全局字节闸、开关关闭时完全不采集）；本表是**始终采集**的下游侧正文
+/// （客户端发来的请求体 + 网关下发的响应体），供请求日志的「预览对话」弹窗
+/// 用。两表按同一个 `id`（请求关联 id）各存各的，谁也不依赖谁 ——
+/// `core::debug_traffic` 的现有行为一字未动，本表是纯粹的并行补充。
+///
+/// ── 为什么独立成表而不是给 requests 加两列 ────────────────────
+/// 正文是大字段（两侧各 128 KiB 上限），明细列表的每次分页都要取
+/// `REQUEST_COLUMNS` —— 混进主表会让「只看列表」的请求反复搬运几百 KB 的
+/// TEXT。独立表后主查询零开销，按 id 取详情时才 join 进来；请求日志列表页
+/// 也不需要改任何 SQL（OmniProxy 的 request_log_raw 副表同此取舍）。
+///
+/// ── 为什么 id 直接当主键 ────────────────────────────────────
+/// 一条请求只有一份「下游视角」的正文，天然一对一（与 requests 表的 id
+/// 不同 —— 那边同 id 可以多行，所以不敢当主键）。主键即唯一约束，
+/// 「同 id 再写」天然是 UPSERT 覆盖，不需要额外判重。
+///
+/// ── 为什么体用 TEXT 而不用 BLOB ─────────────────────────────
+/// 与 debug_traffic 同一取向：里面是 JSON / SSE 文本，存 TEXT 才能在
+/// `sqlite3` 命令行里直接看（排障的主要用法）。
+///
+/// ── 为什么没有索引（连 ts 都不建）────────────────────────────
+/// 本表只有两种读法：按主键 id 取单行（主键自带）、按「保留最新 N 行」裁剪
+/// （2000 行的表全排序是微秒级）。唯一会按 ts 范围查它的是清理预览的计数，
+/// 那条走的是 `id IN (SELECT id FROM requests ...)` 主键查找。表有行数硬闸，
+/// 不会长到大到需要索引。
+const V3_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS request_raw (
+  id            TEXT PRIMARY KEY,
+  ts            INTEGER NOT NULL,
+  request_body  TEXT NOT NULL DEFAULT '',
+  response_body TEXT NOT NULL DEFAULT '',
+  size          INTEGER NOT NULL DEFAULT 0
+);
+";
+
+/// 版本 4：v3 建表语句的幂等重放（存量库修复，完整背景见 [`SCHEMA_VERSION`]）。
+///
+/// 直接复用 [`V3_SCHEMA`] 而不是复制一份：两处若各写一份，将来 request_raw
+/// 加列时必然只改一处，而「表定义只有一处事实来源」正是 v2 那条纪律。
+/// `CREATE TABLE IF NOT EXISTS` 保证对正常库（表已在）是无操作。
+const V4_SCHEMA: &str = V3_SCHEMA;
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -428,6 +490,10 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         // 与 v1 的差别只有一条：这里是 ALTER 而不是 CREATE，所以**没有**
         // IF NOT EXISTS 可用（见 V2_SCHEMA 的说明），幂等由版本号保证。
         2 => conn.execute_batch(V2_SCHEMA),
+        // v3：request_raw 原始报文表（新表用 CREATE IF NOT EXISTS，见 V3_SCHEMA）
+        3 => conn.execute_batch(V3_SCHEMA),
+        // v4：重放 v3 建表（修复「版本号 3、表却不在」的存量库，见 SCHEMA_VERSION）
+        4 => conn.execute_batch(V4_SCHEMA),
         _ => Ok(()),
     }
 }

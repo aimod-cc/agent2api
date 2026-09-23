@@ -25,6 +25,7 @@
 //!   models          ← 模型目录（切片 4 起为真实清单，含远程刷新结果）
 //!   sanitizeBlacklistFingerprints ← 出站指纹脱敏开关（与 GET /api/sanitize 同源）
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -35,7 +36,7 @@ use serde_json::{json, Value};
 use crate::server::api::health::UNCONFIGURED_REASON;
 use crate::server::config;
 use crate::server::core::login::AUTH_URL_WAIT_MS;
-use crate::server::core::providers::{kind_id, router};
+use crate::server::core::providers::router;
 use crate::server::core::routing;
 use crate::server::errors::management_error;
 use crate::server::http::{ok_json, parse_body};
@@ -48,7 +49,17 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
     // 账号快照取一次：`accounts` 字段与下面的 routedAccountId 读的是同一份数据，
     // 分两次取会各读一遍盘，还可能出现「两次读之间账号被改」的撕裂
     let accounts = state.store().list_accounts();
-    let routed = routed_account_id(&accounts, snapshot.last_request_model());
+    // 在途请求计数：★ 的推算口径要与真实选路一致 —— 转发选路会跳过已达并发
+    // 上限的账号（`routing::pick_account_by_priority` 的并发过滤），★ 也要剔除
+    // 它们，否则界面上标的「下一个请求会先用谁」在实际都忙时是错的。取快照的
+    // 方式与选路层同源（`UpstreamService::connections()`）。
+    let counts: HashMap<String, usize> = state
+        .upstream()
+        .connections()
+        .snapshot()
+        .into_iter()
+        .collect();
+    let routed = routed_account_id(&accounts, snapshot.last_request_model(), &counts);
     let summary = state.auth().get_config_summary();
     let configured = summary
         .get("configured")
@@ -113,18 +124,20 @@ pub async fn get_session(State(state): State<ServerState>) -> Response {
 ///
 /// 模型未知 / 该模型下确实没有可用账号时给 null —— 界面回落到
 /// `currentAccountId`，宁可让它标一个「队列第一位」，也不要整列 ★ 凭空消失。
-fn routed_account_id(accounts: &Value, model: Option<&str>) -> Value {
+fn routed_account_id(accounts: &Value, model: Option<&str>, counts: &HashMap<String, usize>) -> Value {
     let Some(model) = model.map(str::trim).filter(|value| !value.is_empty()) else {
         return Value::Null;
     };
-    let providers: Vec<&str> = router::route_for_forward(model)
-        .into_iter()
-        .map(kind_id)
-        .collect();
+    // 候选链是 id 空间（内置家 + 自定义家同列，见 `router` 的模块头）；
+    // 自定义家的账号同样在全局队列里，`pick_for_model` 按 provider 字符串
+    // 过滤候选，两种 id 天然可比。
+    let candidates = router::route_for_forward(model);
+    let providers: Vec<&str> = candidates.iter().map(String::as_str).collect();
     routing::pick_for_model(
         &routing::accounts_of(accounts),
         model,
         &providers,
+        counts,
         logging::now_ms(),
     )
     .and_then(|account| routing::account_id(&account).map(str::to_string))

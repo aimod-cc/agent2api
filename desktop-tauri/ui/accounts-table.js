@@ -196,7 +196,7 @@
     const columns = visibleColumns();
     const cells = columns.map((column, index) => {
       const hint = column.hint ? `<span class="th-hint">${esc(column.hint)}</span>` : '';
-      // 把手不放勾选列（26px 宽，把手会压住复选框），也不放最后一列 ——
+      // 把手不放勾选列（47px 宽，把手会压住复选框），也不放最后一列 ——
       // 它绝对定位在右缘（right: -4px），钉在表格右缘会顶出一条横向滚动条
       // （见模块头）。「哪一列在最后」是用户配置出来的，所以按渲染后的位置判。
       const grip = column.key === 'pick' || index === columns.length - 1

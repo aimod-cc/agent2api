@@ -111,6 +111,7 @@ pub fn seed_cline_defaults(provider: &str, ids: &[String]) -> Option<String> {
             provider: Some(provider.to_string()),
             // 种子建的映射不绑思考等级（那是用户手动绑定的东西，见 mod.rs 模块头）
             reasoning: None,
+            enabled: true,
         });
         mappings_added.push(format!("{alias} → {id}"));
     }
@@ -168,21 +169,21 @@ pub fn migrate_cline_split() -> Option<String> {
     let mut touched = false;
     let mut summary: Vec<String> = Vec::new();
 
-    // ① 启停列表：provider 改名
-    for (label, list) in [("禁用", &mut rules.disabled), ("隐藏", &mut rules.hidden)] {
-        let mut count = 0usize;
-        for entry in list.iter_mut() {
-            if entry.provider.as_deref() != Some(LEGACY_CLINE_ID) {
-                continue;
-            }
-            let pool = crate::server::core::providers::cline::models::pool_of(&entry.id);
-            entry.provider = Some(pool.provider_id().to_string());
-            count += 1;
+    // ① 启停列表：provider 改名（`hidden` 列表已随「删除/恢复」机制移除，
+    //    迁移只剩 `disabled` —— 旧配置里残留的 hidden 条目在读取层就被丢弃，
+    //    见 mod.rs 的「一次性清理语义」）
+    let mut count = 0usize;
+    for entry in rules.disabled.iter_mut() {
+        if entry.provider.as_deref() != Some(LEGACY_CLINE_ID) {
+            continue;
         }
-        if count > 0 {
-            touched = true;
-            summary.push(format!("{label} {count} 条"));
-        }
+        let pool = crate::server::core::providers::cline::models::pool_of(&entry.id);
+        entry.provider = Some(pool.provider_id().to_string());
+        count += 1;
+    }
+    if count > 0 {
+        touched = true;
+        summary.push(format!("禁用 {count} 条"));
     }
 
     // ② 映射：带旧 provider 的改名；provider 缺失但 target 是 Cline 池前缀的补上

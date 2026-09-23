@@ -40,6 +40,9 @@ pub mod billing;
 pub mod captcha;
 pub mod chat;
 pub mod config_api;
+// 自定义提供商的管理接口（新建时顺带创建首个账号；存储与账号接入见
+// `core::custom_providers` 与 `core::account_store::custom_accounts`）
+pub mod custom_providers;
 pub mod debug_api;
 pub mod endpoints;
 pub mod health;

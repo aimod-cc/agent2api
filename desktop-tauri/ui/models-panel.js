@@ -1,11 +1,11 @@
-/* Agent2API · 模型管理页：表格渲染 + 筛选 + 启停 / 删除 / 恢复 + 自定义模型 + 模型映射 + 刷新模型清单 */
+/* Agent2API · 模型管理页：表格渲染 + 筛选 + 启停 + 自定义模型 + 模型映射（含映射开关）+ 刷新模型清单 */
 /* global workbuddyDesktop, wbApp */
 
 /**
- * 数据来自 `GET /api/models/manage`（`{models, mappings, reasoningLevels}`，含禁用 /
- * 隐藏的条目，每条带 enabled / hidden / aliases）。本模块自持这份数据：写接口都会
- * 返回最新的同形数据，就地替换后重绘，不经过 app.js 的 state（那是 /api/session
- * 的快照，轮询会整份覆盖）。
+ * 数据来自 `GET /api/models/manage`（`{models, mappings, reasoningLevels}`，含
+ * 禁用的条目与关闭的映射，每条模型带 enabled / aliases，每条映射带 enabled）。
+ * 本模块自持这份数据：写接口都会返回最新的同形数据，就地替换后重绘，不经过
+ * app.js 的 state（那是 /api/session 的快照，轮询会整份覆盖）。
  *
  * 表格按提供商分组（顺序 = 后端数组顺序 = 路由优先级），每组默认只展开前
  * `GROUP_LIMIT` 行，其余折叠成一行「展开其余 N 个」；有搜索词或非「全部」筛选时
@@ -17,6 +17,11 @@
  * 下游用同一个名字请求时，网关在「原生承载家 + 各映射提供商」之间按账号
  * 全局优先级主备切换，发送时按承载家自动换成它认识的真名。
  *
+ * 每条映射自带一个**开关**（chip 上的小滑块，参考 OmniProxy 的模型管理）：
+ * 关掉 = 这条别名暂时不存在（不广告、不路由），可再打开；删除才是不可逆的。
+ * 切换走 `/api/models/mappings`（只传 alias / target / provider / enabled，
+ * 不带 reasoning —— 不动等级），与「模型行的启停开关」同一套乐观更新模式。
+ *
  * ── 自定义模型（顶部「＋ 添加自定义模型」）─────────────────────
  * 手动登记一个「上游目录里没有、但实际能路由」的模型（灰度中的新模型、按账号
  * 下发却没进目录的模型）。登记后它**真的进入该家清单**（后端在
@@ -24,9 +29,10 @@
  * 它、路由与转发也都认它 —— 与内置模型相比只少几个能力位元数据（用户无从
  * 知道那些值，编一个等于对下游撒谎）。
  *
- * 它的「删除」是**直接移除这条登记**，不是内置模型那种隐藏：内置模型的存在性
- * 由上游清单决定（隐藏后还能恢复），自定义模型的存在性完全由这次登记决定。
- * 「来源」列因此多一个 `manual` 值（后端逐条标出，前端只做文案映射）。
+ * 它的「移除」是**直接移除这条登记**：内置模型的存在性由上游清单决定
+ * （启停开关管的是「接不接请求」），自定义模型的存在性完全由这次登记决定，
+ * 不要了就移除。操作列因此只剩这一种按钮（source=manual 的行才有）。
+ * 「来源」列多一个 `manual` 值（后端逐条标出，前端只做文案映射）。
  *
  * ── 思考等级（照抄 OmniProxy 的手动绑定，R7）─────────────────
  * 每条映射可以带一个「思考等级」，值取自**后端下发的** `reasoningLevels`
@@ -86,8 +92,7 @@
     { key: 'model', label: '上游模型' },
     { key: 'rate', label: '倍率' },
     { key: 'source', label: '来源' },
-    { key: 'alias', label: '对外映射名' },
-    { key: 'state', label: '启用' },
+    { key: 'alias', label: '模型映射' },
     { key: 'act', label: '操作', align: 'right' },
   ];
 
@@ -140,6 +145,46 @@
     reasoningOf = reasoning?.buildIndex(mappings()) || (() => '');
   }
 
+  /**
+   * 「三元组 → 映射条目」查询闭包（chip 开关的 enabled 状态来源）。
+   *
+   * chip 的名字来自行上的 `m.aliases`（后端管理视图**全量**列出，含关闭的），
+   * 而开关状态挂在顶层 `mappings` 的条目上 —— 与思考等级同一套查询方式：
+   * 按 (alias, target, provider) 三元组查。口径与后端 `Mapping` 的命中规则
+   * 对齐：**旧版全局条目（provider 缺失）对任何家都命中**（它们本来就显示在
+   * 所有承载 target 的行上），行上 provider 总是非空，所以查询侧按
+   * 「条目 provider 缺失或相等」判命中即可。
+   *
+   * 与 `rebuildReasoningIndex` 同一取舍：每次渲染前重建一次（数据换了索引就
+   * 得跟着换），建成哈希查询而不是每个 chip 对全表 find —— render() 在搜索框
+   * 每敲一个字就跑一次。
+   */
+  let mappingOf = () => undefined;
+
+  function rebuildMappingIndex() {
+    const exact = new Map();
+    const global = new Map();
+    const keyOf = (alias, target, provider) =>
+      `${String(alias ?? '').trim().toLowerCase()}\u0001${String(target ?? '').trim().toLowerCase()}`
+      + `\u0001${String(provider ?? '').trim().toLowerCase()}`;
+    mappings().forEach(mapping => {
+      const key = keyOf(mapping.alias, mapping.target, mapping.provider || '');
+      (mapping.provider ? exact : global).set(key, mapping);
+    });
+    // 先查按家条目（更精确），未命中再看全局条目 —— 与后端展示口径一致
+    mappingOf = (alias, target, provider) =>
+      exact.get(keyOf(alias, target, provider)) || global.get(keyOf(alias, target, ''));
+  }
+
+  /** chip 上那枚映射开关（复用 state 列的 switch 结构，CSS 里有 chip 内的小号版）。
+      `on` 是开关状态；关着的 chip 整体弱化（`map-off` class，见 page-gateway.css）。 */
+  function chipSwitchHtml(alias, target, provider, on, busy) {
+    return `<label class="switch" title="${on ? '映射已启用，点击关闭' : '映射已关闭，点击启用'}">`
+      + `<input type="checkbox" data-act="map-toggle" data-alias="${esc(alias)}"`
+      + ` data-target="${esc(target)}" data-provider="${esc(provider || '')}"`
+      + `${on ? ' checked' : ''}${busy ? ' disabled' : ''}><span class="track"></span></label>`;
+  }
+
   /** chip 上那枚等级标（转调 `models-reasoning.js`）。
       缺失该脚本时给空串 —— 少一枚可以点击的标，chip 名字与删除按钮照常，
       不整块报错（与 `reasoningOf` 的兜底同一取舍）。 */
@@ -167,7 +212,7 @@
   /**
    * 某一家当前清单里的模型（映射弹窗的「上游模型」下拉数据源）。
    *
-   * 含已禁用 / 已删除的行：映射是「名字 → 名字」的静态规则，与启停正交 ——
+   * 含已禁用的行：映射是「名字 → 名字」的静态规则，与启停正交 ——
    * 用户完全可能先建好映射、之后才把那个模型打开。把它们藏起来会让
    * 「为什么我的模型不在下拉里」变成一个查不出的问题。
    * 排序：启用的在前（与表格分组内同一取舍），组内保持后端顺序。
@@ -176,13 +221,12 @@
     if (!providerId) return [];
     return models()
       .filter(m => (m.provider || '') === providerId)
-      .sort((a, b) => Number(a.enabled === false || a.hidden === true)
-        - Number(b.enabled === false || b.hidden === true))
+      .sort((a, b) => Number(a.enabled === false) - Number(b.enabled === false))
       .map(m => ({
         id: m.id,
         // 展示名与 id 不同才补在括号里，避免出现「GLM-5.3（GLM-5.3）」这种重复
         label: m.name && m.name !== m.id ? `${m.id}（${m.name}）` : m.id,
-        off: m.enabled === false || m.hidden === true,
+        off: m.enabled === false,
       }));
   }
 
@@ -217,9 +261,8 @@
   }
 
   function matches(m, keyword) {
-    if (stateFilter === 'hidden' ? !m.hidden : m.hidden) return false;
-    if (stateFilter === 'enabled' && !m.enabled) return false;
-    if (stateFilter === 'disabled' && m.enabled) return false;
+    if (stateFilter === 'enabled' && !bindingsOf(m).some(binding => binding.enabled !== false)) return false;
+    if (stateFilter === 'disabled' && bindingsOf(m).some(binding => binding.enabled !== false)) return false;
     if (stateFilter === 'mapped' && !(m.aliases || []).length) return false;
     if (providerFilter !== 'all' && (m.provider || '') !== providerFilter) return false;
     if (!keyword) return true;
@@ -232,7 +275,6 @@
     if (!seg) return;
     const counts = new Map();
     models().forEach(m => {
-      if (m.hidden) return;
       const key = m.provider || '';
       const entry = counts.get(key) || { label: m.providerLabel || key || '未知', n: 0 };
       entry.n++;
@@ -248,17 +290,45 @@
 
   /** 映射 chips（照抄 OmniProxy）：每条 chip 属于自己所在的那一行（提供商 ×
       上游模型），删除时带三元组精确定位 —— 同一对外名在多行出现是主备关系。
-      绑了思考等级的 chip 在名字后面挂一枚可点的小标（`· high`），点它打开映射
-      弹窗改等级：那是这条映射上唯一的**可编辑属性**（alias / target / provider
-      是它的身份，改了就变成另一条映射），所以入口就挂在它旁边。
-      未绑定时那枚标显示「＋等级」（见 `badgeHtml`）—— 入口要一直看得见。 */
+      chip 上现在有两枚控件 + 一枚等级标：开关（`data-act="map-toggle"`，
+      关掉的映射 = 这条别名暂时不存在，可再打开）与删除 ×；绑了思考等级的
+      chip 在名字后面挂一枚可点的小标（`· high`），点它打开映射弹窗改等级
+      （alias / target / provider 是它的身份，改了就变成另一条映射）。
+      行禁用时 chips 随行压淡（`off`），映射自己的开关另用 `map-off` 弱化 ——
+      两个维度独立：行开着、映射关着的状态必须一眼可辨。 */
+  function bindingsOf(model) {
+    const provider = model.provider || '';
+    const same = (left, right) => String(left || '').toLowerCase() === String(right || '').toLowerCase();
+    const bindings = mappings().filter(mapping => same(mapping.target, model.id)
+      && (!mapping.provider || same(mapping.provider, provider)));
+    const unique = new Map();
+    for (const binding of bindings) {
+      const key = String(binding.alias).toLowerCase();
+      if (!unique.has(key) || binding.provider) unique.set(key, binding);
+    }
+    const idKey = String(model.id).toLowerCase();
+    const defaults = unique.get(idKey);
+    unique.delete(idKey);
+    return [{ ...defaults, alias: model.id, target: model.id, provider,
+      enabled: model.enabled !== false && defaults?.enabled !== false, isDefault: true },
+    ...unique.values()];
+  }
+
   function aliasChips(m) {
     const provider = m.provider || '';
-    const chips = (m.aliases || []).map(alias => `<span class="alias${m.enabled ? '' : ' off'}">`
-      + `<span class="t">${esc(alias)}</span>`
-      + badgeHtml(alias, m.id, provider, false)
-      + `<button type="button" class="x" data-act="unmap" data-alias="${esc(alias)}" data-target="${esc(m.id)}" data-provider="${esc(provider)}" title="删除映射 ${esc(alias)}">×</button></span>`).join('');
-    const add = m.hidden ? '' : `<button type="button" class="alias-add" data-act="map" data-id="${esc(m.id)}" data-provider="${esc(provider)}">＋ 映射</button>`;
+    const chips = bindingsOf(m).map(binding => {
+      const alias = binding.alias;
+      const on = binding.enabled !== false;
+      const busy = pending.has(`${alias}:${m.id}:${provider}`);
+      const label = binding.isDefault ? '<span class="binding-default">默认</span>' : '';
+      const remove = binding.isDefault ? ''
+        : `<button type="button" class="x" data-act="unmap" data-alias="${esc(alias)}" data-target="${esc(m.id)}" data-provider="${esc(provider)}" title="删除映射 ${esc(alias)}"${busy ? ' disabled' : ''}>×</button>`;
+      return `<span class="alias${on ? '' : ' map-off'}">`
+        + chipSwitchHtml(alias, m.id, provider, on, busy)
+        + `<span class="t" title="${esc(alias)}">${esc(alias)}</span>${label}`
+        + badgeHtml(alias, m.id, provider, busy) + remove + '</span>';
+    }).join('');
+    const add = `<button type="button" class="alias-add" data-act="map" data-id="${esc(m.id)}" data-provider="${esc(provider)}">＋ 映射</button>`;
     return `<div class="aliases">${chips}${add}</div>`;
   }
 
@@ -280,19 +350,17 @@
       : '<span class="rate">—</span>'}</td>`,
     source: m => `<td class="cell-source">${sourceCell(m)}</td>`,
     alias: m => `<td class="cell-alias">${aliasChips(m)}</td>`,
-    state: (m, busyRow) => `<td class="cell-state state"><label class="switch">`
-      + `<input type="checkbox" data-act="toggle" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"`
-      + `${m.enabled ? ' checked' : ''}${m.hidden || busyRow ? ' disabled' : ''}><span class="track"></span></label></td>`,
+    // 操作列只移除手动登记；对外名称统一在模型映射列切换。
     act: (m, busyRow) => `<td class="cell-act r"><div class="row-actions">`
-      + (m.hidden
-        ? `<button type="button" class="sm ghost" data-act="restore" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>恢复</button>`
-        : `<button type="button" class="sm ghost danger-text" data-act="hide" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>删除</button>`)
+      + (m.source === 'manual'
+        ? `<button type="button" class="sm ghost danger-text" data-act="hide" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>移除</button>`
+        : '')
       + '</div></td>',
   };
 
   function row(m) {
     const busyRow = pending.has(rowKey(m));
-    return `<tr class="${m.enabled && !m.hidden ? '' : 'off'}" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}">`
+    return `<tr data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}">`
       + visibleColumns().map(column => withAlign(CELLS[column.key](m, busyRow), column.align)).join('')
       + '</tr>';
   }
@@ -306,7 +374,7 @@
       前端照实显示。 */
   function sourceCell(m) {
     if (m.source === 'manual') {
-      return '<span class="badge tag brand" title="手动登记的上游模型；删除它会直接移除这条登记（不是隐藏）">手动</span>';
+      return '<span class="badge tag brand" title="手动登记的上游模型；移除它会直接删掉这条登记">手动</span>';
     }
     if (m.source !== 'remote' && m.source !== 'builtin') return '<span class="rate">—</span>';
     const remote = m.source === 'remote';
@@ -345,23 +413,22 @@
   function render() {
     const body = $('models');
     if (!body) return;
-    // 重建思考等级索引（每次渲染一次，见 rebuildReasoningIndex 的说明）
+    // 重建两个索引（思考等级 + 映射开关，每次渲染一次，见各自的 rebuild 说明）
     rebuildReasoningIndex();
+    rebuildMappingIndex();
     renderProviderSeg();
     const all = models();
     const keyword = searchTerm();
     const shown = all.filter(m => matches(m, keyword));
     // 计数：总数 / 启用数 / 映射数（不受筛选影响，是「这台网关现在的状态」）
-    const visible = all.filter(m => !m.hidden);
     const count = $('models-count');
     if (count) {
       // 条数只算「挂上了行的」映射；孤儿映射单独点名 —— 混在一起数会让
       // 「25 条映射」在表格里怎么数都对不上
       const orphans = orphanMappings().length;
       count.textContent = all.length
-        ? `${visible.length} 个上游模型 · ${visible.filter(m => m.enabled).length} 已启用 · ${mappings().length - orphans} 条映射`
+        ? `${all.length} 个上游模型 · ${all.flatMap(bindingsOf).filter(binding => binding.enabled !== false).length} 个开启的对外名称`
           + (orphans ? ` · ${orphans} 条未挂载` : '')
-          + (all.length !== visible.length ? ` · ${all.length - visible.length} 已删除` : '')
         : '';
     }
     if (!all.length) {
@@ -370,7 +437,7 @@
       body.innerHTML = `<tr><td colspan="${span()}" class="empty">${data ? '暂无模型（请先添加账号）' : '加载中…'}</td></tr>`;
       return;
     }
-    // 孤儿映射不随模型的启停 / 删除筛选走：那些维度是「模型的状态」，
+    // 孤儿映射不随启停筛选走：那个维度是「模型的状态」，
     // 而它们连行都没有；「全部」与「有映射」两个筛选下才列出来。
     // 但**提供商筛选要跟随** —— 见 orphanSection 的说明。
     const orphans = (stateFilter === 'all' || stateFilter === 'mapped') ? orphanSection(keyword) : '';
@@ -405,12 +472,12 @@
    * 「挂不到行的映射」分组（见 [`orphanMappings`]）：只在有这类映射时出现，
    * 排在各家分组之后，表头标签走警示色（`.tr-orphan`）区别于提供商分组。
    *
-   * ── 为什么**跟随提供商筛选**（而启停 / 删除筛选不跟随）──────────
+   * ── 为什么**跟随提供商筛选**（而启停筛选不跟随）──────────
    * 顶部那个提供商分段是「我在看哪一家」的视角，用户点「Cline Free」时
    * 期待看到的是**这一家的全部信息**。孤儿映射带 provider（旧版全局条目除外），
    * 所以完全筛得动：不过滤的话，看 Cline Free 时会看到一屏 `cline-pass/*`
    * 的条目，很容易被当成「Cline Free 收 pass 的模型」—— 而它们恰恰是
-   * **另一家**的。启停 / 删除那两档不跟随，是因为它们描述的是「模型的状态」，
+   * **另一家**的。启停那一档不跟随，是因为它描述的是「模型的状态」，
    * 而孤儿映射连行都没有，套用那些维度没有意义（见调用点）。
    *
    * 旧版全局条目（`provider` 为 null）在**任何一家**的筛选下都列出：它不属于
@@ -456,7 +523,8 @@
       // 它的等级就在哪儿可编辑（否则挂不到行的映射反而成了改不了死角的配置）。
       // `data-act` 必须是各自的（不能复用 del 那串）：事件委托按 data-act 分派，
       // 一个按钮挂两个动作会让「点等级」变成「删映射」。
-      const chips = `<span class="alias orphan"><span class="t">${esc(mapping.alias)}</span>`
+      const chips = `<span class="alias orphan${mapping.enabled !== false ? '' : ' map-off'}"><span class="t">${esc(mapping.alias)}</span>`
+        + chipSwitchHtml(mapping.alias, mapping.target, mapping.provider, mapping.enabled !== false, busy)
         + badgeHtml(mapping.alias, mapping.target, mapping.provider, busy)
         + `<button type="button" class="x" ${del} title="删除映射 ${esc(mapping.alias)}"${busy ? ' disabled' : ''}>×</button></span>`;
       // 两档的差异全在右半边那句小字上（表格里没有「状态」列可用，也不该为它加一列）
@@ -522,47 +590,26 @@
     if (!button) return;
     const { act, id, alias, target, provider } = button.dataset;
     // 同一模型 id 在多家同时存在时（如 kimi-k3 同时由 CatPaw 与小浣熊提供），
-    // 启停 / 删除都要带上提供商才能精确到一行
+    // 操作都要带上提供商才能精确到一行
     const key = `${provider || ''}:${id}`;
     if (act === 'expand') { expanded.add(provider); render(); return; }
     if (act === 'collapse') { expanded.delete(provider); render(); return; }
     if (act === 'hide') {
-      // 原生 confirm 在 Tauri 的 WebView 里不弹窗、直接放行（等于没有确认）—— 下同
-      //
-      // 自定义模型走**另一条**删除语义（从登记里移除，不是隐藏）：
-      // 它的存在完全由这次登记决定，没有「上游刷新会把它带回来」这回事，
-      // 打隐藏标记只会留下一条既没用、又占着「已删除」筛选的死数据。
+      // 能走到这里的只剩手动登记的自定义模型（source=manual，见 CELLS.act）：
+      // 「移除」是删掉那条**登记**，不是隐藏 —— 它的存在完全由这次登记决定，
+      // 没有「上游刷新会把它带回来」这回事，移除后 /v1/models、路由同时消失。
       // 判据用后端给的 `source`，前端不自己推断（见 sourceCell）。
-      const custom = models().find(
-        item => item.id === id && (item.provider || '') === (provider || ''),
-      )?.source === 'manual';
-      if (custom) {
-        if (!(await window.wbConfirm?.ask?.({
-          title: '删除自定义模型',
-          html: `确定删除自定义模型「<strong>${esc(id)}</strong>」？`
-            + `这条登记会被<b>直接移除</b>（不是隐藏），之后 <code>/v1/models</code> 不再广告它、请求它也会被拒。`
-            + `内置模型那种「在『已删除』筛选里恢复」的路径对它不适用。`,
-          okText: '删除',
-          okClass: 'danger',
-        }))) return;
-        void runRowAction(
-          key,
-          () => workbuddyDesktop.removeCustomModel(provider, id),
-          '自定义模型已删除',
-        );
-        return;
-      }
       if (!(await window.wbConfirm?.ask?.({
-        title: '删除模型',
-        html: `确定删除模型「<strong>${esc(id)}</strong>」？只是从该提供商的清单隐藏，可在「已删除」筛选里恢复。`,
-        okText: '删除',
+        title: '移除自定义模型',
+        html: `确定移除自定义模型「<strong>${esc(id)}</strong>」？这条登记会被<b>直接移除</b>，之后 <code>/v1/models</code> 不再广告它、请求它也会被拒。`,
+        okText: '移除',
         okClass: 'danger',
       }))) return;
-      void runRowAction(key, () => workbuddyDesktop.setModelState({ id, provider, hidden: true }), '模型已删除');
-      return;
-    }
-    if (act === 'restore') {
-      void runRowAction(key, () => workbuddyDesktop.setModelState({ id, provider, hidden: false }), '模型已恢复');
+      void runRowAction(
+        key,
+        () => workbuddyDesktop.removeCustomModel(provider, id),
+        '自定义模型已移除',
+      );
       return;
     }
     if (act === 'unmap') {
@@ -589,16 +636,20 @@
   }
 
   function onTableChange(event) {
-    const input = event.target.closest('input[data-act="toggle"]');
+    const input = event.target.closest('input[data-act]');
     if (!input) return;
-    const { id, provider } = input.dataset;
-    const enabled = input.checked;
-    const key = `${provider || ''}:${id}`;
-    void runRowAction(
-      key,
-      () => workbuddyDesktop.setModelState({ id, provider, enabled }),
-      enabled ? '模型已启用' : '模型已禁用',
-    );
+    const { act, provider, alias, target } = input.dataset;
+    // 映射 chip 上的开关：按三元组定位那条映射，只传 enabled 不带 reasoning
+    // （后端三态协议：不带 reasoning 不动等级）。走与行内操作同一套
+    // runRowAction：提交中禁用、失败 toast 后重绘即恢复原状态（data 未变）。
+    if (act === 'map-toggle') {
+      const enabled = input.checked;
+      void runRowAction(
+        `${alias}:${target}:${provider || ''}`,
+        () => workbuddyDesktop.addModelMapping(alias, target, provider, undefined, enabled),
+        enabled ? '映射已启用' : '映射已关闭',
+      );
+    }
   }
 
   // ─── 映射弹窗（照抄 OmniProxy 的模型映射）────────────────
@@ -790,6 +841,11 @@
     // 下拉为空 = 这一家清单里一个模型都没有（还没加账号 / 清单没拉到）
     if (!target) { status.textContent = '该提供商当前没有可选的上游模型'; return; }
     if (!provider) { status.textContent = '请选择提供商'; return; }
+    const same = (a, b) => String(a || '').toLowerCase() === String(b || '').toLowerCase();
+    if (!editing && same(alias, target) && models().some(model => same(model.id, target) && same(model.provider, provider))) {
+      status.textContent = '原始 ID 已作为默认绑定，请直接使用该绑定的开关或等级按钮';
+      return;
+    }
     mappingSaving = true;
     $('mapping-modal-save').disabled = true;
     status.textContent = '保存中…';

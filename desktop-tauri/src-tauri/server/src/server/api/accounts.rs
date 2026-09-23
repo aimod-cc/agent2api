@@ -314,6 +314,23 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         .and_then(Value::as_str)
         .map(str::to_string);
     let import_name = name.as_deref();
+    // ── 自定义提供商（`custom-` 前缀，不在静态注册表里）─────────
+    // 它**不进** `ProviderKind` 枚举 —— `kind_from_id` 对它返回 None 是设计
+    // 而不是遗漏（见 `providers` 的模块头），所以必须在穷举 match **之前**
+    // 分流：落进 `None` 分支会被当成 workbuddy 会话形态存进 workbuddy 组
+    // （凭证是 apiKey、分组是错的，正是 W4a 要消灭的「静默进错组」）。
+    // 判据是 `is_custom_provider_id`（前缀 + 存储里存在）：只看前缀会让
+    // 手改数据塞进来的陌生 id 也被收下，而它没有协议与基址，必然是个死组。
+    if crate::server::core::custom_providers::is_custom_provider_id(provider) {
+        let result = store.add_custom_account(provider, &payload, import_name);
+        return match result {
+            Ok(account) => ok_json(json!({
+                "account": account,
+                "list": store.list_accounts(),
+            })),
+            Err(error) => store_error(error),
+        };
+    }
     let result = match crate::server::core::providers::kind_from_id(provider) {
         Some(crate::server::core::providers::ProviderKind::Raccoon) => {
             if import_desktop {
@@ -529,6 +546,16 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
         },
     };
     logging::verbose("[Accounts]", &format!("刷新账号 token: {id}"));
+    // 自定义提供商账号：凭证是用户手填的 apiKey（`custom_accounts`），没有
+    // 可刷新的登录态。不拦截的话会落到下面的 workbuddy 刷新链路 ——
+    // `get_credentials_by_id` 对只有 `apiKey` 的记录返回 None，用户会得到
+    // 一条「账号不存在」，与列表里明明可见的那条自相矛盾。
+    if state.store().custom_account_provider(&id).is_some() {
+        return management_error(
+            400,
+            "自定义提供商账号的凭证由用户直接提供，无需刷新（更换凭证请重新添加或直接编辑）",
+        );
+    }
     if state.store().qoder_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Qoder).await;
     }

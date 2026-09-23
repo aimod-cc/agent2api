@@ -429,6 +429,9 @@ impl ServerState {
                 daily_days: settings.daily_days,
             }
         }));
+        // 启动即收尾上次运行遗留的进行中行（详情见方法注释）：不等到第一条
+        // 请求进来才清理，界面打开时看到的就已经是「已中断」的终态
+        request_stats.sweep_stale_running();
 
         // ── 账号侧的启动期一次性迁移：**有待迁移数据时整块跳过** ──────
         // 那一组迁移（auth.json 旧登录态、`migrate_startup` 的整队与拆池、

@@ -63,10 +63,12 @@ fn parse_object(
     Ok(payload)
 }
 
-/// 一次转发的公共前半段：解析模型 → 送转发层。
+/// 一次转发的公共前半段：把已解析的 Chat 形态请求体交给转发层。
 ///
-/// 返回 `(upstream_body, outcome, telemetry, model)`。
-/// `upstream_body` 是**送给转发层**的 Chat 形态请求体（已填好模型）。
+/// `telemetry` 由**调用方**创建（with_id 生成关联 id）后传入：进行中行
+/// （`record_started`）要在转发开始前插入，而插入点需要 id 与模型名 ——
+/// 那两样都只在 endpoint 手里，所以槽位的创建也上移到 endpoint
+/// （与 `/v1/chat/completions` 的结构对齐）。
 ///
 /// `scope` 是本次请求命中的网关 Key 的限制（R9，`None` = 不限制）：
 /// **提供商**那一半进转发层（选路时按承载家过滤），**模型**那一半在调用方
@@ -79,8 +81,8 @@ async fn forward_chat(
     stream: bool,
     dedupe_key: String,
     scope: Option<KeyScope>,
-) -> (Arc<RequestTelemetry>, Result<ForwardOutcome, GatewayError>) {
-    let telemetry = Arc::new(RequestTelemetry::with_id());
+    telemetry: Arc<RequestTelemetry>,
+) -> Result<ForwardOutcome, GatewayError> {
     let outcome = state
         .upstream()
         .forward(ForwardRequest {
@@ -92,7 +94,7 @@ async fn forward_chat(
             allowed_providers: scope,
         })
         .await;
-    (telemetry, outcome)
+    outcome
 }
 
 // ─── POST /v1/responses ─────────────────────────────────────
@@ -160,17 +162,49 @@ pub async fn responses_endpoint(
 
     // 上游恒走流式（理由见模块头）
     // scope 的**提供商**那一半进转发层（选路时按承载家过滤）；
-    // 模型那一半已在上面判过（分工见 forward_chat 的说明）
-    let (telemetry, outcome) =
-        forward_chat(&state, chat_body, &headers, stream, pipeline::sha256_hex(&body), scope).await;
+    // 模型那一半已在上面判过（分工见 forward_chat 的说明）。
+    // telemetry 在这里创建（不再由 forward_chat 代建）：进行中行要在
+    // 转发开始前插入，见下方 record_started。
+    let telemetry = Arc::new(RequestTelemetry::with_id());
+    let client_model = pipeline::model_field_text(&raw);
+    // 「进行中」行（与 /v1/chat/completions 同一处时点：模型解析成功、
+    // 转发开始前；生命周期见 `RequestStats::record_started`）
+    let telemetry_id = telemetry.snapshot().id;
+    state.request_stats().record_started(
+        &telemetry_id,
+        started_at,
+        &requested_model,
+        &client_model,
+    );
+    // 在途回写（与 /v1/chat/completions 同一处时点与理由，见
+    // `pipeline::live_row_sink`）
+    telemetry.set_live_sink(pipeline::live_row_sink(
+        state.request_stats(),
+        telemetry_id,
+        started_at,
+    ));
+    let outcome = forward_chat(
+        &state,
+        chat_body,
+        &headers,
+        stream,
+        pipeline::sha256_hex(&body),
+        scope,
+        telemetry.clone(),
+    )
+    .await;
     let context = RecordContext {
         stats: state.request_stats(),
         telemetry,
         started_at,
         model: requested_model.clone(),
         // 下游原始名取自客户端原始请求体（转换前的 model 字段）
-        client_model: pipeline::model_field_text(&raw),
+        client_model,
         status: 200,
+        // 下游原始请求体：客户端发来的那一份（协议翻译前）。响应侧非流式
+        // 在聚合完成后补，流式由 RecordingStream 在流结束时定稿
+        raw_request: pipeline::raw_body_text(&body),
+        raw_response: None,
     };
 
     match outcome {
@@ -195,6 +229,11 @@ pub async fn responses_endpoint(
             collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
             let body = collector.into_response(&model, &request);
+            // 响应正文在记账前定稿（完整 JSON 文本；序列化失败给 None）
+            let context = RecordContext {
+                raw_response: serde_json::to_string(&body).ok(),
+                ..context
+            };
             pipeline::record_entry(&context, None);
             json_response(body)
         }
@@ -202,6 +241,10 @@ pub async fn responses_endpoint(
             // 上游走了聚合路径（本不该发生：我们恒要流式，但 CatPaw 等
             // 有状态适配器可能直接给 Completion）。照样翻译，不丢请求。
             let response = responses::responses_from_chat(&chat, &requested_model, &original);
+            let context = RecordContext {
+                raw_response: serde_json::to_string(&response).ok(),
+                ..context
+            };
             pipeline::record_entry(&context, None);
             json_response(response)
         }
@@ -268,17 +311,49 @@ pub async fn messages_endpoint(
     pipeline::write_debug_files(&body, "POST", path, &user_agent);
 
     // scope 的**提供商**那一半进转发层（选路时按承载家过滤）；
-    // 模型那一半已在上面判过（分工见 forward_chat 的说明）
-    let (telemetry, outcome) =
-        forward_chat(&state, chat_body, &headers, stream, pipeline::sha256_hex(&body), scope).await;
+    // 模型那一半已在上面判过（分工见 forward_chat 的说明）。
+    // telemetry 在这里创建（与 responses_endpoint 同理：进行中行要在
+    // 转发开始前插入）
+    let telemetry = Arc::new(RequestTelemetry::with_id());
+    let client_model = pipeline::model_field_text(&raw);
+    // 「进行中」行（与 /v1/chat/completions 同一处时点：模型解析成功、
+    // 转发开始前；生命周期见 `RequestStats::record_started`）
+    let telemetry_id = telemetry.snapshot().id;
+    state.request_stats().record_started(
+        &telemetry_id,
+        started_at,
+        &requested_model,
+        &client_model,
+    );
+    // 在途回写（与 /v1/chat/completions 同一处时点与理由，见
+    // `pipeline::live_row_sink`）
+    telemetry.set_live_sink(pipeline::live_row_sink(
+        state.request_stats(),
+        telemetry_id,
+        started_at,
+    ));
+    let outcome = forward_chat(
+        &state,
+        chat_body,
+        &headers,
+        stream,
+        pipeline::sha256_hex(&body),
+        scope,
+        telemetry.clone(),
+    )
+    .await;
     let context = RecordContext {
         stats: state.request_stats(),
         telemetry,
         started_at,
         model: requested_model.clone(),
         // 下游原始名取自客户端原始请求体（转换前的 model 字段）
-        client_model: pipeline::model_field_text(&raw),
+        client_model,
         status: 200,
+        // 下游原始请求体：客户端发来的那一份（协议翻译前）。响应侧非流式
+        // 在聚合完成后补，流式由 RecordingStream 在流结束时定稿
+        raw_request: pipeline::raw_body_text(&body),
+        raw_response: None,
     };
 
     match outcome {
@@ -300,11 +375,20 @@ pub async fn messages_endpoint(
             collect_stream(source, &mut |chunk| collector.push(chunk)).await;
             collector.finish();
             let body = collector.into_response(&model);
+            // 响应正文在记账前定稿（完整 JSON 文本；序列化失败给 None）
+            let context = RecordContext {
+                raw_response: serde_json::to_string(&body).ok(),
+                ..context
+            };
             pipeline::record_entry(&context, None);
             json_response(body)
         }
         Ok(ForwardOutcome::Completion { body: chat }) => {
             let response = anthropic::anthropic_from_chat(&chat, &requested_model);
+            let context = RecordContext {
+                raw_response: serde_json::to_string(&response).ok(),
+                ..context
+            };
             pipeline::record_entry(&context, None);
             json_response(response)
         }

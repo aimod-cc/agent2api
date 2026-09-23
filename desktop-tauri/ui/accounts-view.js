@@ -32,7 +32,6 @@
   const { toast } = wbApp;
   // 领域判定与标签渲染抽到 accounts-model.js（纯逻辑，无状态），这里直接引用
   const {
-    providerOf,
     supportsUsage,
     supportsCheckin,
     checkinableAccounts,
@@ -141,6 +140,10 @@
    *
    * 每行的 ctx 都是现算的：位置表（序号与 ↑/↓ 边界）、各自的展开态。
    * 明细行紧跟在各自账号行之后（整宽内容，放进单元格会被那一列锁死）。
+   * **不插提供商组头行**：队列本身就是一条平铺的优先级序，组头会把一条
+   * 队列切回几块（用户明确要求账号列表不要分组）；提供商维度由「提供商」
+   * 筛选下拉与行上的徽章表达。自定义提供商的管理入口在工具栏那颗
+   * 「自定义提供商」按钮里（见 custom-provider-ui.js 的管理弹窗）。
    */
   function render() {
     const list = $('account-list');
@@ -545,6 +548,13 @@
         // 勾选「启用」保存是同一条链路，语义一致。
         if (menuAction === 'enable' || menuAction === 'disable') {
           await toggleAccountEnabled(id, menuAction === 'enable');
+          return;
+        }
+        // 并发上限：通用账号属性（内置 + custom 都有这一项），点开小对话框。
+        // 弹窗本体在 account-conc-dialog.js（单字段的弹窗不值得让本文件再长）
+        if (menuAction === 'maxConcurrent') {
+          const account = accounts().find(item => item.id === id);
+          if (account) window.wbAccountConcDialog?.open(account);
           return;
         }
         window.wbApp.runAccountAction?.(menuAction, id);

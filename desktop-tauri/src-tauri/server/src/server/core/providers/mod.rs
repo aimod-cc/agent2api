@@ -94,6 +94,12 @@ pub mod catalog;
 pub mod catpaw;
 pub mod cline;
 pub mod content_block;
+/// 自定义提供商的**运行期接线**（目录聚合的追加段 + Chat Completions 协议
+/// 转发）。它不进本文件的身份体系（`ProviderKind` / `PROVIDERS`，见
+/// `custom_providers` 的模块头），但目录合并与转发的分派点都以 id 字符串
+/// 形态调用它 —— 挂在这里与其它子模块并列，便于对照「内置家走适配器、
+/// 自定义家走独立通道」的两条路径。
+pub mod custom;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
@@ -330,19 +336,37 @@ pub fn is_known_provider_id(id: &str) -> bool {
     kind_from_id(id).is_some()
 }
 
-/// provider id → 注册表里的展示名；未登记的 id 原样回显。
+/// provider id → 给人看的名字；未登记的 id 原样回显。
 ///
-/// 回退成 id 而不是「未知」：调用点手上的 id 来自真实数据（账号记录、
-/// `owned_by`、日志），真出现未登记的 id 时，回显原文比一句笼统的「未知」
-/// 更能定位问题。前端也照这个口径做兜底（见 `ui/providers.js`）。
+/// ── 为什么返回 `String` 而不是 `&str`（改动自有数据那天起就定了）────
+/// 自定义提供商（`custom-` 前缀，见 `custom_providers`）的名字是**运行期
+/// 数据**（存在 kv 配置里），拿不到 `&'static`。给 `&str` 凑寿命只有两条路：
+/// leak 静态化（内存只进不出，禁用）或把名字缓存在某个全局里（与配置失同步
+/// 的又一处风险）。返回 `String` 让调用点多付一次分配 —— 调用点全是日志与
+/// HTTP 响应的展示路径，这点成本换「不泄漏、不失同步」是划算的。
+///
+/// ── 回退顺序 ──────────────────────────────────────────────
+/// 1. `custom-` 前缀 → 先查 `custom_providers::label_of`（用户给的名字优先），
+///    查不到（已被删除 / 手改数据塞进来的陌生 id）回显原 id；
+/// 2. 其余走注册表：登记的返回 `label`，未登记的原样回显。
+///
+/// 回显成 id 而不是「未知」的理由不变：调用点手上的 id 来自真实数据（账号
+/// 记录、`owned_by`、日志），真出现未登记的 id 时，回显原文比一句笼统的
+/// 「未知」更能定位问题。前端也照这个口径做兜底（见 `ui/providers.js`）。
 ///
 /// 这是「id → 给人看的名字」的**唯一入口** —— 别处不要再写
 /// `match id { "catpaw" => "CatPaw", ... }`：那种表漏一家不会报错，
 /// 只会让界面上少一个名字。
-pub fn label_of(id: &str) -> &str {
+pub fn label_of(id: &str) -> String {
+    if id.starts_with(crate::server::core::custom_providers::ID_PREFIX) {
+        if let Some(label) = crate::server::core::custom_providers::label_of(id) {
+            return label;
+        }
+        return id.to_string();
+    }
     match kind_from_id(id) {
-        Some(kind) => meta(kind).label,
-        None => id,
+        Some(kind) => meta(kind).label.to_string(),
+        None => id.to_string(),
     }
 }
 

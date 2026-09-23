@@ -362,6 +362,53 @@
     return true;
   });
 
+  // ─── 后注册的提供商表单（自定义提供商，见 add-custom-provider.js）──────
+  //
+  // ADD_FORMS 在本文件加载时定型，而 add-custom-provider.js 按 index.html 的
+  // 约定排在本文件**之后**加载 —— 自定义提供商的表单（新建 / 加入已有两套
+  // 字段、两个不同的提交端点）与 ADD_FORMS 的「字段 + 统一提交 POST
+  // /api/accounts」模型对不上，硬塞进去要给每个环节开特例。这里开一个
+  // 后注册口：对方在加载期调 registerAddForm，把整个块挂进弹窗，结构、
+  // 交互与提交全部自治。
+  //
+  // 必须声明在 syncAddProviderOptions **之前**：本文件加载末尾就会调它一次，
+  // const 声明放在后面会踩暂时性死区（TDZ）直接抛 ReferenceError。
+  const EXTRA_ADD_FORMS = [];
+
+  /**
+   * 挂一个后注册的表单块。配置形状（provider / label 与 ADD_FORMS 条目同名
+   * 字段含义相同，其余由对方定义）：
+   *   provider       块 id 与选项值的 key（如 'custom'）
+   *   label          提供商选择项与弹窗标题里的展示名
+   *   buildBlock()   返回块的 HTML（结构与交互完全由对方定义）
+   *   mount(block)   块进 DOM 后绑定自己的事件
+   *   onShow()       弹窗切到这一项时回调（对方借此刷新自己的动态内容）
+   *
+   * 块插在「即将上线」占位之前；block id 登记进 ADD_FORM_PROVIDERS 后，
+   * 显隐切换（syncAddProvider）与选项重建（syncAddProviderOptions）无需再改。
+   */
+  function registerAddForm(config) {
+    if (!config?.provider || EXTRA_ADD_FORMS.some(item => item.provider === config.provider)) return;
+    EXTRA_ADD_FORMS.push(config);
+    const blockId = `add-block-${config.provider}`;
+    ADD_FORM_PROVIDERS[config.provider] = blockId;
+    const body = $('add-modal')?.querySelector('.modal-body');
+    if (body && !$(blockId)) {
+      const block = document.createElement('div');
+      block.id = blockId;
+      block.className = 'add-provider-block';
+      block.hidden = true;
+      block.innerHTML = config.buildBlock?.() || '';
+      const placeholder = $(ADD_PLACEHOLDER_ID);
+      if (placeholder) body.insertBefore(block, placeholder);
+      else body.appendChild(block);
+      config.mount?.(block);
+    }
+    // 选项里补上刚注册的这家（当前选中项不受影响：注册发生在加载期，
+    // 那时弹窗还没开，addProvider 仍是缺省的 workbuddy）
+    syncAddProviderOptions();
+  }
+
   /**
    * 注入添加账号弹窗的提供商选择区，并把既有 WorkBuddy 区块收进一个容器。
    *
@@ -529,7 +576,7 @@
         <div class="field-row">
           <button id="${prefix}-oauth-zai" class="primary">使用 Zai 账号登录</button>
           <button id="${prefix}-oauth-google">使用 Google 账号登录</button>
-          <button id="${prefix}-oauth-cancel" style="display:none">取消等待</button>
+          <button id="${prefix}-oauth-cancel" style="display:none">取消</button>
         </div>
         <div class="field-row">
           <span class="detail" id="${prefix}-oauth-hint">${esc(modes[0]?.hint || oauth.hint || '')}</span>
@@ -679,7 +726,10 @@
     const seg = $(ADD_PROVIDER_SEG_ID);
     if (!seg) return;
     const id = addProvider || 'workbuddy';
-    const label = window.wbProviders?.labelOf?.(id)
+    // 后注册的表单（自定义提供商）不进 wbProviders 目录，label 直接用配置里的
+    const extra = EXTRA_ADD_FORMS.find(item => item.provider === id);
+    const label = extra?.label
+      || window.wbProviders?.labelOf?.(id)
       || seg.querySelector('.seg-item.active')?.textContent?.trim()
       || id;
     const block = ADD_FORM_PROVIDERS[id];
@@ -694,6 +744,9 @@
       const text = $('add-placeholder-text');
       if (text && !block) text.textContent = `「${label}」的账号添加功能还在开发中，敬请期待。`;
     }
+    // 弹窗当前显示的是后注册的块：给它一个信号，让它刷新自己的动态内容
+    //（自定义提供商要借此重读列表、同步「新建 / 选择已有」的可用性）
+    if (extra && block) extra.onShow?.();
   }
 
   /**
@@ -710,6 +763,13 @@
     const options = list.length
       ? list.map(item => ({ id: item.id, label: item.label }))
       : [{ id: 'workbuddy', label: 'WorkBuddy' }];
+    // 后注册的提供商（自定义提供商，见 registerAddForm）不依赖后端摘要，
+    // 永远参与选项 —— 摘要慢一拍也不能让它从分段控件里消失
+    for (const config of EXTRA_ADD_FORMS) {
+      if (!options.some(item => item.id === config.provider)) {
+        options.push({ id: config.provider, label: config.label });
+      }
+    }
     const signature = options.map(item => `${item.id}:${item.label}`).join('|');
     if (seg.dataset.signature !== signature) {
       seg.dataset.signature = signature;
@@ -907,8 +967,9 @@
    *     用户可能在发起之前来回切换，快照会让最后一次切换不生效；
    *   · `hint`：当前打开方式对应的空闲提示，引擎在流程结束与切换打开方式时
    *     用它恢复那一行文案（流程中的阶段提示由引擎自己写，见那个文件的说明）；
-   *   · `cancelId`：「取消等待」按钮。系统浏览器模式下没有可关的窗口，
-   *     没有它就只能靠关弹窗取消（另外几家的 external 都有这个按钮）。
+   *   · `cancelId`：「取消」按钮。全程挂着：验证码阶段点它 = 作废滑块等待，
+   *     拿到地址后的等待登录阶段点它 = 撤掉壳侧那一轮（系统浏览器模式下
+   *     没有可关的窗口，它是唯一的取消出口）。
    *
    * `onSuccess` 复用 afterAdd：那条链最终也是往账号库里加一条记录，收尾逻辑
    * 与「填写凭证」「手机验证码」没有理由分三套（响应形状由后端统一）。
@@ -1003,5 +1064,12 @@
       addProvider = 'workbuddy';
       syncAddProviderOptions();
     },
+    // 后注册口与分段控件工具：add-custom-provider.js 的「新建 / 选择已有」
+    // 模式切换复用同一套 .seg 交互（点击 / 方向键 / roving tabindex）
+    registerAddForm,
+    bindSeg,
+    segValueOf,
+    setSegValue,
+    SEG_EVENT,
   };
 })();

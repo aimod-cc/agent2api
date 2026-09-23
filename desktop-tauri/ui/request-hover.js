@@ -176,9 +176,10 @@
    * 三种结局的判据与颜色：
    *   · `error` 非空         → 失败（红），带状态码（可能没有：传输层失败）
    *   · `status` 有值、无错误 → 成功（绿），带状态码
-   *   · 两者都无             → 未定论（淡灰）。只在「这一轮还在飞」时出现，
-   *     而列表里看到的行都是已收尾的，所以它几乎只会来自被手工改过的库；
-   *     给一个中性文案而不是猜成功/失败。
+   *   · 两者都无             → 未定论（淡灰）。**两种来源**：这一轮还在飞
+   *     （`inFlight`，进行中行的最后一条明细 —— 转发一开始就在途回写，
+   *     所以这是常态），以及被手工改过的库。前者写「进行中…」，后者才写
+   *     「无结果记录」：对一条正在跑的请求说「无结果」会被读成它已经失败。
    *
    * 账号名（`item.account`）挂在提供商名后面：一家可以有多个账号，
    * 「WorkBuddy / aibjchat001@gmail.com」比只有家名更能定位到那一轮
@@ -186,7 +187,7 @@
    *
    * 下面还跟着这一轮的重试子行与提示行（有才显示）。
    */
-  function attemptRowHtml(item, index) {
+  function attemptRowHtml(item, index, inFlight) {
     const name = providerLabel(item?.provider);
     const account = String(item?.account ?? '').trim();
     const status = Number(item?.status);
@@ -206,7 +207,9 @@
       : hasStatus
         ? `<span class="rh-ok">成功（${esc(String(status))}）</span>`
         // 有状态码之外的最后一种：状态码缺失且没有错误摘要（见上面「未定论」）
-        : '<span class="rh-dim">无结果记录</span>';
+        : inFlight
+          ? '<span class="rh-dim">进行中…</span>'
+          : '<span class="rh-dim">无结果记录</span>';
     return `<div class="rh-row">${head}${body}</div>${extras}`;
   }
 
@@ -219,6 +222,12 @@
    *      —— 这条记录来自「尝试明细」这个字段上线之前，明细确实拿不到，
    *      但已有的两个读数（次数、最终承载者）仍然值得显示。
    *      **不编造中间过程**：那会是猜，而不是事实。
+   *
+   * ── 进行中行也走①（本次改造）────────────────────────────────
+   * 转发一开始就在途回写，所以还在跑的行同样有明细，最后一条的
+   * `status` / `error` 都为空 —— 那是「这一轮还在飞」，由 `attemptRowHtml`
+   * 的第三个参数渲染成「进行中…」（判据与列表的进行中徽章同一个：
+   * status=0 且没有错误摘要）。
    */
   function chainPanelHtml(entry) {
     const attempts = Number(entry?.attempts) || 1;
@@ -237,8 +246,13 @@
     const truncated = details.length < attempts
       ? `<div class="rh-row rh-dim">另有 ${attempts - details.length} 次尝试未记录明细（只保留最早的 ${details.length} 条）</div>`
       : '';
+    // 「还在飞」只可能是最后一条：尝试是严格串行的，前面的轮次一旦定局就不再
+    // 变化（后端的口径见 `usage::AttemptDetail::status`）
+    const running = (Number(entry?.status) || 0) === 0 && !entry?.error;
     return chainHtml(details)
-      + details.map(attemptRowHtml).join('')
+      + details.map((item, index) => (
+        attemptRowHtml(item, index, running && index === details.length - 1)
+      )).join('')
       + truncated;
   }
 

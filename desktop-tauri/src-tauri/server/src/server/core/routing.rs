@@ -103,12 +103,28 @@ impl<'a> CooldownKeys<'a> {
         // 传 `None` 账号：`wire_target_for_provider` 当前不读它（同家多条映射
         // 由 target 的通道前缀判定，见那里的说明），而选路时账号还没被选中 ——
         // 「按账号解析」在判定阶段根本无从谈起。
-        let wire = crate::server::core::providers::catalog::wire_target_for_provider(
-            self.requested,
-            provider_id,
-            None,
-        )
-        .model;
+        //
+        // ── 自定义提供商走自己的解析（第二阶段）───────────────────
+        // modelRules 的映射表不认识 custom id（添加侧按注册表校验），
+        // `wire_target_for_provider` 对它只会原样返回请求名 —— 而自定义家的
+        // 真名解析有自己的数据源（提供商记录上的 `mappings`，见
+        // `custom_providers::wire_model_for`）。跳过这一步会让 alias 请求的
+        // 冷却写在请求名上：正是本模块头描述的那类「判定漏命中、已限额账号
+        // 被反复选中」的事故形态，所以这里必须按家分派。
+        let wire =
+            if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+                crate::server::core::providers::custom::forward::cooldown_model(
+                    provider_id,
+                    self.requested,
+                )
+            } else {
+                crate::server::core::providers::catalog::wire_target_for_provider(
+                    self.requested,
+                    provider_id,
+                    None,
+                )
+                .model
+            };
         if let Ok(mut cache) = self.resolved.lock() {
             cache.insert(provider_id.to_string(), wire.clone());
         }
@@ -177,6 +193,20 @@ pub struct AccountUsability {
     pub reason: Option<&'static str>,
 }
 
+/// 账号记录上的并发上限（单账号**同时在途**的下游请求数）。
+///
+/// 「一次下游请求 = 一条连接」的计数在 `upstream::connections`（账号页「连接数」
+/// 列的数据源），口径正是并发上限要限制的东西，所以这里直接读账号记录上的
+/// `maxConcurrent` 与那份计数比对。记录里没有该键、或值不是数字 = 0 = **不限**
+/// —— 与写入侧（`store_crud::apply_patch` 的 0）和公开形态
+/// （`store_util::max_concurrent_public` 的缺省 0）三条口径一致。
+pub fn max_concurrent_of(account: &Value) -> u64 {
+    account
+        .get("maxConcurrent")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
 /// 按优先级挑选本次请求使用的账号。
 ///
 /// `accounts` 为 store.listAccounts().accounts 的公开形态；
@@ -185,11 +215,23 @@ pub struct AccountUsability {
 ///
 /// `keys` 是请求名到各家真名的解析器（冷却键，见 [`CooldownKeys`]）。
 ///
+/// `counts` 是各账号**当前在途请求数**（账号 id → 数，`upstream::connections`
+/// 的快照）：`maxConcurrent > 0` 且在途数已达上限的账号被跳过，请求转给
+/// 其他账号。没有运行时计数可拿的调用方传**空表** = 不做并发过滤（见
+/// `pick_for_model` / `describe_route_decision` 的说明）。
+///
+/// ── 并发上限是**软上限**（选路与 rebind 之间的微小窗口）────────
+/// 两个并发请求可能在同一瞬间选中同一个账号、然后各自 +1 —— 期间谁都还
+/// 读不到对方的计数。为此引入额外加锁不值得：超出的那 1-2 个请求只意味着
+/// 短暂超载（请求结束计数立刻回落），而选路必须是「读一次快照、立刻决策」
+/// 的廉价操作。把这个口径写明：**允许短暂超 1-2 个，不做强一致**。
+///
 /// 排序取首位即为唯一答案（优先级唯一由写入侧保证）；并列属手工编辑出来的
 /// 异常数据，按加入时间兜底，结果依旧稳定。
 pub fn pick_account_by_priority(
     accounts: &[Value],
     keys: &CooldownKeys<'_>,
+    counts: &HashMap<String, usize>,
     exclude_ids: &[String],
     now: i64,
 ) -> Option<Value> {
@@ -203,6 +245,9 @@ pub fn pick_account_by_priority(
                 return false;
             }
             account_usability(account, keys, now).usable
+                // 并发过滤放在 usability 之后：先答「这个账号让不让你用」，
+                // 再答「它忙不忙」—— 禁用 / 限流的原因不变，这里只追加一条。
+                && !at_concurrency_limit(account, id, counts)
         })
         .cloned()
         .collect();
@@ -211,6 +256,15 @@ pub fn pick_account_by_priority(
     }
     candidates.sort_by(compare_by_priority);
     candidates.into_iter().next()
+}
+
+/// 该账号的在途请求数是否已达并发上限（`maxConcurrent == 0` = 不限，恒 false）。
+///
+/// 计数缺失按 0（空闲）算：快照里只留非零项（见 `Connections::snapshot`），
+/// 「缺键」与「0 个在途」是同一件事。
+fn at_concurrency_limit(account: &Value, id: &str, counts: &HashMap<String, usize>) -> bool {
+    let limit = max_concurrent_of(account);
+    limit > 0 && counts.get(id).copied().unwrap_or(0) >= limit as usize
 }
 
 /// 按**指定模型**派生队首：候选先收窄到「清单里有这个模型的家」，再走
@@ -233,10 +287,16 @@ pub fn pick_account_by_priority(
 ///
 /// 冷却键按各家真名解析（[`CooldownKeys`]）—— 界面标的 ★ 因此与转发实际会先试
 /// 的那个账号同判据：别名请求撞限额后，★ 不会再指向那个额度已耗尽的账号。
+///
+/// `counts` 的口径同样要对齐真实选路（并发过滤，见
+/// [`pick_account_by_priority`]）：★ 推算拿得到运行时计数就传（`/api/session`
+/// 从 `UpstreamService::connections()` 取），拿不到就传空表 = 并发不过滤 ——
+/// 宁可 ★ 少剔一个忙账号，也不要让整条推算在缺数据时静默失效。
 pub fn pick_for_model(
     accounts: &[Value],
     model: &str,
     providers: &[&str],
+    counts: &HashMap<String, usize>,
     now: i64,
 ) -> Option<Value> {
     let candidates: Vec<Value> = accounts
@@ -251,7 +311,7 @@ pub fn pick_for_model(
         .cloned()
         .collect();
     let keys = CooldownKeys::new(model);
-    pick_account_by_priority(&candidates, &keys, &[], now)
+    pick_account_by_priority(&candidates, &keys, counts, &[], now)
 }
 
 /// 账号记录上的 provider id（缺失按默认 provider 兜底，与 store 的
@@ -302,7 +362,9 @@ pub fn describe_route_decision(
             }));
         }
     }
-    let picked = pick_account_by_priority(accounts, &keys, exclude_ids, now);
+    // 排障快照，拿不到运行时的在途计数（它住在 UpstreamService 里），
+    // 传空表 = 并发过滤不生效 —— 这里只回答「按启用/限流该选谁」。
+    let picked = pick_account_by_priority(accounts, &keys, &HashMap::new(), exclude_ids, now);
     let priority = picked
         .as_ref()
         .map(|account| normalize_priority_value_of(account))

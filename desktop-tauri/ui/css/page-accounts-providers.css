@@ -129,3 +129,75 @@
 
 /* 行内文字链接（「小浣熊客户端登录态文件」）：点了在弹窗里显示完整路径 */
 .raccoon-hint-link { color: var(--primary-fg); text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
+
+/* ─── 自定义提供商的下拉（见 add-custom-provider.js / custom-provider-ui.js）───
+   文本输入框走全局 input 样式（flex: 1 1 auto 自动吃剩余宽度）；select 没有那条
+   全局伸展，这里显式给上，否则协议 / 提供商下拉缩在内容宽度上，与同一行的
+   标签之间留一大块空白。max-width 收口：Base URL 这类长值不该把弹窗撑宽。
+   不带 #add-modal 前缀：编辑弹窗（custom-provider-edit-modal）里的协议下拉
+   用的是同一个类，两处观感必须一致。 */
+.custom-provider-select { flex: 1 1 auto; max-width: 320px; }
+
+/* ═══ 自定义提供商管理弹窗的列表（custom-provider-ui.js）══════════════
+   弹窗本体按需创建、关闭即移除，所以这些规则挂在 id 选择器上而不是某个
+   常驻容器里。一行一条提供商：左侧名称 + 协议/地址/账号数，右侧三项操作。
+   行与行之间用 hairline 分隔（与 .table 的行分隔同一档），最后一个不画线 ——
+   弹窗底部就是 .modal-foot，多一条线会显得没收尾。 */
+
+#custom-providers-manage-modal .modal { width: min(680px, 92vw); }
+
+.cp-list { display: flex; flex-direction: column; }
+
+.cp-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.cp-item:last-child { border-bottom: none; }
+
+/* min-width: 0 让省略号三件套生效：Base URL 可以很长，不能把操作列顶出去 */
+.cp-main { flex: 1 1 auto; min-width: 0; }
+
+.cp-name { font-size: 12.5px; font-weight: 600; color: var(--text); }
+
+.cp-sub {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  margin-top: 2px;
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.cp-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.cp-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
+
+.cp-count { flex: 0 0 auto; white-space: nowrap; }
+
+/* 操作列：与账号表操作列同一形制（小按钮右对齐），删除是唯一不可逆的动作，悬停走危险色 */
+.cp-actions { flex: 0 0 auto; display: inline-flex; gap: 4px; }
+
+.cp-actions button {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  border-radius: var(--r-sm);
+}
+
+.cp-actions button.danger:hover:not(:disabled) {
+  border-color: var(--danger-bd);
+  background: var(--danger-soft);
+  color: var(--danger);
+}

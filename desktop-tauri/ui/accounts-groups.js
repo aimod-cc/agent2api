@@ -265,19 +265,16 @@
 
   // ─── 筛选维度 ───────────────────────────────
   //
-  // 三个维度各自独立、可任意组合：provider / edition / enabled / limit。
+  // provider / enabled / limit 三个维度各自独立、可任意组合。
   // 判定函数集中在这里，让「可见列表」与「分段计数」共用同一份口径 ——
   // 否则徽标数字与点进去看到的结果会各算各的。
   // 曾经的「模型」维度已随「账号页不再选模型」下线：限流是按模型记的，
   // 「限流」现在指的是该账号**任一模型**限流中，具体哪个模型去行上的
   // 「限流」明细里看（见 accounts-model 的 limitPanelHtml）。
+  // 「版本」维度也已下线：国内 / 国际只作为账号属性出在行上的徽章里。
 
   function matchProvider(account, filter) {
     return filter.provider === 'all' || providerOf(account) === filter.provider;
-  }
-
-  function matchEdition(account, filter) {
-    return filter.edition === 'all' || accountEdition(account) === filter.edition;
   }
 
   function matchEnabled(account, filter) {
@@ -292,10 +289,9 @@
     return filter.limit === 'limited' ? isRateLimited(account) : !isRateLimited(account);
   }
 
-  /** 当前筛选条件下的可见账号（四个维度同时生效） */
+  /** 当前筛选条件下的可见账号（三个维度同时生效） */
   function visibleAccounts(all, filter) {
     return (all || []).filter(account => matchProvider(account, filter)
-      && matchEdition(account, filter)
       && matchEnabled(account, filter)
       && matchLimit(account, filter));
   }
@@ -306,20 +302,15 @@
    */
   function filterCounts(all, filter, summaries) {
     const list = all || [];
-    // 排除掉某个维度后的口径：except='edition' 表示「不管版本筛选」的账号集合
+    // 排除掉某个维度后的口径：except='provider' 表示「不管提供商筛选」的账号集合
     const scope = except => list.filter(account => (except === 'provider' || matchProvider(account, filter))
-      && (except === 'edition' || matchEdition(account, filter))
       && (except === 'enabled' || matchEnabled(account, filter))
       && (except === 'limit' || matchLimit(account, filter)));
 
-    const forEdition = scope('edition');
     const forEnabled = scope('enabled');
     const forLimit = scope('limit');
     const forProvider = scope('provider');
     const counts = {
-      editionAll: forEdition.length,
-      cn: forEdition.filter(a => accountEdition(a) === 'cn').length,
-      intl: forEdition.filter(a => accountEdition(a) === 'intl').length,
       enabledAll: forEnabled.length,
       enabled: forEnabled.filter(isEnabled).length,
       disabled: forEnabled.filter(a => !isEnabled(a)).length,
@@ -390,7 +381,6 @@
     checkinableAccounts,
     // 筛选与队列
     matchProvider,
-    matchEdition,
     matchEnabled,
     matchLimit,
     visibleAccounts,

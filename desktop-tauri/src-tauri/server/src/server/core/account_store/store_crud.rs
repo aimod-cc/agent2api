@@ -614,6 +614,35 @@ impl AccountStore {
             }
         }
 
+        if let Some(value) = patch.get("maxConcurrent") {
+            // 单账号并发上限：必须是**非负整数**（`as_u64` 对浮点 / 负数 /
+            // 字符串一律返回 None），封顶 999；0 = 不限。选路消费它时的口径
+            // 见 `routing::max_concurrent_of`（缺失 = 0 = 不限）。
+            const MAX_CONCURRENT_LIMIT: u64 = 999;
+            let next = match value.as_u64() {
+                Some(number) if number <= MAX_CONCURRENT_LIMIT => number,
+                // 999 以内才合法；文案说清范围，省得用户对着「非负整数」猜上限
+                Some(_) => {
+                    return Err(AccountStoreError::bad_request(
+                        "并发上限必须是不大于 999 的非负整数",
+                    ))
+                }
+                None => {
+                    return Err(AccountStoreError::bad_request("并发上限必须是非负整数"))
+                }
+            };
+            // 缺省记录无此键 = 不限（读侧按 0 处理），所以这里恒存显式数字
+            let current = record.get("maxConcurrent").and_then(Value::as_u64).unwrap_or(0);
+            if next != current {
+                record.set("maxConcurrent", Value::from(next));
+                changes.push(if next == 0 {
+                    "并发上限 → 不限".to_string()
+                } else {
+                    format!("并发上限 → {next}")
+                });
+            }
+        }
+
         Ok(changes)
     }
 

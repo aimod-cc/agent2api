@@ -1,6 +1,6 @@
 {
   "name": "agent2api-desktop-tauri",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "private": true,
   "description": "Agent2API 桌面端 — 多提供商本地网关与会话管理（Tauri）",
   "scripts": {

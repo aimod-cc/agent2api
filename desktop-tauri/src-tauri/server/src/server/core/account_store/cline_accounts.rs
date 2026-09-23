@@ -50,7 +50,7 @@ use crate::server::core::account_store::priority::next_free_priority;
 use crate::server::core::account_store::sql;
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
-use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
+use crate::server::core::account_store::store_util::{max_concurrent_public, token_tail_of, truncate_chars};
 use crate::server::core::account_store::{
     is_cline_family, CredentialWrite, CLINE_FREE_PROVIDER_ID, CLINE_PASS_PROVIDER_ID,
     MAX_TOKEN_LENGTH,
@@ -712,6 +712,12 @@ impl AccountStore {
         if let Some(expires) = expires {
             out.insert("expiresAt".to_string(), expires);
         }
+        // 单账号并发上限（所有家通用，兜底共用 `max_concurrent_public`）：
+        // 0 = 不限，缺键同样输出 0
+        out.insert(
+            "maxConcurrent".to_string(),
+            Value::from(max_concurrent_public(value.get("maxConcurrent"))),
+        );
         Value::Object(out)
     }
 }

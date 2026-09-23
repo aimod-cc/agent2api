@@ -22,6 +22,9 @@
 //!   auto_checkin.rs      定时签到调度（轮询 + 补签）    （workbuddy-auto-checkin.mjs）
 //!   credential_maintenance.rs 凭证自动维护（遍历账号 → 刷新临期凭证；判定逻辑
 //!                        在适配器，见 `providers::adapter` 的扩展 5）
+//!   custom_providers.rs  自定义提供商（用户自建上游端点）的存储与校验；
+//!                        管理 API 在 `api::custom_providers`，账号接入在
+//!                        `account_store::custom_accounts`
 //!   scheduled_tasks.rs   间隔型定时任务注册表与调度循环（凭证维护 / 模型刷新 /
 //!                        定时查询积分 / 两个前端自动刷新；开关与间隔来自 config，
 //!                        路由见 `api::scheduled_tasks`）
@@ -50,6 +53,7 @@ pub mod auto_checkin;
 pub mod billing;
 pub mod clash;
 pub mod credential_maintenance;
+pub mod custom_providers;
 pub mod debug_traffic;
 pub mod degrade;
 pub mod egress;

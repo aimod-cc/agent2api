@@ -76,9 +76,11 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::server::config;
+use crate::server::core::custom_providers;
 use crate::server::core::providers::adapter::{
     adapter_for, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
 };
+use crate::server::core::providers::custom::forward as custom_forward;
 use crate::server::core::providers::router::route_for_forward;
 use crate::server::core::providers::{kind_from_id, kind_id, meta, ProviderKind};
 use crate::server::errors::GatewayError;
@@ -264,13 +266,13 @@ pub(super) async fn forward_with_providers(
     }
     if candidates.is_empty() {
         // 空链有两条来源（见 `route_for_forward`）：注册表里连默认 provider 都
-        // 没有，或者这个名字的承载家**全被禁用**（那时不回落默认家）。后者是
+        // 没有，或者这个名字的承载家**全被关闭**（那时不回落默认家）。后者是
         // 用户可操作的，文案要指出去哪儿改，不能只说「没有可用的提供商」。
         if crate::server::core::providers::catalog::model_blocked_everywhere(&model) {
             return Err(GatewayError::with_status(
                 404,
                 format!(
-                    "模型已在网关中禁用: {model}。完整列表见 GET /v1/models"
+                    "模型已在网关中关闭: {model}。完整列表见 GET /v1/models"
                 ),
             )
             .with_code("model_not_found"));
@@ -283,7 +285,9 @@ pub(super) async fn forward_with_providers(
     // 过滤与「全被排除时的错误」都在 `filter_by_key_scope` 里（它要能提前返回
     // 错误，所以返回 Result）。
     let candidates = filter_by_key_scope(candidates, ctx.key_scope, &model)?;
-    let provider_ids: Vec<&str> = candidates.iter().map(|kind| kind_id(*kind)).collect();
+    // 候选链已是 id 空间（`route_for_forward` 的返回值，见 router 的模块头）：
+    // 内置家与自定义家的 id 同列，自定义 id 直接透传给选路与分派。
+    let provider_ids: Vec<&str> = candidates.iter().map(String::as_str).collect();
     // 映射扩池的提示：链比本名承载家长，说明追加了映射的提供商（选路顺序仍是
     // 原生优先）。用户看到请求落到映射家时，这里与发送侧的改写日志对得上。
     let with_mapping = crate::server::core::model_rules::current()
@@ -307,6 +311,10 @@ pub(super) async fn forward_with_providers(
 ///（「未知模型」与「全被禁用」的区分，见它的模块头），而白名单是**逐请求**的
 /// 东西，混进去会让「路由结果」变成与请求相关的量。
 ///
+/// 候选链是 id 空间（内置家 + 自定义家同列）：`KeyScope` 的提供商白名单本来
+/// 就是 id 字符串数组（见 `core::key_scope`），两种 id 直接可比 —— 自定义 id
+/// 在这里不需要任何转换，勾了就放行、没勾就被剔除，与内置家同一判据。
+///
 /// ── 白名单把候选全部排除时给一条**可读错误**（本需求明确要求的一条）──
 /// 照抄 OmniProxy「空候选必有明确 404」的做法（它那里也是
 /// `fail(res, ..., 404, 'model_not_found')`），但文案要点出真正的原因：
@@ -316,18 +324,18 @@ pub(super) async fn forward_with_providers(
 /// 与同文件其它错误路径一样：**绝不静默失败、绝不 panic**
 ///（release 是 panic=abort，落到那个分支会带走整个桌面应用）。
 fn filter_by_key_scope(
-    candidates: Vec<ProviderKind>,
+    candidates: Vec<String>,
     scope: Option<&crate::server::core::key_scope::KeyScope>,
     model: &str,
-) -> Result<Vec<ProviderKind>, GatewayError> {
+) -> Result<Vec<String>, GatewayError> {
     let Some(scope) = scope.filter(|scope| scope.restricts_providers()) else {
         // 没有 scope / 这个维度不限制 —— 原样放行（绝大多数请求走这条）
         return Ok(candidates);
     };
-    let kept: Vec<ProviderKind> = candidates
+    let kept: Vec<String> = candidates
         .iter()
-        .copied()
-        .filter(|kind| scope.allows_provider(kind_id(*kind)))
+        .filter(|id| scope.allows_provider(id))
+        .cloned()
         .collect();
     if !kept.is_empty() {
         return Ok(kept);
@@ -423,6 +431,76 @@ async fn attempt_queue(
         // 于是「一个请求任意时刻只占一个账号」这条口径不需要每个分支各维护一次
         // （429 降级、401 刷新后换号、会话式失败顺延三条路径都经过这里）。
         connections.rebind(target.account_id.clone());
+        // ── 自定义提供商的分流（第二阶段；与下面的 is_stateful 同形状）──
+        // 位置在 `kind_from_id` 之前：custom id **不进** `ProviderKind`
+        // （「不认识就是不认识」的全仓口径，见 `custom_providers` 的模块头），
+        // 它有自己的「一次发送」（`providers::custom::forward`）。选路是共用的
+        // —— 自定义账号就在全局队列里（`RouteTarget.provider` 对它就是
+        // custom id，`provider_of` 天然兼容），分派只替换发送动作。
+        if custom_providers::is_custom_provider_id(&target.provider) {
+            let custom_provider_id = target.provider.clone();
+            let custom_account_id = target.account_id.clone();
+            match attempt_custom(service, ctx, target, slot, connections, degraded).await {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) => {
+                    // 失败的账号记入 tried，回到账号循环顺延 —— 与会话式
+                    // 失败（is_stateful 分支）同一套兜底。
+                    if let Some(account_id) = custom_account_id {
+                        let first_failure = !tried_ids.contains(&account_id);
+                        if first_failure {
+                            tried_ids.push(account_id.clone());
+                            // 429 → 限额冷却（与无状态路径的动作 1 同一落库
+                            // 口径：键是**上游真名**，恢复时间由 attempt_custom
+                            // 并进 message、`mark_account_limited` 内部再解析）。
+                            // 自定义家没有「同名多池」之类的键重排，冷却键
+                            // 与发送名同源（`custom::forward::cooldown_model`）。
+                            if error.is_quota_limit() {
+                                let wire_model = custom_forward::cooldown_model(
+                                    &custom_provider_id,
+                                    &model,
+                                );
+                                rotate::mark_account_limited(
+                                    service,
+                                    &account_id,
+                                    &wire_model,
+                                    error.status_code,
+                                    error.upstream_code,
+                                    None,
+                                    &error.message,
+                                );
+                            }
+                        }
+                    }
+                    match rotate::pick_next_account(
+                        service,
+                        provider_ids,
+                        &cooldown_keys,
+                        &tried_ids,
+                    ) {
+                        Some(next) => {
+                            // 换号额度用尽 → 队列里即使还有人也不再顺延
+                            // （`take_switch` 已写过那行终端日志），本次错误原样
+                            // 返回：与「没有下一个可用账号」同一个出口。
+                            if !take_switch(&mut switches_left, switch_total) {
+                                return Err(error);
+                            }
+                            logging::console_line(
+                                "[Upstream]",
+                                &format!(
+                                    "⚠️ 自定义转发失败，按队列顺延 → {}（优先级 {}）",
+                                    account_display(&next),
+                                    next.get("priority").and_then(Value::as_i64)
+                                        .map(|value| value.to_string())
+                                        .unwrap_or_else(|| "-".to_string()),
+                                ),
+                            );
+                            continue 'accounts;
+                        }
+                        None => return Err(error),
+                    }
+                }
+            }
+        }
         let Some(kind) = kind_from_id(&target.provider) else {
             return Err(GatewayError::with_status(
                 503,
@@ -1078,6 +1156,135 @@ async fn attempt_queue(
         return Ok(ForwardOutcome::Completion { body: aggregated.body });
     }
     Err(GatewayError::with_status(500, "上游转发重试次数超限"))
+}
+
+/// **自定义提供商**的一次转发（第二阶段；与 [`attempt_stateful`] 同形状）。
+///
+/// ── 共用与不共用的部分（与有状态路径逐条对照）───────────────
+/// ```text
+///   共用：账号选路（全局队列里选出的 `target` 由调用方传入）、telemetry 记账、
+///         429 冷却标记（在调用方的 Err 分支做）、在途槽位与连接计数的移交
+///   不共用：「一次发送」的实现 —— 走 `providers::custom::forward`
+///          （自定义家没有适配器，也不进 ProviderKind，见 mod.rs 的模块头）
+/// ```
+///
+/// ── 与有状态路径的两处差别（都是刻意的）──────────────────────
+///   1. **没有环境变量旁路**：自定义家的凭证只来自账号记录，`account_id`
+///      为空直接报 503（判据与文案在 `custom::forward` 内部，这里不再预判
+///      —— 报错点离原因最近，文案才不会漂移）；
+///   2. **不调 `ensure_access_token`**：自定义账号的凭证是用户填的 apiKey，
+///      没有「临期主动刷新」的概念 —— 读凭证就是读记录（`custom_credential_by_id`）。
+///
+/// ── 发送体与冷却键（为什么这里不调 `wire_target_for_provider`）──
+/// `send_body` 对自定义 id 会原样放行（那套改写只认 modelRules 的映射表），
+/// 所以「alias → 上游真名」与「思考等级注入」发生在 `custom::forward` 内部
+/// （数据源是提供商记录上的 `models` / `mappings`）。冷却键在调用方的 Err
+/// 分支用 `custom_forward::cooldown_model` 解析 —— 与发送名同一纯函数、同一
+/// 结果，两次调用不会分叉（见那个函数的说明）。
+///
+/// 明细记账的定稿粒度与无状态路径对齐：成功时记**上游真实状态码**（流式在
+/// `ForwardOutcome::Stream.status`、聚合完成恒为 200 —— 非 2xx 在 forward
+/// 内部已经分类成错误了），失败时记网关错误的状态码与文案。
+async fn attempt_custom(
+    service: &UpstreamService,
+    ctx: &ProviderContext<'_>,
+    target: RouteTarget,
+    slot: &mut Option<InFlightGuard>,
+    connections: &mut ConnectionGuard,
+    degraded: bool,
+) -> Result<ForwardOutcome, GatewayError> {
+    let provider_id = target.provider.clone();
+    // 旁路记账：本 provider + 本账号是这一轮的实际承载者（attempts +1）。
+    // 账号展示名的兜底链与有状态路径同（账号名 → 账号 id）；没有会话对象可传。
+    let attempt_account = account_label(
+        target.account.as_ref(),
+        target.account_id.as_deref().unwrap_or(""),
+        &Value::Null,
+    );
+    ctx.telemetry
+        .note_attempt(target.account_id.as_deref(), &attempt_account, &provider_id);
+    ctx.telemetry
+        .note_attempt_started(&provider_id, &attempt_account);
+    if let Some(notice) = target.proxy_notice.as_deref() {
+        ctx.telemetry.note_attempt_notice(notice);
+    }
+    let started_at = logging::now_ms();
+    // 内容处理（系统提示词 + 脱敏）与内置家同一时机：凭证已就绪、这一家
+    // **即将发送**。`send_body` 对自定义 id 是零改写（它的模型名改写只认
+    // modelRules），处理结果就是「提示词/脱敏后的客户端请求体」—— 自定义
+    // 语义的改写（映射 alias → 真名、思考等级）在 forward 里做。
+    let send = send_body(ctx, &provider_id, target.account.as_ref(), degraded);
+    // 「上游模型」列以**真名**为准：send_body 对自定义 id 是零改写（它记的
+    // 是请求名），真名的解析与改写发生在 forward 内部 —— 这里按同源解析
+    // 覆盖一次（note_upstream_model 是覆盖式，最后一次为准；空串被内部过滤）。
+    let wire_model = custom_forward::cooldown_model(&provider_id, &model_of(ctx.body));
+    ctx.telemetry.note_upstream_model(&wire_model);
+    logging::verbose(
+        "[Upstream]",
+        &format!(
+            "自定义转发 model={} stream={} account={} priority={} 出口={} provider={provider_id}",
+            limit_model_label(&model_of(ctx.body), &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body))),
+            ctx.stream,
+            target.account_id.as_deref().unwrap_or("-"),
+            target
+                .priority
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            describe_proxy(target.proxy.as_ref()),
+        ),
+    );
+    match custom_forward::forward(
+        &service.store,
+        &provider_id,
+        target.account_id.as_deref().unwrap_or(""),
+        &send.body,
+        target.proxy.clone(),
+        ctx.stream,
+        ctx.telemetry,
+        slot,
+        connections,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            // 成功：明细记**上游真实状态码**（流式在 outcome 里、聚合恒 200）。
+            // 限额标记的清理对自定义家是空操作 —— 它们的冷却由调用方的 429
+            // 分支写入，成功清理走 `cap_cleared` 的同一条路径（这里与有状态
+            // 路径一样在 outcome 到手后调用，见 attempt_stateful 的说明）。
+            let status = match &outcome {
+                ForwardOutcome::Stream { status, .. } => i64::from(*status),
+                ForwardOutcome::Completion { .. } => 200,
+            };
+            cap_cleared(
+                service,
+                &target,
+                &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)),
+                &limit_model_label(
+                    &model_of(ctx.body),
+                    &custom_forward::cooldown_model(&provider_id, &model_of(ctx.body)),
+                ),
+                &Value::Null,
+                &provider_id,
+            );
+            logging::verbose(
+                "[Upstream]",
+                &format!("自定义转发完成: HTTP {status}（{}ms）", logging::now_ms() - started_at),
+            );
+            ctx.telemetry.finish_last_attempt(Some(status), None);
+            Ok(outcome)
+        }
+        Err(error) => {
+            // 只在终端：这条错误会作为 GatewayError 抛回入口（或由调用方的
+            // Err 分支顺延），由 `api::chat` / `api::protocol` 记进请求日志。
+            logging::console_line(
+                "[CustomProvider]",
+                &format!("❌ {}", error.message),
+            );
+            ctx.telemetry
+                .finish_last_attempt(Some(i64::from(error.status_code)), Some(&error.message));
+            Err(error)
+        }
+    }
 }
 
 /// **有状态 provider** 的一次转发（架构文档 §4.2.1；当前只有 CatPaw）。

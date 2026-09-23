@@ -14,12 +14,13 @@
  * `visibleAccounts` / `filterCounts` 去算 —— 口径只有那一份实现，
  * 「可见列表」与「分段计数」不会各算各的。视图侧读 `wbAccountsFilters.state`。
  *
- * ── 四个维度各自独立 ──────────────────────────────────────────
+ * ── 三个维度各自独立 ──────────────────────────────────────────
  *   provider = all|providerId    所属提供商（选项来自 providers 摘要）
- *   edition  = all|cn|intl       账号版本（仅对有国内/国际之分的 provider 有意义）
  *   enabled  = all|enabled|disabled  启用状态
  *   limit    = all|normal|limited    限流状态（该账号任一模型限流中即算「有限流」）
  *
+ * 曾经的「版本」维度已下线：国内 / 国际只作为账号属性出现在行上的徽章里
+ * （accounts-model 的 editionCell），不再单独给一个筛选入口。
  * 曾经的「模型」维度已下线：它只是 WorkBuddy 单上游时代的遗留 —— 限额按模型记，
  * 每个账号「具体哪个模型限流」现在由行上的「限流」列直接展开（见 accounts-table.js），
  * 不必再让整张表跟着一个模型下拉切换口径。
@@ -27,9 +28,9 @@
 (() => {
   const $ = id => document.getElementById(id);
   const { esc } = wbApp;
-  const { providerSummaries, providerFeatures, filterCounts } = wbAccountsModel;
+  const { providerSummaries, filterCounts } = wbAccountsModel;
 
-  const state = { provider: 'all', edition: 'all', enabled: 'all', limit: 'all' };
+  const state = { provider: 'all', enabled: 'all', limit: 'all' };
 
   const snapshot = () => wbApp.getState()?.accounts;
   /** providers 摘要（后端注册表顺序；缺失时由账号列表派生，见 accounts-model） */
@@ -37,17 +38,17 @@
 
   // ─── 动态注入：提供商筛选器与计数摘要 ───────
   //
-  // 用 select 而不是像版本/状态那样的分段按钮：提供商数量是**动态**的（后端注册表
+  // 用 select 而不是像状态/限额那样的分段按钮：提供商数量是**动态**的（后端注册表
   // 加一家就多一项），分段按钮会随家数增长把工具条挤成一团；选项里带账号数
   // （`WorkBuddy（14）`），于是「哪家有账号、各有多少」不用切页就能看到。
 
   const PROVIDER_FILTER_ID = 'account-provider-filter';
   const PROVIDER_SUMMARY_ID = 'accounts-provider-summary';
 
-  /** 把提供商筛选器插进工具条（「版本」组之前） */
+  /** 把提供商筛选器插进工具条最前（「状态」组之前） */
   function mountProviderFilter() {
     if ($(PROVIDER_FILTER_ID)) return;
-    const anchor = $('account-edition-filter')?.closest('.group');
+    const anchor = $('account-enabled-filter')?.closest('.group');
     const toolbar = anchor?.closest('.toolbar');
     if (!toolbar || !anchor) return;
     const group = document.createElement('div');
@@ -55,12 +56,9 @@
     group.dataset.providerGroup = '1';
     group.innerHTML = `<span class="label">提供商</span>`
       + `<select id="${PROVIDER_FILTER_ID}" class="model-select" aria-label="按提供商筛选账号"></select>`;
-    // 落点：工具条是「提供商 | 线 | 版本 | 状态 | 限额 | 操作」，提供商要插在
-    // 「版本」之前、紧贴既有的那条分隔线之后 —— 直接往版本组前连插两条会与
-    // 既有分隔线凑成两道线，看起来像画重了。
-    const wired = anchor.previousElementSibling;
-    if (wired && wired.classList.contains('divider')) wired.insertAdjacentElement('afterend', group);
-    else toolbar.insertBefore(group, anchor);
+    // 落点：工具条是「提供商 | 状态 | 限额 | 操作」，提供商是第一个维度，
+    // 于是插在「状态」组之前、并紧跟一条分隔线。
+    toolbar.insertBefore(group, anchor);
     const divider = document.createElement('div');
     divider.className = 'divider';
     divider.dataset.providerDivider = '1';
@@ -85,7 +83,7 @@
 
   // ─── 每次重绘前归一化 ───────────────────────
 
-  /** 刷新提供商维度相关的界面：筛选器选项（含各家账号数）、计数摘要与「版本」组显隐 */
+  /** 刷新提供商维度相关的界面：筛选器选项（含各家账号数）与计数摘要 */
   function syncProviderUi(all) {
     const list = summaries();
     // 摘要里已不存在的 provider（账号被删光且后端注册表也移除了）复位成「全部」
@@ -108,21 +106,6 @@
     if (summary) summary.textContent = all.length
       ? list.map(item => `${item.label} ${item.count}`).join(' · ')
       : '';
-    // 「版本」筛选只对分国内/国际的 provider 有意义：选了别家（或全部里没有这类账号）时
-    // 把整组连它前面那条分隔线一起藏起来，免得留一个点了永远空的入口。分隔线取
-    // 「版本组前面的兄弟节点」而不是 querySelector('.divider') —— 本模块刚在版本组前插了
-    // 提供商组 + 一条分隔线，querySelector 会拿错那一条。
-    const editionGroup = $('account-edition-filter')?.closest('.group');
-    const editionDivider = editionGroup?.previousElementSibling?.classList.contains('divider')
-      ? editionGroup.previousElementSibling
-      : null;
-    const editionRelevant = list.some(item =>
-      (state.provider === 'all' || state.provider === item.id)
-      && providerFeatures(item.id).edition
-      && item.count > 0);
-    if (editionGroup) editionGroup.hidden = !editionRelevant;
-    if (editionDivider) editionDivider.hidden = !editionRelevant;
-    if (!editionRelevant && state.edition !== 'all') state.edition = 'all';
   }
 
   /**
@@ -142,7 +125,7 @@
 
   /**
    * 更新各筛选分段的计数徽标：key 取自 HTML 上的 data-count（各维度的「全部」
-   * 是 editionAll / enabledAll / limitAll，代表「另外几个维度已选条件下的合计」）。
+   * 是 enabledAll / limitAll，代表「另外几个维度已选条件下的合计」）。
    * 口径来自 accounts-model 的 filterCounts —— 与「可见列表」同一份实现。
    */
   function syncCounts(all) {
@@ -171,7 +154,7 @@
    * 筛选条件一变就要重绘列表，而重绘入口在那边；本文件不反向引用视图。
    */
   function bind(onChange) {
-    // 版本 / 启用状态 / 限流：三个分段按钮维度，可任意组合
+    // 启用状态 / 限流：两个分段按钮维度，可任意组合
     const bindSeg = (containerId, attr) => {
       $(containerId)?.addEventListener('click', event => {
         const item = event.target.closest(`.seg-item[data-${attr}]`);
@@ -183,7 +166,6 @@
         onChange();
       });
     };
-    bindSeg('account-edition-filter', 'edition');
     bindSeg('account-enabled-filter', 'enabled');
     bindSeg('account-limit-filter', 'limit');
 

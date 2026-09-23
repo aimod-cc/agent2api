@@ -109,12 +109,11 @@
 .models-table td.empty { padding: 26px 14px; text-align: center; color: var(--text-3); }
 
 /* 列宽（合计 100%，table-layout: fixed 下按 colgroup 分配） */
-.models-table .c-model { width: 30%; }
-.models-table .c-rate { width: 8%; }
+.models-table .c-model { width: 25%; }
+.models-table .c-rate { width: 7%; }
 .models-table .c-source { width: 8%; }
-.models-table .c-alias { width: 30%; }
-.models-table .c-state { width: 8%; }
-.models-table .c-act { width: 16%; }
+.models-table .c-alias { width: 48%; }
+.models-table .c-act { width: 12%; }
 .keys-table .k-name { width: 22%; }
 .keys-table .k-key { width: 44%; }
 .keys-table .k-time { width: 16%; }
@@ -185,6 +184,25 @@
   font-weight: 600;
 }
 .alias.off { border-color: var(--border); background: var(--surface-inset); color: var(--text-3); text-decoration: line-through; }
+/* 关闭的映射（chip 上自己的开关关着）：整体灰化弱化并加删除线，但仍可点
+   （开关就在 chip 里）。与行级压淡的 .off 互相独立 —— 「行开着、某条映射
+   关着」的状态要一眼可辨，所以另起一个类名。 */
+.alias.map-off { border-color: var(--border); background: var(--surface-inset); color: var(--text-3); }
+.alias.map-off .t { text-decoration: line-through; }
+.alias .t { min-width: 0; overflow-wrap: anywhere; }
+.alias { height: auto; min-height: 26px; max-width: 100%; padding-top: 3px; padding-bottom: 3px; gap: 5px; }
+.binding-default { flex: 0 0 auto; padding: 0 4px; border: 1px solid var(--border); border-radius: var(--r-xs); background: var(--surface); color: var(--text-3); font-family: var(--font-sans); font-size: 10px; font-weight: 500; }
+.alias .switch { flex: 0 0 auto; }
+.alias .alias-level, .alias .x { flex: 0 0 auto; }
+#custom-models-modal .binding-reasoning { width: 110px; flex: 0 0 110px; }
+#custom-models-modal .binding-add { display: flex; align-items: center; gap: 5px; margin-top: 4px; }
+#custom-models-modal .binding-add input { width: 150px; }
+/* chip 内的小号开关：复用 .switch 的结构与交互（components.css），只在这里
+   收尺寸 —— 药丸高 22px，滑块压到 24×14 才放得下；滑块位移同步缩放 */
+.alias .switch { gap: 0; margin-right: 2px; }
+.alias .switch .track { width: 24px; height: 14px; }
+.alias .switch .track::after { top: 2px; left: 2px; width: 10px; height: 10px; }
+.alias .switch input:checked + .track::after { transform: translateX(10px); }
 /* 未挂载的映射（目标不在该家清单里）：警示色浅底，与正常映射的「品牌色 + 可点」
    一眼分开 —— 它不是错误，但确实需要用户处理（换个目标，或删掉） */
 .alias.orphan { border-color: var(--warn-bd); background: var(--warn-soft); color: var(--warn); }

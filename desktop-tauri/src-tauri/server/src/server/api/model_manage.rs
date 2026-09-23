@@ -1,8 +1,8 @@
 //! 模型管理 API（模型管理页）：
 //!
-//! - `GET  /api/models/manage`          → `{models, mappings, reasoningLevels}`（含禁用 / 隐藏条目）
-//! - `POST /api/models/state`           `{id, enabled?, hidden?}` 启停 / 隐藏（删除）/ 恢复
-//! - `POST /api/models/mappings`        `{alias, target, reasoning?}` 新增映射 / 改思考等级
+//! - `GET  /api/models/manage`          → `{models, mappings, reasoningLevels}`（含禁用条目与关闭的映射）
+//! - `POST /api/models/state`           `{id, enabled?}` 启停（`hidden` 已移除，传了报 400）
+//! - `POST /api/models/mappings`        `{alias, target, reasoning?, enabled?}` 新增映射 / 改思考等级 / 切开关
 //! - `POST /api/models/mappings/remove` `{alias, target, provider?}` 删除映射
 //! - `POST /api/models/custom`          `{provider, id}` 登记一个上游目录里没有的模型
 //! - `POST /api/models/custom/remove`   `{provider, id}` 移除该登记
@@ -15,6 +15,11 @@
 //! 适配器翻译成本家上游认识的档位字段（各家的规则与「哪些情况故意不注入」见
 //! `model_rules::reasoning` 的模块头）。接口形状与转发无关 —— 转发侧读的是
 //! `ModelRules` 里的同一条映射，这里一行都不用改。
+//!
+//! `enabled`（映射开关）与 `reasoning` 共用同一条接口、同一套三态协议：
+//! 请求体里**没带**这个键 = 不动；带了 bool = 显式开 / 关。管理页切换开关时
+//! 只传 (alias, target, provider, enabled) 四项，不带 `reasoning` ——
+//! 两个三态字段各管各的，互不干扰（语义见 `model_rules::add_mapping`）。
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -61,42 +66,48 @@ pub async fn set_state(State(state): State<ServerState>, body: Bytes) -> Respons
     if id.is_empty() {
         return errors::management_error(400, "缺少模型 id");
     }
-    let enabled = object.get("enabled").and_then(Value::as_bool);
-    let hidden = object.get("hidden").and_then(Value::as_bool);
-    if enabled.is_none() && hidden.is_none() {
-        return errors::management_error(400, "enabled / hidden 至少给一项");
+    // `hidden` 已随「删除/恢复」机制移除（启停开关接管了它的全部职责）：
+    // 旧版前端 / 脚本还带着这个字段打进来时，明确报 400 而不是静默忽略 ——
+    // 静默忽略会让调用方以为「删除」成功了，模型其实还开着。
+    if object.contains_key("hidden") {
+        return errors::management_error(400, "hidden 已移除，请使用 enabled 开关");
     }
+    let enabled = match object.get("enabled") {
+        None => return errors::management_error(400, "缺少 enabled 字段"),
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => return errors::management_error(400, "enabled 必须是布尔值"),
+    };
     // 目标提供商：新版前端总是带着（启停粒度是「提供商 × 模型 id」）；
     // 缺省走旧版全局语义 —— 只有旧版前端（升级前）会这么传
     let provider = text_field(&object, "provider");
     let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
     // 启用某一家时可能要把旧版的全局条目展开成「其余各家」，这里给出当前
-    // 清单里同样承载该模型的其他提供商（目录的匹配口径：先 id 后 name）
+    // 清单里同样承载该模型的其他提供商（目录的匹配口径：先 id 后 name）。
+    // 返回值是 id 空间（内置家 + 自定义家同列，见 `providers_for_model`）；
+    // 自定义 id 进不了 modelRules 的启停状态（它们有自己的 enabled），
+    // `set_state` 对陌生 id 的处理由那一侧兜底，这里如实转出即可。
     let others: Vec<String> = if enabled == Some(true) {
         crate::server::core::providers::catalog::providers_for_model(&id)
             .into_iter()
-            .map(crate::server::core::providers::kind_id)
-            .filter(|kind_provider| {
-                Some(*kind_provider) != provider_opt.map(str::to_string).as_deref()
-            })
-            .map(str::to_string)
+            .filter(|kind_provider| Some(kind_provider.as_str()) != provider_opt)
             .collect()
     } else {
         Vec::new()
     };
-    model_rules::set_state(provider_opt, &id, enabled, hidden, &others);
+    if let Some(provider) = provider_opt {
+        if crate::server::core::providers::kind_from_id(provider).is_none() {
+            return errors::management_error(400, format!("未知的内置提供商: {provider}"));
+        }
+    }
+    if let Err(error) = model_rules::set_state(provider_opt, &id, enabled, &others) {
+        return errors::management_error(500, error);
+    }
     // 日志里把提供商带上：同名模型在多家同时存在时，单看 id 分不清动的是哪家
     let subject = match provider_opt {
         Some(name) => format!("[{name}] {id}"),
         None => id.clone(),
     };
-    let what = match (enabled, hidden) {
-        (_, Some(true)) => "已删除（隐藏）",
-        (_, Some(false)) => "已恢复",
-        (Some(true), _) => "已启用",
-        (Some(false), _) => "已禁用",
-        _ => "已更新",
-    };
+    let what = if enabled == Some(true) { "已启用" } else { "已禁用" };
     logging::log("[Models]", &format!("模型 {subject} {what}"));
     ok_json(catalog::manage_view(state.store()))
 }
@@ -157,17 +168,37 @@ pub async fn add_mapping(State(state): State<ServerState>, body: Bytes) -> Respo
         }
         Some(_) => return errors::management_error(400, "reasoning 必须是字符串或 null"),
     };
-    model_rules::add_mapping(&alias, &target, provider_opt, reasoning);
+    // 映射开关的三态见函数头 / `model_rules::add_mapping`：键缺失 = 不动
+    // （新建默认开）；带 bool = 显式开 / 关。非 bool 在这里就拒掉，不留一条
+    // 读回来会被丢弃的脏数据。
+    let enabled = match object.get("enabled") {
+        None => None,
+        Some(Value::Bool(value)) => Some(*value),
+        Some(_) => return errors::management_error(400, "enabled 必须是布尔值"),
+    };
+    let others = catalog::providers_for_model(&target).into_iter()
+        .filter(|id| crate::server::core::providers::kind_from_id(id).is_some())
+        .filter(|id| Some(id.as_str()) != provider_opt)
+        .collect::<Vec<_>>();
+    if let Err(error) = model_rules::add_mapping(&alias, &target, provider_opt, reasoning, enabled, &others) {
+        return errors::management_error(500, error);
+    }
     let subject = match provider_opt {
         Some(name) => format!("{alias} → {target}（{name}）"),
         None => format!("{alias} → {target}"),
     };
-    // 日志把等级一并写出来（改等级走的也是这条接口，不说出来日志里看不出区别）
+    // 日志把等级与开关一并写出来（改等级 / 切开关走的都是这条接口，
+    // 不说出来日志里看不出区别）
     let reasoning_text = match reasoning.flatten() {
         Some(level) => format!("，思考等级 {level}"),
         None => String::new(),
     };
-    logging::log("[Models]", &format!("保存映射 {subject}{reasoning_text}"));
+    let enabled_text = match enabled {
+        Some(true) => "，开关 开",
+        Some(false) => "，开关 关",
+        None => "",
+    };
+    logging::log("[Models]", &format!("保存映射 {subject}{reasoning_text}{enabled_text}"));
     ok_json(catalog::manage_view(state.store()))
 }
 
@@ -190,15 +221,16 @@ pub async fn remove_mapping(State(state): State<ServerState>, body: Bytes) -> Re
     if alias.is_empty() || target.is_empty() {
         return errors::management_error(400, "缺少映射名或目标上游模型");
     }
+    if alias.eq_ignore_ascii_case(&target) {
+        return errors::management_error(400, "原始 ID 的默认绑定不能删除，请关闭它的开关");
+    }
     let provider_opt = if provider.is_empty() { None } else { Some(provider.as_str()) };
+    // 其余承载家（id 空间，见 `providers_for_model`；口径与 `set_state` 的
+    // others 同一处）
     let others: Vec<String> = if provider_opt.is_some() {
         crate::server::core::providers::catalog::providers_for_model(&target)
             .into_iter()
-            .map(crate::server::core::providers::kind_id)
-            .filter(|kind_provider| {
-                Some(*kind_provider) != provider_opt.map(str::to_string).as_deref()
-            })
-            .map(str::to_string)
+            .filter(|kind_provider| Some(kind_provider.as_str()) != provider_opt)
             .collect()
     } else {
         Vec::new()
