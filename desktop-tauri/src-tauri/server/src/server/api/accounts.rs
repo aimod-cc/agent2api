@@ -419,10 +419,28 @@ pub async fn import_accounts(state: &ServerState, body: &Bytes) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
+    // 兼容管理 API 的 `{ success, data }` 信封壳：网页端此前的「导出」把整个
+    // 信封存成了文件，顶层没有 accounts。这类文件导回时在这里下钻一层 ——
+    // 已发出的旧文件不作废；标准导出文件（顶层就是 accounts）不受影响。
+    let payload = match envelope_data(&payload) {
+        Some(data) => data,
+        None => payload,
+    };
     match crate::server::core::account_transfer::import_accounts(state.store(), &payload) {
         Ok(result) => ok_json(result),
         Err(error) => store_error(error),
     }
+}
+
+/// 若 `payload` 是「信封壳」（对象、顶层无 accounts、`data` 字段是含 accounts
+/// 的对象）则返回内层 data 的克隆，否则 None。
+fn envelope_data(payload: &Value) -> Option<Value> {
+    let object = payload.as_object()?;
+    if object.contains_key("accounts") {
+        return None;
+    }
+    let data = object.get("data")?;
+    data.get("accounts").is_some().then(|| data.clone())
 }
 
 // ─── POST /api/accounts/current ─────────────────────────────

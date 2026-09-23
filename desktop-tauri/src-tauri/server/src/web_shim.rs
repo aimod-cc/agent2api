@@ -320,6 +320,21 @@ pub fn shim_js() -> &'static str {
     var response = await fetch(path, { method: method, headers: headers });
     if (!response.ok) throw new Error('导出失败（HTTP ' + response.status + '）');
     var blob = await response.blob();
+    // 管理 API 的响应带 { success, data } 信封：落盘前剥掉，存 data 本体 ——
+    // 与桌面端的导出文件同一格式；信封壳留着，这份文件导回去时顶层没有
+    // accounts，只会得到「缺少 accounts 字段」。顺带把账号数带回给调用方
+    //（设置页用它提示「已导出 N 个账号」，拿不到会误报「没有可导出的账号」）
+    var summary = {};
+    try {
+      var body = JSON.parse(await blob.text());
+      if (body && body.success === true && body.data && typeof body.data === 'object') {
+        var accounts = Array.isArray(body.data.accounts) ? body.data.accounts : null;
+        var providers = Array.isArray(body.data.customProviders) ? body.data.customProviders : null;
+        if (accounts) summary.count = accounts.length;
+        if (providers) summary.customProviders = providers.length;
+        blob = new Blob([JSON.stringify(body.data, null, 2)], { type: 'application/json' });
+      }
+    } catch (e) { /* 非 JSON 响应（日志下载）按原文保存 */ }
     var url = URL.createObjectURL(blob);
     var link = document.createElement('a');
     link.href = url;
@@ -328,7 +343,8 @@ pub fn shim_js() -> &'static str {
     link.click();
     link.remove();
     setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
-    return { saved: true };
+    summary.saved = true;
+    return summary;
   }
 
   /** 壳命令的总入口（同时接住 UI 里两处直接的 internals.invoke('api_request')） */

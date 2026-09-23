@@ -27,6 +27,7 @@ use serde_json::{json, Map, Value};
 
 use crate::server::errors::GatewayError;
 
+use super::cancellation;
 use super::sse::ModelRewrite;
 use super::usage::RequestTelemetry;
 
@@ -78,10 +79,31 @@ pub async fn aggregate_sse_completion(
 /// reqwest::Response 换成已翻译的帧流。telemetry / model_rewrite 的语义
 /// 与那个函数完全一致（见它的说明）。
 pub async fn aggregate_frame_stream(
-    mut stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
+    stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
     model_rewrite: Option<ModelRewrite>,
 ) -> Result<AggregatedCompletion, GatewayError> {
+    // ── 手动终止的旁路流（与 `ForwardStream::from_translated` 同一手法）──
+    // 聚合是 `while let Some(item) = stream.next().await` 的拉取循环：没有
+    // 旁路流时，取消要等下一个上游分片（上游停滞时可能等很久）。把令牌的
+    // 等待挂成一条只产出一个错误项的流与上游 select 合并，置位后下一轮
+    // await 立刻拿到 Err，由下面的 map_err 折成 408 的网关错误（非流式
+    // 客户端此时还没收到任何响应，收尾记账会把它记成「请求已被手动终止」）。
+    // 放在本函数而不是 `aggregate_sse_completion`：自定义家的翻译协议流
+    // 也走这里（聚合规则共用），两处都要覆盖。
+    let mut stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>> =
+        match telemetry.cancel_token() {
+            Some(token) => {
+                let signal = futures::stream::once(async move {
+                    token.cancelled().await;
+                    Err::<bytes::Bytes, std::io::Error>(std::io::Error::other(
+                        cancellation::MANUAL_TERMINATED,
+                    ))
+                });
+                Box::pin(futures::stream::select(stream, signal))
+            }
+            None => stream,
+        };
     let mut buffer = String::new();
     let mut acc = CompletionAccumulator { rewrite: model_rewrite, ..Default::default() };
     // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
@@ -91,6 +113,12 @@ pub async fn aggregate_frame_stream(
     let mut first_chunk_seen = false;
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(|error| {
+            // 手动终止的旁路流给的就是原文（见上面的说明）：折成 408 的
+            // 网关错误，不加「上游流中断」前缀 —— 它不是上游的问题
+            let text = error.to_string();
+            if text == cancellation::MANUAL_TERMINATED {
+                return cancellation::cancelled_error();
+            }
             // 错误描述已在构造时折进 io::Error（reqwest 直连在
             // `aggregate_sse_completion`、翻译流在 `ProtocolTranslateStream`）
             GatewayError::with_status(502, format!("上游流中断: {error}"))

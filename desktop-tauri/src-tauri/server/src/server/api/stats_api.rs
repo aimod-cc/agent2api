@@ -333,6 +333,35 @@ pub async fn compact_stats_db(State(state): State<ServerState>) -> Response {
     }
 }
 
+/// POST /api/stats/requests/terminate?id=... —— 手动终止一条**在途**请求。
+///
+/// 参考 OmniProxy 的 `POST /api/request-logs/:id/terminate`，但更薄：受理只做
+/// 一件事 —— 置位该请求的取消令牌（`core::upstream::cancellation`）。真正的
+/// 收尾（断开上游、给客户端错误帧、把明细写成 408 + 「请求已被手动终止」）
+/// 全部由转发链自己的收尾路径完成 —— **明细的写者仍然只有那一条路径**
+/// （与「在途回写晚到一步不该覆盖终态」同一纪律：接口自己不碰库）。
+///
+/// 不在在途表里给 404（已结束 / 来自上次启动的遗留行 / id 打错）：
+/// 前端据此提示「已结束或已刷新」，比谎报「已受理」诚实。
+/// 重复点按幂等（令牌置位是单向的）：第二次调用仍返回受理 —— 收尾可能
+/// 正在进行中，重复点击不该被当成错误。
+pub async fn stats_request_terminate(
+    State(_state): State<ServerState>,
+    Query(params): Query<Params>,
+) -> Response {
+    let Some(id) = text_of(&params, "id") else {
+        return errors::management_error(400, "缺少 id 参数");
+    };
+    if crate::server::core::upstream::cancellation::cancel(&id) {
+        ok_json(json!({ "success": true, "terminated": true }))
+    } else {
+        errors::management_error(
+            404,
+            "这条请求已不在进行中（可能已结束，或来自上次启动遗留的进行中行）",
+        )
+    }
+}
+
 /// GET /api/retention
 pub async fn get_retention(State(_state): State<ServerState>) -> Response {
     ok_json(retention_json(config::retention_settings()))

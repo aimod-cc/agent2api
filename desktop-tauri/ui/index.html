@@ -932,7 +932,7 @@
                 <section class="panel">
                   <div class="panel-head">
                     <h2>账号导入 / 导出</h2>
-                    <span class="tip-q" data-tip="导出会把全部账号写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：按账号 UID 去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号。"></span>
+                    <span class="tip-q" data-tip="导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。"></span>
                     <div class="head-actions">
                       <button id="btn-settings-export">导出账号</button>
                       <button id="btn-settings-import" class="primary">导入账号</button>
@@ -940,7 +940,7 @@
                   </div>
                   <div class="panel-body">
                     <div class="danger-zone">
-                      <strong>导出文件内含 accessToken / refreshToken 等凭证</strong>，可直接用于登录。请妥善保管，不要外传或上传到公共位置。
+                      <strong>导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义</strong>，可直接用于登录。请妥善保管，不要外传或上传到公共位置。
                     </div>
                     <div class="io-result" id="settings-io-result" style="display:none"></div>
                   </div>
@@ -1343,6 +1343,9 @@
       <div class="modal-foot">
         <span class="hint" id="req-detail-hint">—</span>
         <div class="spacer"></div>
+        <!-- 手动终止（仅进行中的行显示；request-detail.js 按 isRunning 切换
+             hidden —— CSS 里有配套的 [hidden] 规则，见 page-requests.css） -->
+        <button id="req-detail-terminate" class="danger" hidden>终止请求</button>
         <button id="req-detail-cancel">关闭</button>
       </div>
     </div>

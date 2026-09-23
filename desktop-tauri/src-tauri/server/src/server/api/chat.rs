@@ -49,6 +49,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
 use crate::server::errors::GatewayError;
@@ -56,6 +57,7 @@ use crate::server::http::raw_json;
 use crate::server::logging;
 use crate::server::ServerState;
 
+use super::disconnect_guard::DisconnectGuard;
 use super::pipeline::{
     self, json_response, model_field_text, record_early_failure, record_entry, sse_response,
     write_debug_files, RecordContext, RecordingStream,
@@ -159,6 +161,18 @@ pub async fn chat_completions(
             &client_model,
             &client_reasoning,
         );
+    // ── 手动终止的取消令牌（本次新增）────────────────────────────
+    // 登记在进程级注册表里（键 = 上面这个 id），详情页的「终止请求」按它
+    // 找到这条在途请求；转发链的每个等待点 select 它。注销见
+    // `DisconnectGuard` 的两条出口（普通路径 / 流式路径的 settle）。
+    if let Some(token) = cancellation::register(&telemetry_id) {
+        telemetry.set_cancel_token(token);
+    }
+    // ── 断线兜底守卫（本次新增）──────────────────────────────────
+    // 客户端在响应产生前断开时 axum 会直接取消 handler，收尾记账走不到 ——
+    // 守卫的 Drop 补一条 408 终态（详见 `DisconnectGuard` 的说明）。
+    // 正常路径必须显式调 `complete()` / `handoff()`，见下面的三个出口。
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
     // 在途回写：选路一定就把「谁在承载」、发送体一定稿就把「上游真名」写进这条
     // 进行中行（连同尝试链、首响、脱敏命中）—— 列表页 1 秒轮询，于是这些读数在
     // 转发期间就能看到，不必等收尾。接线在这里、core 只持有闭包，理由见
@@ -205,6 +219,9 @@ pub async fn chat_completions(
             };
             // 收尾帧特征取 Chat 的：客户端读到 `data: [DONE]` 就停是常态写法，
             // 那时连接会被立刻关掉、`Drop` 不会被拉到 EOF（见 `RecordingStream`）
+            // 收尾移交给响应流：守卫不再兜底（流的 Drop 有自己的 settle），
+            // 取消令牌保持登记到流结束（长流仍可被「终止请求」终止）
+            guard.handoff();
             sse_response(
                 status,
                 Box::new(RecordingStream::with_terminals(
@@ -233,6 +250,8 @@ pub async fn chat_completions(
                 },
                 None,
             );
+            // 记账已完成：解除断线兜底并注销取消令牌（请求不再在途）
+            guard.complete();
             json_response(body)
         }
         Err(error) => {
@@ -260,6 +279,8 @@ pub async fn chat_completions(
                 },
                 Some(message),
             );
+            // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
+            guard.complete();
             error.payload_response()
         }
     }

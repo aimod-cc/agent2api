@@ -425,6 +425,32 @@ impl RequestStats {
         });
     }
 
+    /// 按 id 收尾一条在途行（**断线兜底**：客户端在响应完成前放弃连接）。
+    ///
+    /// ── 谁调它 ──────────────────────────────────────────────────
+    /// `api::pipeline::DisconnectGuard` 的 Drop —— 入口 handler 被 axum 取消
+    /// 时（连接关闭即取消 handler，官方语义）执行。那条路径上收尾记账
+    /// （`record_entry`）永远不会被调用，行会停在 status=0 直到 1 小时的僵尸
+    /// 清扫；本方法把「断开」变成第三条收尾路径（与 OmniProxy 的
+    /// `res.on('close')` 收尾同一意图：**断开也要落一条明确的终态**）。
+    ///
+    /// 只 UPDATE 不 INSERT：没有进行中行（转发前就失败的路径）时影响 0 行，
+    /// 什么都不做 —— 那些请求由各自的记账点负责，这里绝不替它们补行。
+    /// 库不可用时静默跳过（与 `record_started` 同一取向：少一次收尾只影响
+    /// 一条明细的显示，不影响任何业务）。
+    pub fn finalize_interrupted(&self, id: &str, error: &str) {
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let guard = self.guard();
+        let _ = self.with_conn_mut(&guard, |conn| {
+            let tx = conn.transaction()?;
+            sql::finish_running_request(&tx, id, error, now_ms())?;
+            tx.commit()
+        });
+    }
+
     /// 回写一条「进行中」行的**在途**字段（转发期间每次状态真的变化时调一次）。
     ///
     /// ── 为什么需要它 ────────────────────────────────────────────

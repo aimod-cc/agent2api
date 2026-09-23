@@ -44,6 +44,9 @@ pub mod config_api;
 // `core::custom_providers` 与 `core::account_store::custom_accounts`）
 pub mod custom_providers;
 pub mod debug_api;
+// 进行中行的断线兜底守卫（从 pipeline.rs 拆出：那边已近 1000 行，而它是
+// 「handler 被 axum 取消时补 408 终态」这一件事的完整封装，见该文件模块头）
+pub mod disconnect_guard;
 pub mod endpoints;
 pub mod health;
 pub mod keys_api;

@@ -36,12 +36,14 @@ use serde_json::{json, Value};
 
 use crate::server::core::key_scope::KeyScope;
 use crate::server::core::protocol::{anthropic, responses};
+use crate::server::core::upstream::cancellation;
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
 use crate::server::errors::GatewayError;
 use crate::server::logging;
 use crate::server::ServerState;
 
+use super::disconnect_guard::DisconnectGuard;
 use super::pipeline::{
     self, error_response, json_response, record_early_failure, sse_response, RecordContext,
 };
@@ -185,9 +187,16 @@ pub async fn responses_endpoint(
     // `pipeline::live_row_sink`）
     telemetry.set_live_sink(pipeline::live_row_sink(
         state.request_stats(),
-        telemetry_id,
+        telemetry_id.clone(),
         started_at,
     ));
+    // 手动终止的取消令牌 + 断线兜底守卫（与 /v1/chat/completions 同一处时点
+    // 与同一套语义：登记后详情页可终止这条请求；handler 被 axum 取消时
+    // 由守卫的 Drop 补 408 终态。三条出口见下面的 complete / handoff）
+    if let Some(token) = cancellation::register(&telemetry_id) {
+        telemetry.set_cancel_token(token);
+    }
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
     let outcome = forward_chat(
         &state,
         chat_body,
@@ -228,6 +237,8 @@ pub async fn responses_endpoint(
                     pipeline::terminal::RESPONSES,
                     move |chunk| machine.push(chunk),
                 );
+                // 收尾移交给响应流（守卫不再兜底；令牌保持登记到流结束）
+                guard.handoff();
                 return sse_response(status, transformed);
             }
             // 下游要非流式：内部收流，聚合成本协议的 JSON
@@ -241,6 +252,8 @@ pub async fn responses_endpoint(
                 ..context
             };
             pipeline::record_entry(&context, None);
+            // 记账已完成：解除断线兜底并注销取消令牌
+            guard.complete();
             json_response(body)
         }
         Ok(ForwardOutcome::Completion { body: chat }) => {
@@ -252,6 +265,8 @@ pub async fn responses_endpoint(
                 ..context
             };
             pipeline::record_entry(&context, None);
+            // 记账已完成：解除断线兜底并注销取消令牌
+            guard.complete();
             json_response(response)
         }
         Err(error) => {
@@ -259,12 +274,15 @@ pub async fn responses_endpoint(
             // 只在终端：`error_response` 会把同一条 message 记进请求日志
             // （见 `api::chat` 同名分支的说明）。
             logging::console_line("[Model]", &format!("❌ {message}"));
-            error_response(context, &error, |status, error| {
+            let response = error_response(context, &error, |status, error| {
                 let code = anthropic::responses_error_code(status);
                 GatewayError::with_status(i32::from(status), error.message.clone())
                     .with_code(code)
                     .payload_response()
-            })
+            });
+            // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
+            guard.complete();
+            response
         }
     }
 }
@@ -339,9 +357,16 @@ pub async fn messages_endpoint(
     // `pipeline::live_row_sink`）
     telemetry.set_live_sink(pipeline::live_row_sink(
         state.request_stats(),
-        telemetry_id,
+        telemetry_id.clone(),
         started_at,
     ));
+    // 手动终止的取消令牌 + 断线兜底守卫（与 /v1/chat/completions 同一处时点
+    // 与同一套语义：登记后详情页可终止这条请求；handler 被 axum 取消时
+    // 由守卫的 Drop 补 408 终态。三条出口见下面的 complete / handoff）
+    if let Some(token) = cancellation::register(&telemetry_id) {
+        telemetry.set_cancel_token(token);
+    }
+    let mut guard = DisconnectGuard::new(state.request_stats(), telemetry_id.clone());
     let outcome = forward_chat(
         &state,
         chat_body,
@@ -380,6 +405,8 @@ pub async fn messages_endpoint(
                     pipeline::terminal::ANTHROPIC,
                     move |chunk| machine.push(chunk),
                 );
+                // 收尾移交给响应流（守卫不再兜底；令牌保持登记到流结束）
+                guard.handoff();
                 return sse_response(status, transformed);
             }
             let mut collector = anthropic::AnthropicCollector::new();
@@ -392,6 +419,8 @@ pub async fn messages_endpoint(
                 ..context
             };
             pipeline::record_entry(&context, None);
+            // 记账已完成：解除断线兜底并注销取消令牌
+            guard.complete();
             json_response(body)
         }
         Ok(ForwardOutcome::Completion { body: chat }) => {
@@ -401,6 +430,8 @@ pub async fn messages_endpoint(
                 ..context
             };
             pipeline::record_entry(&context, None);
+            // 记账已完成：解除断线兜底并注销取消令牌
+            guard.complete();
             json_response(response)
         }
         Err(error) => {
@@ -408,9 +439,12 @@ pub async fn messages_endpoint(
             // 只在终端：`error_response` 会把同一条 message 记进请求日志
             // （见 `api::chat` 同名分支的说明）。
             logging::console_line("[Model]", &format!("❌ {message}"));
-            error_response(context, &error, |status, error| {
+            let response = error_response(context, &error, |status, error| {
                 anthropic_error_response_with_status(status, &error.message)
-            })
+            });
+            // 记账已完成（含手动终止的 408）：解除兜底并注销令牌
+            guard.complete();
+            response
         }
     }
 }

@@ -44,6 +44,7 @@
 //! SSE 流的中断（客户端断开、上游断开）是**正常路径**，一律用 Result/Option。
 
 pub mod aggregate;
+pub mod cancellation;
 pub mod connections;
 pub mod request;
 mod payload;
@@ -270,7 +271,15 @@ impl UpstreamService {
                 ));
             }
         }
-        let mut slot = self.begin_slot(&request.dedupe_key).await;
+        // 手动终止的取消令牌（入口 handler 装入；None = 未接线）。取一次、
+        // 走完全程：去重排队与流式轮询都要用它，中途不会再变
+        let cancel = request.telemetry.cancel_token();
+        // 已受理终止（罕见：登记之后、转发之前就被点了）——立刻返回，
+        // 不必白跑一次选路
+        if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+            return Err(cancellation::cancelled_error());
+        }
+        let mut slot = self.begin_slot(&request.dedupe_key, cancel.as_ref()).await;
         // 账号级活跃连接计数：**本请求**的凭证，随选路改绑到实际使用的账号。
         // 建在这里（而不是选路处）是因为它必须活到响应体发完 —— 流式路径由
         // `handoff()` 把归属移进响应流，非流式路径随本函数返回而析构释放。
@@ -313,11 +322,25 @@ impl UpstreamService {
     /// 等待同 body 的在途请求完成，然后占住槽位。
     ///
     /// 返回 None 表示不需要去重（dedupe_key 为空）。
-    async fn begin_slot(&self, dedupe_key: &str) -> Option<InFlightGuard> {
+    ///
+    /// `cancel` 是手动终止的令牌（None = 未接线）：等待期间被置位就提前返回
+    /// 且**不占槽位** —— 转发链紧接着会在循环顶查到令牌并收尾，不占槽位是为了
+    /// 不给一次已经作废的转发留下需要清理的去重登记。
+    async fn begin_slot(
+        &self,
+        dedupe_key: &str,
+        cancel: Option<&Arc<cancellation::CancelToken>>,
+    ) -> Option<InFlightGuard> {
         if dedupe_key.is_empty() {
             return None;
         }
-        self.wait_for_in_flight(dedupe_key).await;
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return None;
+        }
+        self.wait_for_in_flight(dedupe_key, cancel).await;
+        if cancel.is_some_and(|token| token.is_cancelled()) {
+            return None;
+        }
         let signal = Arc::new(InFlight::new());
         lock_table(&self.in_flight).insert(dedupe_key.to_string(), signal.clone());
         Some(InFlightGuard {
@@ -327,8 +350,12 @@ impl UpstreamService {
         })
     }
 
-    /// 等待同 body 的在途请求完成（最多 45 秒）
-    async fn wait_for_in_flight(&self, key: &str) {
+    /// 等待同 body 的在途请求完成（最多 45 秒；被手动终止则立即返回）
+    async fn wait_for_in_flight(
+        &self,
+        key: &str,
+        cancel: Option<&Arc<cancellation::CancelToken>>,
+    ) {
         let signal = lock_table(&self.in_flight).get(key).cloned();
         let Some(signal) = signal else {
             return;
@@ -347,7 +374,19 @@ impl UpstreamService {
         if signal.is_done() {
             return;
         }
-        let _ = tokio::time::timeout(Duration::from_millis(INFLIGHT_WAIT_MS), notified).await;
+        let wait = tokio::time::timeout(Duration::from_millis(INFLIGHT_WAIT_MS), notified);
+        tokio::pin!(wait);
+        match cancel {
+            // 排队期间被手动终止：立即醒来（返回后由 begin_slot 放弃占位、
+            // 转发链在循环顶收尾）
+            Some(token) => tokio::select! {
+                _ = &mut wait => {}
+                _ = token.cancelled() => {}
+            },
+            None => {
+                let _ = wait.await;
+            }
+        }
     }
 }
 
@@ -447,6 +486,26 @@ impl ForwardStream {
         telemetry: Arc<usage::RequestTelemetry>,
         model_rewrite: Option<ModelRewrite>,
     ) -> Self {
+        // ── 手动终止的旁路流（本次新增）────────────────────────────
+        // 把令牌的等待挂成一条「只产出一个错误项」的旁路流，与上游流 select
+        // 合并：置位后 poll 立刻拿到 Err，**不必等下一个上游分片**（上游停滞
+        // 时正是这个场景，光靠轮询顶部的同步检查会拖到下一片数据才反应）。
+        // 不额外起任务 —— 旁路流随本流一起被丢弃，没有「唤醒谁来收尾」的
+        // 悬空问题（对比：spawn 一个等待任务需要 Weak 反查防止任务泄漏）。
+        // 错误项的文案就是手动终止原文，poll_next 的错误分支据此不加
+        // 「上游流中断」前缀（那会把它说成上游的问题）。
+        let inner = match telemetry.cancel_token() {
+            Some(token) => {
+                let signal = futures::stream::once(async move {
+                    token.cancelled().await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::other(
+                        cancellation::MANUAL_TERMINATED,
+                    ))
+                });
+                Box::pin(futures::stream::select(inner, signal))
+            }
+            None => inner,
+        };
         // 采集器在构造时取一次（见字段说明）
         let capture = telemetry.capture();
         Self {
@@ -506,7 +565,14 @@ impl Stream for ForwardStream {
                         self.pending.push_back(frame);
                     }
                     // 错误描述已在构造时折进 io::Error（见 inner 字段说明）
-                    let message = format!("上游流中断: {error}");
+                    // 手动终止的旁路流给的就是原文（见 from_translated）：
+                    // 不加「上游流中断」前缀 —— 它不是上游的问题
+                    let text = error.to_string();
+                    let message = if text == cancellation::MANUAL_TERMINATED {
+                        text
+                    } else {
+                        format!("上游流中断: {error}")
+                    };
                     // 只在终端：这条原因由下面的 `note_error` 进请求日志
                     // （客户端此时已收到部分内容，HTTP 状态早就是 200，
                     // 只有请求日志的「错误」列能解释「为什么这条是失败的」）。

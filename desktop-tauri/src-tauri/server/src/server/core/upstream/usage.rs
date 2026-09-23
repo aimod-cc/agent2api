@@ -427,6 +427,13 @@ pub struct RequestTelemetry {
     capture: Mutex<Option<Arc<super::super::debug_traffic::TrafficCapture>>>,
     /// 在途回写（钩子 + 上一次已回写的指纹；见 [`Self::set_live_sink`]）
     live: Mutex<LiveWrite>,
+    /// 手动终止的取消令牌（`core::upstream::cancellation`；None = 这条请求
+    /// 没登记 —— 转发前就失败的记账路径，或未接线的调用方）。
+    ///
+    /// 与 `capture` 同一挂法：转发链的各个等待点（等响应头、退避睡眠、流式
+    /// 轮询）手上只有 telemetry，令牌放这里它们才够得着；接线在入口 handler
+    /// （`api::chat` / `api::protocol` 在 `record_started` 之后装入）。
+    cancel: Mutex<Option<Arc<super::cancellation::CancelToken>>>,
 }
 
 impl Default for RequestTelemetry {
@@ -441,6 +448,7 @@ impl RequestTelemetry {
             inner: Mutex::new(TelemetrySnapshot::default()),
             capture: Mutex::new(None),
             live: Mutex::new(LiveWrite::default()),
+            cancel: Mutex::new(None),
         }
     }
 
@@ -472,6 +480,34 @@ impl RequestTelemetry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// 装入手动终止的取消令牌（入口 handler 在 `record_started` 之后调一次）。
+    ///
+    /// 与 `ensure_id` 同一时机与同一「首次为准」纪律的变体：令牌只在请求
+    /// 开始时装一次，转发链上各处只读不写（置位走注册表 `cancellation::cancel`，
+    /// 不从这里进）。
+    pub fn set_cancel_token(&self, token: Arc<super::cancellation::CancelToken>) {
+        let mut guard = self
+            .cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(token);
+    }
+
+    /// 取取消令牌（未接线时为 None，各等待点据此退化成「不可取消」的原行为）
+    pub fn cancel_token(&self) -> Option<Arc<super::cancellation::CancelToken>> {
+        self.cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 本条请求是否已被手动终止（循环顶的同步判据；令牌缺省时恒 false）
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token()
+            .map(|token| token.is_cancelled())
+            .unwrap_or(false)
     }
 
     /// 生成并记下本条请求的关联 id（转发开始前调一次）。

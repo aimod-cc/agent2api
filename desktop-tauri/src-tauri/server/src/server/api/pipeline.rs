@@ -753,6 +753,10 @@ impl RecordingStream {
             // 若未来有入口想预填响应正文，那它不该再走流式包装（自相矛盾的约定）
             context.raw_response = self.raw.into_text();
             record_entry(&context, fallback_error);
+            // 手动终止的令牌在此注销：流的结束点 = 请求不再在途（与
+            // DisconnectGuard::complete 同一条生命周期；settle 由 Drop 兜底
+            // 调用，所以「客户端断开」「流跑完」「服务退出」三条路都会走到这里）
+            crate::server::core::upstream::cancellation::unregister(&context.telemetry.id());
         }
     }
 

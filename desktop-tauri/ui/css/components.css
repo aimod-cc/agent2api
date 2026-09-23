@@ -617,11 +617,18 @@ input[type="number"] { max-width: 130px; }
 /* ─── 表格列宽拖动把手 ───
    四张表的表头右缘共用这一枚把手（账号表由 accounts-columns.js 委托，
    模型管理 / 网关 Key / 请求日志由 table-columns.js 委托）：
-   平时隐形，悬停浮出 1px 竖线，按住时变主色加粗。
-   靠绝对定位挂在宿主单元格上，所以宿主必须是定位元素 —— 四张表的表头单元格
-   都是 position: sticky，本来就是，不需要额外声明。
+   常驻一枚 1px 竖线标出可拖的列边界（实时调列宽不必先悬停摸索），
+   按住时变主色加粗。
+   靠绝对定位挂在宿主单元格上，所以宿主必须是定位元素 —— 三张 table 表的
+   表头是 position: sticky（本来就是），请求日志的表头格也单独声明了 relative。
    right: -4px 让竖线正好压住列边界；代价是最后一列不能插把手（钉在表格右缘
-   会顶出滚动容器），这一条由各自的脚本负责。 */
+   会顶出滚动容器），这一条由各自的脚本负责（请求日志是网格布局、整行填满
+   不滚动，末列照插）。
+
+   竖线不随宿主撑满、改定高 20px 垂直居中：四张表的宿主高度参差 —— 账号表
+   th 行高 32px（眼睛按钮撑起行盒），32 − 上下各 6px 恰是 20px；模型/网关
+   th 上下内边距各多 1px；请求日志的宿主格只有一行字高（~17px），按撑满算
+   只剩几像素。定高才保证四条分隔线一样长，20px 即以账号页为准。 */
 .col-grip {
   position: absolute;
   top: 0;
@@ -636,17 +643,14 @@ input[type="number"] { max-width: 130px; }
   content: "";
   position: absolute;
   left: 4px;
-  top: 6px;
-  bottom: 6px;
+  top: 50%;
+  height: 20px;
+  transform: translateY(-50%);
   width: 1px;
   background: var(--border-strong);
-  opacity: 0;
-  transition: opacity .12s;
 }
 
-/* 悬停显形：宿主有的是 th，有的是请求日志表头里的 span，所以按「直接父级」匹配 */
-:hover > .col-grip::after { opacity: 1; }
-.col-grip.active::after { left: 3.5px; width: 2px; background: var(--primary); opacity: 1; }
+.col-grip.active::after { left: 3.5px; width: 2px; background: var(--primary); }
 
 /* 拖动中：全局换光标并禁用选中（拖过文本会触发原生的拖选，把手就「断」了） */
 body.col-resizing { cursor: col-resize; user-select: none; }

@@ -207,14 +207,18 @@ body.colset-dragging { cursor: grabbing; user-select: none; }
 
 /* 模型管理 / 网关 Key */
 .models-table td.ta-center > .mid,
-.models-table td.ta-center > .aliases,
 .models-table td.ta-center > .row-actions,
 .models-table td.ta-center > .keycell { justify-content: center; }
 
+/* .aliases 是纵向容器（每条绑定一行），水平对齐走 align-items 而不是
+   justify-content —— 主轴已经竖过来了，justify 会变成上下撑开 */
+.models-table td.ta-center > .aliases { align-items: center; }
+
 .models-table td.ta-right > .mid,
-.models-table td.ta-right > .aliases,
 .models-table td.ta-right > .row-actions,
 .models-table td.ta-right > .keycell { justify-content: flex-end; }
+
+.models-table td.ta-right > .aliases { align-items: flex-end; }
 
 /* ── 3. 竖排读数与靠边的 grid 项 ── */
 

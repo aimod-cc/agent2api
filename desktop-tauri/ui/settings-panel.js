@@ -256,8 +256,11 @@
       const result = await api.exportAccounts();
       if (result?.canceled) { toast('已取消导出'); return; }
       const count = Number(result?.count) || 0;
-      if (!count) { toast('没有可导出的账号', 'err'); return; }
-      toast(`✅ 已导出 ${count} 个账号${result?.file ? ` 到 ${result.file}` : ''}`);
+      const providers = Number(result?.customProviders) || 0;
+      if (!count && !providers) { toast('没有可导出的账号', 'err'); return; }
+      // v2 导出文件附带自定义提供商定义：账号为 0 但有定义时同样值得导
+      const providerNote = providers ? `、${providers} 个自定义提供商` : '';
+      toast(`✅ 已导出 ${count} 个账号${providerNote}${result?.file ? ` 到 ${result.file}` : ''}`);
     });
   }
 
@@ -272,18 +275,30 @@
       const skipped = Number(result?.skipped) || 0;
       const failed = Number(result?.failed) || 0;
       const errors = Array.isArray(result?.errors) ? result.errors : [];
+      const custom = result?.customProviders ?? {};
+      const customAdded = Number(custom.added) || 0;
+      const customUpdated = Number(custom.updated) || 0;
 
       const extras = [];
       if (skipped) extras.push(`跳过 ${skipped} 个`);
       if (failed) extras.push(`失败 ${failed} 个`);
       const suffix = extras.length ? `，${extras.join('、')}` : '';
-      const summary = `新增 ${added} 个、更新 ${updated} 个${suffix}`;
+      const providerNote = (customAdded || customUpdated)
+        ? `，自定义提供商新增 ${customAdded} 个、更新 ${customUpdated} 个`
+        : '';
+      const summary = `新增 ${added} 个、更新 ${updated} 个${suffix}${providerNote}`;
 
       if (failed) {
         toast(`导入完成：${summary}`, 'err');
-        // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致
+        // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致；
+        // 定义警告（customProvider 标记）没有账号语义，展示时注明归属
         const detail = errors.slice(0, 3)
-          .map(item => `${item?.id ?? '未知账号'}（${item?.message ?? '未知原因'}）`)
+          .map(item => {
+            const label = item?.customProvider
+              ? `自定义提供商 ${item?.id || '(无 id)'}`
+              : (item?.id ?? '未知账号');
+            return `${label}（${item?.message ?? '未知原因'}）`;
+          })
           .join('；');
         setIoResult(`<span style="color:var(--danger)">失败 ${failed} 个：${esc(detail)}${
           errors.length > 3 ? ' 等' : ''}</span>`);
@@ -291,8 +306,9 @@
         toast(`✅ 导入完成：${summary}`);
       }
 
-      // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数等
-      await wbApp.refresh?.();
+      // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数等；
+      // 自定义提供商定义有变化时同样要刷（分组名、模型清单都会变）
+      if (added || updated || customAdded || customUpdated) await wbApp.refresh?.();
     });
   }
 

@@ -379,6 +379,13 @@
 
 .modal-wide { width: min(920px, 100%); }
 
+/* 「终止请求」按钮（详情弹窗底部，仅进行中的行显示）。
+   必须显式写 [hidden] 的规则：components.css 给 button 设了
+   display: inline-flex，会压过浏览器对 hidden 的默认 display: none
+   （与 .add-provider-block[hidden]、.report-rank-grid > .panel[hidden]
+   同一个坑）。 */
+#req-detail-terminate[hidden] { display: none; }
+
 .req-detail-meta {
   padding-bottom: 10px;
   border-bottom: 1px solid var(--hairline);

@@ -166,6 +166,12 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/stats/requests/raw",
             get(api::stats_api::stats_request_raw),
         )
+        // 手动终止一条在途请求（详情弹窗的「终止请求」按钮）。POST 且同样
+        // 排在通配之前 —— 顺序理由与上面两条相同
+        .route(
+            "/api/stats/requests/terminate",
+            post(api::stats_api::stats_request_terminate),
+        )
         // 清理弹窗的预览统计（将删明细数 / 带报文数 / 库占用 / 压缩状态）
         .route(
             "/api/stats/requests/clear-preview",

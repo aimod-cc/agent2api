@@ -406,6 +406,10 @@ const BRIDGE_JS: &str = r#"
     // （详情弹窗「预览对话」的数据源；列表接口不回正文，行保持轻）。
     // 找不到给 404，前端据此提示「没有保存原始报文」。
     getStatsRequestRaw: id => call('GET', '/api/stats/requests/raw' + toQuery({ id })),
+    // 手动终止一条**在途**请求（详情弹窗的「终止请求」按钮）：
+    // 受理 `{success:true,terminated:true}`；不在进行中给 404（已结束 /
+    // 上次启动遗留的进行中行），前端据此提示刷新列表
+    terminateStatsRequest: id => call('POST', '/api/stats/requests/terminate' + toQuery({ id })),
     // 清理弹窗的预览统计 `{all, raw, dbBytes, vacuumRunning, lastVacuum}`：
     // 与 DELETE 共用同一份筛选解析（后端 filter_from_params），预览说删 N 条、
     // 确认删掉的就是 N 条 —— 预览与执行必须同源，否则就是新的「清空事故」

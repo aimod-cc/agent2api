@@ -390,8 +390,9 @@ pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettin
 
 /// 导出账号：拉取导出数据，弹系统保存框落盘。
 ///
-/// 账号数为 0 时直接返回，不弹保存框 —— 让用户选完路径再被告知「没东西可存」
-/// 是纯打扰。
+/// 账号与自定义提供商定义**都为 0** 时直接返回，不弹保存框 —— 让用户选完
+/// 路径再被告知「没东西可存」是纯打扰。只有定义没有账号（或反之）仍值得导：
+/// 导出文件现在同时承载两层（v2 起带 `customProviders` 段）。
 #[tauri::command]
 pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
     let data = gateway::call("GET", "/api/accounts/export", None).await?;
@@ -400,7 +401,12 @@ pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if accounts.is_empty() {
+    let custom_providers = data
+        .get("customProviders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if accounts.is_empty() && custom_providers.is_empty() {
         return Ok(json!({ "count": 0 }));
     }
 
@@ -424,13 +430,19 @@ pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
     let text = serde_json::to_string_pretty(&data)
         .map_err(|error| format!("导出内容序列化失败: {error}"))?;
     std::fs::write(&path, text.as_bytes()).map_err(|error| format!("写入账号文件失败: {error}"))?;
-    Ok(json!({ "count": accounts.len(), "file": path.to_string_lossy() }))
+    Ok(json!({
+        "count": accounts.len(),
+        "customProviders": custom_providers.len(),
+        "file": path.to_string_lossy(),
+    }))
 }
 
-/// 从文件导入账号（merge 语义：按 uid 匹配，命中更新、未命中追加）。
+/// 从文件导入账号（merge 语义：按身份匹配，命中更新、未命中追加）。
 ///
-/// 兼容两种形态：整体导出文件 `{ version, exportedAt, accounts }`
-/// 与直接的账号数组 `[...]`，统一取成 accounts 数组再提交给后端。
+/// 兼容两种形态：整体导出文件 `{ version, exportedAt, customProviders, accounts }`
+/// 与直接的账号数组 `[...]`。`customProviders` 段（v2 起的自定义提供商定义）
+/// 原样透传给后端 —— 账号的 provider 字段指向这些定义，丢了它们自定义账号
+/// 就导不回。
 #[tauri::command]
 pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
     let file = app
@@ -452,24 +464,43 @@ pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
 
     let parsed: Value = serde_json::from_str(&text)
         .map_err(|error| format!("文件不是有效 JSON: {error}"))?;
-    let accounts = match parsed {
+    let document = unwrap_envelope_file(parsed);
+    let accounts = match &document {
         // 整体导出文件
-        Value::Object(ref map) => map
+        Value::Object(map) => map
             .get("accounts")
             .and_then(Value::as_array)
             .cloned()
             .ok_or("文件中缺少 accounts 字段")?,
         // 直接就是账号数组
-        Value::Array(items) => items,
+        Value::Array(items) => items.clone(),
         _ => return Err("文件内容既不是导出文件也不是账号数组".to_string()),
     };
 
-    gateway::call(
-        "POST",
-        "/api/accounts/import",
-        Some(&json!({ "accounts": accounts, "mode": "merge" })),
-    )
-    .await
+    let mut payload = json!({ "accounts": accounts, "mode": "merge" });
+    if let Value::Object(map) = &document {
+        if let Some(definitions) = map.get("customProviders") {
+            payload["customProviders"] = definitions.clone();
+        }
+    }
+
+    gateway::call("POST", "/api/accounts/import", Some(&payload)).await
+}
+
+/// 网页端旧版「导出」把管理 API 的 `{ success, data }` 响应信封整个存成了
+/// 文件：顶层没有 accounts 而 data 里有时下钻一层，让旧文件不作废。
+/// 标准导出文件（顶层就是 accounts）与纯账号数组原样通过。
+fn unwrap_envelope_file(parsed: Value) -> Value {
+    let Value::Object(map) = &parsed else {
+        return parsed;
+    };
+    if map.contains_key("accounts") {
+        return parsed;
+    }
+    match map.get("data") {
+        Some(data) if data.get("accounts").is_some() => data.clone(),
+        _ => parsed,
+    }
 }
 
 /// 检查新版本：把本应用版本作为 query 参数交给后端比较。

@@ -15,6 +15,7 @@ use serde_json::{Map, Value};
 
 use crate::server::core::account_store::state::StoredAccount;
 use crate::server::core::account_store::store_util::{token_tail_of, truncate_text};
+use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 use crate::server::core::endpoints::resolve_edition;
 use crate::server::core::providers::{kind_id, ProviderKind};
 
@@ -175,15 +176,87 @@ pub(super) fn normalize_imported(
         normalize_workbuddy_known_fields(&mut record, item, before);
     } else {
         // 非 WorkBuddy：edition / prefixPath / endpoint / platform 是 WorkBuddy 的
-        // 已知字段（腾讯端点身份），不属于其余三家的 schema。一律不写入 ——
+        // 已知字段（腾讯端点身份），不属于其余各家的 schema。一律不写入 ——
         // 既不给新记录注入腾讯端点，也不让导出文件里的残留值覆盖别家记录。
         for key in ["edition", "prefixPath", "endpoint", "platform"] {
             record.remove(key);
         }
     }
 
+    // 自定义提供商账号：apiKey / baseUrl / tokenTail 是本家 schema，
+    // 通用保留兜不住校验（超长、非法 URL），走专属归一
+    if provider.starts_with(crate::server::core::custom_providers::ID_PREFIX) {
+        normalize_custom_known_fields(&mut record, item, before)?;
+    }
+
     // provider 已在上面落位：这里不再重复写入
     Ok(record)
+}
+
+/// 自定义提供商账号的专属字段：apiKey（凭证）、baseUrl（账号级覆盖项）、
+/// tokenTail（界面尾号）。
+///
+/// 三者都是 `custom_accounts::add_custom_account` 落盘的形状，导入沿用同一套
+/// 规则：apiKey trim 后落盘（超长该条失败）、导入值为空时保留本机旧凭证
+/// （与 accessToken / refreshToken 的合并纪律一致）；baseUrl 带键才动 ——
+/// 空值清除覆盖项（回落提供商默认基址），非空值过 `normalize_base_url` 门禁；
+/// tokenTail 显式值优先，否则按最终 apiKey 重新派生（尾号必须与凭证同源，
+/// 用旧尾号配新 key 会让界面展示对不上号）。
+fn normalize_custom_known_fields(
+    record: &mut Map<String, Value>,
+    item: &Map<String, Value>,
+    before: Option<&StoredAccount>,
+) -> Result<(), String> {
+    let api_key = {
+        let incoming = text_of(item.get("apiKey"));
+        if incoming.is_empty() {
+            before
+                .and_then(|record| record.get("apiKey"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            incoming
+        }
+    };
+    if api_key.chars().count() > MAX_TOKEN_LENGTH {
+        return Err("apiKey 过长".to_string());
+    }
+    record.insert("apiKey".to_string(), Value::String(api_key.clone()));
+
+    let token_tail = {
+        let incoming = text_of(item.get("tokenTail"));
+        if !incoming.is_empty() {
+            incoming
+        } else if api_key.is_empty() {
+            String::new()
+        } else {
+            token_tail_of(&api_key)
+        }
+    };
+    if token_tail.is_empty() {
+        record.remove("tokenTail");
+    } else {
+        record.insert("tokenTail".to_string(), Value::String(token_tail));
+    }
+
+    if item.contains_key("baseUrl") {
+        let raw = item
+            .get("baseUrl")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if raw.is_empty() {
+            // 带键但为空 = 清除覆盖项，回落提供商的 baseUrl（与添加路径同语义：
+            // 「没有覆盖项」与「覆盖成空串」必须可区分，空串不是合法 URL 落不了盘）
+            record.remove("baseUrl");
+        } else {
+            let base_url = crate::server::core::custom_providers::normalize_base_url(&raw)?;
+            record.insert("baseUrl".to_string(), Value::String(base_url));
+        }
+    }
+    Ok(())
 }
 
 /// WorkBuddy 的已知字段：端点/版本三件套按 edition 归一，运营字段沿用旧口径。

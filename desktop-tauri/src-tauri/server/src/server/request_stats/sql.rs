@@ -465,6 +465,34 @@ pub(super) fn finish_stale_running(
     )
 }
 
+/// 按 id 收尾一条**在途**行（`RequestStats::finalize_interrupted` 的唯一语句）。
+///
+/// 与 [`finish_stale_running`] 的分工：那个按「开始时刻早于阈值」批量扫，
+/// 是崩溃恢复；这个按 id 精确收尾，由断线兜底守卫（`api::pipeline::DisconnectGuard`）
+/// 在 handler 被 axum 取消（客户端放弃连接）时调用。两者都补 408 —— 对报表
+/// 而言都是「这一轮没跑完」，具体原因在 error 文案里。
+///
+/// ── 只改终态三列，**不动**两个明细列 ────────────────────────
+/// 在途回写可能已经攒了真实的尝试链与敏感词命中，那是排障材料（对比
+/// `finish_stale_running`：崩溃行没有任何在途数据，整体重置是合理的）。
+/// `attempts` 取 `MAX(attempts, 1)`：保留在途已记录的轮数，但不让它落到 0
+/// （存储契约是「含首次、恒 ≥1」）。
+///
+/// 匹配条件与收尾 UPDATE 一致（`id + status = 0`）：已收尾的行打空，
+/// 不覆盖终态 —— 与「在途回写晚到一步」同一纪律。
+pub(super) fn finish_running_request(
+    conn: &Connection,
+    id: &str,
+    error: &str,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE requests SET status = 408, error = ?2, duration_ms = MAX(?3 - ts, 0), \
+         attempts = MAX(attempts, 1) WHERE id = ?1 AND status = 0",
+        params![id, error, now],
+    )
+}
+
 /// 回写一条**进行中**明细的**在途**字段（转发期间每次状态真的变化时调一次；
 /// 见 `RequestStats::update_running`）。
 ///

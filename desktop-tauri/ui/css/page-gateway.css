@@ -167,8 +167,10 @@
 .mname { color: var(--text-3); font-size: 11.5px; }
 .rate { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
 
-/* 映射名药丸：品牌色浅底；行禁用时随行压淡并加删除线 */
-.aliases { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+/* 映射名药丸：品牌色浅底；行禁用时随行压淡并加删除线。
+   纵向排列（每条绑定独占一行，参照账号页模型管理弹窗）——映射一多条，
+   横向 wrap 会挤成变宽的迷宫，竖着读每行一条才对得上「绑定列表」的心智。 */
+.aliases { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
 .alias {
   display: inline-flex;
   align-items: center;

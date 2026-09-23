@@ -57,6 +57,12 @@
 //! 保存，转发时报 400（见 `providers::custom::forward` 的分派骨架）。
 
 mod bindings;
+/// 自定义提供商**定义**的导入合并（账号导出文件里的 `customProviders` 段）。
+///
+/// `pub(crate)`：调用方是 `account_transfer::import_accounts` —— 账号导入的
+/// 前置步骤（先有提供商，账号的外键才不悬空）。除此之外它不该被任何人触碰：
+/// 定义的手工增删改走 `create` / `update` / `remove`，不走导入。
+pub(crate) mod transfer;
 pub use bindings::public_models;
 
 use std::time::Duration;

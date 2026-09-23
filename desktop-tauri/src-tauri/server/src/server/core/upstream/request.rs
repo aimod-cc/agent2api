@@ -35,6 +35,19 @@ use crate::server::errors::GatewayError;
 /// 这里不再叠加总超时 —— 那会掐断长回答的 SSE 流。
 pub const NO_TOTAL_TIMEOUT: Option<u64> = None;
 
+/// 单次尝试**等待上游响应头**的上限（毫秒）。
+///
+/// 与 OmniProxy 的 `headers_timeout`（默认 300 秒）同义：连接建立之后、
+/// 响应头到达之前的静默等待必须有个上限 —— `read_timeout` 管的是「两次数据
+/// 之间」，虽然首包之前的等待也计入它，但 600 秒 × 重试链（同账号重发 ×
+/// 换号）会把一条请求拖到几十分钟，而客户端早就等不及了。
+///
+/// 为什么 300 秒是安全的：网关请求上游**恒带 `stream: true`**（见
+/// `UpstreamService::forward` 的说明），响应头在 SSE 建立时就到达，
+/// 与「模型思考多久」无关；非流式的长回答也走这条路径（本地聚合）。
+/// 超时按传输层失败处理（502 + 既有退避重试），与连接失败同一档。
+pub const HEADERS_TIMEOUT_MS: u64 = 300_000;
+
 /// 一次上游请求的全部素材（协议无关形态；provider 差异在构造阶段已消解）
 pub struct TransportRequest {
     /// 上游完整 URL（由适配器给出）
@@ -129,21 +142,31 @@ pub async fn send_chat_request(
     if let Some(timeout) = NO_TOTAL_TIMEOUT {
         builder = builder.timeout(Duration::from_millis(timeout));
     }
-    builder.send().await.map_err(|error| {
-        // 网络层错误（ECONNREFUSED、代理鉴权失败、DNS…）：带上根因与出口说明，
-        // 便于判断是不是代理配错了 —— 文案照抄 Node 的 fetchViaProxy
-        let via = match &plan.proxy {
-            Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
-            Some(proxy) => format!("经代理 {}", proxy.host),
-            None => "直连".to_string(),
-        };
-        UpstreamRequestError {
+    // 出口说明（失败文案用）：文案照抄 Node 的 fetchViaProxy
+    let via = match &plan.proxy {
+        Some(proxy) if !proxy.label.is_empty() => format!("经代理 {}", proxy.label),
+        Some(proxy) => format!("经代理 {}", proxy.host),
+        None => "直连".to_string(),
+    };
+    // 等待响应头有上限（见 HEADERS_TIMEOUT_MS 的说明）：超时后 future 被丢弃，
+    // 上游连接随之关闭（与客户端断开时的取消是同一机制）
+    match tokio::time::timeout(Duration::from_millis(HEADERS_TIMEOUT_MS), builder.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(UpstreamRequestError {
+            // 网络层错误（ECONNREFUSED、代理鉴权失败、DNS…）：带上根因与出口说明，
+            // 便于判断是不是代理配错了
             message: format!(
                 "上游请求失败（{via}）: {}",
                 egress::describe_error_detail(&error)
             ),
-        }
-    })
+        }),
+        Err(_elapsed) => Err(UpstreamRequestError {
+            message: format!(
+                "上游响应超时（等待响应头超过 {} 秒，出口 {via}）",
+                HEADERS_TIMEOUT_MS / 1000
+            ),
+        }),
+    }
 }
 
 /// 传输层失败（统一收敛成 502，与 Node 的 fetchViaProxy 一致）

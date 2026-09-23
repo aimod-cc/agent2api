@@ -432,6 +432,23 @@ impl ServerState {
         // 启动即收尾上次运行遗留的进行中行（详情见方法注释）：不等到第一条
         // 请求进来才清理，界面打开时看到的就已经是「已中断」的终态
         request_stats.sweep_stale_running();
+        // ── 僵尸行的主动周期清扫（每 5 分钟一次）─────────────────────
+        // 清扫的判定（1 小时阈值）此前只在「下一条请求进来」时顺带跑：
+        // 夜间 / 空闲时段没人发请求，卡死的行会一直挂到第二天早上。
+        // 定时器补上「没人请求也要清」这一半 —— 与启动那次共用同一套判定
+        // （`sweep_stale_running`），不引入第二套规则。
+        // 注：断线兜底（`DisconnectGuard`）与手动终止上线后，进程内产生的
+        // 僵尸行已基本消失；这一层只兜「进程崩溃 / 未覆盖的等待路径」。
+        let sweep_stats = request_stats.clone();
+        crate::spawn_task(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            // 第一次 tick 立即完成 —— 启动时刚扫过，跳过它
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                sweep_stats.sweep_stale_running();
+            }
+        });
 
         // ── 账号侧的启动期一次性迁移：**有待迁移数据时整块跳过** ──────
         // 那一组迁移（auth.json 旧登录态、`migrate_startup` 的整队与拆池、
