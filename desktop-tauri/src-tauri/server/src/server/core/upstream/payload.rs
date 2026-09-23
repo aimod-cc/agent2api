@@ -219,14 +219,31 @@ pub(super) fn send_body<'a>(
     );
     ctx.telemetry.note_upstream_model(&wire.model);
     rewrite_model(&mut body, &requested, &wire.model, provider_id);
-    apply_reasoning(
+    let injected = apply_reasoning(
         &mut body,
         provider_id,
         &requested,
         &wire.model,
         wire.reasoning.as_deref(),
     );
+    // 采集「实际随上游请求发出的思考等级」（请求日志模型列的 `(等级)`）。
+    // 注入值优先（映射绑定生效时的最终档位，CatPaw 已在 patch 内归并）；
+    // 没注入时问承载家的 `outbound_reasoning` —— 客户端显式指定的档位走这条
+    // （绑定让位，但字段原样在 body 里随请求上行）。两路都空 = 没有等级随行，
+    // 记 None（空串），显示层不给「没发的等级」预支一个值。
+    // 注入路径已经问过一次适配器，这里再查一次注册表是两次哈希查找，可忽略。
+    let upstream_reasoning = injected.or_else(|| outbound_reasoning_of(provider_id, &body));
+    ctx.telemetry.note_upstream_reasoning(upstream_reasoning);
     SendBody { body, wire_model: wire.model }
+}
+
+/// 承载家的 [`ProviderAdapter::outbound_reasoning`]（读发送体里随行的等级）。
+///
+/// 未知 provider id 返回 None：与 [`apply_reasoning`] 里同一条防御 ——
+/// 选路早已校验过注册表，走到这里还查不到说明调用链坏了，什么都不做比 panic 安全。
+fn outbound_reasoning_of(provider_id: &str, body: &Value) -> Option<String> {
+    let kind = crate::server::core::providers::kind_from_id(provider_id)?;
+    crate::server::core::providers::adapter::adapter_for(kind).outbound_reasoning(body)
 }
 
 /// 请求体里的消息条数（提示词层的详细日志用；没有 messages 数组时给 0）。
@@ -295,15 +312,21 @@ fn rewrite_model(body: &mut Cow<'_, Value>, requested: &str, wire: &str, provide
 ///
 /// **不碰客户端自己传的思考字段**：覆盖与否是适配器的判断（它复用本家那个
 /// resolver 读的键名），这里只往它指定的 `field` 上写。
+///
+/// 返回值是**注入成功时的档位字符串**（`Set` 分支里写进 body 的那个值；
+/// `value` 不是字符串形态时给 None）：调用方拿它当「上游等级」采集的第一优先
+/// 来源 —— 映射绑定生效时它就是发出去的档位（CatPaw 的归并已在 patch 内完成）。
+/// 其余分支（没绑 / 关闭思考 / Skip / 请求体不是对象）一律返回 None，
+/// 由调用方改问承载家的 `outbound_reasoning`。
 fn apply_reasoning(
     body: &mut Cow<'_, Value>,
     provider_id: &str,
     requested: &str,
     wire_model: &str,
     level: Option<&str>,
-) {
+) -> Option<String> {
     let Some(level) = level.map(str::trim).filter(|text| !text.is_empty()) else {
-        return;
+        return None;
     };
     if crate::server::core::model_rules::reasoning_is_off(level) {
         logging::verbose(
@@ -313,13 +336,13 @@ fn apply_reasoning(
                  「{level}」（关闭思考），本网关不向任何上游发「关闭思考」字段，跳过注入"
             ),
         );
-        return;
+        return None;
     }
     // 未知 provider id 直接返回：选路早已按注册表校验过（`provider_loop` 对未知
     // id 直接 503），走到这里说明调用链坏了 —— 什么都不做比 panic 安全
     // （release 是 panic=abort）。
     let Some(kind) = crate::server::core::providers::kind_from_id(provider_id) else {
-        return;
+        return None;
     };
     let adapter = crate::server::core::providers::adapter::adapter_for(kind);
     match adapter.reasoning_patch(level, wire_model, body.as_ref()) {
@@ -336,7 +359,7 @@ fn apply_reasoning(
                          绑定的思考等级 {level} 未注入：请求体不是 JSON 对象"
                     ),
                 );
-                return;
+                return None;
             };
             logging::verbose(
                 "[Upstream]",
@@ -345,7 +368,11 @@ fn apply_reasoning(
                      注入思考等级 {level} → {field}={value}"
                 ),
             );
+            // 采集用值在 move 前取出：字符串形态才是「档位」，其它形态（将来
+            // 某家的开关 / 对象）交给调用方那侧的 outbound_reasoning 再读
+            let injected = value.as_str().map(str::to_string);
             object.insert(field.to_string(), value);
+            injected
         }
         crate::server::core::providers::adapter::ReasoningPatch::Skip { reason } => {
             logging::verbose(
@@ -355,6 +382,7 @@ fn apply_reasoning(
                      绑定的思考等级 {level} 未注入：{reason}"
                 ),
             );
+            None
         }
     }
 }

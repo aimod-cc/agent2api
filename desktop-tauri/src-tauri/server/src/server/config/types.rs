@@ -21,6 +21,8 @@
 //!   - **边界**（`DEFAULT_*` / `*_MIN_*` / `*_MAX_*`）：读侧回落与写侧校验
 //!     共用同一份数字，避免「接口拒绝 60 而手改库接受它」这种两套口径。
 
+use std::sync::Arc;
+
 /// 默认模型：客户端未指定模型时使用（对应 Node 版 `--default-model` 默认值）
 pub const DEFAULT_MODEL: &str = "auto";
 /// 计费接口默认语言（对应 Node 版 `--locale` 默认值）
@@ -381,6 +383,22 @@ pub const DEFAULT_RETRY_SWITCH_COUNT: i64 = 5;
 /// 重试间隔默认值：5 秒
 pub const DEFAULT_RETRY_INTERVAL_SECONDS: i64 = 5;
 
+/// 「指定错误码不重试」的配置键（值是 HTTP 状态码数组，如 `[402, 429]`）。
+///
+/// 命中名单的上游失败**原样收尾**：既不在同一账号上原地重发，也不换账号
+/// （含 429 降级 / 401 刷新这类特殊动作）—— 名单的语义就是「这个码没什么
+/// 可试的，直接把错误给客户端」。
+pub const KEY_RETRY_NO_RETRY_CODES: &str = "noRetryStatusCodes";
+/// 默认名单：402（WorkBuddy 积分不足）。余额问题重发结论不变，
+/// 客户端拿到 402 才能如实体感「这个账号没钱了」。
+pub const DEFAULT_NO_RETRY_CODES: &[u16] = &[402];
+/// 名单里状态码的合法范围：HTTP 状态码本身就定义在 100–599
+pub const RETRY_CODE_MIN: u16 = 100;
+pub const RETRY_CODE_MAX: u16 = 599;
+/// 名单长度上限：状态码总共就 500 个，50 项足够表达任何配置，
+/// 也防止一次粘贴把界面和 config.json 撑爆
+pub const RETRY_MAX_NO_RETRY_CODES: usize = 50;
+
 /// 次数与间隔的合法范围。
 ///
 /// 上限 10 次 / 300 秒：次数过多或间隔过长都会让客户端干等（重试是「再发一次」，
@@ -394,8 +412,10 @@ pub const RETRY_MAX_INTERVAL_SECONDS: i64 = 300;
 /// 请求重试设置（设置页「通用 → 请求重试」区域）。
 ///
 /// 与 `RetentionSettings` 同一取舍：几个值总是一起用（转发层每次重试判定
-/// 都取），打包成 `Copy` 值让调用方一次拿到、不必多次读锁。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// 都取），打包成一个快照值让调用方一次拿到、不必多次读锁。
+/// 曾经是 `Copy` 的；`no_retry_codes` 加进来后共享列表只能 `Clone`
+/// （`Arc` 本身不是 Copy）—— 快照克隆只多一次指针自增，热路径无感。
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetrySettings {
     /// **同一账号内**的原地重发次数（0 = 失败立即换号）
     pub count: i64,
@@ -408,6 +428,12 @@ pub struct RetrySettings {
     pub account_switch_count: i64,
     /// 两次重试之间的间隔（秒）
     pub interval_seconds: i64,
+    /// **指定错误码不重试**名单（[`KEY_RETRY_NO_RETRY_CODES`]）。
+    ///
+    /// 为什么是 `Arc<[u16]>` 而不是 `Vec<u16>`：快照被逐失败请求取用，
+    /// `Arc` 让克隆只付一次指针自增；判定（`no_retry`）读的是共享切片，
+    /// 不需要任何锁。
+    pub no_retry_codes: Arc<[u16]>,
 }
 
 impl RetrySettings {
@@ -428,6 +454,11 @@ impl RetrySettings {
     pub fn switch_budget(&self) -> usize {
         self.account_switch_count.max(0) as usize
     }
+
+    /// 这个上游状态码是否命中「不重试」名单。
+    pub fn no_retry(&self, status: u16) -> bool {
+        self.no_retry_codes.contains(&status)
+    }
 }
 
 impl Default for RetrySettings {
@@ -436,14 +467,16 @@ impl Default for RetrySettings {
             count: DEFAULT_RETRY_COUNT,
             account_switch_count: DEFAULT_RETRY_SWITCH_COUNT,
             interval_seconds: DEFAULT_RETRY_INTERVAL_SECONDS,
+            no_retry_codes: Arc::from(DEFAULT_NO_RETRY_CODES),
         }
     }
 }
 
 /// 请求重试的**部分**更新入参（`None` = 该项不动）。
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RetryPatch {
     pub count: Option<i64>,
     pub account_switch_count: Option<i64>,
     pub interval_seconds: Option<i64>,
+    pub no_retry_codes: Option<Vec<u16>>,
 }

@@ -110,6 +110,14 @@ pub struct TelemetrySnapshot {
     /// 决定处（`upstream::payload::send_body`，每家首次尝试时覆盖一次）。
     /// 空串口径与 `account_id` 一致：键恒在、空串表示没有。
     pub upstream_model: String,
+    /// 实际随上游请求发出的**思考等级**（空串 = 没有等级随行）。
+    ///
+    /// 与 `upstream_model` 同点同时采集（`payload::send_body`，发送体定稿处）、
+    /// 同一「最后一次为准」口径：429 换家后留下实际承载那一次的等级。
+    /// 空串的三种成因：客户端没指定且映射没绑、承载家不接等级（适配器的
+    /// `outbound_reasoning` 返回 None）、「关闭思考」档被注入闸拦下。
+    /// 请求日志的模型列用它给上游模型名带 `(等级)` 后缀。
+    pub upstream_reasoning: String,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
@@ -357,6 +365,7 @@ struct LiveStamp {
     account_id: String,
     account_name: String,
     upstream_model: String,
+    upstream_reasoning: String,
     attempts: i64,
     /// 首响的**绝对时刻**（与快照同形，转换在 api 层做）
     first_response_at: Option<i64>,
@@ -378,6 +387,7 @@ impl LiveStamp {
             account_id: snapshot.account_id.clone(),
             account_name: snapshot.account_name.clone(),
             upstream_model: snapshot.upstream_model.clone(),
+            upstream_reasoning: snapshot.upstream_reasoning.clone(),
             attempts: snapshot.attempts,
             first_response_at: snapshot.first_response_at,
             details: snapshot.attempts_detail.len(),
@@ -685,6 +695,21 @@ impl RequestTelemetry {
         guard.upstream_model = model.to_string();
         // 在途回写：上游真名是发送体定稿那一刻就确定的，比请求真正发出去还早
         // —— 模型列因此能在转发期间就显示「⬆️ 上游 / ⬇️ 下游」两行
+        self.flush_live(&guard);
+    }
+
+    /// 记录「这一次尝试实际随请求发给上游的思考等级」（覆盖式，最后一次为准）。
+    ///
+    /// 与 [`Self::note_upstream_model`] 同点调用、同一口径；`None` / 空串不写
+    /// （空串 = 没有等级随行，槽位初始值就是它 —— 「没有」不能覆盖「已采到」，
+    /// 与模型名那条注释同理）。
+    pub fn note_upstream_reasoning(&self, level: Option<String>) {
+        let Some(level) = level.filter(|text| !text.is_empty()) else {
+            return;
+        };
+        let mut guard = self.lock();
+        guard.upstream_reasoning = level;
+        // 在途回写：与模型名同一时刻定稿，进行中行的模型列一并显示等级
         self.flush_live(&guard);
     }
 

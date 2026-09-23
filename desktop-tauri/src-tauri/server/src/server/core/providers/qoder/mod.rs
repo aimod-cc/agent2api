@@ -342,6 +342,30 @@ impl ProviderAdapter for QoderAdapter {
         }
     }
 
+    /// 从发送体读随行的思考等级：取值链复用 [`protocol::declared_reasoning`]。
+    ///
+    /// 显示的是**意图值**（客户端指定的原值，小写归一）而不是归一终值 ——
+    /// 按「模型声明的档位表」归一（`minimal` → `low`、不支持档位退默认）那一步
+    /// 需要 `resolve_thinking` 的模型目录上下文，发送体阶段拿不到（与
+    /// `reasoning_patch` 只看得到名字是同一个约束，见上）。三档「不算等级」的
+    /// 判定与 `resolve_thinking` 逐字同源：`off` / `none` / `disabled`（上游无法
+    /// 真正关闭，不发档位）、布尔与 null（「开/关/默认」是开关语义，不是档位）。
+    fn outbound_reasoning(&self, body: &Value) -> Option<String> {
+        let raw = protocol::declared_reasoning(body)?;
+        match raw {
+            Value::String(text) => {
+                let trimmed = text.trim().to_lowercase();
+                match trimmed.as_str() {
+                    "off" | "none" | "disabled" => None,
+                    "" => None,
+                    _ => Some(trimmed),
+                }
+            }
+            // 布尔（开/关思考）与 null（未指定）都不构成「档位」
+            _ => None,
+        }
+    }
+
     /// SSE 帧的 model 名回写由本适配器**自己做**（在 `forward_conversation` 里
     /// 用 `Translator::model_out`）—— 通用层的回写机制不认识 Qoder 的双层信封，
     /// 所以这里保持默认 false，避免通用层在错误的字节上做替换。

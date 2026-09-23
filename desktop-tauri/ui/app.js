@@ -554,6 +554,10 @@ function maybeShowUpdateModal(info) {
 $('update-modal-go')?.addEventListener('click', () => {
   closeUpdateModal();
   showPage('settings');
+  // 更新面板在设置页的「关于」分类下；设置页自己会按 localStorage 恢复上次
+  // 手点过的分类（比如「数据」），所以跳过去之后要显式切到「关于」。
+  // 只切视图、不写偏好 —— 这是弹窗带来的深链，不该改用户手点的默认分类。
+  window.wbSettingsPanel?.showCategory?.('about');
   // 跳到设置页后直接把下载跑起来，别让人再点一次「下载并安装」——
   // 他点「去更新」的意图就是要更新，停在面板上等下一步是多余的。
   // 用 lastUpdateInfo（弹窗自己那次 checkUpdate 的结果）而不是让面板重查：
@@ -603,7 +607,6 @@ function render() {
   renderGateway();
   renderModels();
   renderProxyStatus();
-  renderNavCounts();
   renderTopbarStatus();
 }
 
@@ -620,11 +623,6 @@ function renderModels() {
 /** 账号列表由 accounts-view 模块负责（含优先级/禁用/代理徽章与行内面板） */
 function renderAccountsView() {
   window.wbAccountsView?.render();
-}
-
-/** 导航上的数量徽标：账号数 / 日志未读 */
-function renderNavCounts() {
-  window.wbAccountsView?.renderNavCount();
 }
 
 // ─── 加载 ─────────────────────────────────────

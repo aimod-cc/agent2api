@@ -160,6 +160,22 @@ fn take_switch(switches_left: &mut usize, total: usize) -> bool {
 /// 动作（见模块头的三个动作），对同一账号原地重试只会白等一个间隔。
 const TRANSIENT_RETRY_STATUSES: &[u16] = &[408, 500, 502, 503, 504];
 
+/// 这次的失败状态码是否命中「指定错误码不重试」名单（设置页「通用 → 请求重试」）。
+///
+/// 命中的失败**原样收尾**：不进 [`send_with_retry`] 的原地重发，也不走
+/// attempt_queue 的换号顺延 —— 名单的语义就是「这个码没什么可试的，把错误
+/// 直接给客户端」。内容拦截补救（动作 0）与 401 刷新（动作 2）也是重试，
+/// 同样被它挡住（所以判定点放在那两个动作之前）。
+///
+/// 传输层失败（DNS / 代理 / 连接）没有上游状态码，不受名单管。
+/// `status_code` 是 `i64` 形态（GatewayError 存的是 `i32`，这里统一收宽），
+/// 负值 / 越界不可能是 HTTP 状态码，按「不在名单」处理。
+fn no_retry_status(status: i64) -> bool {
+    u16::try_from(status)
+        .map(|code| config::retry_settings().no_retry(code))
+        .unwrap_or(false)
+}
+
 /// 瞬时 HTTP 错误的统一退避建议（设置页「请求重试」的全局兜底）。
 ///
 /// `remaining` 是原地重发**还剩几次**（见 [`RetryBudget`] 的说明）；
@@ -443,6 +459,11 @@ async fn attempt_queue(
             match attempt_custom(service, ctx, target, slot, connections, degraded).await {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) => {
+                    // 「指定错误码不重试」命中即原样收尾（与无状态路径同一判定，
+                    // 见 no_retry_status）：不换号、错误直接给客户端
+                    if no_retry_status(i64::from(error.status_code)) {
+                        return Err(error);
+                    }
                     // 失败的账号记入 tried，回到账号循环顺延 —— 与会话式
                     // 失败（is_stateful 分支）同一套兜底。
                     if let Some(account_id) = custom_account_id {
@@ -798,6 +819,19 @@ async fn attempt_queue(
                     break (response, wire_model);
                 }
                 Err(failure) => {
+                    // ── 指定错误码不重试：命中即原样收尾 ──────────────────
+                    // 位置在动作 0 / 动作 2 之前：内容拦截补救与 401 刷新也是
+                    // 「同账号再发一次」，同样被名单挡住 —— 用户点名的码没有
+                    // 任何例外。明细在这里定稿（与下面「不会再重发同一个账号」
+                    // 处的那条定稿出口互斥：一次起头对应恰好一次定稿），
+                    // 错误原样返回给客户端。
+                    if no_retry_status(i64::from(failure.error.status_code)) {
+                        ctx.telemetry.finish_last_attempt(
+                            Some(i64::from(failure.error.status_code)),
+                            Some(&failure.error.message),
+                        );
+                        return Err(failure.error);
+                    }
                     // ── 动作 0：内容策略拦截 → 换中性提示词，同账号立即重试一次 ──
                     // 上游按逐字精确匹配审核，命中即整单拦截；这是**误报**而不是
                     // 账号问题（余额健康、未限流、session 未死），所以既不罚账号
@@ -1655,7 +1689,15 @@ async fn send_with_retry(
         // （拦截由指纹逐字匹配触发，字节没变结论就不会变），还白吃掉重试预算。
         // 换过提示词之后（`degraded`）才回到既有口径：仍被拦就按适配器的退避建议
         // 重试（11-128 的「拦截窗口会持续一小段时间」是实测结论），再不行才换账号。
+        //
+        // ── 「指定错误码不重试」为什么是第二道闸 ────────────────────
+        // 用户点名的状态码（默认 402）连「再看一眼」都不值得：重发同一份 body
+        // 结论不变。这里返回 None 会让下面的终端错误路径立即收尾，不再消耗
+        // 原地重发预算 —— 换号那条路由 attempt_queue 里的同一判定拦（见
+        // `no_retry_status` 的说明），两处合起来才是「这个码不重试」的完整语义。
         let advice = if !degraded && matches!(class, UpstreamErrorClass::ContentBlocked { .. }) {
+            None
+        } else if no_retry_status(i64::from(status)) {
             None
         } else {
             adapter

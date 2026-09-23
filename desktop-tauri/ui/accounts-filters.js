@@ -19,8 +19,9 @@
  *   enabled  = all|enabled|disabled  启用状态
  *   limit    = all|normal|limited    限流状态（该账号任一模型限流中即算「有限流」）
  *
- * 曾经的「版本」维度已下线：国内 / 国际只作为账号属性出现在行上的徽章里
- * （accounts-model 的 editionCell），不再单独给一个筛选入口。
+ * 曾经的「版本」维度已下线：国内 / 国际只作为账号属性出现在提供商徽章的文字里
+ * （accounts-model 的 editionSuffix，拼成「WorkBuddy 国际版」一枚徽章），
+ * 不再单独给一个筛选入口。
  * 曾经的「模型」维度已下线：它只是 WorkBuddy 单上游时代的遗留 —— 限额按模型记，
  * 每个账号「具体哪个模型限流」现在由行上的「限流」列直接展开（见 accounts-table.js），
  * 不必再让整张表跟着一个模型下拉切换口径。
@@ -30,7 +31,16 @@
   const { esc } = wbApp;
   const { providerSummaries, filterCounts } = wbAccountsModel;
 
-  const state = { provider: 'all', enabled: 'all', limit: 'all' };
+  /**
+   * 三个维度的当前值。初值来自上次会话的存盘（wbFilterMemory）——
+   * 「筛选条件记住上次的选择」，重启后照常生效；存坏的键由 load 落回「全部」。
+   */
+  const FILTERS_KEY = 'workbuddy-desktop-accounts-filters';
+  const state = window.wbFilterMemory
+    ? window.wbFilterMemory.load(FILTERS_KEY, { provider: 'all', enabled: 'all', limit: 'all' })
+    : { provider: 'all', enabled: 'all', limit: 'all' };
+  /** 当前条件整体落盘（load/save 都按整份对象走，不必逐维度记改动） */
+  const persist = () => window.wbFilterMemory?.save(FILTERS_KEY, state);
 
   const snapshot = () => wbApp.getState()?.accounts;
   /** providers 摘要（后端注册表顺序；缺失时由账号列表派生，见 accounts-model） */
@@ -79,6 +89,12 @@
   function mount() {
     mountProviderFilter();
     mountProviderSummary();
+    // 把存过的「启用状态」落到分段按钮上。限流与提供商两个维度的控件
+    // 每次 syncAll 都会按 state 纠正（syncLimitAvailability / syncProviderUi），
+    // 只有这一组是一次性静态 HTML、没人同步它，这里补一次。
+    document.querySelectorAll('#account-enabled-filter .seg-item').forEach(item => {
+      item.classList.toggle('active', item.dataset.enabled === state.enabled);
+    });
   }
 
   // ─── 每次重绘前归一化 ───────────────────────
@@ -160,6 +176,7 @@
         const item = event.target.closest(`.seg-item[data-${attr}]`);
         if (!item) return;
         state[attr] = item.dataset[attr];
+        persist();
         document.querySelectorAll(`#${containerId} .seg-item`).forEach(node => {
           node.classList.toggle('active', node === item);
         });
@@ -172,6 +189,7 @@
     // 提供商下拉（动态注入的节点，所以在这里显式绑定；select.js 负责外观增强）
     $(PROVIDER_FILTER_ID)?.addEventListener('change', event => {
       state.provider = event.target.value || 'all';
+      persist();
       onChange();
     });
   }

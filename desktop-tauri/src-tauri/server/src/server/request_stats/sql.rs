@@ -69,7 +69,8 @@ use super::report::normalize_status_filter;
 /// 所有后续字段的序号整体挪一位，那种改动在整个文件里看不出错，只会静默取错值。
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
-     cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits";
+     cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
+     client_reasoning, upstream_reasoning";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -109,6 +110,10 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         upstream_model: row.get(16)?,
         attempt_details: decode_json_list::<AttemptDetail>(&attempt_details),
         sensitive_hits: decode_json_list::<SensitiveHit>(&sensitive_hits),
+        // 末尾两列是 schema v5 加的（顺序与 REQUEST_COLUMNS 一致）；
+        // 旧行的 DEFAULT '' 原样读出，前端按空串处理
+        client_reasoning: row.get(19)?,
+        upstream_reasoning: row.get(20)?,
     })
 }
 
@@ -419,6 +424,7 @@ pub(super) fn insert_started_request(
     ts: i64,
     model: &str,
     client_model: &str,
+    client_reasoning: &str,
 ) -> rusqlite::Result<bool> {
     let existing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM requests WHERE id = ?1 AND status = 0",
@@ -428,9 +434,12 @@ pub(super) fn insert_started_request(
     if existing > 0 {
         return Ok(false);
     }
+    // client_reasoning 随首发写入：下游等级在请求开始时就定稿了（与 client_model
+    // 同一时刻、同一来源），进行中行就能显示「请求的什么(等级)」
     conn.execute(
-        "INSERT INTO requests (id, ts, model, client_model, status) VALUES (?1, ?2, ?3, ?4, 0)",
-        params![id, ts, model, client_model],
+        "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        params![id, ts, model, client_model, client_reasoning],
     )?;
     Ok(true)
 }
@@ -477,14 +486,15 @@ pub(super) fn update_running_progress(
 ) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE requests SET provider = ?2, account_id = ?3, account_name = ?4, \
-         upstream_model = ?5, attempts = ?6, first_response_ms = ?7, attempt_details = ?8, \
-         sensitive_hits = ?9 WHERE id = ?1 AND status = 0",
+         upstream_model = ?5, upstream_reasoning = ?6, attempts = ?7, first_response_ms = ?8, \
+         attempt_details = ?9, sensitive_hits = ?10 WHERE id = ?1 AND status = 0",
         params![
             id,
             progress.provider,
             progress.account_id,
             progress.account_name,
             progress.upstream_model,
+            progress.upstream_reasoning,
             progress.attempts,
             progress.first_response_ms,
             encode_json_list(&progress.attempt_details),
@@ -519,7 +529,8 @@ pub(super) fn update_running_request(
         "UPDATE requests SET ts = ?2, model = ?3, account_id = ?4, account_name = ?5, status = ?6, \
          duration_ms = ?7, first_response_ms = ?8, attempts = ?9, error = ?10, prompt_tokens = ?11, \
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
-         client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19 \
+         client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
+         client_reasoning = ?20, upstream_reasoning = ?21 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -541,6 +552,8 @@ pub(super) fn update_running_request(
             entry.upstream_model,
             encode_json_list(&entry.attempt_details),
             encode_json_list(&entry.sensitive_hits),
+            entry.client_reasoning,
+            entry.upstream_reasoning,
         ],
     )
 }
@@ -554,9 +567,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits) \
+         sensitive_hits, client_reasoning, upstream_reasoning) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19)",
+         ?18, ?19, ?20, ?21)",
         params![
             entry.id,
             entry.ts,
@@ -577,6 +590,8 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.upstream_model,
             encode_json_list(&entry.attempt_details),
             encode_json_list(&entry.sensitive_hits),
+            entry.client_reasoning,
+            entry.upstream_reasoning,
         ],
     )?;
     Ok(())

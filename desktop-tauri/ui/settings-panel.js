@@ -554,6 +554,22 @@
     { key: 'retryIntervalSeconds', inputId: 'settings-retry-interval', label: '重试间隔', min: 0, max: 300 },
   ];
 
+  // ─── 指定错误码不重试（标签输入）────────────
+  //
+  // GitHub Topics 同款交互：框里是已添加的状态码徽章 + 一个行内输入框，
+  // 回车添加、点 × 删除（输入框为空时退格删最后一枚）。每次增删立即 PUT
+  // —— 与三个数字框「改完即存」的节奏一致，不做「再点一次保存」。
+  const NO_RETRY_CODES_KEY = 'noRetryStatusCodes';
+  const TAG_BOX_ID = 'settings-retry-no-codes';
+  const TAG_FIELD_ID = 'settings-retry-no-codes-input';
+  /** 状态码的合法范围与名单上限：与后端 retry_api.rs 的校验逐字同源 */
+  const RETRY_CODE_MIN = 100;
+  const RETRY_CODE_MAX = 599;
+  const RETRY_MAX_CODES = 50;
+
+  /** 最近一次从后端拿到的名单（数字数组）；整个重试设置不可用时为 null */
+  let noRetryCodes = null;
+
   /** 最近一次从后端读到的生效值；为 null 表示后端不可用（此时输入框保持禁用） */
   let retry = null;
 
@@ -573,6 +589,8 @@
 
     if (!data || typeof data !== 'object') {
       retry = null;
+      noRetryCodes = null;
+      renderNoRetryCodes();
       badge.className = 'badge bad';
       badge.textContent = '不可用';
       inputs.forEach(input => { input.value = ''; input.disabled = true; });
@@ -595,6 +613,13 @@
     }
 
     retry = next;
+    // 名单：只收 100–599 的整数项（后端已排序去重，这里不再排序 ——
+    // 顺序就是后端给的）。键缺失（旧后端）时沿用上一轮的值，不误判成「清空」
+    if (Array.isArray(data[NO_RETRY_CODES_KEY])) {
+      noRetryCodes = data[NO_RETRY_CODES_KEY].filter(code =>
+        Number.isInteger(code) && code >= RETRY_CODE_MIN && code <= RETRY_CODE_MAX);
+    }
+    renderNoRetryCodes();
     RETRY_FIELDS.forEach((field, index) => {
       const input = inputs[index];
       const value = next[field.key];
@@ -685,6 +710,70 @@
         }
       });
     }
+  }
+
+  /**
+   * 「指定错误码不重试」的界面：把 `noRetryCodes` 画成一排徽章（状态码 + ✕），
+   * 行内输入框永远留在最后（GitHub Topics 的形态）。徽章是动态的，
+   * 每次增删整排重画 —— 几十枚的量级，重建比逐个增删节点省心。
+   */
+  function renderNoRetryCodes() {
+    const box = $(TAG_BOX_ID);
+    const field = $(TAG_FIELD_ID);
+    if (!box || !field) return;
+    box.querySelectorAll('.tag-chip').forEach(node => node.remove());
+    for (const code of noRetryCodes || []) {
+      const chip = document.createElement('span');
+      chip.className = 'tag-chip';
+      chip.innerHTML = `<span class="v">${code}</span>`
+        + `<button type="button" class="tag-x" data-code="${code}" title="删除 ${code}" aria-label="删除状态码 ${code}">✕</button>`;
+      box.insertBefore(chip, field);
+    }
+    const disabled = noRetryCodes === null;
+    field.disabled = disabled;
+    box.classList.toggle('disabled', disabled);
+    field.placeholder = disabled ? '—' : '输入状态码，回车添加';
+  }
+
+  /** 增删后的统一提交：乐观更新本地值 → PUT → 用响应里的生效值重画 */
+  async function saveNoRetryCodes(codes) {
+    if (panelBusy) { renderNoRetryCodes(); return; }
+    noRetryCodes = codes;
+    renderNoRetryCodes();
+    panelBusy = true;
+    const field = $(TAG_FIELD_ID);
+    if (field) field.disabled = true;
+    try {
+      const saved = await api.saveRetry({ [NO_RETRY_CODES_KEY]: codes });
+      // PUT 契约返回生效后的全量值（含三个数字项），交给 renderRetry 统一回填，
+      // 顺带把徽章重画成后端确认的形态（排序去重后的结果）
+      renderRetry(saved);
+      toast('✅ 已保存：指定错误码不重试');
+    } catch (error) {
+      toast(`保存失败：${error.message}`, 'err');
+      await loadRetry(); // 回滚到后端的真实值
+    } finally {
+      panelBusy = false;
+      renderNoRetryCodes();
+    }
+  }
+
+  /** 校验并添加一枚：整数、100–599、去重、限量（口径与后端 400 文案同源） */
+  function addNoRetryCode(raw) {
+    if (noRetryCodes === null) return;
+    const text = String(raw ?? '').trim();
+    if (!text) return;
+    if (!/^\d+$/.test(text) || Number(text) < RETRY_CODE_MIN || Number(text) > RETRY_CODE_MAX) {
+      toast(`状态码必须是 ${RETRY_CODE_MIN}–${RETRY_CODE_MAX} 的整数（收到: ${text}）`, 'err');
+      return;
+    }
+    const code = Number(text);
+    if (noRetryCodes.includes(code)) { toast(`状态码 ${code} 已在名单里`); return; }
+    if (noRetryCodes.length >= RETRY_MAX_CODES) {
+      toast(`名单最多 ${RETRY_MAX_CODES} 个状态码`, 'err');
+      return;
+    }
+    void saveNoRetryCodes([...noRetryCodes, code]);
   }
 
   // ─── 数据存储概况（只读） ──────────────────────
@@ -891,6 +980,37 @@
   });
 
   $('btn-retry-refresh')?.addEventListener('click', () => loadRetry().then(() => toast('重试设置已刷新')));
+
+  // 「指定错误码不重试」标签输入：回车添加、空输入框上退格删最后一枚、
+  // 点 ×（或点框任意处聚焦输入框）。徽章是动态渲染的，删除走事件委托。
+  {
+    const box = $(TAG_BOX_ID);
+    const field = $(TAG_FIELD_ID);
+    box?.addEventListener('click', event => {
+      const remove = event.target.closest('.tag-x');
+      if (remove) {
+        const code = Number(remove.dataset.code);
+        if (noRetryCodes && noRetryCodes.includes(code)) {
+          void saveNoRetryCodes(noRetryCodes.filter(item => item !== code));
+        }
+        return;
+      }
+      // 点框体空白处 = 聚焦输入框（整框是一个输入控件的观感）
+      field?.focus();
+    });
+    field?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        addNoRetryCode(field.value);
+        field.value = '';
+        return;
+      }
+      // 与 GitHub Topics 一致：输入框为空时退格删掉最后一枚
+      if (event.key === 'Backspace' && !field.value && noRetryCodes?.length) {
+        void saveNoRetryCodes(noRetryCodes.slice(0, -1));
+      }
+    });
+  }
 
   // ─── 调试模式（上游原始报文的采集开关）──────────────────────
 
@@ -1189,7 +1309,7 @@
   // 改过配置目录后能立刻重读一次，不必重开程序。
   $('btn-storage-refresh')?.addEventListener('click', () => loadStorage().then(() => toast('存储概况已刷新')));
 
-  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderSanitize, renderPrompt, renderStorage };
+  window.wbSettingsPanel = { load, render: renderSettings, renderRetention, renderRetry, renderDebug, renderSanitize, renderPrompt, renderStorage, showCategory };
 
   // 重试设置同样在首次读到后端值之前保持禁用：空输入框既能被误改，
   // 也会让「值与后端是否一致」的判断失真。读成功后由 renderRetry 解禁，

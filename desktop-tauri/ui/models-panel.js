@@ -71,9 +71,18 @@
   let data = null;
   let loading = false;
   let refreshing = false;
-  /** 筛选状态 */
-  let providerFilter = 'all';
-  let stateFilter = 'all';
+  /**
+   * 筛选状态。初值来自上次会话的存盘（wbFilterMemory）——
+   * 提供商 / 状态 / 搜索词都记住；存坏的取值由下面的白名单与
+   * matches() 的判定兜底（认不出的状态等于「全部」）。
+   */
+  const FILTERS_KEY = 'workbuddy-desktop-models-filters';
+  const savedFilters = window.wbFilterMemory
+    ? window.wbFilterMemory.load(FILTERS_KEY, { provider: 'all', state: 'all', search: '' })
+    : { provider: 'all', state: 'all', search: '' };
+  const MODEL_STATES = ['all', 'enabled', 'disabled', 'mapped'];
+  let providerFilter = savedFilters.provider;
+  let stateFilter = MODEL_STATES.includes(savedFilters.state) ? savedFilters.state : 'all';
   /** 已展开全部行的提供商集合 */
   const expanded = new Set();
   /** 行内操作在途标记：防同一行连点 */
@@ -1050,19 +1059,31 @@
 
   // ─── 绑定 ─────────────────────────────
 
-  $('model-search')?.addEventListener('input', render);
+  // 恢复上次的筛选：搜索框回填；提供商分段是每次渲染按 providerFilter 动态画的
+  // （renderProviderSeg），只有状态分段是一次性静态 HTML，这里补一次 active。
+  // 搜索词变更随 input 落盘（各敲一个字写一次 localStorage，量小无感）。
+  if ($('model-search')) $('model-search').value = savedFilters.search || '';
+  document.querySelectorAll('#models-state-seg .seg-item').forEach(el =>
+    el.classList.toggle('active', el.dataset.state === stateFilter));
+
+  $('model-search')?.addEventListener('input', event => {
+    window.wbFilterMemory?.save(FILTERS_KEY, { search: event.target.value });
+    render();
+  });
   $('models')?.addEventListener('click', onTableClick);
   $('models')?.addEventListener('change', onTableChange);
   $('models-provider-seg')?.addEventListener('click', event => {
     const item = event.target.closest('.seg-item[data-provider]');
     if (!item) return;
     providerFilter = item.dataset.provider;
+    window.wbFilterMemory?.save(FILTERS_KEY, { provider: providerFilter });
     render();
   });
   $('models-state-seg')?.addEventListener('click', event => {
     const item = event.target.closest('.seg-item[data-state]');
     if (!item) return;
     stateFilter = item.dataset.state;
+    window.wbFilterMemory?.save(FILTERS_KEY, { state: stateFilter });
     $('models-state-seg').querySelectorAll('.seg-item').forEach(el => el.classList.toggle('active', el === item));
     render();
   });

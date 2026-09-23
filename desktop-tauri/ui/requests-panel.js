@@ -147,6 +147,16 @@
   }
 
   let range = readRange();
+  /**
+   * 三个下拉筛选（状态 / 提供商 / 模型）的跨次启动记忆。空串 = 「全部」。
+   * 状态下拉的选项是静态 HTML，启动即可回填；提供商 / 模型的候选清单是异步
+   * 拉的（refreshFilterOptions），回填走 fillFilterSelect 的 desired 入参 ——
+   * 提前给 select.value 赋值在选项还不存在时会被浏览器丢弃。
+   */
+  const FILTERS_KEY = 'workbuddy-desktop-requests-filters';
+  const savedFilters = window.wbFilterMemory
+    ? window.wbFilterMemory.load(FILTERS_KEY, { status: '', provider: '', model: '' })
+    : { status: '', provider: '', model: '' };
   let entries = [];
   let total = 0;      // 明细总量（未过滤）
   let matched = 0;    // 命中筛选条件的条数
@@ -419,6 +429,15 @@
    * 不一致（映射 / 备援按家改写发生过）→ 两行：
    *   ⬆️ 上游实际收到的模型名（主读数，在上）
    *   ⬇️ 下游请求的模型名（次读数，淡一档，在下）
+   *
+   * 推理等级：模型名后带 `(等级)` 后缀，如 `glm-5.3-flash(max)` ——
+   *   - 上游行 = upstreamReasoning（实际随上游请求发出的等级：映射绑定的
+   *     或客户端显式指定的，经承载家归一后的值）
+   *   - 下游行 = clientReasoning（客户端请求体里显式指定的等级）
+   *   - 单行（无映射）时两者指同一个模型，优先显示上游等级（它是真正发出去
+   *     的档位），没有（客户端没指定且映射没绑 / 承载家不接）回退下游等级
+   *   - 两键都为空串 = 无等级随行，只显示模型名（与既有显示一致）；
+   *     旧数据没有这两个键，同样落到这里
    * 双名缺失时退回单行：`model` 缺失或旧数据没有 clientModel / upstreamModel
    * （这两个键是后加的），请求没走到上游的那次失败也没有上游名。
    */
@@ -426,12 +445,18 @@
     const client = String(entry.clientModel ?? '').trim();
     const upstream = String(entry.upstreamModel ?? '').trim();
     const shown = String(entry.model ?? '').trim();
+    const clientLevel = String(entry.clientReasoning ?? '').trim();
+    const upstreamLevel = String(entry.upstreamReasoning ?? '').trim();
+    const tag = (name, level) => (level ? `${name}(${level})` : name);
     if (!client || !upstream || upstream.toLowerCase() === client.toLowerCase()) {
-      return `<span class="req-model" title="${esc(shown)}">${esc(shown || '—')}</span>`;
+      const text = tag(shown, upstreamLevel || clientLevel);
+      return `<span class="req-model" title="${esc(text)}">${esc(text || '—')}</span>`;
     }
+    const upText = tag(upstream, upstreamLevel);
+    const downText = tag(client, clientLevel);
     return `<span class="req-model req-model-split">`
-      + `<span class="req-model-line" title="转发到上游的模型名">⬆️ ${esc(upstream)}</span>`
-      + `<span class="req-model-line sub" title="下游请求的模型名">⬇️ ${esc(client)}</span></span>`;
+      + `<span class="req-model-line" title="${esc(`转发到上游的模型：${upText}`)}">⬆️ ${esc(upText)}</span>`
+      + `<span class="req-model-line sub" title="${esc(`下游请求的模型：${downText}`)}">⬇️ ${esc(downText)}</span></span>`;
   }
 
   /**
@@ -637,10 +662,12 @@
    * 第一项（「全部提供商」/「全部模型」）由 HTML 声明，原样保留 ——
    * 它的文案是页面的一部分，不在数据里。
    */
-  function fillFilterSelect(id, items) {
+  function fillFilterSelect(id, items, desired) {
     const select = $(id);
     if (!select) return;
-    const current = select.value;
+    // desired（记忆恢复的值）优先于 DOM 当前值：候选清单是异步填的，
+    // 启动时先给 select 赋过一次值，在选项不存在时并不会被记住
+    const current = desired === undefined ? select.value : desired;
     const head = select.options[0];
     const headHtml = head ? head.outerHTML : '<option value="">全部</option>';
     const labels = new Map(items.map(item => [String(item.value), String(item.label)]));
@@ -679,12 +706,12 @@
       fillFilterSelect('req-provider', providers.map(item => ({
         value: String(item?.id || ''),
         label: String(item?.label || item?.id || ''),
-      })));
+      })), savedFilters.provider);
       const models = Array.isArray(filters?.models) ? filters.models : [];
       fillFilterSelect('req-model', models.map(name => ({
         value: String(name || ''),
         label: String(name || ''),
-      })));
+      })), savedFilters.model);
     } catch (error) {
       console.warn('读取请求日志筛选清单失败，筛选项退化为「全部」:', error.message);
     }
@@ -877,6 +904,10 @@
     item.classList.toggle('active', item.dataset.range === range);
   });
 
+  // 状态下拉的选项是静态 HTML，存过的值直接回填（提供商 / 模型两个下拉
+  // 的候选是异步的，走 fillFilterSelect 的 desired 入参，见 savedFilters）
+  if ($('req-status')) $('req-status').value = savedFilters.status;
+
   $('req-range')?.addEventListener('click', event => {
     const item = event.target.closest('.seg-item[data-range]');
     if (!item) return;
@@ -921,9 +952,14 @@
   });
 
   // 四个筛选维度都会换掉结果集，页码必须回到第 1 页，否则停的位置没有意义。
-  // 三个下拉共用一条绑定（它们的语义完全一致，逐个写三遍只会多三处要同步的地方）
+  // 三个下拉共用一条绑定（它们的语义完全一致，逐个写三遍只会多三处要同步的地方）；
+  // 变更同时落盘 —— 下次启动按同一批条件恢复（见 savedFilters 的说明）。
   for (const id of ['req-status', 'req-provider', 'req-model']) {
-    $(id)?.addEventListener('change', () => load({ resetPage: true }));
+    $(id)?.addEventListener('change', () => {
+      savedFilters[id.slice(4)] = $(id)?.value || '';
+      window.wbFilterMemory?.save(FILTERS_KEY, savedFilters);
+      void load({ resetPage: true });
+    });
   }
 
   // ─── 详情弹窗（上游原始报文）─────────────────

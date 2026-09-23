@@ -1,10 +1,12 @@
-//! GET/PUT /api/retry —— 请求重试设置（两档次数 / 间隔）。
+//! GET/PUT /api/retry —— 请求重试设置（两档次数 / 间隔 / 不重试错误码）。
 //!
 //! 转发层对上游瞬时错误与传输层失败做「睡一个间隔再原样重发」，次数分两档
 //! （见 `config.rs` 的说明）：
 //!   - `retryCount`：在**同一个账号**上原地重发几次；
 //!   - `retryCrossProviderCount`：失败后**最多换几个账号**再试（按账号计，
 //!     不分家 —— 键名是旧措辞，语义见 `config.rs`）。
+//!   - `noRetryStatusCodes`：指定上游状态码不重试（命中即原样收尾，见
+//!     `config.rs` 的 `KEY_RETRY_NO_RETRY_CODES`）。
 //!
 //! 循环见 `upstream::provider_loop`（原地重发在 `send_with_retry`，
 //! 换账号在 `attempt_queue`）。
@@ -23,7 +25,8 @@ use serde_json::{json, Value};
 
 use crate::server::config::{
     self, RetryPatch, RetrySettings, KEY_RETRY_ACCOUNT_SWITCH_COUNT, KEY_RETRY_COUNT,
-    KEY_RETRY_INTERVAL_SECONDS, RETRY_MAX_COUNT, RETRY_MAX_INTERVAL_SECONDS, RETRY_MIN_COUNT,
+    KEY_RETRY_INTERVAL_SECONDS, KEY_RETRY_NO_RETRY_CODES, RETRY_CODE_MAX, RETRY_CODE_MIN,
+    RETRY_MAX_COUNT, RETRY_MAX_INTERVAL_SECONDS, RETRY_MAX_NO_RETRY_CODES, RETRY_MIN_COUNT,
     RETRY_MIN_INTERVAL_SECONDS,
 };
 use crate::server::errors;
@@ -36,7 +39,7 @@ pub async fn get_retry(State(_state): State<ServerState>) -> Response {
     ok_json(retry_json(config::retry_settings()))
 }
 
-/// PUT /api/retry —— body `{retryCount?, retryCrossProviderCount?, retryIntervalSeconds?}`
+/// PUT /api/retry —— body `{retryCount?, retryCrossProviderCount?, retryIntervalSeconds?, noRetryStatusCodes?}`
 ///
 /// 允许部分字段（未出现的项保持原值，null 同义）。校验通过后：写 config.json
 /// → 返回**生效后**的值（前端直接用响应刷新界面，不必再 GET 一次）。
@@ -93,6 +96,21 @@ pub async fn put_retry(State(_state): State<ServerState>, body: Bytes) -> Respon
         }
     }
 
+    // ── 第四项：指定错误码不重试（整数数组）─────────────────────
+    // 与三个数字项同一顺序：先整单校验，非法整体不落盘。允许 null / 缺省
+    // （这一项不动）；空数组是合法值 = 清空名单（任何错误都照常重试）。
+    if let Some(value) = object.get(KEY_RETRY_NO_RETRY_CODES) {
+        if !value.is_null() {
+            match parse_no_retry_codes(value) {
+                Ok(codes) => {
+                    patch.no_retry_codes = Some(codes);
+                    updated = true;
+                }
+                Err(message) => return errors::management_error(400, message),
+            }
+        }
+    }
+
     if updated && !config::set_retry(patch) {
         // 写盘失败：内存快照已更新（本次运行仍生效），但重启后会回到旧值 ——
         // 必须让用户知道，否则「改了设置重启又变回去」会被当成玄学问题
@@ -104,15 +122,18 @@ pub async fn put_retry(State(_state): State<ServerState>, body: Bytes) -> Respon
         logging::log(
             "[Config]",
             &format!(
-                "请求重试已更新: 同一账号 {} 次 / 最多换 {} 个账号 / 间隔 {} 秒",
-                settings.count, settings.account_switch_count, settings.interval_seconds
+                "请求重试已更新: 同一账号 {} 次 / 最多换 {} 个账号 / 间隔 {} 秒 / 不重试错误码 {:?}",
+                settings.count,
+                settings.account_switch_count,
+                settings.interval_seconds,
+                settings.no_retry_codes,
             ),
         );
     }
     ok_json(retry_json(settings))
 }
 
-/// 三个重试字段的响应体（GET 与 PUT 共用，键名与 config.rs 的常量必然一致 ——
+/// 四个重试字段的响应体（GET 与 PUT 共用，键名与 config.rs 的常量必然一致 ——
 /// 与 `stats_api::retention_json` 同一手法：键用常量标识符而不是手写字符串）。
 ///
 /// 键名对前端是**契约**（`settings-panel.js` 的 RETRY_FIELDS 逐字对齐），
@@ -122,7 +143,46 @@ fn retry_json(settings: RetrySettings) -> Value {
         KEY_RETRY_COUNT: settings.count,
         KEY_RETRY_ACCOUNT_SWITCH_COUNT: settings.account_switch_count,
         KEY_RETRY_INTERVAL_SECONDS: settings.interval_seconds,
+        KEY_RETRY_NO_RETRY_CODES: settings.no_retry_codes.to_vec(),
     })
+}
+
+/// 「指定错误码不重试」的校验：整数数组、每项 100–599、最多 50 项。
+///
+/// 与 `parse_bounded_int` 同一口径：只认 JSON 数字（含 `402.0` 这种整值浮点）；
+/// 有一项非法就整单 400（不悄悄剔除），写盘前排序去重，落库形态规整。
+fn parse_no_retry_codes(value: &Value) -> Result<Vec<u16>, String> {
+    let Some(items) = value.as_array() else {
+        return Err(format!("{KEY_RETRY_NO_RETRY_CODES} 必须是状态码数组（收到: {value}）"));
+    };
+    if items.len() > RETRY_MAX_NO_RETRY_CODES {
+        return Err(format!(
+            "{KEY_RETRY_NO_RETRY_CODES} 最多 {} 项（收到 {} 项）",
+            RETRY_MAX_NO_RETRY_CODES,
+            items.len()
+        ));
+    }
+    let mut codes = Vec::with_capacity(items.len());
+    for item in items {
+        let number = item.as_i64().or_else(|| {
+            item.as_f64()
+                .filter(|raw| raw.is_finite() && raw.fract() == 0.0)
+                .map(|raw| raw as i64)
+        });
+        let Some(number) = number else {
+            return Err(format!("{KEY_RETRY_NO_RETRY_CODES} 里必须是整数（收到: {item}）"));
+        };
+        if !(i64::from(RETRY_CODE_MIN)..=i64::from(RETRY_CODE_MAX)).contains(&number) {
+            return Err(format!(
+                "{KEY_RETRY_NO_RETRY_CODES} 里的值必须是 {}-{} 的 HTTP 状态码（收到: {number}）",
+                RETRY_CODE_MIN, RETRY_CODE_MAX
+            ));
+        }
+        codes.push(number as u16);
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    Ok(codes)
 }
 
 /// 单个数字字段的校验：必须是 min–max 的整数，否则给出可读的 400 文案。

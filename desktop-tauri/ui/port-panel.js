@@ -72,21 +72,20 @@
   }
 
   /**
-   * 侧栏底部的两条状态：常驻显示，不必切到「网关」页也能确认服务是否在监听。
+   * 侧栏底部的网关状态：常驻显示，不必切到「网关」页也能确认服务是否在监听。
    *
-   * ── 为什么是两条（别再合并回一条）──────────────────────────
+   * ── 只说网关进程这一件事（别把账号可用性并回来）──────────────
    * 这里原本只有一行「网关运行中 / 网关未就绪」，判据却取自 /api/session 的
    * upstreamConfigured（= 有没有可用账号）。于是「没有账号」被说成了
    * 「网关没就绪」—— 而能渲染出这句话本身就证明网关正在监听（否则这个请求
    * 根本发不出去）。同一个字段在顶栏又叫「未登录」，用户无从判断哪个坏了。
    *
-   * 现在拆成两个互相独立的事实，判据各自独立：
-   *   · 网关进程：`backendStatus.ready`，来自壳侧 is_ready 探测，
-   *     **不依赖本页面能否调通管理 API**（端口冲突时管理 API 全打不通，
-   *     那时 state 是 null，只有这份状态能说清发生了什么）
-   *   · 可用账号：`state.accounts.currentAccountId`，全局队列队首，
-   *     **与转发口径一致**（health.upstreamConfigured 收窄到 workbuddy 一家，
-   *     只登录小浣熊的机器上会误报红）
+   * 因此判据只认 `backendStatus.ready`（壳侧 is_ready 探测），
+   * **不依赖本页面能否调通管理 API**（端口冲突时管理 API 全打不通，
+   * 那时 state 是 null，只有这份状态能说清发生了什么）。
+   * 曾经还有第二条「可用账号」（`state.accounts.currentAccountId`，全局队列
+   * 队首、与转发口径一致），已按需求移除 —— 有没有账号、几个可用，
+   * 账号页的筛选器与状态列是权威出处。
    */
   function renderSidebarStatus() {
     const dot = $('sidebar-status-dot');
@@ -94,7 +93,7 @@
     if (!dot || !text) return;
     const port = portLabel();
 
-    // ── 第一条：网关进程 ──
+    // ── 网关进程 ──
     const ready = backendStatus?.ready;
     const failure = backendStatus?.failure;
     if (ready === true) {
@@ -120,31 +119,6 @@
         : ready === true
           ? `本地网关正在监听 ${gatewayBase}，可直接调用 OpenAI 兼容接口`
           : '正在确认网关是否已就绪';
-    }
-
-    // ── 第二条：可用账号 ──
-    const accountDot = $('sidebar-account-dot');
-    const accountText = $('sidebar-account-text');
-    if (accountDot && accountText) {
-      const current = window.wbApp?.getState?.();
-      const accounts = current?.accounts?.accounts || [];
-      const enabled = accounts.filter(item => item.enabled !== false).length;
-      if (!current) {
-        // 状态还没到（首屏）或管理 API 打不通 —— 打不通的原因由上面那条说
-        accountDot.className = 'live off';
-        accountText.textContent = '正在检查…';
-        accountText.title = '';
-      } else if (current.accounts?.currentAccountId) {
-        accountDot.className = 'live';
-        accountText.textContent = `${enabled} 个账号可用`;
-        accountText.title = '转发请求时会在这些账号之间按优先级轮换';
-      } else {
-        accountDot.className = 'live bad';
-        accountText.textContent = '无可用账号';
-        accountText.title = accounts.length
-          ? '账号都被禁用或缺少凭证，转发会失败 —— 去「账号」页启用一个'
-          : '还没有登录任何账号 —— 去「账号」页添加一个';
-      }
     }
 
     // ── 出口：有端口冲突时才露出 ──

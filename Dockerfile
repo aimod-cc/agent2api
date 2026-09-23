@@ -27,12 +27,19 @@ WORKDIR /build
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
 
-# TARGETARCH 由 buildx/BuildKit 自动注入：amd64 / arm64。arm64 需要
-# aarch64 的 C 工具链（rusqlite bundled 编 SQLite 的 C 源码用）与链接器。
+# TARGETARCH 由 buildx/BuildKit 自动注入：amd64 / arm64。注意它是预置 ARG，
+# 只在 FROM 行可用；阶段内的 RUN 要用必须在此重新声明，否则恒为空串 ——
+# arm64 分支永远不会命中，交叉编译退化成原生 amd64 编译，arm64 镜像里
+# 装进 amd64 二进制（v2.7.1 及之前线上镜像的 bug 根因）。
+ARG TARGETARCH
+# arm64 需要 aarch64 的 C 工具链与 glibc 开发头文件（rusqlite bundled 的
+# SQLite、ring 的 C/汇编源码用）。注意 libc6-dev-arm64-cross 只是
+# gcc-aarch64-linux-gnu 的 Recommends，--no-install-recommends 下必须显式
+# 列出，否则交叉编译 C 代码时会捡宿主的 /usr/include 头文件报错。
 RUN if [ "$TARGETARCH" = "arm64" ]; then \
         rustup target add aarch64-unknown-linux-gnu \
         && apt-get update \
-        && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu \
+        && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 # cc / cargo 按这两个变量找交叉工具（只在 arm64 构建时生效；amd64 原生用默认值）

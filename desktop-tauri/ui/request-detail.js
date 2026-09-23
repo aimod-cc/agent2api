@@ -178,17 +178,24 @@
   /**
    * 模型：与列表 modelCell 同口径 —— 下游 / 上游双名齐全且不同时两行
    * （⬆️ 上游实际收到的 / ⬇️ 下游请求的），否则回落 `model` 单行。
+   * 推理等级同列表：模型名带 `(等级)` 后缀（上游 = 实际发出的等级，
+   * 下游 = 客户端指定的等级；空串 = 无等级随行，与旧行为一致）。
    */
   function modelHtml(row) {
     const client = String(row.clientModel ?? '').trim();
     const upstream = String(row.upstreamModel ?? '').trim();
     const shown = String(row.model ?? '').trim();
+    const clientLevel = String(row.clientReasoning ?? '').trim();
+    const upstreamLevel = String(row.upstreamReasoning ?? '').trim();
+    const tag = (name, level) => (level ? `${name}(${level})` : name);
     if (!client || !upstream || upstream.toLowerCase() === client.toLowerCase()) {
-      return esc(shown || '—');
+      return esc(tag(shown, upstreamLevel || clientLevel) || '—');
     }
+    const upText = tag(upstream, upstreamLevel);
+    const downText = tag(client, clientLevel);
     return `<span class="req-detail-model-split">`
-      + `<span title="转发到上游的模型名">⬆️ ${esc(upstream)}</span>`
-      + `<span class="sub" title="下游请求的模型名">⬇️ ${esc(client)}</span></span>`;
+      + `<span title="转发到上游的模型：${esc(upText)}">⬆️ ${esc(upText)}</span>`
+      + `<span class="sub" title="下游请求的模型：${esc(downText)}">⬇️ ${esc(downText)}</span></span>`;
   }
 
   /** 令牌一行：输入 / 输出 / 总计 / 缓存读（0 显示 0 —— 与列表的数字格式一致） */

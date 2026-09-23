@@ -110,7 +110,7 @@ mod reasoning;
 
 pub use reasoning::{
     effort_rank as reasoning_rank, is_thinking_off as reasoning_is_off,
-    normalize as normalize_reasoning, REASONING_LEVELS,
+    normalize as normalize_reasoning, read_client_level, REASONING_LEVELS,
 };
 
 /// 一条映射：把上游模型（`provider` × `target`）以对外名 `alias` 暴露给下游。

@@ -88,12 +88,15 @@
     return tags.join('');
   }
 
-  /** 版本徽章：国内 / 国际，配色固定（类名 edition-* 被样式与批量徽章共用） */
-  function editionCell(account) {
+  /**
+   * 版本后缀：国内 / 国际。只返回文字，由调用方拼进提供商徽章 ——
+   * 「WorkBuddy 国际版」是**一枚**徽章，与 AutoClaw 那种「名字自带版本」的
+   * 家看起来是同一种标签，不再两枚并排。无版本的家园地返回空串。
+   */
+  function editionSuffix(account) {
     if (!providerFeatures(providerOf(account)).edition) return '';
     const edition = accountEdition(account);
-    const label = account.editionLabel || (edition === 'intl' ? '国际版' : '国内版');
-    return `<span class="badge edition-${edition}">${esc(label)}</span>`;
+    return account.editionLabel || (edition === 'intl' ? '国际版' : '国内版');
   }
 
   // ─── 行内面板（积分 / 签到） ─────────────────
@@ -346,7 +349,7 @@
     // 标签与面板
     statusTag,
     accountTags,
-    editionCell,
+    editionSuffix,
     moreMenuHtml,
     limitPanelHtml,
     formatResetText,

@@ -163,7 +163,12 @@ pub fn is_reserved(key: &str) -> bool {
 /// 进行中行永远收不了尾（界面上表现为「只有进行中、没有结束」）。
 /// v3 的 DDL 本身是 `CREATE TABLE IF NOT EXISTS`，重跑一次零成本：
 /// 表在就跳过，表不在就补上，两种库的最终形态一致。
-pub const SCHEMA_VERSION: i64 = 4;
+///
+/// ── 版本 5：requests 表加两个思考等级列 ──────────────────────
+/// 见 [`V5_SCHEMA`]。与 v2 完全同一形态（既有表加列，ALTER 两连）：
+/// v1 的 DDL 不回填，两条建库路径（全新库跑 1→5 / 老库从任意版本升上来）
+/// 得到同一份表结构。
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -439,6 +444,28 @@ CREATE TABLE IF NOT EXISTS request_raw (
 /// `CREATE TABLE IF NOT EXISTS` 保证对正常库（表已在）是无操作。
 const V4_SCHEMA: &str = V3_SCHEMA;
 
+/// 版本 5：`requests` 补两列（schema v5）—— 思考等级的双端记录。
+///
+/// ── 存什么 ──────────────────────────────────────────────────
+///   - `client_reasoning`：**下游请求体里**客户端显式指定的思考等级
+///     （识别键与归一规则见 `core::model_rules::reasoning::read_client_level`）。
+///     空串 = 客户端没指定（或该行来自还没有此列的旧版本）。
+///   - `upstream_reasoning`：**实际随上游请求发出**的思考等级（映射绑定注入的
+///     或客户端显式指定且承载家接等级的最终值；采集点在
+///     `core::upstream::payload::send_body`，与 `upstream_model` 同点同时）。
+///     空串 = 没有等级随行（客户端没指定且映射没绑、承载家不接等级、
+///     「关闭思考」档、或一次都没发出去）。
+///
+/// 两列都 NOT NULL DEFAULT ''：与 `client_model` / `upstream_model` 同一套
+/// 「键恒在、空串就是没有」的存储契约，前端不必处理第三种「键缺失」形态。
+/// 加列走 ALTER 的全部理由（为什么不动 v1 的 DDL、为什么不能写
+/// IF NOT EXISTS、幂等靠版本号）与 [`V2_SCHEMA`] 完全相同，不赘述。
+const V5_SCHEMA: &str = "
+-- ── requests 补两列（schema v5）──────────────────────────────
+ALTER TABLE requests ADD COLUMN client_reasoning TEXT NOT NULL DEFAULT '';
+ALTER TABLE requests ADD COLUMN upstream_reasoning TEXT NOT NULL DEFAULT '';
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -494,6 +521,8 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         3 => conn.execute_batch(V3_SCHEMA),
         // v4：重放 v3 建表（修复「版本号 3、表却不在」的存量库，见 SCHEMA_VERSION）
         4 => conn.execute_batch(V4_SCHEMA),
+        // v5：requests 补两个思考等级列（下游指定 / 上游实际发出，见 V5_SCHEMA）
+        5 => conn.execute_batch(V5_SCHEMA),
         _ => Ok(()),
     }
 }

@@ -396,14 +396,14 @@ impl RequestStats {
     /// 同 id 已有进行中行时跳过（重复调用不产生第二行）；库不可用时静默跳过
     /// —— 这一步的失败只是「列表里晚一点才看到这条请求」，与统计整体的
     /// 「少记不影响请求」同一取向。
-    pub fn record_started(&self, id: &str, ts: i64, model: &str, client_model: &str) {
+    pub fn record_started(&self, id: &str, ts: i64, model: &str, client_model: &str, client_reasoning: &str) {
         if id.is_empty() {
             return;
         }
         let guard = self.guard();
         let _ = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
-            sql::insert_started_request(&tx, id, ts, model, client_model)?;
+            sql::insert_started_request(&tx, id, ts, model, client_model, client_reasoning)?;
             // 陈旧清理与插入同事务：僵尸行的判定时点与本次开始时点一致，
             // 中断也只影响「这次有没有清成」，不会留下半删状态
             sql::finish_stale_running(&tx, stale_cutoff(), now_ms())?;

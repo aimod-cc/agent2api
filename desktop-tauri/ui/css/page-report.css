@@ -202,6 +202,15 @@
   white-space: nowrap;
 }
 
+/* Top 账号行名字前的提供商徽章：与账号页「提供商」列同一枚（pbadge 的
+   样式住在 page-accounts-table.css，全局加载，这里只做行内适配）——
+   徽章比文字行盒高，基线对齐会显得下沉，改居中；右缘留一道与名字的间距。
+   名字过长被省略号截断时徽章完整保留，截的只是名字本身。 */
+.rank-row .name .pbadge {
+  margin-right: 6px;
+  vertical-align: middle;
+}
+
 /* 卡片铺满整行时（另一维没数据、被隐藏）给名字列更宽的上限。
    查询的是具名容器 rank，也就是卡片本身（见上面 .report-rank-grid > .panel）。 */
 @container rank (min-width: 700px) {

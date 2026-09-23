@@ -38,7 +38,7 @@
     supportsCheckin,
     checkedInToday,
     accountTags,
-    editionCell,
+    editionSuffix,
     formatResetText,
     activeLimits,
     limitPanelHtml,
@@ -49,6 +49,27 @@
   const PRIORITY_MIN = 0;
   const PRIORITY_MAX = 9999;
   const PRIORITY_DEFAULT = 100;
+
+  /**
+   * 账号名隐藏开关（表头「账号」旁边那颗眼睛）：打开后账号列的名字整体显示成
+   * 星号，截图 / 演示时不必逐个打码。这是「怎么看这张表」的偏好，与列宽同一档，
+   * 存 localStorage 跨次启动保留。
+   */
+  const NAMES_HIDDEN_KEY = 'workbuddy-desktop-accounts-names-hidden';
+  let namesHidden = localStorage.getItem(NAMES_HIDDEN_KEY) === '1';
+
+  /** 切换隐藏状态并落盘，返回切换后的值（点击处理用它触发整表重绘） */
+  function toggleNamesHidden() {
+    namesHidden = !namesHidden;
+    localStorage.setItem(NAMES_HIDDEN_KEY, namesHidden ? '1' : '0');
+    return namesHidden;
+  }
+
+  /**
+   * 星号掩码：按原名长度生成、4~12 个封顶 —— 完全不保长会把账号列压成短短一截，
+   * 与关闭时版式差得太多；封顶 12 则不让超长名字把星号串拉到撑破列宽。
+   */
+  const maskName = name => '*'.repeat(Math.min(Math.max(name.length, 4), 12));
 
   const clampPriority = value => Math.min(PRIORITY_MAX, Math.max(PRIORITY_MIN, Math.round(value)));
   const priorityOf = account => {
@@ -180,7 +201,7 @@
     })),
     // 挂载点是批量栏右侧的操作组（「批量操作 / 取消选择」那两颗）：齿轮插在最前，
     // 正好落在「批量操作」左边。放在这里而不是工具条右侧的操作组，是因为工具条
-    // 那组已经被「查询积分 / 全部签到 / 添加账号」占满，齿轮挤在它们前面时
+    // 那组已经被「查询余额 / 全部签到 / 添加账号」占满，齿轮挤在它们前面时
     // 会与三段筛选抢同一行的右端；批量栏这组按钮本就偏「对当前这张表做什么」，
     // 列设置（怎么看这张表）排头更顺。
     mount: () => document.querySelector('#batch-bar .batch-actions'),
@@ -196,6 +217,15 @@
     const columns = visibleColumns();
     const cells = columns.map((column, index) => {
       const hint = column.hint ? `<span class="th-hint">${esc(column.hint)}</span>` : '';
+      // 账号列的「隐藏账号名」眼睛：点一下名字整列变星号（处理在 accounts-view.js
+      // 的委托里，与本表「纯展示、不绑事件」的分工一致）。图标随状态换睁眼 / 闭眼，
+      // 隐藏生效时常亮主色 —— 「现在处于打码状态」不用悬停就能看出来。
+      const eye = column.key === 'account'
+        ? `<button class="name-eye${namesHidden ? ' on' : ''}" data-action="toggle-names"`
+          + ` title="${namesHidden ? '显示账号名' : '隐藏账号名（名字显示为星号）'}"`
+          + ` aria-label="${namesHidden ? '显示账号名' : '隐藏账号名'}"`
+          + ` aria-pressed="${namesHidden}">${window.wbIcons?.icon?.(namesHidden ? 'eyeOff' : 'eye', 13) || ''}</button>`
+        : '';
       // 把手不放勾选列（47px 宽，把手会压住复选框），也不放最后一列 ——
       // 它绝对定位在右缘（right: -4px），钉在表格右缘会顶出一条横向滚动条
       // （见模块头）。「哪一列在最后」是用户配置出来的，所以按渲染后的位置判。
@@ -210,7 +240,7 @@
       // data-col 是列的身份：列设置能换顺序，列宽（accounts-columns.js 的
       // columnAt）与它自己的 <col> 都靠这个属性认列，不再靠「第几个」。
       return `<th class="cell-${column.key} ta-${column.align}" data-col="${esc(column.key)}">`
-        + `<span class="th-label"${column.title ? ` title="${esc(column.title)}"` : ''}>${esc(column.label)}${hint}</span>${grip}</th>`;
+        + `<span class="th-label"${column.title ? ` title="${esc(column.title)}"` : ''}>${esc(column.label)}${hint}${eye}</span>${grip}</th>`;
     }).join('');
     return `<thead><tr>${cells}</tr></thead>`;
   }
@@ -300,17 +330,18 @@
   }
 
   /**
-   * 提供商：展示名 + 版本徽章，**默认同一行**，列宽不够才整块折行（flex-wrap，
-   * 见 .cell-provider .pv 的样式说明——折行是整块下移，badge 文字不会被截断）。
+   * 提供商：一枚徽章，带版本后缀（「WorkBuddy 国际版」）——与 AutoClaw 那种
+   * 「名字自带版本」的家同一种形态，不再提供商、版本两枚并排。列宽不够时
+   * 整块折行（flex-wrap，见 .cell-provider .pv 的样式说明）。
    * 徽章的配色按 provider id 生成（`p-<id>` 类），未登记的家在 CSS 里落到中性兜底
    * —— 加一家时不必改样式表，也不会显示成空白。
    */
   function providerCell(provider, account) {
-    const edition = providerFeatures(provider).edition ? editionCell(account) : '';
     const label = window.wbProviders?.labelOf?.(provider) || provider;
+    const edition = providerFeatures(provider).edition ? editionSuffix(account) : '';
+    const text = edition ? `${label} ${edition}` : label;
     return `<td class="cell-provider"><div class="pv">`
-      + `<span class="pbadge p-${esc(provider)}" title="提供商：${esc(label)}">${esc(label)}</span>`
-      + edition
+      + `<span class="pbadge p-${esc(provider)}" title="提供商：${esc(text)}">${esc(text)}</span>`
       + `</div></td>`;
   }
 
@@ -351,8 +382,11 @@
     // 明细行为空时整行不渲染：一个空的 .acct-sub 仍占一行行高（margin + line-height），
     // 在没有任何副标识的账号上会白留一道空隙，而它恰恰是「这行没什么可说的」那种账号
     const note = healthNote(account);
+    // 隐藏开关打开时名字整体变星号（掩码按原名取长，见 maskName 的说明）；
+    // 悬停提示里本来就没有名字（只有标识 / Token 尾号），照常保留
+    const shown = namesHidden ? maskName(name) : name;
     return `<td class="cell-account"><div class="acct-name"${title ? ` title="${esc(title)}"` : ''}>`
-      + `<span class="name">${esc(name)}</span></div>`
+      + `<span class="name">${esc(shown)}</span></div>`
       + (desktop ? `<div class="acct-sub">${desktop}</div>` : '')
       + note
       + '</td>';
@@ -759,6 +793,9 @@
     PRIORITY_DEFAULT,
     priorityOf,
     clampPriority,
+    // 账号名隐藏开关：状态在本模块（accountCell / headRowHtml 渲染时都要读），
+    // 切换入口给视图侧的点击委托调 —— 本模块不绑事件，见模块头的分工说明
+    toggleNamesHidden,
     captureEditing,
     restoreEditing,
   };

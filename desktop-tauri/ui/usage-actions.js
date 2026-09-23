@@ -170,7 +170,7 @@
   }
 
   /**
-   * 批量查询全部可查询账号的余额（工具条「查询积分」）。
+   * 批量查询全部可查询账号的余额（工具条「查询余额」）。
    *
    * 目标集合只含「有余额概念 + 启用」：已禁用账号后端同样会跳过，
    * 界面若把它算进分母，播报的「已更新 N/M」会与真实条数对不上。
@@ -227,7 +227,7 @@
       toast(`余额查询失败：${message}`, 'err');
     } finally {
       usageBusy = false;
-      if (button) { button.disabled = false; button.textContent = '查询积分'; }
+      if (button) { button.disabled = false; button.textContent = '查询余额'; }
     }
   }
 

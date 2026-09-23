@@ -584,11 +584,12 @@ pub fn scheduled_settings() -> ScheduledSettings {
 ///
 /// 与 `retention_settings()` 同一取舍：转发层每个失败请求都要问一次
 /// 「还能重试几次、间隔多久」，而 `current()` 每次都会克隆整个 `raw` Map
-/// —— 热路径上没必要。读锁取一个 `Copy` 值即可。未初始化时给默认值。
+/// —— 热路径上没必要。读锁取一份快照克隆（错误码名单是 `Arc`，
+/// 克隆只付一次指针自增）。未初始化时给默认值。
 pub fn retry_settings() -> RetrySettings {
     if let Ok(guard) = CONFIG.read() {
         if let Some(config) = guard.as_ref() {
-            return config.retry;
+            return config.retry.clone();
         }
     }
     RetrySettings::default()
@@ -823,7 +824,7 @@ pub fn set_scheduled_task(
 /// 失败请求立刻用新值，后者保证写盘时不吃掉 config.json 里的其它字段。
 pub fn set_retry(patch: RetryPatch) -> bool {
     update(|config| {
-        let mut next = config.retry;
+        let mut next = config.retry.clone();
         if let Some(count) = patch.count {
             config.raw.insert(KEY_RETRY_COUNT.to_string(), Value::from(count));
             next.count = count;
@@ -839,6 +840,15 @@ pub fn set_retry(patch: RetryPatch) -> bool {
                 .raw
                 .insert(KEY_RETRY_INTERVAL_SECONDS.to_string(), Value::from(seconds));
             next.interval_seconds = seconds;
+        }
+        if let Some(codes) = &patch.no_retry_codes {
+            // raw 底稿存「与 API 契约同形」的整数数组（写侧已校验排序去重，
+            // 这里原样落库）；内存快照换成新的共享切片
+            let array: Vec<Value> = codes.iter().map(|code| Value::from(*code)).collect();
+            config
+                .raw
+                .insert(KEY_RETRY_NO_RETRY_CODES.to_string(), Value::Array(array));
+            next.no_retry_codes = std::sync::Arc::from(codes.as_slice());
         }
         config.retry = next;
     })

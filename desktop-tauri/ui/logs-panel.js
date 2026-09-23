@@ -108,6 +108,25 @@
   /** 档位的当前值以内存为准：localStorage 只负责跨次启动恢复 */
   let eventRange = readRange(EVENT_RANGE_KEY);
 
+  /**
+   * 级别 / 分类 / 关键词三个筛选的跨次启动记忆（空串 = 「全部」）。
+   * 级别与关键词的控件是静态 HTML，启动直接回填；分类的选项由后端字典
+   * 异步填充（fillCategories），回填挂在它填完之后 —— 提前赋值在选项
+   * 不存在时不会被 select 记住。
+   */
+  const FILTERS_KEY = 'workbuddy-desktop-logs-filters';
+  const savedFilters = window.wbFilterMemory
+    ? window.wbFilterMemory.load(FILTERS_KEY, { level: '', category: '', keyword: '' })
+    : { level: '', category: '', keyword: '' };
+  /** 把三个筛选控件的当前值整体落盘（change / 防抖后的关键词输入共用） */
+  function persistFilters() {
+    window.wbFilterMemory?.save(FILTERS_KEY, {
+      level: $('logs-level')?.value || '',
+      category: $('logs-category')?.value || '',
+      keyword: $('logs-keyword')?.value.trim() || '',
+    });
+  }
+
   // ─── 时间档位 → start 参数 ────────────────────
 
   /** 取某个时刻的本地零点毫秒值 */
@@ -253,6 +272,10 @@
       select.appendChild(option);
     }
     select.dataset.filled = '1';
+    // 选项就位后补一次记忆恢复：启动时的那次赋值发生在选项存在之前，
+    // select 并不会记住它。存过的分类已不存在（后端字典变了）时赋值无效，
+    // 自然落回「全部分类」，不必特判
+    if (savedFilters.category) select.value = savedFilters.category;
   }
 
   // ─── 加载 ──────────────────────────────────
@@ -507,14 +530,20 @@
   $('btn-logs-export').addEventListener('click', exportLogs);
   $('btn-logs-prev').addEventListener('click', () => gotoPage(page - 1));
   $('btn-logs-next').addEventListener('click', () => gotoPage(page + 1));
-  // 级别 / 分类 / 关键词都会换掉结果集，页码必须回到第 1 页，否则停的位置没有意义
-  $('logs-level').addEventListener('change', () => load({ resetPage: true }));
-  $('logs-category').addEventListener('change', () => load({ resetPage: true }));
-  // 关键词输入做防抖，避免每敲一个字就打一次接口
+  // 恢复上次的筛选：级别与关键词的控件是静态 HTML，直接回填；
+  // 分类的选项是异步填的，回填在 fillCategories 末尾补（见那里的说明）
+  if ($('logs-level')) $('logs-level').value = savedFilters.level;
+  if ($('logs-keyword')) $('logs-keyword').value = savedFilters.keyword;
+
+  // 级别 / 分类 / 关键词都会换掉结果集，页码必须回到第 1 页，否则停的位置没有意义。
+  // 变更同时落盘，下次启动按同一批条件恢复（见 savedFilters 的说明）
+  $('logs-level').addEventListener('change', () => { persistFilters(); load({ resetPage: true }); });
+  $('logs-category').addEventListener('change', () => { persistFilters(); load({ resetPage: true }); });
+  // 关键词输入做防抖，避免每敲一个字就打一次接口；落盘跟着防抖走
   let keywordTimer = null;
   $('logs-keyword').addEventListener('input', () => {
     clearTimeout(keywordTimer);
-    keywordTimer = setTimeout(() => load({ resetPage: true }), 300);
+    keywordTimer = setTimeout(() => { persistFilters(); load({ resetPage: true }); }, 300);
   });
   /**
    * 从别的页面跳转过来并把分类筛选预设好（定时任务页「查看签到日志」按钮用）。
@@ -537,6 +566,7 @@
     // 程序赋值不派发 change，增强外壳（select.js）的触发器文本也不会自己跟上
     // —— 与 models-panel.js 设置映射弹窗下拉后显式 sync 同一个既有模式
     window.wbSelect?.sync?.(select);
+    persistFilters();
     page = 1;
     await load({ resetPage: true });
     window.wbApp?.showPage?.('logs', { persist: true });

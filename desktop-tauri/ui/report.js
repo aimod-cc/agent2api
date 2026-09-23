@@ -278,8 +278,31 @@
       emptyText: '所选范围内还没有账号用量',
       // 账号名可能重复（两家都能叫「默认」），id 才是身份 —— tooltip 里带上它
       tipName: item => (item.id ? `${item.label}（${item.id}）` : item.label),
+      // 名字前面带一枚提供商徽章（与账号页「提供商」列同一枚，见 providerBadgeHtml）
+      badge: true,
     },
   };
+
+  /**
+   * 账号行的提供商徽章：与账号页「提供商」列**同一枚**（`pbadge p-<provider>`，
+   * 配色按 provider id 生成，带 edition 的家把「国际版 / 国内版」拼在同一枚里，
+   * 判定走 accounts-model 的 editionSuffix —— 与 providerCell 一份口径）。
+   *
+   * 查的是**当前账号表**（wbApp 的状态）：报表聚合里没有 provider 维度，
+   * 后端补这一维要动记账链路且历史数据没有；而「这条账号属于哪家」
+   * 现查现用就是准确的。账号已删除（聚合里的历史名字快照）或后端的
+   * 「未知账号」行查不到归属，不给徽章 —— 空壳徽章是噪音。
+   */
+  function providerBadgeHtml(accountId) {
+    const account = (window.wbApp?.getState?.()?.accounts?.accounts || [])
+      .find(item => item?.id === accountId);
+    const provider = typeof account?.provider === 'string' ? account.provider : '';
+    if (!provider) return '';
+    const label = window.wbProviders?.labelOf?.(provider) || provider;
+    const suffix = window.wbAccountsModel?.editionSuffix?.(account) || '';
+    const text = suffix ? `${label} ${suffix}` : label;
+    return `<span class="pbadge p-${esc(provider)}" title="提供商：${esc(text)}">${esc(text)}</span>`;
+  }
 
   /**
    * 一组排行行 → HTML（只讲 Token 用量，见上「为什么这一维只看 Token」）。
@@ -326,8 +349,10 @@
       // 条宽用百分比：容器宽度变化时条跟着伸缩，不必像 SVG 那样量宽度重绘。
       // 气泡只讲用量：读数 + 占比，与格里看到的两列同源（不给成功率，见板块头）
       const tip = `${full}：${text} tokens · 占 ${percent.toFixed(1)}%`;
+      // 账号行的名字前面放一枚提供商徽章（providers 卡没有这一项）
+      const badge = config.badge ? providerBadgeHtml(item.id) : '';
       return `<div class="rank-row" data-tip="${esc(tip)}">
-          <span class="name" title="${esc(full)}">${esc(name)}</span>
+          <span class="name" title="${esc(full)}">${badge}${esc(name)}</span>
           <span class="track"><span class="bar" style="width:${percent.toFixed(1)}%"></span></span>
           <span class="num" title="${esc(`${text} tokens`)}">${esc(text)}</span>
           <span class="pct">${percent.toFixed(1)}%</span>

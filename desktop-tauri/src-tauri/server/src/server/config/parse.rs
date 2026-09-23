@@ -211,7 +211,7 @@ pub(super) fn scheduled_from(map: &Map<String, Value>) -> ScheduledSettings {
     }
 }
 
-// ─── 请求重试设置的解析（retryCount / retryCrossProviderCount / retryIntervalSeconds）──
+// ─── 请求重试设置的解析（retryCount / retryCrossProviderCount / retryIntervalSeconds / noRetryStatusCodes）──
 
 /// 由原始 JSON 解析请求重试设置（缺字段各自用默认值）
 pub(super) fn retry_from(map: &Map<String, Value>) -> RetrySettings {
@@ -238,7 +238,42 @@ pub(super) fn retry_from(map: &Map<String, Value>) -> RetrySettings {
             RETRY_MIN_INTERVAL_SECONDS,
             RETRY_MAX_INTERVAL_SECONDS,
         ),
+        no_retry_codes: no_retry_codes_field(map, KEY_RETRY_NO_RETRY_CODES),
     }
+}
+
+/// 「指定错误码不重试」名单的解析。
+///
+/// ── 各形态的落点 ────────────────────────────────────────────
+///   - 键缺失 / 不是数组 → **默认名单**（[402]）：配置从没写过这一项是常态，
+///     默认值就该在这时出现；整体写坏（手改成了字符串）与「没配过」无法区分，
+///     按同一口径处理（回落默认，见模块头）。
+///   - 空数组 → **空名单**：这是用户的明确选择（任何错误都照常重试），
+///     必须与「没配过」区分开。
+///   - 数组里的垃圾项（非整数 / 越出 100–599）→ **丢弃该项**：接口写入侧
+///     已整单校验（400），能到这里的坏项只来自手改库，跳过比整单回落默认
+///     更接近手改者的本意。排序去重：判定只问 contains，顺序无意义，
+///     存一份规整形态让手改过的 config.json 也保持可读。
+fn no_retry_codes_field(map: &Map<String, Value>, key: &str) -> std::sync::Arc<[u16]> {
+    let Some(Value::Array(items)) = map.get(key) else {
+        return std::sync::Arc::from(DEFAULT_NO_RETRY_CODES);
+    };
+    let mut codes: Vec<u16> = items
+        .iter()
+        .filter_map(|item| {
+            let number = item.as_i64().or_else(|| {
+                item.as_f64()
+                    .filter(|raw| raw.is_finite() && raw.fract() == 0.0)
+                    .map(|raw| raw as i64)
+            });
+            u16::try_from(number?)
+                .ok()
+                .filter(|code| (RETRY_CODE_MIN..=RETRY_CODE_MAX).contains(code))
+        })
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    std::sync::Arc::from(codes)
 }
 
 // ─── 历史路由优先级（providerRoute，只读，供账号迁移）───────────

@@ -2,6 +2,8 @@
 
 [简体中文](./README.md) | **English**
 
+This project is also open-sourced on Gitee: [gitee.com/aimodcc/agent2api](https://gitee.com/aimodcc/agent2api)
+
 Wraps the login state of several AI desktop clients into a local **OpenAI-compatible API gateway**, exposing a single `base_url` and bundling multi-provider account management, model management (enable / disable / delete / alias), content redaction, egress proxying and request reporting — plus a ready-to-run Tauri desktop app. Any OpenAI client that accepts a custom `base_url` can call these providers' model quota through `http://127.0.0.1:3065/v1` — no API key, no client source changes needed.
 
 ```

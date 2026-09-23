@@ -64,6 +64,18 @@
       + '<path d="M12 19V5"/><path d="m6 11 6-6 6 6"/></g>',
 
     /**
+     * 账号名隐私开关的两枚眼睛（账号表「账号」表头的显隐按钮）。
+     * 几何沿用 Feather 的 eye / eye-off：睁眼是轮廓 + 瞳孔，闭眼是斜杠 + 裂开的轮廓，
+     * 两枚共用同一外轮廓弧线，切换时只有斜杠与缺口出现 / 消失，不觉得是换了一个图标。
+     * 与箭头同一手法：stroke 画、粗细 1.8（显示 13px 时约 1px，与表头 10.5px 小字相称）。
+     */
+    eye: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></g>',
+    eyeOff: '<g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+      + '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>'
+      + '<path d="m1 1 22 22"/></g>',
+
+    /**
      * 品牌标：应用图标本体（蓝底圆角方块 + 白色双向箭头）。
      *
      * 几何照搬 build/make-icon.mjs —— 那里画在 1024 画布上，这里按同一比例

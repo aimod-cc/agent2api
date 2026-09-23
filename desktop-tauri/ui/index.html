@@ -59,7 +59,7 @@
       <nav class="nav" id="nav">
         <div class="nav-group-label">运行状态</div>
         <button class="nav-item active" data-page="overview" data-icon="overview"><span class="ico"></span><span class="label">报表</span></button>
-        <button class="nav-item" data-page="accounts" data-icon="accounts"><span class="ico"></span><span class="label">账号</span><span class="count muted" id="nav-count-accounts">0</span></button>
+        <button class="nav-item" data-page="accounts" data-icon="accounts"><span class="ico"></span><span class="label">账号</span></button>
 
         <div class="nav-group-label">转发能力</div>
         <button class="nav-item" data-page="gateway" data-icon="gateway"><span class="ico"></span><span class="label">模型管理</span></button>
@@ -80,26 +80,14 @@
 
       <div class="sidebar-foot">
         <!-- 网关状态：常驻显示，不必切到「网关」页也能确认服务是否在监听。
-
-             ── 为什么是两条而不是一条 ──────────────────────────
-             这里原本只有一行「网关运行中 / 网关未就绪」，判据却取自
-             /api/session 的 upstreamConfigured（= 有没有可用账号）。于是
-             「没有账号」被说成了「网关没就绪」—— 而能渲染出这句话本身就
-             证明网关正在监听（否则这个请求根本发不出去）。同一个字段在顶栏
-             又叫「未登录」，用户无从判断到底哪个坏了。
-
-             现在拆成两个互相独立的事实：
-               · 网关进程：进程在不在监听（判据来自壳侧，不依赖 HTTP 能否应答）
-               · 可用账号：转发时有没有账号可用（判据 = 全局队列队首，与转发口径一致）
-             两者可以任意组合：没账号不影响网关监听，端口被占也不影响账号存在。 -->
+             只说**网关进程**这一件事（进程在不在监听，判据来自壳侧，
+             不依赖 HTTP 能否应答）。曾经还有第二条「可用账号」，与它拆成
+             两个独立事实；账号那行已按需求移除 —— 有没有账号、几个可用，
+             账号页的筛选器与状态列本来就是权威出处。 -->
         <div class="sidebar-status" id="sidebar-status" title="本地网关监听状态">
           <div class="status-line">
             <span class="live" id="sidebar-status-dot"></span>
             <span class="txt" id="sidebar-status-text">正在检查…</span>
-          </div>
-          <div class="status-line">
-            <span class="live" id="sidebar-account-dot"></span>
-            <span class="txt" id="sidebar-account-text">正在检查…</span>
           </div>
           <!-- 异常时的出口：只在出现端口冲突时露出（见 app.js）。
                两个按钮的显隐条件不同：「结束占用进程」在端口被别的进程占着时给，
@@ -323,7 +311,7 @@
               </div>
 
               <div class="actions">
-                <button id="btn-query-usage">查询积分</button>
+                <button id="btn-query-usage">查询余额</button>
                 <button id="btn-checkin-all">全部签到</button>
                 <button id="btn-manage-custom-providers" title="管理自定义提供商：模型清单与映射、编辑、删除">自定义提供商</button>
                 <button id="btn-add-account-2" class="primary">添加账号</button>
@@ -785,7 +773,7 @@
                 <section class="panel">
                   <div class="panel-head">
                     <h2>请求重试</h2>
-                    <span class="tip-q" data-tip="请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11128 敏感词拦截），网关会等一段间隔后再发一次。次数分两档，管的是两件事：①「同一账号重试次数」在同一账号上原地重发几次 —— 一般是提示词被上游拦截、或链路瞬时抖动，等一会儿重发往往就好了；②「切换账号重试次数」这份请求最多再换几个账号试 —— 首发的那个账号不算，每换一个扣一次，不分是不是同一家（换到同一家的下一个账号也算一次），换满还失败就把错误返回给客户端。两项都设为 0 表示失败不重试、直接报错。注意账号级限额（429）不占这里的换号次数 —— 那类失败走「冷却该账号并换下一个账号」的降级，与这里的重试是两条路。"></span>
+                    <span class="tip-q" data-tip="请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11128 敏感词拦截），网关会等一段间隔后再发一次。次数分两档，管的是两件事：①「同一账号重试次数」在同一账号上原地重发几次 —— 一般是提示词被上游拦截、或链路瞬时抖动，等一会儿重发往往就好了；②「切换账号重试次数」这份请求最多再换几个账号试 —— 首发的那个账号不算，每换一个扣一次，不分是不是同一家（换到同一家的下一个账号也算一次），换满还失败就把错误返回给客户端。两项都设为 0 表示失败不重试、直接报错。注意账号级限额（429）不占这里的换号次数 —— 那类失败走「冷却该账号并换下一个账号」的降级，与这里的重试是两条路。另有「指定错误码不重试」名单（默认 402）：命中名单的上游状态码不再原地重发、也不换账号，错误直接返回给客户端。"></span>
                     <span id="retry-badge" class="badge">检测中…</span>
                     <div class="head-actions">
                       <button id="btn-retry-refresh">刷新</button>
@@ -816,6 +804,19 @@
                           <span class="unit">秒</span>
                         </span>
                         <div class="hint">两次重试之间的等待时间，两项共用，可填 0–300 秒。</div>
+                      </div>
+                      <!-- 指定错误码不重试：GitHub Topics 同款标签输入 ——
+                           回车添加一枚、点 × 删除，控件本体（.tag-input）由
+                           settings-panel.js 渲染与读写（值来自 /api/retry）。 -->
+                      <div class="retention-row">
+                        <label for="settings-retry-no-codes-input">指定错误码不重试</label>
+                        <div class="retention-input">
+                          <div class="tag-input" id="settings-retry-no-codes">
+                            <input type="text" id="settings-retry-no-codes-input" class="tag-input-field"
+                                   placeholder="输入状态码，回车添加" inputmode="numeric" autocomplete="off">
+                          </div>
+                        </div>
+                        <div class="hint">命中这些上游状态码的失败不再重试（同一账号不重发、也不换账号，错误原样返回给客户端）。输入 100–599 的状态码后回车添加，点 × 或退格删除；默认 402（积分不足）。清空全部表示任何错误都照常重试。</div>
                       </div>
                     </div>
                     <div class="hint retention-note">保存后立即生效，不用重启；次数用尽仍失败时，错误原样返回给客户端。</div>
@@ -1616,11 +1617,14 @@
        它只依赖 workbuddyDesktop 与 icons.js，不依赖 wbApp；排在 app.js
        之后仅为读取顺序整洁。 -->
   <script src="titlebar.js"></script>
-  <!-- 端口状态面板：侧栏那两条状态（网关进程 / 可用账号）与端口冲突时的两个出口。
+  <!-- 端口状态面板：侧栏的网关进程状态与端口冲突时的两个出口。
        必须在 app.js 之后：它通过 window.wbApp 读状态、调 toast 与顶栏重画
        （app.js 的 render() 也会反过来委托它，用可选链，谁先就绪都不报错）。 -->
   <script src="port-panel.js"></script>
   <script src="clipboard.js"></script>
+  <!-- 筛选条件的跨次启动记忆（账号 / 模型 / 请求日志 / 日志四页共用的读写工具）：
+       纯 localStorage 存取、无任何依赖，排在所有消费面板之前即可。 -->
+  <script src="filter-memory.js"></script>
   <!-- 网关页「可用模型」区块（渲染 / 本地过滤 / 刷新模型清单按钮）：必须排在
        app.js 之后 —— 它在加载期就从 window.wbApp 取 esc / toast / getState
        （跨文件引用走 wbApp 是本项目的既有约定，见 usage-panel.js）；

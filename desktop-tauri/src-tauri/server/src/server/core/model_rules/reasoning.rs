@@ -86,6 +86,16 @@
 //!
 //! 生效与不生效都走 `logging::verbose` 记一行（`upstream::payload` 里），
 //! 于是「我绑了为什么不生效」在详细日志里能直接读到答案。
+//!
+//! ── 下游等级的读取（`read_client_level`）────────────────────
+//! 它服务的是**请求日志显示**（下游模型名旁的 `(等级)`），不是转发决策 ——
+//! 转发时「客户端指定了什么」永远由各家适配器自己的 resolver 读（上面的
+//! 第 3 条），本函数只是把两家取值链的并集做成一个展示侧读取器。它**绝不能**
+//! 被拿来判断「客户端有没有指定」去做转发分支：两家的链有细节差异
+//! （CatPaw 的空串会让上游 400、Qoder 的取值链到第一个存在的键为止），
+//! 用并集做判断迟早与某家的真实行为分叉。
+
+use serde_json::Value;
 
 /// 思考等级的通用候选表（**照抄 OmniProxy 的 `GENERIC_REASONING_LEVELS`**）。
 ///
@@ -164,4 +174,40 @@ pub fn effort_rank(level: &str) -> Option<usize> {
     EFFORT_LEVELS
         .iter()
         .position(|known| trimmed.eq_ignore_ascii_case(known))
+}
+
+/// 从**下游请求体**里读客户端显式指定的思考等级（请求日志「下游等级」的展示
+/// 读取器；`None` = 请求体里没有可显示的档位）。
+///
+/// ── 取值链是两家的**并集**，按优先级排列 ─────────────────────
+/// `reasoning_effort` → `reasoningEffort` → `effort`（CatPaw 的三键）→
+/// `reasoning`（Qoder 的键；对象形态取 `effort` 子键 —— responses API 的
+/// `reasoning: {"effort": …}` 也是这个形状）→ `thinking`（Qoder 的键）。
+/// 值必须是字符串才算档位：布尔（开/关思考）、anthropic 式的 thinking 对象
+/// 都没有「档位字符串」可显示，跳过。
+///
+/// ── 为什么它只服务显示、不参与转发 ──────────────────────────
+/// 见模块头最后一条。两家的真实取值链细节不同（CatPaw 三键、Qoder 三键、
+/// 到第一个存在的键为止），并集链只是「展示上尽量认出客户端写了什么」的
+/// 尽力而为；转发行为的唯一事实来源永远是各家 resolver。归一复用
+/// [`normalize`]（trim、非空、≤32 字符）：与映射绑定同一条规矩，超长的
+/// 自定义值同样不显示。
+pub fn read_client_level(body: &Value) -> Option<String> {
+    for key in ["reasoning_effort", "reasoningEffort", "effort", "reasoning", "thinking"] {
+        match body.get(key) {
+            Some(Value::String(text)) => return normalize(text),
+            // responses API 的对象形态：reasoning: { effort: "high" }
+            // 对象里没有字符串 effort 时继续试后面的键
+            Some(Value::Object(object)) if key == "reasoning" => {
+                if let Some(Value::String(effort)) = object.get("effort") {
+                    if let Some(level) = normalize(effort) {
+                        return Some(level);
+                    }
+                }
+            }
+            // null / 布尔 / 数字 / 其它对象不构成「档位」，继续后面的键
+            _ => {}
+        }
+    }
+    None
 }

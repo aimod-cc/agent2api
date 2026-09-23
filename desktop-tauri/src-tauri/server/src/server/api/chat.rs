@@ -80,7 +80,7 @@ pub async fn chat_completions(
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(&state, started_at, "", &error);
+        record_early_failure(&state, started_at, "", "", &error);
         return error.payload_response();
     };
     // ② messages 必须是数组
@@ -91,7 +91,8 @@ pub async fn chat_completions(
     {
         let error = GatewayError::bad_request("缺少 messages 数组");
         let model = model_field_text(&payload);
-        record_early_failure(&state, started_at, &model, &error);
+        let reasoning = pipeline::client_reasoning_of(&payload);
+        record_early_failure(&state, started_at, &model, &reasoning, &error);
         return error.payload_response();
     }
 
@@ -113,10 +114,19 @@ pub async fn chat_completions(
     //    请求日志的「下游模型」显示的是客户端发来的名字，不是解析后的。
     //    第三参是这把 Key 的可用模型白名单（None = 不限制）
     let client_model = model_field_text(&payload);
+    // 下游等级与下游模型名同一时机采集（payload 被就地改写前；改写只动 model，
+    // 两边前后一致，见 client_reasoning_of 的说明）
+    let client_reasoning = pipeline::client_reasoning_of(&payload);
     let requested_model = match pipeline::resolve_model(&state, &mut payload, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &model_field_text(&payload), &error);
+            record_early_failure(
+                &state,
+                started_at,
+                &model_field_text(&payload),
+                &client_reasoning,
+                &error,
+            );
             return error.payload_response();
         }
     };
@@ -142,7 +152,13 @@ pub async fn chat_completions(
     let telemetry_id = telemetry.snapshot().id;
     state
         .request_stats()
-        .record_started(&telemetry_id, started_at, &requested_model, &client_model);
+        .record_started(
+            &telemetry_id,
+            started_at,
+            &requested_model,
+            &client_model,
+            &client_reasoning,
+        );
     // 在途回写：选路一定就把「谁在承载」、发送体一定稿就把「上游真名」写进这条
     // 进行中行（连同尝试链、首响、脱敏命中）—— 列表页 1 秒轮询，于是这些读数在
     // 转发期间就能看到，不必等收尾。接线在这里、core 只持有闭包，理由见
@@ -181,6 +197,7 @@ pub async fn chat_completions(
                 started_at,
                 model: requested_model.clone(),
                 client_model: client_model.clone(),
+                client_reasoning: client_reasoning.clone(),
                 status: i64::from(status.as_u16()),
                 // 请求侧正文已抄好；响应侧由 RecordingStream 在流结束时定稿
                 raw_request,
@@ -209,6 +226,7 @@ pub async fn chat_completions(
                     started_at,
                     model: requested_model.clone(),
                     client_model: client_model.clone(),
+                    client_reasoning: client_reasoning.clone(),
                     status: 200,
                     raw_request,
                     raw_response,
@@ -233,6 +251,7 @@ pub async fn chat_completions(
                     started_at,
                     model: requested_model.clone(),
                     client_model: client_model.clone(),
+                    client_reasoning: client_reasoning.clone(),
                     status,
                     // 请求侧正文照存（失败请求的请求体同样是排障材料）；
                     // 响应体由网关自己生成（error 摘要已在明细里），不另存

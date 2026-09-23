@@ -202,6 +202,18 @@ impl ProviderAdapter for CatPawAdapter {
         }
     }
 
+    /// 从发送体读随行的思考等级：复用 [`models::resolve_effort`] 本身。
+    ///
+    /// 它的取值链（`reasoning_effort` / `reasoningEffort` / `effort`）、小写归一
+    /// 与三档校验就是本家转发时对档位做的**全部**处理 —— 所以这里读出的值
+    /// 就是上游 `declarativeParams.effort` 将会收到的值，不需要第二份逻辑。
+    /// `Err`（客户端传了本家不认的档位）返回 None：那条请求随后会被
+    /// `prepare::prepare` 以 400 拒掉，上游从未收到任何档位，错误列会说清原因，
+    /// 等级列不预支一个「没发出去」的值。
+    fn outbound_reasoning(&self, body: &Value) -> Option<String> {
+        models::resolve_effort(body).ok().flatten()
+    }
+
     /// 取可用凭证（`X-Passport-Token` + `uid`），**含存在性校验**。
     ///
     /// `account_id` 为空表示「没有指定账号」：环境变量旁路（`CATPAW_COOKIE`）

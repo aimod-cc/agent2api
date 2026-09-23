@@ -56,7 +56,7 @@ fn parse_object(
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let Some(payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(state, started_at, "", &error);
+        record_early_failure(state, started_at, "", "", &error);
         logging::verbose("[Model]", &format!("← POST {path} 请求体不是 JSON 对象"));
         return Err(error.payload_response());
     };
@@ -119,6 +119,10 @@ pub async fn responses_endpoint(
     // 原始请求体留一份：回程要用它回显请求侧字段（instructions / tools / …），
     // 而下面会把 payload 改写成 Chat 形态
     let original = raw.clone();
+    // 下游等级与下游模型名同一时机采集（读客户端**原始**体：reasoning.effort
+    // 在协议翻译里会搬到 chat_body 的 reasoning_effort，值相同 —— 见
+    // client_reasoning_of 的说明）
+    let client_reasoning = pipeline::client_reasoning_of(&raw);
     let stream = raw.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     // 协议翻译（有状态字段在这里被拒）
@@ -126,7 +130,7 @@ pub async fn responses_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
             return error.payload_response();
         }
     };
@@ -136,7 +140,7 @@ pub async fn responses_endpoint(
         .unwrap_or(false)
     {
         let error = GatewayError::bad_request("input 必须能转换成对话消息");
-        record_early_failure(&state, started_at, "", &error);
+        record_early_failure(&state, started_at, "", &client_reasoning, &error);
         return error.payload_response();
     }
 
@@ -145,7 +149,7 @@ pub async fn responses_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
             return error.payload_response();
         }
     };
@@ -175,6 +179,7 @@ pub async fn responses_endpoint(
         started_at,
         &requested_model,
         &client_model,
+        &client_reasoning,
     );
     // 在途回写（与 /v1/chat/completions 同一处时点与理由，见
     // `pipeline::live_row_sink`）
@@ -200,6 +205,7 @@ pub async fn responses_endpoint(
         model: requested_model.clone(),
         // 下游原始名取自客户端原始请求体（转换前的 model 字段）
         client_model,
+        client_reasoning,
         status: 200,
         // 下游原始请求体：客户端发来的那一份（协议翻译前）。响应侧非流式
         // 在聚合完成后补，流式由 RecordingStream 在流结束时定稿
@@ -287,15 +293,18 @@ pub async fn messages_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), "", &error);
             return anthropic_error_response(&error);
         }
     };
-    // 第三参是这把 Key 的可用模型白名单（None = 不限制），与另两条入口同源
+    // 第三参是这把 Key 的可用模型白名单（None = 不限制），与另两条入口同源。
+    // 下游等级从**翻译后的 chat 体**读：Anthropic 的 thinking/output_config →
+    // reasoning_effort 是网关自己的映射（anthropic_effort），比通用并集链更准
+    let client_reasoning = pipeline::client_reasoning_of(&chat_body);
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
             return anthropic_error_response(&error);
         }
     };
@@ -324,6 +333,7 @@ pub async fn messages_endpoint(
         started_at,
         &requested_model,
         &client_model,
+        &client_reasoning,
     );
     // 在途回写（与 /v1/chat/completions 同一处时点与理由，见
     // `pipeline::live_row_sink`）
@@ -349,6 +359,7 @@ pub async fn messages_endpoint(
         model: requested_model.clone(),
         // 下游原始名取自客户端原始请求体（转换前的 model 字段）
         client_model,
+        client_reasoning,
         status: 200,
         // 下游原始请求体：客户端发来的那一份（协议翻译前）。响应侧非流式
         // 在聚合完成后补，流式由 RecordingStream 在流结束时定稿

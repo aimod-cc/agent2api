@@ -263,15 +263,6 @@
     renderBatchBar(accounts(), lastVisibleIds);
   }
 
-  /** 导航上的账号数徽标（总数：这是「我总共有几个登录态」，与家数无关） */
-  function renderNavCount() {
-    const all = accounts();
-    const badge = $('nav-count-accounts');
-    if (!badge) return;
-    badge.textContent = String(all.length);
-    badge.classList.toggle('muted', all.length === 0);
-  }
-
   /** 清掉已删除账号的本地缓存（缓存本体在 usage-actions.js，展开态在本文件） */
   function refreshCaches(validIds) {
     actions.refreshCaches(validIds);
@@ -572,6 +563,14 @@
       }
       closeMoreMenu();
 
+      // 表头那颗眼睛：切换「账号名显示为星号」，整表重绘一次到位
+      // （表头图标与每行的名字都随重绘换到新状态）
+      if (action === 'toggle-names') {
+        table.toggleNamesHidden();
+        render();
+        return;
+      }
+
       if (action === 'move-up' || action === 'move-down') {
         button.disabled = true;
         try {
@@ -593,7 +592,7 @@
         // 点「余额」按钮即展开明细；已展开时再点则收起（当成开关用）。
         // 这颗按钮本次改造从余额列挪进了操作列（见 accounts-table.js 的
         // actionsCell），但**这里一行都不用改** —— 委托靠 data-action 匹配，
-        // 与它渲染在哪一格无关。批量那颗「查询积分」走的是
+        // 与它渲染在哪一格无关。批量那颗「查询余额」走的是
         // usage-actions.js 的 queryAllUsage，两处的展开态判据是同一份
         // （openPanels，见那边「唯一判据来源」的说明）。
         const wasOpen = panelOpen(id, 'usage');
@@ -766,7 +765,6 @@
 
   window.wbAccountsView = {
     render,
-    renderNavCount,
     refreshCaches,
     openPanels: openPanelsFor,
     // 批量「开着没」的两个判据与「收起」入口一并导出：余额批量动作的那条链

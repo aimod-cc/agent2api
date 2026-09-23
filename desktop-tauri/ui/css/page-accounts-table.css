@@ -101,6 +101,26 @@
 .acct-table thead th .th-label { display: inline-flex; align-items: center; gap: 4px; }
 .acct-table thead th .th-hint { font-weight: 400; letter-spacing: 0; opacity: .7; }
 
+/* 表头的「隐藏账号名」眼睛（只在账号列出现）：一颗纯图标小按钮，贴在列名后面。
+   默认继承表头小字的灰色、不抢注意力；隐藏生效时常亮主色（.on）——
+   「整列此刻是打码状态」不用悬停就能看出来。 */
+.acct-table thead th .name-eye {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+.acct-table thead th .name-eye:hover { background: var(--surface-3); color: var(--text-2); }
+.acct-table thead th .name-eye.on,
+.acct-table thead th .name-eye.on:hover { color: var(--primary); }
+
 /* ─── 列宽拖动把手 ───
    把手本身的样式（.col-grip / body.col-resizing）已挪到 components.css ——
    模型管理、网关 Key、请求日志三张表共用同一枚把手，放在页面级文件里
@@ -219,24 +239,10 @@
 .pbadge.p-catpaw { background: var(--warn-soft); border-color: var(--warn-bd); color: var(--warn); }
 .pbadge.p-autoclaw { background: var(--intl-soft); border-color: var(--intl-bd); color: var(--intl); }
 
-/* 提供商列：徽章与版本竖排两行。
-   「WorkBuddy」「小浣熊」「CatPaw」这些展示名长度不可控，横排时后面还跟着一枚
-   「国内版」，两者相加必然超出列宽、名字被省略号砍成「Work…」——
-   而这一列正是整张表里唯一区分「换了一家」的线索，砍不得。
-   竖排后每个都独占整列宽度，两行的高度也与相邻账号列（名字 + 明细）相当。 */
-/* 提供商名与版本徽章**默认同一行**，列宽不够才整体折行（flex-wrap）——
-   曾经强制竖排（column），结果是「WorkBuddy」右边空着一整块、「国内版」
-   也掉到第二行，两枚徽章明明放得下。折行是整块下移，badge 内文字不会被截断。 */
+/* 提供商列：一枚徽章（「WorkBuddy 国际版」这类名字 + 版本拼在一枚里）。
+   .pv 仍保留 flex-wrap：自定义提供商的名字长度不可控，列宽放不下时整块折行，
+   徽章内文字不会被截断（徽章自身另有 ellipsis 兜底，单枚比整列还宽才触发）。 */
 .cell-provider .pv { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 4px; }
-.cell-provider .badge {
-  font-size: 10.5px;
-  padding-inline: 6px;
-  /* 优先保持内容宽度（放不下时整块换行），单枚比整列还宽才允许截断兜底 */
-  flex: 0 0 auto;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 
 /* ─── 账号列 ─── */
 
