@@ -225,6 +225,11 @@ impl AccountStore {
         } else if super::is_cline_family(&record.provider()) {
             // 两个池（`cline-free` / `cline-pass`）共用这一份公开形态
             self.to_cline_public_account(record)
+        } else if super::is_accio_family(&record.provider()) {
+            // 两个地区（`accio` / `accio-cn`）共用这一份公开形态：账号字段、
+            // 续期语义两地完全一致，差别只在登录站点与区域头（那是转发与
+            // 凭证层的事，公开形态不体现）
+            self.to_accio_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

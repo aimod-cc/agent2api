@@ -283,6 +283,11 @@ impl ServerState {
         if let Some(reason) = config_migration::pending_reason() {
             return Err(reason);
         }
+        // Accio 的 OAuth 回调要落在本机端口上，而授权地址由**适配器**拼
+        // （`ProviderAdapter::build_login_url` 是同步无参的，拿不到 ServerState）。
+        // 端口在进程生命周期内不变，这里写一次、之后只读 —— 与各家 models 的
+        // 进程级缓存同一手法（见 `providers::accio::oauth::set_loopback_port`）。
+        crate::server::core::providers::accio::oauth::set_loopback_port(port);
         let config_dir = config::config_dir();
         // 与 Node 版一致：verbose 由环境变量 AGENT2API_VERBOSE=1 打开
         // （旧名 WORKBUDDY_VERBOSE 仍可读，新名优先），

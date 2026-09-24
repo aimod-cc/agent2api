@@ -30,7 +30,7 @@ OpenAI 客户端 / 任意 SDK
 
 > **本项目仅供学习与交流使用。** 它通过本地反向代理复用你自己账号的登录态，这种「以非官方客户端形态转发」的方式可能不符合上游服务的用户协议，使用风险（含账号被风控、封禁）由使用者自行承担；禁止用于商业用途或绕过计费。详见[使用声明](#使用声明)与 [LICENSE](./LICENSE)。
 >
-> 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder）、Cline 及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
+> 本项目是个人用途的本地代理工具，与腾讯（WorkBuddy）、美团（CatPaw）、商汤（小浣熊）、智谱（AutoClaw/autoglm）、阿里巴巴（Qoder / Accio）、Cline 及其官方产品均无关；所有接口形态来自对各家桌面端通信的观察，上游随时可能调整。
 
 ---
 
@@ -51,7 +51,7 @@ OpenAI 客户端 / 任意 SDK
 从 Releases 下载安装包（NSIS，简体中文，默认装到 `C:\Program Files\Agent2API`，安装时需要管理员授权），安装后启动即可，**无需安装 Node 或任何其它运行时**。
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口；若检测到旧版本的数据目录或数据文件，会弹窗提示迁移，按指引操作即可。
-2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上）。
+2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline / Accio 国际版 / Accio 国内版），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上）。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。
@@ -122,7 +122,7 @@ services:
 
 从源码构建：克隆本仓库后 `docker compose up -d --build`（镜像里只有网关与面板，不含 Rust 工具链）。
 
-**网页端功能差异**（都源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；AutoClaw / CatPaw 网页登录的回调打本机端口，远程面板请改用粘贴凭证；小浣熊网页登录与「导入本机桌面端登录态」不可用（用填写凭证）。
+**网页端功能差异**（都源于「没有本机桌面客户端」）：网页登录（WorkBuddy / Qoder / Cline）、手机验证码、粘贴凭证完全可用；AutoClaw / CatPaw / Accio 网页登录的回调打本机端口，远程面板请改用粘贴凭证；小浣熊网页登录与「导入本机桌面端登录态」不可用（用填写凭证）。
 
 ---
 
@@ -196,10 +196,16 @@ agent2api/
 │  │  │  │  │  │                auth / cosy（COSY 签名与体编码）/ protocol（信封解码）/
 │  │  │  │  │  │                chat（会话式转发）/ stream / machine（PKCE 与机器标识）/
 │  │  │  │  │  │                credentials / refresh / models / balance
-│  │  │  │  │  └─ cline/        Cline：adapter（Bearer + 产品面头）/ credentials（workos: 前缀
-│  │  │  │  │                   + 桌面端登录态 + 姓名解析）/ login（WorkOS 设备授权）/
-│  │  │  │  │                   refresh（单飞续期）/ models（两额度池 + 默认映射种子）/
-│  │  │  │  │                   balance（credit 余额，微 credit ÷1e6）
+│  │  │  │  │  ├─ cline/        Cline：adapter（Bearer + 产品面头）/ credentials（workos: 前缀
+│  │  │  │  │  │                + 桌面端登录态 + 姓名解析）/ login（WorkOS 设备授权）/
+│  │  │  │  │  │                refresh（单飞续期）/ models（两额度池 + 默认映射种子）/
+│  │  │  │  │  │                balance（credit 余额，微 credit ÷1e6）
+│  │  │  │  │  └─ accio/        Accio（国际版 + 国内版两家）：endpoints（两地区与端点）/
+│  │  │  │  │                   credentials / auth / refresh（单飞续期）/
+│  │  │  │  │                   oauth（PKCE 网页登录 + loopback 回调）/
+│  │  │  │  │                   models（静态兜底 + /api/llm/config/v2）/
+│  │  │  │  │                   protocol（OpenAI ↔ ADK 的 Gemini 风格信封）/
+│  │  │  │  │                   chat（会话式转发）/ stream（ADK SSE 解包）/ balance
 │  │  │  │  ├─ upstream/        转发编排：全局账号队列循环（provider_loop）+ 发送体处理
 │  │  │  │  │                    （payload）+ SSE 透传/聚合 + usage 旁路提取
 │  │  │  │  ├─ account_store/   账号存储（全局优先级、限额冷却、各家添加与导入）
@@ -267,7 +273,7 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
 
 ### 仅供学习与交流
 
-本项目是一个用于学习 HTTP 反向代理、SSE 流式透传、多上游协议适配与桌面端打包（Tauri）等技术主题的实践项目，**仅供个人学习与研究使用**。它不是官方产品，与腾讯公司及 WorkBuddy / CodeBuddy、美团及 CatPaw、商汤及小浣熊、智谱及 AutoClaw / autoglm、阿里巴巴及 Qoder 均无任何关联，未获得其授权、认可或赞助。
+本项目是一个用于学习 HTTP 反向代理、SSE 流式透传、多上游协议适配与桌面端打包（Tauri）等技术主题的实践项目，**仅供个人学习与研究使用**。它不是官方产品，与腾讯公司及 WorkBuddy / CodeBuddy、美团及 CatPaw、商汤及小浣熊、智谱及 AutoClaw / autoglm、阿里巴巴及 Qoder / Accio 均无任何关联，未获得其授权、认可或赞助。
 
 ### 关于反向代理行为
 

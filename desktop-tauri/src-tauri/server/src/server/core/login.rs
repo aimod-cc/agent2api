@@ -27,6 +27,7 @@
 //! 任务完成后保留 10 分钟，清理在「取任务时顺手做过期检查」里完成，
 //! 不额外起后台定时器。
 
+mod accio;
 mod autoclaw;
 mod catpaw;
 mod qoder;

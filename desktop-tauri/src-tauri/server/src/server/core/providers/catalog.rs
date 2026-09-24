@@ -80,6 +80,16 @@ fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::cline::models::remote_refreshed(),
             super::cline::models::last_refreshed_at(),
         ),
+        // Accio 两个地区各有自己的目录缓存（上游按 `x-package-region` 给清单）：
+        // 两家任一刷过就算「有远程来源」，时间取两者里更近的那次
+        ProviderKind::Accio | ProviderKind::AccioCn => {
+            let region = super::accio::endpoints::Region::from_kind(kind)
+                .unwrap_or(super::accio::endpoints::Region::Global);
+            (
+                !super::accio::models::remote_models(region).is_empty(),
+                super::accio::models::last_refreshed_at(region),
+            )
+        }
     }
 }
 

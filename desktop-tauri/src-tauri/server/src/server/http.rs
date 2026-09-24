@@ -115,6 +115,15 @@ pub fn panel_router(state: ServerState) -> Router {
         .route(
             "/auth/callback-{vendor}",
             get(api::session::login_autoclaw_oauth_callback),
+        )
+        // Accio 网页登录的 loopback 回调：**浏览器 302 到这里**（授权页完成后
+        // 顶层导航到我们交给它的 return_url，查询串带 code / state）。
+        // 与上面 AutoClaw 那条同一形态、同一理由免鉴权；路径是我们自己定的
+        // （Accio 的 return_url 由发起方给，不必与官方客户端逐字同款），
+        // 见处理函数的说明。
+        .route(
+            "/auth/callback-accio",
+            get(api::session::login_accio_callback),
         );
 
     // 需鉴权：Node 版对这些路径都调用了 checkApiKey
