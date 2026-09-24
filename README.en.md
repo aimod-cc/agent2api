@@ -25,7 +25,7 @@ OpenAI client / any SDK
 
 > **This project is for learning and discussion only.** It reuses the login state of your own accounts through a local reverse proxy; forwarding requests in the shape of a non-official client may violate the upstream services' terms of service, and any risk (including rate limiting or account bans) is borne by the user. Commercial use and circumventing billing are prohibited. See [Usage Notice](#usage-notice) and [LICENSE](./LICENSE).
 >
-> This is a personal, local-purpose proxy tool. It is unaffiliated with Tencent (WorkBuddy), Meituan (CatPaw), SenseTime (Raccoon), Zhipu (AutoClaw/autoglm) or Alibaba (Qoder) and their official products; every interface shape comes from observing each vendor's desktop client traffic, and upstream may change at any time.
+> This is a personal, local-purpose proxy tool. It is unaffiliated with Tencent (WorkBuddy), Meituan (CatPaw), SenseTime (Raccoon), Zhipu (AutoClaw/autoglm) or Alibaba (Qoder / Accio) and their official products; every interface shape comes from observing each vendor's desktop client traffic, and upstream may change at any time.
 
 ---
 
@@ -46,7 +46,7 @@ OpenAI client / any SDK
 Download the installer from Releases (NSIS, Simplified Chinese, installs to `C:\Program Files\Agent2API` by default, and needs administrator approval during setup), then launch it — **no Node or any other runtime required**.
 
 1. First launch starts the local gateway (port 3065) inside the app process and opens the main window. If an older version's data directory or data files are found, a dialog walks you through the migration.
-2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw domestic / AutoClaw international / Qoder / Cline), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again).
+2. Click "Add account" on the Accounts page, pick a provider (WorkBuddy / Raccoon / CatPaw / AutoClaw domestic / AutoClaw international / Qoder / Cline / Accio international / Accio domestic), then sign in or fill in credentials using whatever that vendor supports: web login, SMS code, pasting credentials, or importing this machine's desktop login state (importing stores no token — the gateway follows once the desktop client signs in again).
 3. Set your OpenAI client's `base_url` to `http://127.0.0.1:3065/v1` and put anything in `api_key` (for example `sk-local`; the server does not check it while authentication is disabled).
 
 Closing the window only minimizes to the tray by default, and the gateway keeps forwarding in the background; to quit for real, right-click the tray icon and choose "Exit".
@@ -117,7 +117,7 @@ Environment variables (all optional — nothing needs to be preset):
 
 Build from source: clone the repo and run `docker compose up -d --build` (the image contains only the gateway and the panel, no Rust toolchain).
 
-**Web panel capability notes** (all differences stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; AutoClaw / CatPaw web-login callbacks hit the machine's own port, so from a remote panel use pasted credentials instead; Raccoon web login and "import desktop login state" are unavailable (use pasted credentials).
+**Web panel capability notes** (all differences stem from having no local desktop client): web login (WorkBuddy / Qoder / Cline), SMS codes and pasted credentials work fully; AutoClaw / CatPaw / Accio web-login callbacks hit the machine's own port, so from a remote panel use pasted credentials instead; Raccoon web login and "import desktop login state" are unavailable (use pasted credentials).
 
 ---
 
@@ -169,7 +169,7 @@ agent2api/
 │  │  │  ├─ request_stats.rs + request_stats/   Statistics time windows, writes, aggregation and trimming
 │  │  │  ├─ core/
 │  │  │  │  ├─ providers/        ★ Multi-provider layer (the heart of this work)
-│  │  │  │  │  ├─ mod.rs        ProviderKind (six vendors; Cline split into two pools) + PROVIDERS registry + id lookups
+│  │  │  │  │  ├─ mod.rs        ProviderKind (built-in vendors; Cline split into two pools, Accio into two regions) + PROVIDERS registry + id lookups
 │  │  │  │  │  ├─ adapter.rs    ProviderAdapter trait + adapter_for + implemented_kinds
 │  │  │  │  │  ├─ router.rs     Model name → set of candidate providers (aggregate catalog)
 │  │  │  │  │  ├─ catalog.rs    Aggregate model catalog (list merging / same-name dedup / availability)
@@ -185,10 +185,16 @@ agent2api/
 │  │  │  │  │  │                domains and identity) / adapter / credentials / refresh / crypto / models /
 │  │  │  │  │  │                balance / login (SMS code, domestic only) /
 │  │  │  │  │  │                oauth (Zai / Google web login, international only) / checkin (daily check-in task)
-│  │  │  │  │  └─ qoder/        Qoder: adapter / endpoints (both sites) / oauth (device authorization) /
-│  │  │  │  │                   auth / cosy (COSY signing and body encoding) / protocol (envelope decoding) /
-│  │  │  │  │                   chat (session-style forwarding) / stream / machine (PKCE and machine id) /
-│  │  │  │  │                   credentials / refresh / models / balance
+│  │  │  │  │  ├─ qoder/        Qoder: adapter / endpoints (both sites) / oauth (device authorization) /
+│  │  │  │  │  │                auth / cosy (COSY signing and body encoding) / protocol (envelope decoding) /
+│  │  │  │  │  │                chat (session-style forwarding) / stream / machine (PKCE and machine id) /
+│  │  │  │  │  │                credentials / refresh / models / balance
+│  │  │  │  │  └─ accio/        Accio (international + domestic): endpoints (both regions and paths) /
+│  │  │  │  │                   credentials / auth / refresh (single-flight) /
+│  │  │  │  │                   oauth (PKCE web login + loopback callback) /
+│  │  │  │  │                   models (static fallback + /api/llm/config/v2) /
+│  │  │  │  │                   protocol (OpenAI <-> ADK Gemini-style envelope) /
+│  │  │  │  │                   chat (session-style forwarding) / stream (ADK SSE unwrapping) / balance
 │  │  │  │  ├─ upstream/        Forwarding orchestration: global account queue loop (provider_loop) + request body
 │  │  │  │  │                   handling (payload) + SSE passthrough/aggregation + usage side-channel extraction
 │  │  │  │  ├─ account_store/   Account storage (global priority, rate-limit cooldown, per-vendor add and import)
@@ -256,7 +262,7 @@ The root project has no runtime dependencies; `package.json` only provides the s
 
 ### For learning and discussion only
 
-This project is a hands-on exercise in HTTP reverse proxying, SSE streaming passthrough, multi-upstream protocol adaptation and desktop packaging (Tauri), and is **for personal learning and research only**. It is not an official product and has no affiliation with, endorsement from or sponsorship by Tencent and WorkBuddy / CodeBuddy, Meituan and CatPaw, SenseTime and Raccoon, Zhipu and AutoClaw / autoglm, or Alibaba and Qoder.
+This project is a hands-on exercise in HTTP reverse proxying, SSE streaming passthrough, multi-upstream protocol adaptation and desktop packaging (Tauri), and is **for personal learning and research only**. It is not an official product and has no affiliation with, endorsement from or sponsorship by Tencent and WorkBuddy / CodeBuddy, Meituan and CatPaw, SenseTime and Raccoon, Zhipu and AutoClaw / autoglm, or Alibaba and Qoder / Accio.
 
 ### About the reverse-proxy behaviour
 

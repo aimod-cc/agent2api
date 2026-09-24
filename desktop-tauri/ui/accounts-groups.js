@@ -81,6 +81,11 @@
     qoder: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
     'cline-free': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
     'cline-pass': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
+    // Accio 两个地区：额度可查（上游只给用量百分比，见 providers::accio::balance）、
+    // **没有签到**（整家都没有那个活动）、有地区概念（edition 列）、标识落在
+    // userId、有效期与 workbuddy 同键名（毫秒时间戳）。两项都必须登记。
+    accio: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+    'accio-cn': { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
   };
 
   /**

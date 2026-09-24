@@ -86,9 +86,17 @@
 //!                 balance.rs     额度查询（credit 余额归一）
 //!                 adapter.rs     ProviderAdapter 实现（无状态，OpenAI 兼容，
 //!                                按池参数化）
+//!   accio/       Accio（`accio` 国际版 / `accio-cn` 国内版，同一份实现按地区
+//!                参数化）：账号管理 **+ 推理转发**。上游不是 OpenAI 协议而是
+//!                阿里 ADK 的 Gemini 风格信封（`/api/adk/llm/generateContent`，
+//!                SSE、token 在 body 里），因此 `is_stateful` 为 true。
+//!                子模块：endpoints / credentials / auth / refresh / oauth(PKCE)
+//!                / models（静态兜底 + `/api/llm/config/v2`）/ protocol /
+//!                stream / chat / balance
 //! 本文件仍然只做「身份与元数据」这一件事，不认识磁盘也不认识账号。
 
 pub mod adapter;
+pub mod accio;
 pub mod autoclaw;
 pub mod catalog;
 pub mod catpaw;
@@ -190,6 +198,30 @@ pub enum ProviderKind {
     /// `ClineAdapter` 持有一个 `Pool`，`adapter_for` 按 kind 给出该池的实例。
     /// 远程目录缓存也共用一份（`models::REMOTE`），两家只是按池过滤它。
     ClinePass,
+    /// Accio **国际版**（`accio`）。适配实现在 `accio/`：账号管理（PKCE 网页
+    /// 登录 / 粘贴凭证 / 续期 / 额度查询）**加推理转发**。
+    ///
+    /// ── 上游长什么样（从客户端安装包逆向，见 `accio/mod.rs` 的模块头）──
+    /// 推理不是 OpenAI 协议而是阿里 ADK 的 **Gemini 风格**信封
+    /// （`POST {gw}/api/adk/llm/generateContent?sg_k=<md5(requestId)>`，body 是
+    /// protobuf-JSON：`contents` / `system_instruction` / `tools`，鉴权靠 body 里的
+    /// `token` 字段），因此 `is_stateful()` 为 true —— 与 Qoder 同一处境
+    /// （「一次发送要适配器自己完成」）。
+    Accio,
+    /// Accio **国内版**（`accio-cn`）。与 [`ProviderKind::Accio`] 同一套协议、
+    /// 同一个网关（`phoenix-gw.alibaba.com`）、同一个 `client_id`（`accio-work`），
+    /// 只有**登录站点**（`www.accio-ai.com`）、文件域名与 `x-package-region`
+    /// 请求头不同（`CN` vs `GLOBAL`）。
+    ///
+    /// ── 为什么两个地区是两家 provider（与 AutoClaw / Cline 同一思路）──────
+    /// 把地区做成「一家的一个字段」的后果与那两次一模一样：地区成了**账号的
+    /// 属性**，界面上混在一起，而「哪个账号走哪个站点」在列表里看不出来。
+    /// 两家共用**一份实现**：`accio::adapter::AccioAdapter` 持有一个
+    /// `accio::endpoints::Region`，两个静态实例（`ACCIO_ADAPTER` /
+    /// `ACCIO_CN_ADAPTER`）由 `adapter_for` 按 kind 给出。
+    /// 地区 → provider 的互查在 `accio::endpoints::Region`（`kind` /
+    /// `provider_id` / `from_provider_id`），别处不要再写 `"accio-cn"` 字面量。
+    AccioCn,
 }
 
 /// 一个提供商的静态元数据。
@@ -225,6 +257,11 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "qoder", label: "Qoder" },
     ProviderMeta { id: "cline-free", label: "Cline Free" },
     ProviderMeta { id: "cline-pass", label: "Cline Pass" },
+    // Accio 两个地区**相邻**排列（与 AutoClaw 同一理由：同一条产品线的两个
+    // 版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
+    // 合并时同名模型先归谁家 —— 国际版在前（用户装的、默认用的是它）。
+    ProviderMeta { id: "accio", label: "Accio" },
+    ProviderMeta { id: "accio-cn", label: "Accio 国内版" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -293,6 +330,8 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "qoder" => Some(ProviderKind::Qoder),
         "cline-free" => Some(ProviderKind::ClineFree),
         "cline-pass" => Some(ProviderKind::ClinePass),
+        "accio" => Some(ProviderKind::Accio),
+        "accio-cn" => Some(ProviderKind::AccioCn),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -319,6 +358,8 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::Qoder => "qoder",
         ProviderKind::ClineFree => "cline-free",
         ProviderKind::ClinePass => "cline-pass",
+        ProviderKind::Accio => "accio",
+        ProviderKind::AccioCn => "accio-cn",
     }
 }
 

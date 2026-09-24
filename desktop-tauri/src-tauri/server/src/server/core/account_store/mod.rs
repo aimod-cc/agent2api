@@ -82,7 +82,10 @@
 //!   custom_accounts.rs   自定义提供商账号（`custom-` 前缀的 provider）：手动
 //!                添加（apiKey + baseUrl 覆盖项）、级联删除、custom 公开形态；
 //!                存储与校验的架构说明见 `core::custom_providers`
+//!   accio_accounts.rs    Accio 账号（两个地区各一家 provider）：添加（粘贴凭证 /
+//!                网页登录共用入口）、续期回写、公开形态（含 edition）
 
+pub mod accio_accounts;
 pub mod autoclaw_accounts;
 pub mod autoclaw_import;
 pub mod catpaw_accounts;
@@ -186,6 +189,16 @@ pub(crate) fn is_cline_family(provider_id: &str) -> bool {
 /// `id == "autoclaw"`（那种写法对国际版恒为假，是个不会报错的静默失配）。
 pub(crate) fn is_autoclaw_family(provider_id: &str) -> bool {
     provider_id == AUTOCLAW_PROVIDER_ID || provider_id == AUTOCLAW_INTL_PROVIDER_ID
+}
+
+/// 这个 provider 是不是 **Accio 系**（两个地区之一）。
+///
+/// 与 [`is_autoclaw_family`] 同一形态、同一理由：账号层有几处判断只关心
+/// 「是不是 Accio」（签到范围排除、公开形态），不关心哪个地区 ——
+/// 那些分支走本函数，于是加地区或改名时只改这里一处，而不是散在各文件里的
+/// `id == "accio"`（那种写法对国内版恒为假，是个不会报错的静默失配）。
+pub(crate) fn is_accio_family(provider_id: &str) -> bool {
+    crate::server::core::providers::accio::endpoints::Region::from_provider_id(provider_id).is_some()
 }
 
 /// 小浣熊 provider id（账号存储内部多处要用）。

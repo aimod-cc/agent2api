@@ -239,7 +239,11 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // AutoClaw 的两个地区**都列出来**：国内版目前走不到这条链（它没有
         // 网页登录），但一起列上是有意的 —— 只列国际版的话，哪天国内版也接上
         // OAuth 就会落进默认分支拿到 WorkBuddy 的白名单，而那个故障极难查。
-        "catpaw" | "qoder" | "cline-free" | "cline-pass" | "autoclaw" | "autoclaw-intl" => None,
+        // Accio 的两个地区也都不设限：登录站点（www.accio.com / www.accio-ai.com）
+        // 可能把用户交给不可穷举的身份提供方（Google / 阿里账号 / 手机验证码链路），
+        // 与 Qoder / AutoClaw 同一情形。
+        "catpaw" | "qoder" | "cline-free" | "cline-pass" | "autoclaw" | "autoclaw-intl"
+        | "accio" | "accio-cn" => None,
         _ => Some(WORKBUDDY_ALLOWED_HOSTS),
     }
 }
@@ -314,6 +318,11 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         "cline-free" => Ok("cline-free"),
         "cline-pass" => Ok("cline-pass"),
         "autoclaw" | "autoclaw-intl" => Ok("autoclaw-intl"),
+        // Accio 两个地区：授权地址由后端适配器拼（PKCE），壳侧只负责开窗口与
+        // 轮询 —— 与 workbuddy / Qoder 同一条路。地区由 **provider 本身**决定
+        // （两家 provider），壳侧不做归一。
+        "accio" => Ok("accio"),
+        "accio-cn" => Ok("accio-cn"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }

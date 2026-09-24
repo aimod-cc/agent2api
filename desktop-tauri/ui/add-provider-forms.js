@@ -305,6 +305,10 @@
     // 一项：池已经是身份，界面上不再有「额度池」那一级选择（见 add-cline.js
     // 的模块头）。两份配置的 provider id 各带池名，块 id 随之天然不撞。
     ...(window.wbClineAddForms || []),
+    // Accio 同理是两家（国际版 / 国内版各占一个 provider）：同一个网关、
+    // 同一套接口，只有登录站点与区域头不同（见 add-accio.js 的模块头与后端
+    // `providers::accio::endpoints::Region`）。
+    ...(window.wbAccioAddForms || []),
   ].filter(Boolean);
 
   /** 块 id / input id 的前缀与 provider id 同名，直接复用（少一处要维护的字段） */
@@ -937,6 +941,9 @@
     qoder: 'assets/providers/qoder.png',
     'cline-free': 'assets/providers/cline.png',
     'cline-pass': 'assets/providers/cline.png',
+    // Accio 两个地区共用一张（同一个客户端、同一个品牌标）
+    accio: 'assets/providers/accio.png',
+    'accio-cn': 'assets/providers/accio.png',
   };
 
   /** 卡片图标：收录过的家出真实图标，其余仍用首字母徽章。

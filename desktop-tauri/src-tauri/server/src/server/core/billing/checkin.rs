@@ -62,9 +62,24 @@ impl std::fmt::Display for CheckinError {
 }
 
 /// 国际版没有签到活动，签到相关操作一律排除该版本账号
-/// （Node: `account.edition !== 'intl'`）
+/// （Node: `account.edition !== 'intl'`）。
+///
+/// Accio 系（两个地区）**整家**也没有签到活动：上游客户端全包检索不到
+/// 「签到 / checkin / 每日任务」的任何痕迹（见 `providers::accio` 的模块头）。
+/// 它按 **provider id** 排除而不是 edition —— 两个地区都没有活动，而 provider
+/// 是落盘契约，不会因为凭证里多一个字段而改变判定。
+///
+/// 这一步是**必需的**：`checkin_for` 的分派 match 里，不在范围的家会落到
+/// workbuddy 那个兜底分支，拿 Accio 的账号去打腾讯的签到接口只会稳定报错。
 pub fn supports_checkin(account: &Value) -> bool {
-    account.get("edition").and_then(Value::as_str) != Some("intl")
+    if account.get("edition").and_then(Value::as_str) == Some("intl") {
+        return false;
+    }
+    let provider = account
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    !crate::server::core::account_store::is_accio_family(provider)
 }
 
 /// 账号的提供商 id（缺失时按默认 provider 处理，与账号存储的兜底口径一致）。

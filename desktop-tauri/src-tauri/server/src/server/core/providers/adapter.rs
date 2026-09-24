@@ -880,6 +880,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 参数化，见 `cline::adapter` 的模块头）
         ProviderKind::ClineFree => &super::cline::CLINE_FREE_ADAPTER,
         ProviderKind::ClinePass => &super::cline::CLINE_PASS_ADAPTER,
+        // Accio 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `accio::endpoints::Region` 与 `accio::mod` 的模块头）
+        ProviderKind::Accio => &super::accio::ACCIO_ADAPTER,
+        ProviderKind::AccioCn => &super::accio::ACCIO_CN_ADAPTER,
     }
 }
 
@@ -923,6 +927,9 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         ProviderKind::Qoder,
         ProviderKind::ClineFree,
         ProviderKind::ClinePass,
+        // Accio 的两个地区各算一家（同一份实现、两套账号与目录缓存）
+        ProviderKind::Accio,
+        ProviderKind::AccioCn,
     ]
 }
 

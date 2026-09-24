@@ -810,6 +810,44 @@ fn oauth_callback_page(status: i32, message: &str) -> Response {
         .into_response()
 }
 
+// ─── GET /auth/callback-accio ───────────────────────────────
+
+/// Accio 网页登录的回调（**浏览器 302 到这里**，查询串带 `code` / `state`）。
+///
+/// ── 为什么免鉴权（挂 public 组）──────────────────────────────
+/// 调用方是**用户的浏览器**（授权页完成后顶层导航到我们交给它的 return_url），
+/// 它当然没有我们的 API Key。与 CatPaw / AutoClaw 两条 loopback 回调同一取舍。
+///
+/// ── 路径是我们自己定的 ──────────────────────────────────────
+/// 与 AutoClaw 那条「必须与官方客户端逐字同款（Zai 按 host 校验白名单）」不同：
+/// Accio 的 `return_url` 由**发起方**随授权请求带上（桌面端自己用的是
+/// `http://127.0.0.1:<port>/auth/callback`），登录页只负责把 code/state 拼回来。
+/// 因此这里用 `callback-accio` 这个别家不会撞的名字。
+///
+/// ── 任务关联 ────────────────────────────────────────────────
+/// `state` 是我们生成的那个（拼在 return_url 前的授权 URL 里），登录页原样带回，
+/// 因此直接按它查任务表即可（与 AutoClaw 的「变体匹配 + 最近发起」不同）。
+///
+/// 响应是给人看的 HTML（浏览器停在这一页），不走 `ok_json` 那套信封。
+pub async fn login_accio_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    match state.login().finish_accio_login(&code, &task_state).await {
+        Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
+        Err(error) => {
+            // 这一轮已经作废：把 PKCE 的 pending 也丢掉，免得留在表里等超时
+            state.login().drop_accio_pending(&task_state);
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
+}
+
 // ─── POST /api/session/refresh ──────────────────────────────
 
 /// POST /api/session/refresh

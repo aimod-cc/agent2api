@@ -371,6 +371,32 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 Err(error) => Err(AccountStoreError::new(error.message, error.status_code)),
             }
         }
+        // Accio（两个地区）：粘贴 accessToken / refreshToken（`mode` 选地区，
+        // 缺省国际版）→ 手动添加。「网页登录」是另一条链路（适配器的
+        // `supports_web_login` 走 `/api/session/login/start` → OAuth 回调 →
+        // 同一个落账号入口 `add_accio_account`）。
+        //
+        // `importDesktop` 不提供：Accio 桌面端的登录态落在 Electron 会话与 OS
+        // 加密区里（没有 auth.json 那种稳定可读的文件形态），给了入口只会稳定
+        // 失败 —— 与 AutoClaw「一读一解密」不同，不要照抄那边。
+        Some(kind @ (crate::server::core::providers::ProviderKind::Accio
+            | crate::server::core::providers::ProviderKind::AccioCn)) => {
+            let region = crate::server::core::providers::accio::endpoints::Region::from_kind(kind)
+                .unwrap_or(crate::server::core::providers::accio::endpoints::Region::Global);
+            if import_desktop {
+                return management_error(
+                    400,
+                    format!(
+                        "Accio {}不支持导入桌面端登录态，请用「网页登录」或粘贴凭证添加账号",
+                        region.label()
+                    ),
+                );
+            }
+            match crate::server::core::providers::accio::auth::prepare_account(&payload).await {
+                Ok(credentials) => store.add_accio_account(&credentials, import_name, "manual"),
+                Err(error) => Err(AccountStoreError::new(error.message, error.status_code)),
+            }
+        }
         // Cline：粘贴 accessToken / refreshToken → 手动添加；
         // `importDesktop: true` → 导入桌面端实时登录态（记录不落 token，
         // 实时读 `~/.cline/data/settings/providers.json`）。
@@ -577,6 +603,18 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     }
     if state.store().qoder_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Qoder).await;
+    }
+    // Accio（两个地区）：走适配器的强制刷新（`POST /api/auth/refresh_token`，
+    // 结果按「比较再写」回写）。两个地区各查一次 —— 账号集合按 provider 隔离，
+    // 同一 id 不可能同时属于两家（撞 id 在存储层就报错了）。
+    for region in crate::server::core::providers::accio::endpoints::Region::ALL {
+        if state
+            .store()
+            .accio_account_record(&id, region.provider_id())
+            .is_some()
+        {
+            return refresh_provider_account(state, &id, region.kind()).await;
+        }
     }
     // Cline 账号：与 AutoClaw 同一取舍 —— **桌面端实时登录态不主动刷新**。
     // 网关与 Cline 客户端共用同一份 providers.json 里的 refreshToken，
