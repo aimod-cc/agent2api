@@ -74,6 +74,13 @@
    *  由 onShow 按第 1 步点的那张卡定死，块内没有切换控件。 */
   let mode = 'create';
   /**
+   * 本次进入新建模式所依据的预置项（wbPresetProviders 的目录条目，从预置卡
+   * 进来才有）。名称 / 协议 / Base URL 预填进表单（用户可改），而 quirks
+   * （上游特判）不进表单 —— 提交时原样随记录写入，见 submitCreate。
+   * 手动新建 / 加入已有模式下为 null。
+   */
+  let activePreset = null;
+  /**
    * 待选中的已有提供商 id：第 1 步点的是**某一家**自定义提供商的卡片，上下文里就带着
    * 那家的 id（见 add-provider-forms.js 的 pickProvider）。落到这里直接预选它 ——
    * 用户点的就是「给这家加账号」，不该再让他自己找一遍。
@@ -91,6 +98,12 @@
     create: { id: 'custom-create-button', text: '创建并添加账号', submit: () => submitCreate() },
     existing: { id: 'custom-existing-button', text: '添加账号', submit: () => submitExisting() },
   };
+  /**
+   * 「删除此提供商」按钮的 id：排在「添加账号」左边，只在「加入已有」模式出现。
+   * 不在 FOOT_ACTIONS 里 —— 那张表的每一项都是「提交」，而这是一条危险操作：
+   * 显隐条件、文案与点击处理都不一样，混进同一张表会让「提交」这个词失真。
+   */
+  const REMOVE_BUTTON_ID = 'custom-existing-remove';
 
   // ─── 块结构 ────────────────────────────────
 
@@ -173,6 +186,9 @@
       const button = $(spec.id);
       if (button) button.hidden = key !== mode;
     }
+    // 「删除此提供商」与「加入已有」模式同显隐：新建 / 预置预填模式没有可删的对象
+    const remove = $(REMOVE_BUTTON_ID);
+    if (remove) remove.hidden = mode !== 'existing';
   }
 
   /** 按当前列表重画「选择已有」的下拉（保留原选中项；空了退回第一项），
@@ -285,6 +301,12 @@
     const button = $(FOOT_ACTIONS.create.id);
     void runSubmit(button, async () => {
       const payload = { name, protocol, baseUrl };
+      // 预置家的上游特判随记录写入（转发层按这些字段修正请求，见
+      // preset-providers.js 的 quirks 说明与后端 custom_providers 的字段注释）
+      const quirks = activePreset?.quirks || {};
+      if (quirks.urlSuffix) payload.urlSuffix = quirks.urlSuffix;
+      if (quirks.headers && Object.keys(quirks.headers).length) payload.headers = { ...quirks.headers };
+      if (quirks.anthropicToolType) payload.anthropicToolType = quirks.anthropicToolType;
       if (apiKey) payload.apiKey = apiKey; // 留空 = 无鉴权上游，不进请求体
       try {
         const data = await providers.customRequest('POST', '/api/custom-providers', payload);
@@ -319,6 +341,34 @@
     });
   }
 
+  // ─── 删除（「加入已有」模式下的那一家的提供商级删除）───
+
+  /**
+   * 删除「加入已有」模式下选中的那一家（级联删账号）。
+   *
+   * 动作本身全在 `wbCustomProvidersUi.remove` 里 —— 二次确认（说明将级联删掉
+   * 多少账号）、POST /api/custom-providers/remove、刷新目录与账号列表都在那边，
+   * 与账号设置弹窗里的「删除提供商」共用同一条链；这里只回答两件事：删的是
+   * 哪一家（下拉当前值）、删完收什么尾（关弹窗 —— 名下账号连同删光，弹窗里
+   * 没有可停留的上下文了）。
+   *
+   * 与提交动作共用 `submitBusy` 互斥：确认框弹着的时候表单按钮不该还能提交。
+   */
+  async function removeExistingProvider() {
+    const providerId = $('custom-existing-select')?.value || '';
+    if (!providerId) { toast('请先选择一个自定义提供商', 'err'); return; }
+    const remover = window.wbCustomProvidersUi?.remove;
+    if (typeof remover !== 'function') { toast('删除功能不可用（脚本未就绪）', 'err'); return; }
+    if (submitBusy) return;
+    submitBusy = true;
+    try {
+      const removed = await remover(providerId);
+      if (removed) $('add-modal')?.classList.remove('open');
+    } finally {
+      submitBusy = false;
+    }
+  }
+
   // ─── 挂载 ─────────────────────────────────
 
   providers.refreshCustom(); // 提前拉一次目录：第一次打开弹窗时下拉就有数据
@@ -341,20 +391,59 @@
         button.addEventListener('click', () => spec.submit());
         actions?.appendChild(button);
       }
+      // 「删除此提供商」插在「添加账号」左边：危险操作不占主位（右侧那颗是
+      // 用户的主路径），但要在同一个上下文里够得着 —— 点的是某一家已建家的
+      // 卡片进来，那一屏说的就是「这一家」。样式与账号设置弹窗里的同名动作
+      // 一致（.danger + 级联删除说明在确认框里，见 removeExistingProvider）。
+      const removeButton = document.createElement('button');
+      removeButton.type = 'button';
+      removeButton.id = REMOVE_BUTTON_ID;
+      removeButton.className = 'danger';
+      removeButton.textContent = '删除此提供商';
+      removeButton.title = '级联删除名下全部账号，不可恢复';
+      removeButton.hidden = mode !== 'existing';
+      removeButton.addEventListener('click', () => { void removeExistingProvider(); });
+      const existingButton = $(FOOT_ACTIONS.existing.id);
+      if (existingButton?.parentElement) {
+        existingButton.parentElement.insertBefore(removeButton, existingButton);
+      } else {
+        actions?.appendChild(removeButton);
+      }
       $('custom-protocol-select')?.addEventListener('change', syncBaseHint);
       $('custom-existing-select')?.addEventListener('change', syncExistingSelect);
     },
     /**
      * 弹窗切到自定义块时回调。第 1 步点的是**哪一张卡**就落到哪种模式，不复用上一次：
      *   · 某一家自定义提供商的卡片 → 上下文带那家的 id → 「加入已有」并预选它；
-     *   · 「新建自定义提供商」那张卡 → 上下文里没有 id → 「新建」。
+     *   · 预置家卡片 → 上下文带 preset key → 「新建」并预填名称 / 协议 / Base URL；
+     *   · 「手动新建」那张卡 → 上下文里没有 id 也没有 preset → 「新建」（空白表单）。
      * 用户点的是哪张卡，就该看到哪种表单。
      */
     onShow(context) {
       const wanted = context?.providerId || '';
+      const presetKey = context?.preset || '';
       mode = wanted ? 'existing' : 'create';
       pendingPick = wanted;
+      // 预置项整体记下：名称 / 协议 / Base URL 预填进表单，quirks 留给提交时
+      // 随记录写入（它们不进表单 —— 是转发层的修正项，不是用户要逐条确认的配置）
+      activePreset = !wanted && presetKey
+        ? window.wbPresetProviders?.presetOf?.(presetKey) || null
+        : null;
       clearFootHint();
+      syncModeUi();
+      // 预置家：把目录项预填进新建表单（名称可改、协议可改）。预填放在 syncModeUi
+      // 之后 —— syncBaseHint 依赖协议下拉的当前值，先填协议再刷提示才是对的。
+      if (activePreset) {
+        const name = $('custom-name-input');
+        const protocol = $('custom-protocol-select');
+        const baseUrl = $('custom-baseurl-input');
+        if (name) name.value = activePreset.name || '';
+        if (protocol && activePreset.protocol) protocol.value = activePreset.protocol;
+        if (baseUrl) baseUrl.value = activePreset.baseUrl || '';
+        const hint = $('custom-baseurl-hint');
+        if (hint) hint.textContent = activePreset.hint || (activePreset.protocol === 'anthropic'
+          ? BASE_HINT_ANTHROPIC : BASE_HINT_OPENAI);
+      }
       syncModeUi();
       void providers.refreshCustom().then(syncModeUi);
     },

@@ -155,6 +155,7 @@ pub(crate) async fn forward(
         ));
     }
     // 翻译协议在这里分出去（凭证与基址已就绪；chat 路径继续往下走）
+    let quirks = ProviderQuirks::from_provider(&provider);
     if let Some(kind) = kind {
         return forward_translated(
             kind,
@@ -162,6 +163,7 @@ pub(crate) async fn forward(
             account_id,
             &credential.api_key,
             &base_url,
+            &quirks,
             body,
             proxy,
             stream,
@@ -171,7 +173,17 @@ pub(crate) async fn forward(
         )
         .await;
     }
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    // chat 透传出口：入口翻译（Anthropic / Responses）暂存的内部字段（`_wb_*`，
+    // 见 `protocol::mod` 的说明）绝不发上游 —— 严格校验的 OpenAI 兼容上游会拒绝
+    // 消息上的未知字段整轮 400。翻译分支（上方已 return）**不**剥：那些字段正是
+    // 出站翻译要消费的（cache_control / is_error / encrypted_content 的恢复源）。
+    let stripped = crate::server::core::protocol::strip_internal_fields(body);
+    let body: &Value = &stripped;
+    let url = format!(
+        "{}/chat/completions{}",
+        base_url.trim_end_matches('/'),
+        quirks.url_suffix
+    );
 
     // ── 请求体改写：模型名（映射 alias → 上游真名）+ 思考等级注入 ──────
     let requested = body
@@ -183,13 +195,14 @@ pub(crate) async fn forward(
     let (outbound, rewrite) = rewrite_body(body, provider_id, &requested);
     let payload = serde_json::to_string(&outbound)
         .map_err(|error| GatewayError::with_status(500, format!("请求体序列化失败: {error}")))?;
-    let headers = vec![
+    let mut headers = vec![
         (
             "Authorization".to_string(),
             format!("Bearer {}", credential.api_key),
         ),
         ("Content-Type".to_string(), "application/json".to_string()),
     ];
+    quirks.apply_to(&mut headers);
 
     logging::verbose(
         "[CustomProvider]",
@@ -274,6 +287,67 @@ impl OutboundKind {
     }
 }
 
+/// 提供商记录上的 **per-provider 特判**（`urlSuffix` / `headers` /
+/// `anthropicToolType`，形状见 `custom_providers` 的模块头）。
+///
+/// 这些字段由预置目录在创建时写入（参考实现 9Router 每家适配器里的修正：
+/// GLM / MiniMax 的 `?beta=true` 与 `Anthropic-Beta`、OpenRouter 的来源头、
+/// MiniMax 的工具 type 补齐），手写的家没有这三个键 —— 提取时缺省即「无特判」，
+/// 旧记录不用迁移。
+struct ProviderQuirks {
+    /// 原样追加到出站 URL 末尾的查询串（如 `?beta=true`）
+    url_suffix: String,
+    /// 合并到默认头上的静态额外头（同名覆盖默认头）
+    headers: Vec<(String, String)>,
+    /// 发 anthropic 上游时给每个工具补 `type: "custom"`（MiniMax 拒绝无 type 工具）
+    tool_type_custom: bool,
+}
+
+impl ProviderQuirks {
+    fn from_provider(provider: &Value) -> Self {
+        // 盘上数据已经过读侧归一（custom_providers::item_of），这里只做防
+        // 御性提取：类型不对的值按缺省跳过，绝不让特判把转发拖成 panic
+        let headers = provider
+            .get("headers")
+            .and_then(Value::as_object)
+            .map(|object| {
+                object
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        value.as_str().map(|text| (key.clone(), text.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            url_suffix: provider
+                .get("urlSuffix")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            headers,
+            tool_type_custom: provider
+                .get("anthropicToolType")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.eq_ignore_ascii_case(custom_providers::TOOL_TYPE_CUSTOM)
+                }),
+        }
+    }
+
+    /// 把特判头按名合并进默认头：同名（ASCII 不区分大小写）的默认头被覆盖，
+    /// 其余追加在后面。覆盖默认凭证头（Authorization / x-api-key）意味着换一种
+    /// 鉴权方式 —— 那是记录持有者的选择，这里只负责如实执行。
+    fn apply_to(&self, headers: &mut Vec<(String, String)>) {
+        for (key, value) in &self.headers {
+            match headers.iter_mut().find(|(name, _)| name.eq_ignore_ascii_case(key)) {
+                Some(slot) => slot.1 = value.clone(),
+                None => headers.push((key.clone(), value.clone())),
+            }
+        }
+    }
+}
+
 /// **翻译协议**（responses / anthropic）的一次转发。
 ///
 /// 与 chat 分支同构的「一次发送」，差异只有三处（都在 [`OutboundKind`] 上
@@ -287,6 +361,7 @@ async fn forward_translated(
     account_id: &str,
     api_key: &str,
     base_url: &str,
+    quirks: &ProviderQuirks,
     body: &Value,
     proxy: Option<ResolvedProxy>,
     stream: bool,
@@ -315,7 +390,11 @@ async fn forward_translated(
 
     let (url, headers, payload) = match kind {
         OutboundKind::Responses => {
-            let url = format!("{}/responses", base_url.trim_end_matches('/'));
+            let url = format!(
+                "{}/responses{}",
+                base_url.trim_end_matches('/'),
+                quirks.url_suffix
+            );
             let mut payload = responses_outbound::responses_request_from_chat(
                 &outbound_chat,
                 &wire_model,
@@ -327,10 +406,11 @@ async fn forward_translated(
             if let Some(object) = payload.as_object_mut() {
                 object.insert("stream".to_string(), Value::Bool(true));
             }
-            let headers = vec![
+            let mut headers = vec![
                 ("Authorization".to_string(), format!("Bearer {api_key}")),
                 ("Content-Type".to_string(), "application/json".to_string()),
             ];
+            quirks.apply_to(&mut headers);
             (url, headers, payload)
         }
         OutboundKind::Anthropic => {
@@ -340,9 +420,9 @@ async fn forward_translated(
             // 「上游挂了」，排查方向会被带偏，所以在这里归一
             let base = base_url.trim_end_matches('/');
             let url = if base.ends_with("/v1") {
-                format!("{base}/messages")
+                format!("{base}/messages{}", quirks.url_suffix)
             } else {
-                format!("{base}/v1/messages")
+                format!("{base}/v1/messages{}", quirks.url_suffix)
             };
             let mut payload = anthropic_outbound::anthropic_request_from_chat(
                 &outbound_chat,
@@ -352,13 +432,29 @@ async fn forward_translated(
             if let Some(object) = payload.as_object_mut() {
                 object.insert("stream".to_string(), Value::Bool(true));
             }
+            // 工具 type 补齐（MiniMax 的 Claude 兼容端点拒绝无 type 的工具，
+            // 见 `custom_providers::TOOL_TYPE_CUSTOM`）：翻译器输出的是无 type
+            // 的老式形态，特判开启时逐个补上 `type: "custom"`
+            if quirks.tool_type_custom {
+                if let Some(tools) = payload.get_mut("tools").and_then(Value::as_array_mut) {
+                    for tool in tools.iter_mut() {
+                        if let Some(object) = tool.as_object_mut() {
+                            object.insert(
+                                "type".to_string(),
+                                Value::String("custom".to_string()),
+                            );
+                        }
+                    }
+                }
+            }
             // anthropic 的鉴权头不是 Bearer（与 `custom_providers::
             // fetch_upstream_models` 同一套），版本头按官方当前稳定值
-            let headers = vec![
+            let mut headers = vec![
                 ("x-api-key".to_string(), api_key.to_string()),
                 ("anthropic-version".to_string(), "2023-06-01".to_string()),
                 ("Content-Type".to_string(), "application/json".to_string()),
             ];
+            quirks.apply_to(&mut headers);
             (url, headers, payload)
         }
     };

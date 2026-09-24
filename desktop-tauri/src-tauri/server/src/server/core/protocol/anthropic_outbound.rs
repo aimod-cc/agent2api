@@ -31,7 +31,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     chat_frame, content_parts, content_text, is_truthy, json_text, random_id, string_field,
-    string_value, SseLineBuffer,
+    string_value, SseLineBuffer, FIELD_CACHE_CONTROL, FIELD_IS_ERROR,
 };
 use super::anthropic::{parse_json_object, tool_result_text, DEFAULT_MAX_TOKENS};
 use super::responses::ConvertError;
@@ -60,6 +60,9 @@ pub fn anthropic_request_from_chat(chat: &Value, model: &str) -> Result<Value, C
         return Err("缺少 messages 数组".to_string());
     };
     let mut system: Vec<String> = Vec::new();
+    // system 上的缓存断点（任一条 system 消息带断点即生效 —— 断点标记的是
+    // 「缓存前缀到此为止」，多段 system 拼接后断点落在整段末尾）
+    let mut system_cache: Option<Value> = None;
     let mut messages: Vec<Value> = Vec::new();
     for message in messages_in {
         let role = {
@@ -76,6 +79,11 @@ pub fn anthropic_request_from_chat(chat: &Value, model: &str) -> Result<Value, C
             let text = content_text(message.get("content").unwrap_or(&Value::Null));
             if !text.trim().is_empty() {
                 system.push(text);
+                if let Some(cache) =
+                    message.get(FIELD_CACHE_CONTROL).filter(|value| value.is_object())
+                {
+                    system_cache = Some(cache.clone());
+                }
             }
             continue;
         }
@@ -95,7 +103,25 @@ pub fn anthropic_request_from_chat(chat: &Value, model: &str) -> Result<Value, C
         Value::Bool(chat.get("stream").and_then(Value::as_bool).unwrap_or(false)),
     );
     if !system.is_empty() {
-        out.insert("system".to_string(), Value::String(system.join("\n\n")));
+        match system_cache {
+            Some(cache) => {
+                // 带断点的 system 用块数组形态（Anthropic 两种都认），
+                // cache_control 落在最后一块 —— 与入口暂存时的位置一致
+                let mut blocks: Vec<Value> = system
+                    .iter()
+                    .map(|text| json!({ "type": "text", "text": text }))
+                    .collect();
+                if let Some(last) = blocks.last_mut() {
+                    if let Some(object) = last.as_object_mut() {
+                        object.insert("cache_control".to_string(), cache);
+                    }
+                }
+                out.insert("system".to_string(), Value::Array(blocks));
+            }
+            None => {
+                out.insert("system".to_string(), Value::String(system.join("\n\n")));
+            }
+        }
     }
 
     // thinking 先判定：它决定 max_tokens 的下限，也决定 temperature/top_p
@@ -160,11 +186,25 @@ fn anthropic_blocks_of(message: &Value, role: &str) -> Vec<Value> {
     // 真实存在的 id —— 缺 id 说明客户端数据本身缺配对，伪造一个只会让
     // 上游的配对校验指向更莫名其妙的块，所以原样发、让上游如实报错）
     if role == "tool" {
-        return vec![json!({
+        // is_error 恢复：入口翻译时暂存的「工具执行失败」标记（见
+        // `anthropic::convert_message`）—— OpenAI 形出口没有这个概念，
+        // 那条路径随 strip 剥离，只有这里能把它带回去
+        let is_error = message.get(FIELD_IS_ERROR).and_then(Value::as_bool) == Some(true);
+        let cache = message.get(FIELD_CACHE_CONTROL).filter(|value| value.is_object());
+        let mut block = json!({
             "type": "tool_result",
             "tool_use_id": string_field(message, "tool_call_id"),
             "content": tool_result_text(message.get("content").unwrap_or(&Value::Null)),
-        })];
+        });
+        if let Some(object) = block.as_object_mut() {
+            if is_error {
+                object.insert("is_error".to_string(), Value::Bool(true));
+            }
+            if let Some(cache) = cache {
+                object.insert("cache_control".to_string(), cache.clone());
+            }
+        }
+        return vec![block];
     }
     let mut blocks: Vec<Value> = Vec::new();
     if role == "assistant" {
@@ -236,6 +276,21 @@ fn anthropic_blocks_of(message: &Value, role: &str) -> Vec<Value> {
                         call.pointer("/function/arguments").unwrap_or(&Value::Null)
                     ),
                 }));
+            }
+        }
+    }
+    // 消息级缓存断点 → 落回最后一个可挂载的块。Anthropic 不允许把
+    // cache_control 挂在 thinking 块上，跳过；没有可挂的块时整段放弃
+    // （给上游发一个非法位置的断点只会换来 400）
+    if let Some(cache) = message.get(FIELD_CACHE_CONTROL).filter(|value| value.is_object()) {
+        for block in blocks.iter_mut().rev() {
+            let kind = string_field(block, "type");
+            let mountable = matches!(kind.as_str(), "text" | "tool_use" | "tool_result" | "image");
+            if mountable {
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("cache_control".to_string(), cache.clone());
+                }
+                break;
             }
         }
     }
@@ -315,6 +370,11 @@ fn tool_to_anthropic(tool: &Value) -> Option<Value> {
     }
     let schema = function.get("parameters").unwrap_or(&Value::Null);
     out.insert("input_schema".to_string(), normalize_input_schema(schema));
+    // 工具定义上的缓存断点随内部暂存字段恢复（工具清单大而稳定，是
+    // Anthropic 提示缓存收益最高的一段；入口侧见 `anthropic::tool_to_chat`）
+    if let Some(cache) = tool.get(FIELD_CACHE_CONTROL).filter(|value| value.is_object()) {
+        out.insert("cache_control".to_string(), cache.clone());
+    }
     Some(Value::Object(out))
 }
 

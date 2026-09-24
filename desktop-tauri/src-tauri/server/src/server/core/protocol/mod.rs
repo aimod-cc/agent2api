@@ -46,6 +46,8 @@ pub mod responses;
 pub mod responses_outbound;
 pub mod tool_plan;
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 /// JS 的 `String(value)`：非字符串也照转（`null` → 空串，与 `value == null ? ""` 同）。
@@ -263,5 +265,94 @@ impl SseLineBuffer {
             return;
         }
         out.push(Some(data.to_string()));
+    }
+}
+
+// ─── 内部暂存字段（跨协议保真）────────────────────────────────
+//
+// ── 解决什么问题 ────────────────────────────────────────────
+// Chat 是本网关的内部枢纽形态，但它**表达能力比两端都窄**：下游 Anthropic 的
+// `cache_control`（提示缓存断点）、`tool_result.is_error`（工具失败标记）与
+// 下游 Responses 的 reasoning `encrypted_content`（store=false 的推理连续性
+// 载体）在 Chat 里都没有对应字段，翻译时直接丢弃会丢失语义。参考实现
+// 9Router 在这三处的取舍都是「保真」（保留 cache_control、恢复 is_error、
+// 暂存并在 Responses 出站恢复 encrypted_content），本模块跟进同一取舍。
+//
+// ── 机制 ────────────────────────────────────────────────────
+// 入口翻译时把这些字段挂在**内部 Chat 形态**上（`_wb_` 前缀，见下面各常量），
+// 交给出站侧时只有两种归宿：
+//   · **翻译出站**（`anthropic_outbound` / `responses_outbound`）：消费字段、
+//     恢复到上游协议的对应位置 —— 出站体是重新构造的，内部字段自然不外泄；
+//   · **透传出站**（内置家适配器、自定义家 chat 透传）：发送前调用
+//     [`strip_internal_fields`] 统一剥离。
+//
+// 剥离为什么是**必须**的而不是洁癖：严格校验的 OpenAI 兼容上游会拒绝 assistant
+// 消息上的未知字段并整轮 400（9Router 在 Groq / Mistral 上真实踩过
+// `reasoning_content` 这一坑，见它的 stripContinuityFields 注释）。内部字段
+// 的形状更陌生，必须一律不给上游见到。
+//
+// 挂载粒度的取舍：cache_control 在 Anthropic 里是**块级**的，但内部 Chat 的
+// 消息 content 可能被折叠成字符串（`collapse_content`），块级位置无从谈起；
+// 这里降级为**消息级**（取该消息最后一个带 cache_control 的块的值），出站时
+// 落回该消息最后一个可挂载的块上。Claude Code 的断点本来就打在消息末尾块上，
+// 这个粒度足以命中缓存；块级精度损失换取整条链路的简单，是划算的。
+
+/// cache_control 的暂存字段（消息对象 / 工具对象上，值 = 原样的 cache_control 对象）
+pub const FIELD_CACHE_CONTROL: &str = "_wb_cache_control";
+/// tool_result 的 is_error 暂存字段（role:"tool" 消息上，仅在 true 时写入）
+pub const FIELD_IS_ERROR: &str = "_wb_is_error";
+/// reasoning encrypted_content 的暂存字段（assistant 消息上，值 = 原样的加密串）
+pub const FIELD_ENCRYPTED_CONTENT: &str = "_wb_encrypted_content";
+
+/// 内部暂存字段的前缀：剥离按**前缀**而不是逐个常量 —— 将来加新字段时
+/// 剥离层自动覆盖，不会因为忘了同步清单而把内部字段漏给上游。
+const INTERNAL_FIELD_PREFIX: &str = "_wb_";
+
+/// 剥离请求体上的全部内部暂存字段（`_wb_` 前缀：顶层、每条消息、每个工具）。
+///
+/// 没有任何内部字段时返回 `Cow::Borrowed` 原体（零拷贝 —— 这是绝大多数请求
+/// 的形态：chat 入口根本不产生暂存字段）；有字段才克隆副本。
+pub fn strip_internal_fields(body: &Value) -> Cow<'_, Value> {
+    let Some(object) = body.as_object() else {
+        return Cow::Borrowed(body);
+    };
+    let top_dirty = object.keys().any(|key| key.starts_with(INTERNAL_FIELD_PREFIX));
+    let messages_dirty = object
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| messages.iter().any(has_internal_fields));
+    let tools_dirty = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| tools.iter().any(has_internal_fields));
+    if !top_dirty && !messages_dirty && !tools_dirty {
+        return Cow::Borrowed(body);
+    }
+    let mut next = object.clone();
+    next.retain(|key, _| !key.starts_with(INTERNAL_FIELD_PREFIX));
+    if let Some(messages) = next.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages.iter_mut() {
+            strip_on_object(message);
+        }
+    }
+    if let Some(tools) = next.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            strip_on_object(tool);
+        }
+    }
+    Cow::Owned(Value::Object(next))
+}
+
+/// 一个对象上是否带内部暂存字段
+fn has_internal_fields(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.keys().any(|key| key.starts_with(INTERNAL_FIELD_PREFIX)))
+}
+
+/// 原地剥掉一个对象上的内部暂存字段（对象本身存在才调用）
+fn strip_on_object(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.retain(|key, _| !key.starts_with(INTERNAL_FIELD_PREFIX));
     }
 }

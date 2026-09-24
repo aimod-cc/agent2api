@@ -100,6 +100,13 @@
 .add-step[hidden] { display: none; }
 .add-step { display: flex; flex-direction: column; gap: 16px; }
 
+/* 弹窗高度锁定在第 1 步（选提供商）的自然高度上（JS 在打开弹窗时量一次，
+   见 add-provider-forms.js 的 lockModalHeight）：body 吃掉 head / foot 之外的
+   全部高度 —— 第 2 步的表单比它高就内部滚动、矮就留白，底部操作条（自定义
+   提供商把主按钮搬在那里）出现时也从 body 里让位。两步之间、各家之间切换，
+   弹窗总高恒定，不再随表单长短跳。 */
+#add-modal .modal-body { flex: 1 1 auto; min-height: 0; }
+
 /* 第 1 步：提供商卡片列表（家数动态：注册表加一家就多一张，自定义家建一家多一张） */
 .add-provider-search { width: 100%; }
 .add-provider-search .input { padding-left: 30px; }
@@ -109,6 +116,19 @@
      再窄的窗口落到一列 */
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 12px;
+  /* 列表高度固定为「反代」段八家四行的自然高度（卡片 ~69px × 4 + 间距 12 × 3
+     = 312px）：切换账号类型分段只换列表内容，弹窗高度恒定 —— 家数多的分段
+     （预置 API 二十家）在列表内滚动，而不是把整个弹窗撑高。改卡片内边距 /
+     字号后这个值要跟着调（反代段正好放下即为准）。 */
+  height: 312px;
+  overflow-y: auto;
+  /* 行按自然高度从顶部排，不拉伸填满容器 —— grid 默认 align-content: stretch
+     会把行高摊到容器高度上：自定义段只有一两行卡时，每张卡会被拉成两百多像素
+     （行少 = 摊得多）。固定高度只是「高度上限的画框」，不是「必须填满」。 */
+  align-content: start;
+  /* 滚动条槽常驻预留：预置 API 段有滚动条、反代段没有，不预留的话切换分段时
+     两列卡片的宽度会跟着滚动条出现/消失跳一下（与账号页分组列表同一手法） */
+  scrollbar-gutter: stable;
 }
 .add-provider-card {
   display: flex;
@@ -166,12 +186,13 @@
   font-weight: 600;
   line-height: 1.4;
 }
-.add-provider-tag {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 0 5px;
-  border-radius: var(--r-xs);
-  border: 1px dashed var(--border-strong);
+/* 账号类型分段下的说明行：贴着分段控件走（与它同属「选择提供商」一块）。
+   分段已经把提供商类型分开了，卡片上不再挂「预置 / 自定义」徽章 —— 整段都是
+   同一类，逐张标注只是噪音；每段的动作差异由卡片第二行的 meta 文案表达。 */
+.add-type-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
   color: var(--text-3);
 }
 .add-provider-meta {

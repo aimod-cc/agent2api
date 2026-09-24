@@ -110,6 +110,20 @@ const MAX_ALIAS_CHARS: usize = 128;
 /// 思考等级绑定的长度上限（字符数；与 `model_rules::normalize_reasoning` 同值）
 const MAX_REASONING_CHARS: usize = 32;
 
+/// ── per-provider 特判字段（预置目录带来的上游修正）的长度上限 ──
+/// urlSuffix（查询串，如 "?beta=true"）：查询串一般十几个字符，128 已宽容
+const MAX_URL_SUFFIX_CHARS: usize = 128;
+/// 静态额外头的条数上限：特判用不到几条（Anthropic-Beta / Referer 类），8 足够
+const MAX_HEADER_ENTRIES: usize = 8;
+/// 静态额外头的键 / 值长度上限：头名 RFC 形态几十字符、值（Anthropic-Beta 的
+/// beta 清单）可能上百字符，512 不拦正常值、只拦把文档粘进来的手改数据
+const MAX_HEADER_NAME_CHARS: usize = 64;
+const MAX_HEADER_VALUE_CHARS: usize = 512;
+/// 工具 type 补齐的唯一合法值：MiniMax 的 Claude 兼容端点拒绝无 type 的工具
+/// （`requireClaudeToolType`，参考实现 translator/concerns/toolCall.js），
+/// 对应给每个工具补 `type: "custom"`。空串 = 按默认（无 type）。
+pub const TOOL_TYPE_CUSTOM: &str = "custom";
+
 /// 拉取上游模型清单的总超时（毫秒）。清单接口是一次性的管理动作，
 /// 不参与对话转发的长连接口径（egress 的 read_timeout 是给 SSE 的）。
 const FETCH_MODELS_TIMEOUT_MS: u64 = 15_000;
@@ -192,7 +206,79 @@ fn item_of(object: &Map<String, Value>) -> Value {
         "createdAt": object.get("createdAt").and_then(Value::as_i64).unwrap_or(0),
         "models": model_entries_of(object.get("models")),
         "mappings": mapping_entries_of(object.get("mappings")),
+        // per-provider 特判字段：读侧容错归一（坏值按缺省丢弃，与 models 同一口径）。
+        // 缺省即「无特判」—— 老记录没有这三个键，转发侧按缺省走。
+        "urlSuffix": url_suffix_of(object.get("urlSuffix")),
+        "headers": headers_of(object.get("headers")),
+        "anthropicToolType": tool_type_of(object.get("anthropicToolType")),
     })
+}
+
+/// 读侧归一：urlSuffix。合法形态 = 空串（无特判）或 `?` 开头、无空白、
+/// 长度有限的查询串（如 `?beta=true`）；坏值一律按无特判处理 —— 导入的
+/// 定义不该因为一个畸形后缀整条被拒，丢弃后转发仍然可用。
+fn url_suffix_of(value: Option<&Value>) -> String {
+    let text = value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let usable = text.starts_with('?')
+        && text.len() >= 2
+        && text.len() <= MAX_URL_SUFFIX_CHARS
+        && !text.chars().any(char::is_whitespace);
+    if usable { text.to_string() } else { String::new() }
+}
+
+/// 读侧归一：静态额外头。只收「键值都是非空字符串」的条目（上限
+/// [`MAX_HEADER_ENTRIES`] 条，键 / 值超长截断 —— 与 model_entries_of 的
+/// 「超长截断不丢弃」同一取向）；同名的最后一条赢，落盘前排序使形态稳定。
+fn headers_of(value: Option<&Value>) -> Map<String, Value> {
+    let mut out = Map::new();
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return out;
+    };
+    for entry in entries.iter().take(MAX_HEADER_ENTRIES * 2) {
+        let Some(object) = entry.as_object() else { continue };
+        // 数组形态 [{name, value}] 与对象形态 {"Name": "value"} 都收：
+        // 对象形态是创建/编辑的入参形态，数组形态留给将来的编辑器
+        let pairs: Vec<(String, String)> = if let Some(name) =
+            object.get("name").and_then(Value::as_str)
+        {
+            match object.get("value").and_then(Value::as_str) {
+                Some(value) => vec![(name.to_string(), value.to_string())],
+                None => vec![],
+            }
+        } else {
+            object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|text| (key.clone(), text.to_string()))
+                })
+                .collect()
+        };
+        for (key, value) in pairs {
+            let key = truncate_chars(key.trim(), MAX_HEADER_NAME_CHARS);
+            let value = truncate_chars(value.trim(), MAX_HEADER_VALUE_CHARS);
+            if key.is_empty() || value.is_empty() || key.contains(':') {
+                continue;
+            }
+            out.insert(key, Value::String(value));
+            if out.len() >= MAX_HEADER_ENTRIES {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// 读侧归一：工具 type 补齐。目前只有 `custom` 一个合法值（空 = 默认）。
+fn tool_type_of(value: Option<&Value>) -> String {
+    let text = value.and_then(Value::as_str).map(str::trim).unwrap_or("");
+    if text.eq_ignore_ascii_case(TOOL_TYPE_CUSTOM) {
+        TOOL_TYPE_CUSTOM.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// 读取容错：`models` 数组 → 归一后的条目列表（非数组 / 坏条目一律丢弃）。
@@ -350,6 +436,12 @@ pub fn create(payload: &Value) -> Result<Value, String> {
         "baseUrl": base_url,
         "enabled": true,
         "createdAt": logging::now_ms(),
+        "models": [],
+        "mappings": [],
+        // per-provider 特判字段（预置目录带来的上游修正），见 validate_* 的说明
+        "urlSuffix": validate_url_suffix(object.get("urlSuffix"))?,
+        "headers": validate_headers(object.get("headers"))?,
+        "anthropicToolType": validate_tool_type(object.get("anthropicToolType"))?,
     });
     let mut items = read_items();
     items.push(item.clone());
@@ -399,6 +491,26 @@ pub fn update(id: &str, payload: &Value) -> Result<Value, String> {
             .as_bool()
             .ok_or_else(|| "enabled 必须是布尔值".to_string())?;
         merged.insert("enabled".to_string(), Value::Bool(enabled));
+    }
+    // 特判字段同样按 patch 语义收：带键才动，非法值报错（与上面同一取向）。
+    // 编辑弹窗不发这三个键，所以从预置创建的家在改名 / 改协议后特判原样保留。
+    if let Some(value) = object.get("urlSuffix") {
+        merged.insert(
+            "urlSuffix".to_string(),
+            Value::String(validate_url_suffix(Some(value))?),
+        );
+    }
+    if let Some(value) = object.get("headers") {
+        merged.insert(
+            "headers".to_string(),
+            Value::Object(validate_headers(Some(value))?),
+        );
+    }
+    if let Some(value) = object.get("anthropicToolType") {
+        merged.insert(
+            "anthropicToolType".to_string(),
+            Value::String(validate_tool_type(Some(value))?),
+        );
     }
     let updated = Value::Object(merged);
     items[index] = updated.clone();
@@ -851,4 +963,79 @@ pub fn normalize_base_url(raw: &str) -> Result<String, String> {
         return Err("baseUrl 必须以 http:// 或 https:// 开头".to_string());
     }
     Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+// ── per-provider 特判字段的写侧校验（create / update 共用）────────
+//
+// 与读侧（url_suffix_of / headers_of / tool_type_of）的分工：读侧面向「盘上
+// 的数据」—— 容错归一，坏值按缺省丢弃（导入不该被一条畸形后缀整条挡住）；
+// 写侧面向「用户的输入」—— 非法值明确报错。非法值静默忽略等于「保存成功但
+// 没生效」，比一条 400 难排查得多（与 update 的既有取向一致）。
+
+/// urlSuffix：空 = 无特判；非空必须是 `?` 开头、无空白、不超过
+/// [`MAX_URL_SUFFIX_CHARS`] 的查询串（如 `?beta=true`）。转发时原样追加到
+/// 出站 URL 末尾（GLM / MiniMax 的 Claude 兼容端点要求 `?beta=true`）。
+fn validate_url_suffix(value: Option<&Value>) -> Result<String, String> {
+    let Some(value) = value else { return Ok(String::new()) };
+    let text = value.as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    if !text.starts_with('?') {
+        return Err("urlSuffix 必须是以 ? 开头的查询串（如 ?beta=true）".to_string());
+    }
+    if text.chars().any(char::is_whitespace) || text.chars().count() > MAX_URL_SUFFIX_CHARS {
+        return Err(format!(
+            "urlSuffix 不能包含空白且最多 {MAX_URL_SUFFIX_CHARS} 个字符"
+        ));
+    }
+    Ok(text.to_string())
+}
+
+/// 静态额外头：JSON 对象 `{"头名": "值"}`。键 / 值都须是非空字符串（去首尾
+/// 空白），头名不含冒号，条数不超过 [`MAX_HEADER_ENTRIES`]。转发时按名合并到
+/// 默认头上 —— **同名的默认头被覆盖**（包括 Authorization / x-api-key：那是
+/// 「换一种鉴权方式」的高级用法，覆盖后默认凭证头不再发出，由使用者负责）。
+fn validate_headers(value: Option<&Value>) -> Result<Map<String, Value>, String> {
+    let Some(value) = value else { return Ok(Map::new()) };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "headers 必须是 JSON 对象（{\"头名\": \"值\"}）".to_string())?;
+    if object.len() > MAX_HEADER_ENTRIES {
+        return Err(format!("headers 最多 {MAX_HEADER_ENTRIES} 条"));
+    }
+    let mut out = Map::new();
+    for (key, value) in object {
+        let key = key.trim();
+        let value_text = value.as_str().unwrap_or("").trim();
+        if key.is_empty() || value_text.is_empty() {
+            return Err("headers 的头名与值都必须是非空字符串".to_string());
+        }
+        if key.contains(':') || key.chars().any(char::is_whitespace) {
+            return Err(format!("headers 的头名「{key}」不是合法的头名（不能含空白或冒号）"));
+        }
+        if key.chars().count() > MAX_HEADER_NAME_CHARS {
+            return Err(format!("headers 的头名最长 {MAX_HEADER_NAME_CHARS} 个字符"));
+        }
+        if value_text.chars().count() > MAX_HEADER_VALUE_CHARS {
+            return Err(format!("headers 的值最长 {MAX_HEADER_VALUE_CHARS} 个字符"));
+        }
+        out.insert(key.to_string(), Value::String(value_text.to_string()));
+    }
+    Ok(out)
+}
+
+/// 工具 type 补齐：空 = 默认（无 type）；`custom` = 发 anthropic 上游时给每个
+/// 工具补 `type: "custom"`。其余值一律拒绝 —— 这是请求体修正的开关，不是
+/// 自由字段，拼错的值等于静默改变转发行为。
+fn validate_tool_type(value: Option<&Value>) -> Result<String, String> {
+    let Some(value) = value else { return Ok(String::new()) };
+    let text = value.as_str().unwrap_or("").trim();
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    if text.eq_ignore_ascii_case(TOOL_TYPE_CUSTOM) {
+        return Ok(TOOL_TYPE_CUSTOM.to_string());
+    }
+    Err("anthropicToolType 只支持 \"custom\"（留空表示不补 type）".to_string())
 }

@@ -32,7 +32,16 @@
   let polling = null;    // 进度轮询定时器
   let busy = false;
   let downloading = false;  // 本会话是否正在下载（决定按钮是「下载并安装」还是「取消下载」）
-  let autoInstall = false;  // 本次下载完成后是否自动安装（避免页面重入时误装遗留任务）
+  /**
+   * 已经自动装过的安装包路径。
+   *
+   * 下载完成即自动安装并重启（点「下载并安装」的意图就是要更新，不该再让人
+   * 手动点第二次）—— 无论下载是不是本次进入面板发起的、中途有没有切过页。
+   * 这个变量只挡**重复自动装**：UAC 被拒 / 安装程序没起来时任务仍停在
+   * 「已完成」，页面重入（load）会再次看到它，没有这道闸就会每切一次页
+   * 弹一次 UAC。装过一次后界面改为给出按钮，由用户手动重试。
+   */
+  let autoInstalledPath = null;
 
   let repository = '';      // owner/repo，来自接口：作者主页与仓库地址由它拼出来，不写死
   let checkedAt = 0;        // 上次检查更新的时刻
@@ -193,32 +202,33 @@
       setBadge('下载失败', 'bad');
       setState(`下载失败：${task.error}`, true);
       if (button) button.textContent = '重试下载';
-      autoInstall = false;
       return true;
     }
     if (task.canceled) {
       setBadge('已取消', 'warn');
       setState('下载已取消，可重新点击「下载并安装」。');
       if (button) button.textContent = '下载并安装';
-      autoInstall = false;
       return true;
     }
     if (task.done && task.path) {
       setBadge('可安装', 'ok');
-      // 只有本次会话发起的下载才自动装：页面切回来时碰上遗留的完成任务
-      // 就直接弹安装程序，属于用户没有预期的副作用
-      if (autoInstall) {
-        autoInstall = false;
+      // 下载完成即自动安装（含「下载中切走、回来时已经下完」这条重入路径）。
+      // 只有同一路径已经自动装过一次才不再重复触发 —— 那时任务仍停在
+      // 「已完成」（UAC 被拒 / 安装程序没起来），反复自动触发等于反复弹 UAC。
+      if (task.path !== autoInstalledPath) {
+        autoInstalledPath = task.path;
         setState(isMacInstaller()
           ? '安装包已下载完成，正在挂载磁盘映像…'
           : '安装包已下载完成，正在启动安装程序（需要管理员权限，会弹出 UAC 确认框）…');
         void install(task.path);
       } else {
         setState(readyHint(task.filename || task.path));
-        if (button) {
-          button.textContent = installButtonText();
-          button.dataset.installPath = task.path;
-        }
+      }
+      // 按钮统一备成手动重试的形态：自动装被 UAC 挡下（应用没有退出）时，
+      // 用户能立刻点它重试，而不是对着一个「取消下载」发呆
+      if (button) {
+        button.textContent = installButtonText();
+        button.dataset.installPath = task.path;
       }
       return true;
     }
@@ -437,7 +447,9 @@
     try {
       await api.downloadUpdate({ url: asset.url, name: asset.name });
       downloading = true;
-      autoInstall = true;
+      // 新一轮下载：清掉上一轮的「已自动装过」记录 —— 同一个安装包重新下载
+      // 后仍应在下载完成时自动安装
+      autoInstalledPath = null;
       delete button?.dataset.installPath;
       setBadge('下载中', 'warn');
       setState(downloadHint());
@@ -463,14 +475,14 @@
       const task = await api.updateProgress();
       if (task?.active) {
         downloading = true;
-        autoInstall = false;   // 遗留任务：下完只提示，不自动装
+        // 遗留任务照样自动装（见 autoInstalledPath 的说明）：这里不再区分
+        // 「本次会话发起」与「切页回来碰上」，下载完成的处理只有一条路
         renderTask(task);
         setBadge('下载中', 'warn');
         startPolling();
         return;
       }
       if (task?.done && task.path) {
-        autoInstall = false;
         renderTask(task);
         return;
       }

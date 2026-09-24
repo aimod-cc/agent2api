@@ -77,6 +77,7 @@ use serde_json::{json, Value};
 
 use crate::server::config;
 use crate::server::core::custom_providers;
+use crate::server::core::protocol::strip_internal_fields;
 use crate::server::core::providers::adapter::{
     adapter_for, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
 };
@@ -753,7 +754,12 @@ async fn attempt_queue(
             let send = send_cache.entry((provider_id, account_pool.clone(), degraded)).or_insert_with(
                 || send_body(ctx, provider_id, target.account.as_ref(), degraded),
             );
-            let body = &send.body;
+            // 内置家是「把 chat 体原样发给上游」的透传出口：入口翻译（Anthropic /
+            // Responses）暂存的内部字段（_wb_*，见 protocol::mod 的说明）绝不能
+            // 到这里 —— 严格校验的上游会拒绝消息上的未知字段整轮 400。没有暂存
+            // 字段时零拷贝借出原体（绝大多数请求的形态）。
+            let stripped = strip_internal_fields(&send.body);
+            let body: &serde_json::Value = &stripped;
             // 这一家实际收到的上游模型名 = 它的限额冷却键（与字节同源，见 `SendBody`）。
             // 随发送体一起取（发送体换了，真名也随之重算），成功时随返回值交给
             // 循环外（`cap_cleared` 要读它）—— 所以它是 break 的第二个元素。
@@ -1438,7 +1444,9 @@ async fn attempt_stateful(
     // provider 一次转发就是一个会话轮次，没有「换提示词重发」这一步），
     // 但降级期内（状态机已生效）首发的提示词也要跟着换。
     let send = send_body(ctx, provider_id, target.account.as_ref(), degraded);
-    let body = &send.body;
+    // 内置家透传出口的内部字段剥离：与无状态路径同一理由（见那里的说明）
+    let stripped = strip_internal_fields(&send.body);
+    let body: &serde_json::Value = &stripped;
     // 这一家实际收到的上游模型名 = 限额冷却键（与字节同源，见 `SendBody`）
     let wire_model = &send.wire_model;
     // 旁路记账：本 provider + 本账号是这一轮的实际承载者（attempts +1）。

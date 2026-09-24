@@ -303,13 +303,17 @@
               </div>
 
               <div class="actions">
+                <!-- 「添加账号」排在操作组第一位（主操作在最左，视线先落到它，
+                     也符合从左往右的操作习惯）；查询余额 / 全部签到是次要动作，
+                     跟在后面。按钮 id 与监听（add-account.js /
+                     add-provider-forms.js）都按 id 绑定，顺序调整不影响行为。 -->
+                <button id="btn-add-account-2" class="primary">添加账号</button>
                 <button id="btn-query-usage">查询余额</button>
                 <button id="btn-checkin-all">全部签到</button>
                 <!-- 这里曾有「自定义提供商」按钮（打开一个管理弹窗：列出全部自定义
                      提供商，每行模型清单 / 编辑 / 删除）。模型清单统一到「模型管理」页、
                      编辑与删除搬进账号自己的「设置」弹窗（该弹窗里那段「提供商」）之后，
                      它列的信息与三项操作都各有归属，按钮与弹窗一并移除。 -->
-                <button id="btn-add-account-2" class="primary">添加账号</button>
               </div>
             </div>
 
@@ -1702,6 +1706,9 @@
   <!-- 提供商目录：provider 摘要与「作用提供商」写入的唯一前端入口。
        必须排在所有消费者（accounts-groups / logs-panel）之前 -->
   <script src="providers.js"></script>
+  <!-- 自定义提供商的预置目录（纯常量，无依赖）：add-provider-forms.js 第 1 步的
+       「自定义」分段与 add-custom-provider.js 的预填都要读它，排在两者之前 -->
+  <script src="preset-providers.js"></script>
   <!-- accounts-groups 必须在 accounts-model 之前：后者按名解构它的判定与分组函数
        （被依赖者先加载）。再往前必须在 providers.js 之后 —— providerSummaries 会问
        window.wbProviders 要 label（运行期调用，实际顺序不如上面那条硬，但保持同序更稳）。

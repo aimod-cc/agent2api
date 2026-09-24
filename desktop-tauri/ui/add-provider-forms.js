@@ -26,6 +26,20 @@
   const ADD_FOOT_ACTIONS_ID = 'add-foot-actions';
   const ADD_FOOT_HINT_ID = 'add-foot-hint';
   const ADD_SEARCH_ID = 'add-provider-search';
+  /** 账号类型分段（反代 / 预置 API / 自定义）：容器与三个取值 */
+  const ADD_TYPE_SEG_ID = 'add-type-seg';
+  /** 反代：客户端登录态 / 官方授权页（内置八家） */
+  const TYPE_PROXY = 'proxy';
+  /** 预置 API：地址 / 协议 / 图标都预置好的官方与托管端点（preset-providers.js） */
+  const TYPE_PRESET = 'preset';
+  /** 自定义：自建上游（手动新建）与用户已建的自定义家（给这家加账号） */
+  const TYPE_CUSTOM = 'custom';
+  /** 分段值归一：三个取值之外的一律按「反代」处理（DOM 被人改坏时的保守落点，
+      与 resetAddStep 的复位取向一致） */
+  const typeValueOf = value =>
+    (value === TYPE_PRESET || value === TYPE_CUSTOM ? value : TYPE_PROXY);
+  /** 预置家卡片的取值前缀（不是 provider id，只是卡片自己的标记） */
+  const PRESET_CARD_PREFIX = 'preset:';
   /** 「新建自定义提供商」那张卡片的取值（不是 provider id，只是卡片自己的标记） */
   const NEW_PROVIDER_CARD_ID = '__new__';
   /** WorkBuddy 账号版本与网页登录区块的容器 */
@@ -447,13 +461,25 @@
     const body = $('add-modal')?.querySelector('.modal-body');
     if (!body || $(ADD_STEP_PICK_ID)) return;
 
-    // ① 第 1 步：提供商卡片列表（选项由 renderProviderCards 按摘要重建）
+    // ① 第 1 步：账号类型分段 + 提供商卡片列表（选项由 renderProviderCards 按摘要重建）。
+    // 类型分段与列表**同一块**（一个 .modal-section）：两者是同一个问题的两面
+    // （「给什么形态的上游加账号」→「给哪一家加」），分两块带边框会让人以为
+    // 是两个独立步骤；列表高度固定（CSS），切分段只换内容、弹窗高度不变。
     const pick = document.createElement('div');
     pick.className = 'add-step';
     pick.id = ADD_STEP_PICK_ID;
     pick.innerHTML = `<div class="modal-section">`
       + `<h3>选择提供商</h3>`
-      + `<p>账号属于某一家提供商。选好之后只显示这一家支持的添加方式。</p>`
+      + `<div class="seg add-seg" id="${ADD_TYPE_SEG_ID}" role="radiogroup"`
+      + ` aria-label="账号类型">`
+      + `<button type="button" class="seg-item active" data-value="${TYPE_PROXY}"`
+      + ` role="radio" aria-checked="true" tabindex="0">反代</button>`
+      + `<button type="button" class="seg-item" data-value="${TYPE_PRESET}"`
+      + ` role="radio" aria-checked="false" tabindex="-1">预置 API</button>`
+      + `<button type="button" class="seg-item" data-value="${TYPE_CUSTOM}"`
+      + ` role="radio" aria-checked="false" tabindex="-1">自定义</button>`
+      + `</div>`
+      + `<p class="add-type-hint" id="add-type-hint">把本机客户端的登录态包装成账号，或用官方授权页登录。</p>`
       + `<span class="input-affix add-provider-search">`
       + `<span class="affix">⌕</span>`
       + `<input type="search" id="${ADD_SEARCH_ID}" placeholder="搜索提供商…" autocomplete="off">`
@@ -528,7 +554,14 @@
       + `</div>`;
     form.appendChild(placeholder);
 
-    // ⑧ 搜索与卡片点选：只作用在步骤显隐与卡片列表上，不碰各家的块
+    // ⑧ 账号类型分段、搜索与卡片点选：只作用在步骤显隐与卡片列表上，不碰各家的块
+    bindSeg($(ADD_TYPE_SEG_ID));
+    $(ADD_TYPE_SEG_ID)?.addEventListener(SEG_EVENT, () => {
+      // 先把选中值落进 addAccountType（renderProviderCards / syncTypeHint 都读它）
+      addAccountType = typeValueOf(segValueOf($(ADD_TYPE_SEG_ID)));
+      syncTypeHint();
+      renderProviderCards();
+    });
     $(ADD_SEARCH_ID)?.addEventListener('input', () => renderProviderCards());
     $(ADD_PROVIDER_GRID_ID)?.addEventListener('click', event => {
       const card = event.target.closest('.add-provider-card');
@@ -789,6 +822,13 @@
   let addProvider = 'workbuddy';
 
   /**
+   * 第 1 步的账号类型（'proxy' = 反代 / 'custom' = 自定义）。
+   * 反代段是现有八家（登录态 / OAuth，账号由网关包装）；自定义段是自定义提供商
+   * （API Key 直连上游）：已建的家 + 预置家 + 「手动新建」卡。打开弹窗复位到反代。
+   */
+  let addAccountType = TYPE_PROXY;
+
+  /**
    * 当前处于哪一步：'pick' = 选提供商，'form' = 选方式 + 填凭证。
    * 打开弹窗（以及点「上一步」）回到 'pick'；选中一家后进 'form'。
    */
@@ -797,9 +837,15 @@
    * 选中某一家自定义提供商时记下它的 id（`custom-…`）。
    * 自定义家的表单是**一个**后注册块（内部有「新建 / 选择已有」两种模式），
    * 这个值就是给那个块的上下文：非空时它切到「选择已有」并预选这一家。
-   * 空串 = 没有上下文（例如从「新建自定义提供商」那张卡进来，或选的是内置家）。
+   * 空串 = 没有上下文（例如从「手动新建」那张卡进来，或选的是内置家）。
    */
   let addProviderHint = '';
+  /**
+   * 第 1 步点的是**预置家**卡片时记下它的 key（preset-providers.js 的目录项）。
+   * 交给自定义块的 onShow，让它把名称 / 协议 / Base URL 预填进新建表单。
+   * 空串 = 不是从预置卡进来的（手动新建 / 加入已有 / 内置家）。
+   */
+  let addPresetKey = '';
 
   /** 该提供商此刻名下的账号数（读主状态；自定义家不在摘要里，只能现算） */
   function accountCountOf(providerId) {
@@ -808,12 +854,36 @@
   }
 
   /**
-   * 第 1 步的卡片列表数据：内置家来自 providers 摘要，自定义家来自自定义目录
-   * （每一家各一张卡 —— 它们是运行期数据，建了几家就有几张）。
-   * 「新建」那张卡**不在这个列表里**：它不是一家提供商，由 renderProviderCards
-   * 单独插在队首（见那里的说明）。
+   * 第 1 步的卡片列表数据，按账号类型分三段：
+   *   · 反代 —— 内置家来自 providers 摘要（现有八家）；
+   *   · 预置 API —— 预置目录（preset-providers.js）的官方与托管端点，
+   *     点一张卡 = 创建这一家并预填；**已建过同名家的预置卡不再出现** ——
+   *     那张已建卡就在「自定义」段里，再给一份只会让人犹豫点哪张；
+   *   · 自定义 —— 已建的自定义家（customList），每张卡是「给这家加账号」
+   *     的对象（点击进「加入已有」并预选）。「手动新建」那张卡**不在这个
+   *     列表里**：它不是一家提供商，由 renderProviderCards 单独插在队首。
    */
   function providerCards() {
+    if (addAccountType === TYPE_PRESET) {
+      const customNames = new Set((window.wbProviders?.customList?.() || [])
+        .map(item => item.name || ''));
+      return (window.wbPresetProviders?.list || [])
+        .filter(preset => !customNames.has(preset.name))
+        .map(preset => ({
+          id: PRESET_CARD_PREFIX + preset.key,
+          label: preset.name,
+          count: 0,
+          preset: true,
+        }));
+    }
+    if (addAccountType === TYPE_CUSTOM) {
+      return (window.wbProviders?.customList?.() || []).map(provider => ({
+        id: provider.id,
+        label: provider.name || provider.id,
+        count: accountCountOf(provider.id),
+        custom: true,
+      }));
+    }
     const list = window.wbProviders?.all?.() || [];
     // 摘要还没到时先放 WorkBuddy 一张：弹窗不能因为一次状态未就绪就空着
     const cards = list.length
@@ -830,14 +900,6 @@
     const from = cards.findIndex(item => item.id === 'qoder');
     const to = cards.findIndex(item => item.id === 'autoclaw');
     if (to >= 0 && from > to) cards.splice(to, 0, cards.splice(from, 1)[0]);
-    for (const provider of window.wbProviders?.customList?.() || []) {
-      cards.push({
-        id: provider.id,
-        label: provider.name || provider.id,
-        count: accountCountOf(provider.id),
-        custom: true,
-      });
-    }
     return cards;
   }
 
@@ -858,9 +920,12 @@
     'cline-pass': 'assets/providers/cline.png',
   };
 
-  /** 卡片图标：收录过的家出真实图标，其余仍用首字母徽章 */
+  /** 卡片图标：收录过的家出真实图标，其余仍用首字母徽章。
+   *  预置家（preset: 前缀）问预置目录要图标（preset-providers.js 已收录 20 家）。 */
   function logoHtml(item) {
-    const icon = PROVIDER_ICONS[item.id];
+    const icon = item.id.startsWith(PRESET_CARD_PREFIX)
+      ? window.wbPresetProviders?.iconOf?.(item.id.slice(PRESET_CARD_PREFIX.length)) || ''
+      : PROVIDER_ICONS[item.id];
     if (icon) {
       return `<span class="add-provider-logo has-icon"><img src="${icon}" alt="" loading="lazy"></span>`;
     }
@@ -868,13 +933,25 @@
     return `<span class="add-provider-logo">${esc(initial)}</span>`;
   }
 
+  /**
+   * 卡片正文第二行（meta）。三段各说各的动作，徽章不再出现 —— 分段已经把
+   * 类型分开了，整段都是同一类，再给每张卡挂一枚「预置 / 自定义」徽章只是噪音：
+   *   · 预置卡：点开即预填，动作是「创建」；
+   *   · 已建自定义家：动作是「给这家加账号」；
+   *   · 内置家：只报账号数（添加方式进第 2 步才出现）。
+   */
+  function cardMeta(item) {
+    if (item.preset) return '点开即预填，填 Key 接入';
+    if (item.custom) return item.count ? `${item.count} 个账号，点击添加` : '点击添加账号';
+    return item.count ? `${item.count} 个账号` : '还没有账号';
+  }
+
   function cardHtml(item) {
     return `<button type="button" class="add-provider-card" data-provider="${esc(item.id)}" role="option">`
       + logoHtml(item)
       + `<span class="add-provider-info">`
-      + `<span class="add-provider-name">${esc(item.label)}`
-      + `${item.custom ? '<span class="add-provider-tag">自定义</span>' : ''}</span>`
-      + `<span class="add-provider-meta">${item.count ? `${item.count} 个账号` : '还没有账号'}</span>`
+      + `<span class="add-provider-name">${esc(item.label)}</span>`
+      + `<span class="add-provider-meta">${esc(cardMeta(item))}</span>`
       + `</span>`
       + `<span class="add-provider-go">›</span>`
       + `</button>`;
@@ -897,10 +974,10 @@
    * 但**不做重排指纹**：卡片上没有正在输入的内容，焦点由浏览器在点击后自己落到
    * 新卡片上，重画的开销可以忽略。
    *
-   * 「新建自定义提供商」排在最前（紧贴搜索框、横跨整行）：这一步里只有它是
-   * 「动作」，其余都是「选择」；原先排在队尾时它跟着家数一起往下沉，建了几家
-   * 之后就得先滚到底才看得见。
-   * 搜索只过滤已有家；有关键词时「新建」那张卡收起来 —— 用户在找的是已有的一家。
+   * 「手动新建自定义提供商」只在自定义段出现、排在最前（紧贴搜索框、横跨整行）：
+   * 这一段里只有它是「动作」，其余都是「选择」；原先排在队尾时它跟着家数一起
+   * 往下沉，建了几家之后就得先滚到底才看得见。
+   * 搜索只过滤当前段的已有家；有关键词时「新建」那张卡收起来 —— 用户在找的是一家。
    */
   function renderProviderCards() {
     const grid = $(ADD_PROVIDER_GRID_ID);
@@ -908,7 +985,8 @@
     const keyword = ($(ADD_SEARCH_ID)?.value || '').trim().toLowerCase();
     const cards = providerCards();
     const hit = cards.filter(item => !keyword || item.label.toLowerCase().includes(keyword));
-    grid.innerHTML = (keyword ? '' : newCardHtml()) + hit.map(cardHtml).join('');
+    const newCard = addAccountType === TYPE_CUSTOM && !keyword ? newCardHtml() : '';
+    grid.innerHTML = newCard + hit.map(cardHtml).join('');
     if (!hit.length && keyword) {
       grid.innerHTML = `<div class="add-provider-empty">没有匹配「${esc(keyword)}」的提供商</div>`;
     }
@@ -928,24 +1006,33 @@
   }
 
   /**
-   * 选中一家（或「新建」卡）并进入第 2 步。
+   * 选中一家（或「新建」/ 预置卡）并进入第 2 步。
    *
-   * 三种取值分别落到哪一块：
-   *   · `__new__`（新建卡）→ 后注册的自定义块，且不带 hint（它自己默认「新建」模式）；
-   *   · 某个自定义家 id    → 同一个自定义块，hint 带上这家，让它切「选择已有」并预选；
-   *   · 其它（内置家 id）  → 该家自己的块。
+   * 四种取值分别落到哪一块：
+   *   · `__new__`（手动新建卡）→ 后注册的自定义块，不带 hint（它自己默认「新建」模式）；
+   *   · `preset:<key>`（预置卡）→ 同一个自定义块的「新建」模式，context 带上 preset，
+   *     让它预填名称 / 协议 / Base URL；
+   *   · 某个自定义家 id         → 同一个自定义块，hint 带上这家，让它切「选择已有」并预选；
+   *   · 其它（内置家 id）       → 该家自己的块。
    */
   function pickProvider(id) {
     if (!id) return;
     if (id === NEW_PROVIDER_CARD_ID) {
       addProvider = 'custom';
       addProviderHint = '';
+      addPresetKey = '';
+    } else if (id.startsWith(PRESET_CARD_PREFIX)) {
+      addProvider = 'custom';
+      addProviderHint = '';
+      addPresetKey = id.slice(PRESET_CARD_PREFIX.length);
     } else if (window.wbProviders?.customList?.().some(item => item.id === id)) {
       addProvider = 'custom';
       addProviderHint = id;
+      addPresetKey = '';
     } else {
       addProvider = id;
       addProviderHint = '';
+      addPresetKey = '';
     }
     showAddStep('form');
   }
@@ -976,10 +1063,14 @@
     const pickedCustom = addProviderHint
       ? window.wbProviders?.customList?.().find(item => item.id === addProviderHint)?.name
       : '';
-    const label = pickedCustom || extra?.label || window.wbProviders?.labelOf?.(id) || id;
-    // 后注册的自定义块有两种进入方式：某一家（hint 带 id）或「新建」卡（hint 为空）。
-    // 后者标题直接说「新建自定义提供商」，而不是笼统的「自定义提供商」。
-    const heading = extra && !addProviderHint ? `新建${extra.label}` : `登录 / 添加 ${label} 账号`;
+    const label = pickedCustom
+      || (addPresetKey ? window.wbPresetProviders?.presetOf?.(addPresetKey)?.name : '')
+      || extra?.label || window.wbProviders?.labelOf?.(id) || id;
+    // 后注册的自定义块有三种进入方式：某一家（hint 带 id）、预置家（preset 带 key）
+    // 或「手动新建」卡（两者都为空）。前两者标题用那家的名字，最后一种才说「新建」。
+    const heading = extra && !addProviderHint && !addPresetKey
+      ? `新建${extra.label}`
+      : `登录 / 添加 ${label} 账号`;
     const block = ADD_FORM_PROVIDERS[id];
     const title = $('add-title');
     if (title) title.textContent = addStep === 'pick' ? '添加账号' : heading;
@@ -996,18 +1087,67 @@
       if (text && !block) text.textContent = `「${label}」的账号添加功能还在开发中，敬请期待。`;
     }
     // 弹窗当前显示的是后注册的块：给它一个信号，让它刷新自己的动态内容
-    //（自定义提供商要借此重读列表、切「新建 / 选择已有」并预选某一家）
-    if (extra && block) extra.onShow?.({ providerId: addProviderHint });
+    //（自定义提供商要借此重读列表、切「新建 / 选择已有」并预选某一家；
+    //  从预置卡进来的还要预填名称 / 协议 / Base URL）。
+    // **只在第 2 步发这个信号**：那个块的 onShow 会点亮底部操作条（它把自己的
+    // 主按钮搬在底部条上），而点「上一步」返回第 1 步时本函数也会被调到 ——
+    // 无条件发信号会让「创建并添加账号」残留成第 1 步底部的孤儿按钮。
+    if (extra && block && addStep === 'form') {
+      extra.onShow?.({ providerId: addProviderHint, preset: addPresetKey });
+    }
+  }
+
+  /** 账号类型分段下面那行说明：随选中段变化（放在 mountAddProviderUi 之前声明，加载期就要用） */
+  function syncTypeHint() {
+    const hint = $('add-type-hint');
+    if (!hint) return;
+    hint.textContent = addAccountType === TYPE_PRESET
+      ? '用 API Key 直连上游，常用提供商的地址与协议已预置。'
+      : addAccountType === TYPE_CUSTOM
+        ? '自建 OpenAI / Anthropic 兼容上游，地址与协议自己填。'
+        : '把本机客户端的登录态包装成账号，或用官方授权页登录。';
+  }
+
+  /**
+   * 锁定弹窗高度：把 .modal 的高度钉在第 1 步（选提供商）的自然高度上。
+   *
+   * ── 为什么要在这一步量 ──────────────────────────────────────
+   * 第 1 步的高度是常量：标题 / 分段 / 说明 / 搜索固定，卡片列表固定 312px
+   * （CSS），所以「停在第 1 步时弹窗的自然高度」就是最稳的基准。第 2 步各家
+   * 表单长短差很多（WorkBuddy 的块比自定义的长一倍），不锁的话点进去弹窗就
+   * 跟着表单跳；锁掉之后由 CSS 让 body 吃掉 head / foot 之外的全部高度
+   * （见 `#add-modal .modal-body` 的 flex:1），表单比它高就内部滚动。
+   *
+   * ── 为什么只量一次 ──────────────────────────────────────────
+   * 内容结构是固定的（列表高度、标题区都不随数据变），窗口宽度变化对弹窗
+   * 宽度的影响只发生在视口极窄时（.modal 是 min(620px, 100%)），那种情况下
+   * 固定高度也只是让第 1 步轻微滚动 —— 不值得为它引入 resize 重算的复杂度。
+   * 弹窗隐藏时（display:none）offsetHeight 是 0，量到 0 就放弃，等下一次
+   * 打开弹窗再量（加载期那次调用走的就是这条）。
+   */
+  function lockModalHeight() {
+    const modal = $('add-modal')?.querySelector('.modal');
+    if (!modal || modal.dataset.heightLocked) return;
+    const height = modal.offsetHeight;
+    if (height <= 0) return;
+    modal.style.height = `${height}px`;
+    modal.dataset.heightLocked = '1';
   }
 
   /** 回到第 1 步并复位选中项（弹窗打开时与点「上一步」时都走这里） */
   function resetAddStep() {
     addProvider = 'workbuddy';
     addProviderHint = '';
+    addPresetKey = '';
+    addAccountType = TYPE_PROXY;
+    setSegValue($(ADD_TYPE_SEG_ID), TYPE_PROXY);
+    syncTypeHint();
     const search = $(ADD_SEARCH_ID);
     if (search) search.value = '';
     renderProviderCards();
     showAddStep('pick');
+    // 此刻弹窗正停在第 1 步：量一次它的自然高度并锁住（只锁一次，见函数说明）
+    lockModalHeight();
     // 摘要还没到（首次打开弹窗早于首屏那次 refresh）时补拉一次再重画：
     // 否则卡片上会清一色写「还没有账号」，而账号其实早就有了。
     // 只在这一步补 —— 已经拿到摘要时不重复发请求。
@@ -1016,6 +1156,10 @@
         if (addStep === 'pick') renderProviderCards();
       });
     }
+    // 自定义目录同理：切到「自定义」段时已建的家要显示出来
+    void window.wbProviders?.refreshCustom?.().then(() => {
+      if (addStep === 'pick') renderProviderCards();
+    });
   }
 
   // ─── 账号添加（数据驱动，配置见 ADD_FORMS）─────────

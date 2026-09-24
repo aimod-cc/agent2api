@@ -29,7 +29,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     content_parts, content_text, event_frame, is_truthy, json_text, random_id, string_field,
-    string_value, SseLineBuffer,
+    string_value, SseLineBuffer, FIELD_CACHE_CONTROL, FIELD_IS_ERROR,
 };
 use super::responses::ConvertError;
 
@@ -54,7 +54,19 @@ pub fn chat_from_anthropic(body: &Value) -> Result<Value, ConvertError> {
     if let Some(system) = body.get("system") {
         let text = system_text(system);
         if !text.trim().is_empty() {
-            messages.push(json!({ "role": "system", "content": text }));
+            let mut entry = Map::new();
+            entry.insert("role".to_string(), Value::String("system".to_string()));
+            entry.insert("content".to_string(), Value::String(text));
+            // system 的缓存断点（Claude Code 打在 system 最后一个块上）同样
+            // 走消息级暂存，出站时落回 system 块
+            if let Some(cache) = system
+                .as_array()
+                .map(|parts| last_cache_control(parts))
+                .unwrap_or(None)
+            {
+                entry.insert(FIELD_CACHE_CONTROL.to_string(), cache);
+            }
+            messages.push(Value::Object(entry));
         }
     }
     // ② 逐条消息转换
@@ -120,6 +132,17 @@ fn system_text(system: &Value) -> String {
         .join("\n\n")
 }
 
+/// 一个内容块上的 cache_control（没有 / 不是对象 → None）
+fn block_cache_control(part: &Value) -> Option<Value> {
+    part.get("cache_control").filter(|value| value.is_object()).cloned()
+}
+
+/// 块数组里**最后一个**带 cache_control 的断点（Anthropic 的惯例是断点打在
+/// 要缓存的前缀末尾块上，一条消息/一组 system 块里取最后一个即整段语义）
+fn last_cache_control(parts: &[Value]) -> Option<Value> {
+    parts.iter().rev().find_map(block_cache_control)
+}
+
 /// 一条 Anthropic 消息 → 一到两条 Chat 消息（追加进 `messages`）。
 ///
 /// 之所以可能拆成两条：Anthropic 把 tool_result 放在 user 消息的 content 块里，
@@ -149,14 +172,23 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
     let mut tool_calls: Vec<Value> = Vec::new();
     let mut reasoning = String::new();
     let mut normal: Vec<Value> = Vec::new();
+    // 块级 cache_control → 消息级暂存（粒度取舍见 mod.rs「内部暂存字段」的说明）。
+    // 思考块按 Anthropic 的规则**不可**挂 cache_control，这里也不收。
+    let mut normal_cache: Option<Value> = None;
+    let mut tool_use_cache: Option<Value> = None;
+    let mut tool_result_caches: Vec<Option<Value>> = Vec::new();
     for part in parts {
         if let Some(text) = part.as_str() {
             normal.push(json!({ "type": "text", "text": text }));
             continue;
         }
+        let cache = block_cache_control(part);
         let kind = string_field(part, "type").to_lowercase();
         match kind.as_str() {
-            "tool_result" => tool_results.push(part.clone()),
+            "tool_result" => {
+                tool_results.push(part.clone());
+                tool_result_caches.push(cache.clone());
+            }
             "tool_use" => {
                 let id = string_field(part, "id");
                 let arguments = {
@@ -171,6 +203,9 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
                         "arguments": arguments,
                     },
                 }));
+                if cache.is_some() {
+                    tool_use_cache = cache.clone();
+                }
             }
             "thinking" | "redacted_thinking" => {
                 let text = string_field(part, "thinking");
@@ -189,6 +224,10 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
             }
             _ => normal.push(part.clone()),
         }
+        // 常规内容块的断点：最后一个带 cache_control 的块为准（顺序覆盖）
+        if cache.is_some() && kind != "tool_result" && kind != "tool_use" {
+            normal_cache = cache.clone();
+        }
     }
 
     let chat_role = if role == "assistant" { "assistant" } else { "user" };
@@ -206,6 +245,11 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
             entry.insert("reasoning_content".to_string(), Value::String(reasoning.clone()));
         }
         entry.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        // 缓存断点优先取 tool_use 块上的（Claude Code 的惯例断点），否则用
+        // 同一条消息里正文块的断点 —— 本来就是同一条 Anthropic 消息拆开的
+        if let Some(cache) = tool_use_cache.or(normal_cache) {
+            entry.insert(FIELD_CACHE_CONTROL.to_string(), cache);
+        }
         messages.push(Value::Object(entry));
     } else if !normal.is_empty() || !reasoning.is_empty() {
         let mut entry = Map::new();
@@ -218,18 +262,38 @@ fn convert_message(messages: &mut Vec<Value>, message: &Value) -> Result<(), Con
         if chat_role == "assistant" && !reasoning.is_empty() {
             entry.insert("reasoning_content".to_string(), Value::String(reasoning));
         }
+        if let Some(cache) = normal_cache {
+            entry.insert(FIELD_CACHE_CONTROL.to_string(), cache);
+        }
         messages.push(Value::Object(entry));
     }
 
     // 工具结果：每条独立成 tool 消息（紧跟上面的 assistant，顺序正确）
-    for result in tool_results {
-        let tool_use_id = string_field(&result, "tool_use_id");
+    for (index, result) in tool_results.iter().enumerate() {
+        let tool_use_id = string_field(result, "tool_use_id");
         let output = result.get("content").unwrap_or(&Value::Null);
-        messages.push(json!({
-            "role": "tool",
-            "tool_call_id": if tool_use_id.is_empty() { random_id("call") } else { tool_use_id },
-            "content": tool_result_text(output),
-        }));
+        // is_error 是「这次工具执行失败了」的显式标记：丢掉后模型会把失败
+        // 结果当正常输出继续推理。挂在内部暂存字段上，由 anthropic 出站
+        // 恢复；OpenAI 形出口没有这个概念，随 strip 剥离。
+        let is_error = result.get("is_error").and_then(Value::as_bool) == Some(true);
+        let cache = tool_result_caches.get(index).cloned().flatten();
+        let mut entry = Map::new();
+        entry.insert("role".to_string(), Value::String("tool".to_string()));
+        entry.insert(
+            "tool_call_id".to_string(),
+            Value::String(if tool_use_id.is_empty() { random_id("call") } else { tool_use_id }),
+        );
+        entry.insert(
+            "content".to_string(),
+            Value::String(tool_result_text(output)),
+        );
+        if is_error {
+            entry.insert(FIELD_IS_ERROR.to_string(), Value::Bool(true));
+        }
+        if let Some(cache) = cache {
+            entry.insert(FIELD_CACHE_CONTROL.to_string(), cache);
+        }
+        messages.push(Value::Object(entry));
     }
     Ok(())
 }
@@ -333,7 +397,15 @@ fn tool_to_chat(tool: &Value) -> Option<Value> {
         function.insert("description".to_string(), description.clone());
     }
     function.insert("parameters".to_string(), parameters);
-    Some(json!({ "type": "function", "function": Value::Object(function) }))
+    let mut out = Map::new();
+    out.insert("type".to_string(), Value::String("function".to_string()));
+    out.insert("function".to_string(), Value::Object(function));
+    // 工具定义上的缓存断点（工具清单大而稳定，是 Anthropic 缓存收益最高的
+    // 一段）随内部暂存字段携带，出站时恢复到 anthropic 工具对象上
+    if let Some(cache) = block_cache_control(tool) {
+        out.insert(FIELD_CACHE_CONTROL.to_string(), cache);
+    }
+    Some(Value::Object(out))
 }
 
 /// Anthropic 的 tool_choice → Chat 的 tool_choice

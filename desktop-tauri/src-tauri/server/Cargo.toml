@@ -1,6 +1,6 @@
 [package]
 name = "agent2api-server"
-version = "2.7.5"
+version = "2.7.6"
 description = "Agent2API 网关本体 — 多提供商本地网关（桌面端与 headless 服务器共用）"
 authors = ["aimod-cc"]
 edition = "2021"

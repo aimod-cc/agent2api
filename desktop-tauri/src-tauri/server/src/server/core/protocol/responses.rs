@@ -26,7 +26,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     content_parts, content_text, event_frame, freeform, is_truthy, json_text, random_id,
-    string_field, string_value, tool_plan, SseLineBuffer,
+    string_field, string_value, tool_plan, SseLineBuffer, FIELD_ENCRYPTED_CONTENT,
 };
 use crate::server::logging;
 
@@ -348,6 +348,11 @@ fn text_of(content: Option<&Value>) -> String {
 struct PendingReasoning {
     /// 本轮（或本轮尚未消费的那一段）的 reasoning 正文
     text: Option<String>,
+    /// 本轮 reasoning 项上的 `encrypted_content`（store=false 的推理连续性
+    /// 载体，Codex / Grok CLI 回传）。与正文分开挂载：正文按既有语义
+    /// 「同一轮每条 assistant 都带」，加密体只挂**第一条**（9Router 同款 ——
+    /// 同一加密体重复出现在多条消息上，上游会当成多段推理）。
+    encrypted: Option<String>,
     /// 这段正文是否已经挂到过消息上。
     ///
     /// 用来区分「同一轮的第二个 reasoning 项」与「下一轮的第一个 reasoning 项」：
@@ -378,6 +383,19 @@ impl PendingReasoning {
         }
     }
 
+    /// 记下 reasoning 项携带的加密连续性载体（新 reasoning 项到来时覆盖旧值；
+    /// 不动 `attached` —— 轮次归属由正文那一侧管理）
+    fn stash_encrypted(&mut self, value: &Value) {
+        if let Some(encrypted) = value.as_str().filter(|text| !text.is_empty()) {
+            self.encrypted = Some(encrypted.to_string());
+        }
+    }
+
+    /// 取走加密载体（**取走即清**：只挂本轮第一条 assistant 消息）
+    fn take_encrypted(&mut self) -> Option<String> {
+        self.encrypted.take()
+    }
+
     /// 本轮要挂到 assistant 消息上的 reasoning（**不清空** —— 同一轮的每条
     /// assistant 消息都要带同一份，见结构体文档），同时记下「已被消费」
     fn attach(&mut self) -> Option<String> {
@@ -391,6 +409,7 @@ impl PendingReasoning {
     /// 轮次结束（遇到新的 user / system 消息）：清掉本轮的 reasoning
     fn end_turn(&mut self) {
         self.text = None;
+        self.encrypted = None;
         self.attached = false;
     }
 }
@@ -417,12 +436,19 @@ fn push_input_item(
                 let raw = json_text(item.get("arguments").unwrap_or(&Value::Null));
                 if raw.is_empty() { "{}".to_string() } else { raw }
             };
-            messages.push(tool_call_message(
+            let mut call_message = tool_call_message(
                 &call_id,
                 &name,
                 arguments,
                 pending.attach(),
-            ));
+            );
+            // 加密载体只挂本轮第一条 assistant（见 take_encrypted 的说明）
+            if let Some(encrypted) = pending.take_encrypted() {
+                if let Some(object) = call_message.as_object_mut() {
+                    object.insert(FIELD_ENCRYPTED_CONTENT.to_string(), Value::String(encrypted));
+                }
+            }
+            messages.push(call_message);
         }
         "function_call_output" => {
             messages.push(json!({
@@ -470,6 +496,10 @@ fn push_input_item(
             if let Some(text) = reasoning_text_of(item) {
                 pending.stash(text);
             }
+            // 加密连续性载体（store=false 多轮，Codex / Grok CLI）同样暂存，
+            // 由出站翻译（responses_outbound）恢复到发给 Responses 上游的
+            // reasoning 项里；其它出口随 strip 剥离（严格上游会拒）
+            pending.stash_encrypted(item.get("encrypted_content").unwrap_or(&Value::Null));
         }
         "input_text" | "text" => {
             messages.push(json!({ "role": "user", "content": string_field(item, "text") }));
@@ -535,6 +565,10 @@ fn push_input_item(
                 let reasoning = summary_text_of(item).or_else(|| pending.attach());
                 if let Some(reasoning) = reasoning {
                     message.insert("reasoning_content".to_string(), Value::String(reasoning));
+                }
+                // 加密载体只挂本轮第一条 assistant（见 take_encrypted 的说明）
+                if let Some(encrypted) = pending.take_encrypted() {
+                    message.insert(FIELD_ENCRYPTED_CONTENT.to_string(), Value::String(encrypted));
                 }
             } else if role != "tool" {
                 // 非 assistant、非 tool 的消息 = 上一轮结束：清掉本轮的 reasoning，

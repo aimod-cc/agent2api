@@ -26,7 +26,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     chat_frame, content_parts, content_text, is_truthy, json_number_of, json_text, random_id,
-    string_field, string_value, SseLineBuffer,
+    string_field, string_value, SseLineBuffer, FIELD_ENCRYPTED_CONTENT,
 };
 use super::responses::{image_url_of, tool_output_text, ConvertError};
 use super::tool_plan;
@@ -171,12 +171,33 @@ fn push_assistant_items(items: &mut Vec<Value>, message: &Value) {
             from_field
         }
     };
-    if !reasoning.is_empty() {
-        items.push(json!({
+    // 加密连续性载体（store=false 多轮）恢复进 reasoning 项：与 summary 文本
+    // 可以并存（OpenAI 官方回传的形态就是两者同项），只有加密体时 summary
+    // 给空数组。没有这个恢复，Codex / Grok CLI 的下一轮就接不上推理链 ——
+    // 它们靠把上游回传的加密体原样带回下一轮请求来延续推理。
+    let encrypted = message
+        .get(FIELD_ENCRYPTED_CONTENT)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    if !reasoning.is_empty() || encrypted.is_some() {
+        let mut item = json!({
             "type": "reasoning",
             "id": random_id("rs"),
-            "summary": [{ "type": "summary_text", "text": reasoning }],
-        }));
+            "summary": if reasoning.is_empty() {
+                Vec::<Value>::new()
+            } else {
+                vec![json!({ "type": "summary_text", "text": reasoning })]
+            },
+        });
+        if let Some(encrypted) = encrypted {
+            if let Some(object) = item.as_object_mut() {
+                object.insert(
+                    "encrypted_content".to_string(),
+                    Value::String(encrypted.to_string()),
+                );
+            }
+        }
+        items.push(item);
     }
     // 正文：Responses 不需要空的 assistant message（只带工具调用的轮次
     // 只发 function_call 项）；空正文跳过也能避免上游把空消息判成错误
