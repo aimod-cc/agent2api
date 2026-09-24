@@ -2,8 +2,6 @@
 
 **简体中文** | [English](./README.en.md)
 
-本项目已在 Gitee 开源：[gitee.com/aimodcc/agent2api](https://gitee.com/aimodcc/agent2api)
-
 把多家 AI 桌面客户端的登录态包装成本地 **OpenAI 兼容 API 网关**，统一暴露一个 `base_url`，附带多提供商账号管理、模型管理（启停 / 删除 / 映射）、出站指纹脱敏、出网代理与请求报表，并提供一个开箱即用的 Tauri 桌面端。任何支持自定义 `base_url` 的 OpenAI 客户端都能以 `http://127.0.0.1:3065/v1` 为端点调用这几家的模型额度——不需要 API Key，不需要改客户端源码。
 
 ```

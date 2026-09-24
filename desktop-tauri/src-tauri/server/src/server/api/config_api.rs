@@ -48,8 +48,6 @@ pub async fn get_config(State(_state): State<ServerState>) -> Response {
         "apiKeySet": snapshot.api_key_set(),
         "locale": snapshot.locale(),
         "defaultModel": snapshot.default_model(),
-        // 软件更新源（"github" / "gitee"，设置页「通用 → 软件更新」）
-        "updateSource": snapshot.update_source(),
         // 指纹脱敏开关（与 GET /api/sanitize 同一个键、同一个值）
         config::KEY_SANITIZE_FINGERPRINTS: snapshot.sanitize_fingerprints(),
     }))
@@ -98,25 +96,11 @@ pub async fn post_config(State(_state): State<ServerState>, body: Bytes) -> Resp
         }
     }
 
-    // ── updateSource ────────────────────────────────────────
-    // 非法值直接 400（与 apiKey 的处理同一取向，不让静默回落掩盖手改的脏请求）；
-    // set_update_source 内部再做一次归一（双保险）
-    if let Some(Value::String(text)) = object.get("updateSource") {
-        let normalized = text.trim().to_lowercase();
-        if normalized != "github" && normalized != "gitee" {
-            return errors::management_error(400, "更新源只能是 github 或 gitee");
-        }
-        config::set_update_source(&normalized);
-        logging::log("[Config]", &format!("软件更新源已切换为 {normalized}"));
-    }
-
     let snapshot = config::current();
     ok_json(json!({
         "apiKeySet": snapshot.api_key_set(),
         "locale": snapshot.locale(),
         "defaultModel": snapshot.default_model(),
-        // 软件更新源（"github" / "gitee"，设置页「通用 → 软件更新」）
-        "updateSource": snapshot.update_source(),
     }))
 }
 

@@ -1,11 +1,4 @@
-//! 软件更新 —— GitHub / Gitee Release 检测与安装包下载（对照 workbuddy-update.mjs）。
-//!
-//! ── 更新源可切换（github / gitee）──────────────────────────
-//! 国内直连 GitHub 不稳，Gitee 镜像让检查与下载都能裸连。源存在配置
-//! `updateSource`（设置页切换），**每次检查/下载时读一次快照**，切完即生效。
-//! Gitee 镜像的账号名与 GitHub 不同（aimodcc vs aimod-cc），仓库路径单独
-//! 定义（见 `version::DEFAULT_REPO_GITEE`）；Gitee 的 Release JSON 与 GitHub
-//! 兼容（tag_name / assets[].browser_download_url），`pick_installer` 原样复用。
+//! 软件更新 —— GitHub Release 检测与安装包下载（对照 workbuddy-update.mjs）。
 //!
 //! ── 为什么检测/下载在后端而不是 Tauri 壳 ────────────────────
 //! 壳侧 reqwest 为省掉 TLS 依赖关掉了默认特性（只能访问本机网关的明文 HTTP），
@@ -45,7 +38,7 @@ use crate::server::logging;
 
 pub use version::{
     assert_downloadable, compare_versions, installer_kind, pick_installer, safe_file_name,
-    UpdateError, DEFAULT_REPO, DEFAULT_REPO_GITEE, GITHUB_API, GITEE_API, MAX_INSTALLER_BYTES,
+    UpdateError, DEFAULT_REPO, GITHUB_API, MAX_INSTALLER_BYTES,
 };
 
 /// 检查更新（GitHub API）请求的总超时（Node 版 REQUEST_TIMEOUT_MS）。
@@ -197,27 +190,9 @@ impl UpdateManager {
     /// 拉取最新 Release（对应 refreshLatest）。
     /// 404 表示仓库还没有发布任何版本，按「无更新」处理（latest = null）。
     async fn refresh_latest(&self) -> Result<(), UpdateError> {
-        // 源每次检查时读一次快照：设置页切完源，下一次「检查更新」立即生效。
-        // Gitee 是国内裸连可达的镜像 —— 出网复用 fetch_with_egress（直连优先），
-        // Clash 兜底对 Gitee 无害（直连必然先成功）
-        let gitee = crate::server::config::current().update_source() == "gitee";
-        let source_label = if gitee { "Gitee" } else { "GitHub" };
         let repository = self.repository();
-        // Gitee 镜像的账号名与 GitHub 不同（aimodcc vs aimod-cc），路径单独定义
-        let url = if gitee {
-            format!("{GITEE_API}/repos/{DEFAULT_REPO_GITEE}/releases/latest")
-        } else {
-            format!("{GITHUB_API}/repos/{repository}/releases/latest")
-        };
-        let headers = if gitee {
-            // Gitee API 不认 GitHub 的 Accept / Api-Version 头，读公开仓库无需 token
-            vec![
-                ("User-Agent".to_string(), USER_AGENT.to_string()),
-                ("Accept".to_string(), "application/json".to_string()),
-            ]
-        } else {
-            client::github_headers()
-        };
+        let url = format!("{GITHUB_API}/repos/{repository}/releases/latest");
+        let headers = client::github_headers();
         let response = client::fetch_with_egress(&url, &headers, Some(REQUEST_TIMEOUT_MS)).await?;
 
         let status = response.status().as_u16();
@@ -226,25 +201,20 @@ impl UpdateManager {
             return Ok(());
         }
         if status == 403 || status == 429 {
-            // 文案照抄 Node（含环境变量提示）：403 多为匿名请求限额用尽。
-            // 提 token 只对 GitHub 有意义（Gitee 匿名按 IP 限额，无 token 可配）
-            let hint = if gitee {
-                String::new()
-            } else {
-                "，或设置 WORKBUDDY_GITHUB_TOKEN 提高限额".to_string()
-            };
+            // 文案照抄 Node（含环境变量提示）：403 多为匿名请求限额用尽
+            let hint = "，或设置 WORKBUDDY_GITHUB_TOKEN 提高限额";
             return Err(UpdateError::new(format!(
-                "{source_label} 接口访问受限（可能是请求频率超限）。稍后再试{hint}"
+                "GitHub 接口访问受限（可能是请求频率超限）。稍后再试{hint}"
             )));
         }
         if !response.status().is_success() {
-            return Err(UpdateError::new(format!("{source_label} 返回 HTTP {status}")));
+            return Err(UpdateError::new(format!("GitHub 返回 HTTP {status}")));
         }
 
         let payload: Value = response
             .json()
             .await
-            .map_err(|error| UpdateError::new(format!("解析 {source_label} 响应失败: {error}")))?;
+            .map_err(|error| UpdateError::new(format!("解析 GitHub 响应失败: {error}")))?;
         let text = |key: &str| {
             payload
                 .get(key)
@@ -268,16 +238,12 @@ impl UpdateManager {
         let page_url = {
             let url = text("html_url");
             if url.is_empty() {
-                if gitee {
-                    format!("https://gitee.com/{DEFAULT_REPO_GITEE}/releases")
-                } else {
-                    format!("https://github.com/{repository}/releases")
-                }
+                format!("https://github.com/{repository}/releases")
             } else {
                 url
             }
         };
-        // Gitee 的 Release 对象只有 created_at（GitHub 是 published_at）
+        // 发布时间：正常都带 published_at；缺失时回落到 created_at（防御）
         let published_at = {
             let value = text("published_at");
             if value.is_empty() { text("created_at") } else { value }
@@ -357,9 +323,6 @@ impl UpdateManager {
                 == Some(true),
             "asset": asset.clone().unwrap_or(Value::Null),
             "repository": repository,
-            // 本次检查用的源（"github" / "gitee"）：界面据此渲染源切换的高亮
-            // 与「在 Gitee / GitHub 查看」文案
-            "source": crate::server::config::current().update_source(),
             "downloadSupported": asset.is_some(),
             // 安装包形态（"nsis" / "dmg"）：界面据此决定文案 ——
             // Windows 要提示 UAC 提权、macOS 是挂载磁盘映像后手动拖进应用程序
@@ -552,13 +515,8 @@ impl UpdateManager {
             _ = wait_cancel(cancel_flag) => return Ok(0),
         };
         if !response.status().is_success() {
-            let source_label = if crate::server::config::current().update_source() == "gitee" {
-                "Gitee"
-            } else {
-                "GitHub"
-            };
             return Err(UpdateError::new(format!(
-                "下载失败：{source_label} 返回 HTTP {}",
+                "下载失败：GitHub 返回 HTTP {}",
                 response.status().as_u16()
             )));
         }

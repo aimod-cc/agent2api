@@ -197,20 +197,6 @@
 }
 
 /* ─── 软件更新 ─── */
-/* 更新源切换（GitHub / Gitee 镜像）：切完立即重新检查，样式沿用全局 .seg。
-   与版本读数同排（.update-version 的首个子项），不独占一行；
-   margin-right 在行内 gap 之外再拉开一点，跟版本药丸分成两组 */
-.update-source {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-right: 8px;
-}
-
-.update-source-label { color: var(--text-3); font-size: 12px; }
-
-.update-source .seg-item { font-size: 12px; }
-
 .update-version {
   display: flex;
   align-items: center;

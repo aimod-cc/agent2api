@@ -1108,7 +1108,7 @@
                 <section class="panel">
                   <div class="panel-head">
                     <h2>软件更新</h2>
-                    <span class="tip-q" data-tip="更新包从所选的发布源下载（GitHub 或 Gitee 镜像），下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性。国内网络建议选 Gitee，直连可达；选 GitHub 时若访问较慢，会自动尝试通过 Clash Verge 的混合端口重试一次。"></span>
+                    <span class="tip-q" data-tip="更新包从 GitHub 发布页下载，下载完成后可直接启动安装程序并自动重启本程序。安装包会先校验来源域名与文件完整性；访问 GitHub 较慢时，会自动尝试通过 Clash Verge 的混合端口重试一次。"></span>
                     <span id="update-badge" class="badge">未检查</span>
                     <div class="head-actions">
                       <button id="btn-update-check">检查更新</button>
@@ -1116,16 +1116,9 @@
                     </div>
                   </div>
                   <div class="panel-body">
-                    <!-- 更新源与版本号同一行：更新源是低频开关不值得独占一行，
-                         排在版本读数前面，窗口放不下时靠 .update-version 的 wrap 自然换行 -->
+                    <!-- 当前版本 → 最新版本两个读数同一行，窗口放不下时靠
+                         .update-version 的 wrap 自然换行 -->
                     <div class="update-version">
-                      <div class="update-source">
-                        <span class="update-source-label">更新源</span>
-                        <div class="seg" id="update-source-switch" role="tablist" aria-label="软件更新源">
-                          <button type="button" class="seg-item active" data-source="github">GitHub</button>
-                          <button type="button" class="seg-item" data-source="gitee" title="国内镜像，直连可达，检查与下载都更快">Gitee</button>
-                        </div>
-                      </div>
                       <span class="version-pill">
                         <span class="k">当前版本</span><span class="v" id="update-current">—</span>
                       </span>

@@ -130,12 +130,6 @@ pub struct RuntimeConfig {
     /// 请求就生效），解析一次存下来最省事。默认 `true`，见 `KEY_CAPTCHA_ENABLED`；
     /// 配置项缺失时可由环境变量 `AGENT2API_CAPTCHA_ENABLED` 兜底（默认 1 开、0 关）。
     captcha_enabled: bool,
-    /// 软件更新源（设置页「通用 → 软件更新」：github / gitee）。
-    ///
-    /// 与 `debug_mode` 同一理由：检查更新逐次读一次（切完源下一次检查立即
-    /// 生效，不重启进程），解析一次存下来最省事。默认 `github`（上游仓库在
-    /// GitHub，Gitee 只是镜像），非法值回落 github（见 `update_source_from`）。
-    update_source: String,
     /// 系统提示词设置（设置页「通用 → 系统提示词」）。
     ///
     /// 与 `sanitize_fingerprints` 同一理由（转发层逐请求取一次，改完下一个请求
@@ -187,11 +181,6 @@ impl RuntimeConfig {
     /// 面板机器人校验开关（登录 / 注册端点逐请求判一次）。
     pub fn captcha_enabled(&self) -> bool {
         self.captcha_enabled
-    }
-
-    /// 软件更新源（"github" / "gitee"；检查更新逐次判一次）
-    pub fn update_source(&self) -> &str {
-        &self.update_source
     }
 
     /// 系统提示词设置（界面 / 日志用；转发层要的是下面的借用视图）
@@ -404,8 +393,6 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .get(KEY_CAPTCHA_ENABLED)
             .and_then(Value::as_bool)
             .unwrap_or_else(env_captcha_enabled),
-        // 软件更新源：只认字面 `gitee`，非法 / 缺失 → github（上游仓库）
-        update_source: update_source_from(&raw),
         // 系统提示词：模式非法/缺失 → passthrough（默认），文件读不到 → 内置默认
         // + 一条原因（见 `prompt_from`）
         prompt: prompt_from(&raw),
@@ -951,36 +938,6 @@ pub fn set_captcha_enabled(enabled: bool) -> bool {
             .raw
             .insert(KEY_CAPTCHA_ENABLED.to_string(), Value::Bool(enabled));
         config.captcha_enabled = enabled;
-    })
-}
-
-// ─── 软件更新源（updateSource）─────────────────────────────────
-
-/// 从原始配置解析软件更新源：只认字面 `gitee`，其余（含缺失）一律 `github`。
-/// 手改文件写坏不报错，与「写坏回落」的既有取向一致。
-fn update_source_from(raw: &Map<String, Value>) -> String {
-    match raw.get(KEY_UPDATE_SOURCE).and_then(Value::as_str) {
-        Some("gitee") => "gitee".to_string(),
-        _ => "github".to_string(),
-    }
-}
-
-/// 写入软件更新源（设置页「通用 → 软件更新」）。
-///
-/// 与 `set_captcha_enabled` 同一模式：内存立即生效（检查更新逐次读快照），
-/// 写盘时不吃掉 config.json 里的其它字段。调用方（`api::config_api`）已校验
-/// 取值，这里再归一一次（防御手写调用）：非 `gitee`（忽略大小写）一律 `github`。
-pub fn set_update_source(source: &str) -> bool {
-    let normalized = if source.trim().eq_ignore_ascii_case("gitee") {
-        "gitee"
-    } else {
-        "github"
-    };
-    update(|config| {
-        config
-            .raw
-            .insert(KEY_UPDATE_SOURCE.to_string(), Value::String(normalized.to_string()));
-        config.update_source = normalized.to_string();
     })
 }
 

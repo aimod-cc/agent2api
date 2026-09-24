@@ -12,11 +12,9 @@ name: build
 #   · 手动 workflow_dispatch（在 Actions 页面选分支触发）：
 #     两个平台一起构建，产物作为 workflow artifact 下载，不发布 Release
 #   · 推送 v* tag：与 docker.yml 同时触发，一次打 tag 安装包与镜像全出；
-#     Windows/macOS 包只挂 workflow artifact —— GitHub Release 与 Gitee
-#     发行版都由发版收尾脚本在本地挂载（scripts/release.sh）：GitHub
-#     Release 本就不自动建；Gitee 侧因境外 runner 直连 Gitee 传附件慢且
-#     会假死（v2.7.2 实测 11MB 挂 10 分钟+），撤掉 CI 跨境上传改由本地
-#     境内直连，秒传且不再占用 CI 时长
+#     Windows/macOS 包只挂 workflow artifact —— GitHub Release 由发版
+#     收尾脚本在本地挂载（scripts/release.sh）：Release 本就不自动建，
+#     安装包只挂 artifact 让构建与发布解耦，发布那步重跑脚本即可
 #
 # ── action 版本为什么都钉在大版本 v7（本次升级）─────────────────
 # 原先用 checkout@v4 / setup-node@v4 / upload-artifact@v4，三者都跑在
