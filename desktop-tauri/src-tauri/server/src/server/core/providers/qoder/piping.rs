@@ -71,12 +71,16 @@ pub(super) async fn prefetch_stream_head(
             Some(Ok(chunk)) => chunk,
             // 首帧之前的传输失败（中断 / 空闲超时）同样交回编排层：还没下发
             // 任何字节、客户端的 200 头也没发出 —— 换下一个账号再试。文案
-            // 与 `drive_aggregate` 的传输中断同一出处。
+            // 与 `drive_aggregate` 的传输中断同一出处；空闲超时是保护性判定
+            // 不是中断，直接用自带文案（含设定秒数，与通用层同一处理）
             Some(Err(error)) => {
-                return Err(GatewayError::with_status(
-                    502,
-                    format!("Qoder 上游流中断: {error}"),
-                ));
+                let text = error.to_string();
+                let message = if text.starts_with(IDLE_TIMEOUT_PREFIX) {
+                    text
+                } else {
+                    format!("Qoder 上游流式传输中断: {text}")
+                };
+                return Err(GatewayError::with_status(502, message));
             }
             None => break,
         };
@@ -215,16 +219,16 @@ pub(super) async fn drive_stream(
         let chunk = match item {
             Ok(chunk) => chunk,
             Err(error) => {
-                // 上游流中断 / 空闲超时：**正常路径**（客户端断开、上游主动
+                // 上游流式传输中断 / 空闲超时：**正常路径**（客户端断开、上游主动
                 // 结束、保护性判定），不 panic。先把已累积的 reasoning 冲刷
                 // 出去，再补「错误帧 + [DONE]」收尾（与通用层 ForwardStream
-                // 一致）。空闲超时是保护性判定不是中断：文案不带「上游流
-                // 中断」前缀（与通用层同一处理，见 stall 的模块头）
+                // 一致）。空闲超时是保护性判定不是中断：文案不带「上游流式
+                // 传输中断」前缀（与通用层同一处理，见 stall 的模块头）
                 let text = error.to_string();
                 failed = Some(if text.starts_with(IDLE_TIMEOUT_PREFIX) {
                     text
                 } else {
-                    format!("上游流中断: {text}")
+                    format!("上游流式传输中断: {text}")
                 });
                 break;
             }

@@ -299,7 +299,14 @@
         ? `↻ ${retries.length} 次`
         : '-';
       const retryTitle = retries.length
-        ? retries.map((retry, i) => `第 ${i + 1} 次：${String(retry?.reason || '未知原因')}`).join('\n')
+        ? retries.map((retry) => {
+            const reason = String(retry?.reason || '未知原因');
+            const delayMs = Number(retry?.delayMs);
+            const delay = Number.isFinite(delayMs) && delayMs > 0
+              ? `，${delayMs >= 1000 ? `${Math.round(delayMs / 1000)}秒` : `${Math.round(delayMs)}毫秒`}后重试`
+              : '';
+            return `${reason}${delay}`;
+          }).join('\n')
         : '';
       const notice = String(item?.notice ?? '').trim();
       return `<tr>`

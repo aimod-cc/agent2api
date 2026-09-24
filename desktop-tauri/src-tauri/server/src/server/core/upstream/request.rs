@@ -53,6 +53,12 @@ fn headers_timeout() -> Duration {
     Duration::from_millis(crate::server::config::timeout_settings().headers_ms())
 }
 
+/// 「连接中超时」的设定值（秒）：连接超时文案标注实际生效的秒数用，
+/// 与设置页「请求超时 → 连接中超时」同一份配置。
+fn connect_timeout_seconds() -> u64 {
+    crate::server::config::timeout_settings().connect_ms() / 1000
+}
+
 /// 一次上游请求的全部素材（协议无关形态；provider 差异在构造阶段已消解）
 pub struct TransportRequest {
     /// 上游完整 URL（由适配器给出）
@@ -158,20 +164,34 @@ pub async fn send_chat_request(
     let headers_budget = headers_timeout();
     match tokio::time::timeout(headers_budget, builder.send()).await {
         Ok(Ok(response)) => Ok(response),
-        Ok(Err(error)) => Err(UpstreamRequestError {
-            // 网络层错误（ECONNREFUSED、代理鉴权失败、DNS…）：带上根因与出口说明，
-            // 便于判断是不是代理配错了
-            message: format!(
-                "上游请求失败（{via}）: {}",
-                egress::describe_error_detail(&error)
-            ),
-        }),
-        Err(_elapsed) => Err(UpstreamRequestError {
-            message: format!(
-                "上游响应超时（等待响应头超过 {} 秒，出口 {via}）",
-                headers_budget.as_secs()
-            ),
-        }),
+        Ok(Err(error)) => {
+            // `send()` 阶段的超时只可能来自连接（等待响应头由外层计时器管，
+            // 它的预算 ≤ 客户端 read_timeout，见 egress 的说明）：此时错误链
+            // 对用户没有信息量（就是「没连上」），文案直接给设置页的旋钮名
+            // 与实际生效的秒数；其余（ECONNREFUSED、代理鉴权失败、DNS…）
+            // 保留根因与出口说明，便于判断是不是代理配错了
+            let reason = if error.is_timeout() {
+                format!("连接中超时({}秒)", connect_timeout_seconds())
+            } else {
+                "上游连接失败".to_string()
+            };
+            let message = if error.is_timeout() {
+                format!("连接中超时({}秒，出口 {via})", connect_timeout_seconds())
+            } else {
+                format!(
+                    "上游请求失败（{via}）: {}",
+                    egress::describe_error_detail(&error)
+                )
+            };
+            Err(UpstreamRequestError { message, reason })
+        }
+        Err(_elapsed) => {
+            let seconds = headers_budget.as_secs();
+            Err(UpstreamRequestError {
+                reason: format!("等待响应超时({seconds}秒)"),
+                message: format!("等待响应超时({seconds}秒，出口 {via})"),
+            })
+        }
     }
 }
 
@@ -179,6 +199,10 @@ pub async fn send_chat_request(
 #[derive(Clone, Debug)]
 pub struct UpstreamRequestError {
     pub message: String,
+    /// 简短原因（重试链里「这次为什么重试」的展示文案）：
+    /// 「连接中超时(N秒)」/「等待响应超时(N秒)」/「上游连接失败」。
+    /// `message` 是最终失败的详细文案（带出口说明），这里是它的简短形态。
+    pub reason: String,
 }
 
 impl UpstreamRequestError {

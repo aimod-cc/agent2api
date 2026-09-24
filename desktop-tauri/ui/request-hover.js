@@ -46,6 +46,13 @@
  * 浮层会被卡片裁掉（tooltip.js / select.js 踩的是同一个坑）。定位策略照抄
  * tooltip.js：默认在锚点下方，放不下且上方更宽裕时翻到上方；贴边时夹进视口。
  *
+ * 与 tooltip.js 的另一处差别：请求日志页默认 1 秒一拍自动刷新、每次整表重绘
+ * （`list.innerHTML = ...`），锚点节点会被换成新的。所以宿主在重绘前后各通知
+ * 一次（`beforeListRedraw` / `afterListRedraw`），本模块把锚点迁到新节点上 ——
+ * 不迁移的话，重绘落在 150ms 打开延迟窗口里时会拿**游离节点**定位，
+ * `getBoundingClientRect()` 全 0，面板落在视口左上角；而且游离节点收不到
+ * pointerout，面板开了就不会自己关（一次实测的 bug）。
+ *
  * 隐藏用 `display: none`（而不是 `visibility` / 透明度）：浮层里有长文本，
  * 让它继续保持布局会参与每帧的重排计算，而它绝大多数时间是不可见的。
  */
@@ -72,12 +79,31 @@
   let anchor = null;      // 当前挂着的标签
   let showTimer = 0;
   let hideTimer = 0;
+  /**
+   * 延迟窗口里排着打开的那枚标签（`showTimer` 的排队目标）。
+   *
+   * 需要单独记：定时器排上时 `anchor` 还是 null（面板还没开），而 pointerout
+   * 的取消判据此前只看 `anchor` —— 于是「悬一下就走」照样会弹出，列表重绘
+   * 把标签删掉时浏览器补发的 pointerout 也拦不住这个定时器（见 pointerout
+   * 处理器与 open 的游离节点判据）。
+   */
+  let pendingTag = null;
+
+  /** 宿主列表与「标签 → 数据」的反查函数（bind 时记下；整表重绘后找回锚点要用） */
+  let hostEl = null;
+  let entryOfFn = null;
+  /**
+   * 重绘期间的锚点处置意图（见 beforeListRedraw / afterListRedraw）：
+   * `null` = 没有重绘在进行；`{ action: 'move', kind, key }` = 迁移；`{ action: 'close' }` = 收起。
+   */
+  let remap = null;
 
   function cancelTimers() {
     clearTimeout(showTimer);
     clearTimeout(hideTimer);
     showTimer = 0;
     hideTimer = 0;
+    pendingTag = null;
   }
 
   // ─── 内容构造（纯函数，输入是请求日志条目）───────────────────
@@ -141,23 +167,22 @@
    * **同一轮账号内**的重发（换的是时间不是账号），并列会让「切换路径」那串
    * 箭头里混进一串同名项，把真正的换号链埋掉（口径见后端 `AttemptDetail::retries`）。
    *
-   * 逐条文案：`第 n 次 · 原因（HTTP 状态码，无则省略） · 等 Xs`。
+   * 逐条文案：`原因（HTTP 状态码，无则省略），X秒后重试`。
    */
   function retryRowsHtml(item) {
     const retries = retriesOf(item);
     if (!retries.length) return '';
     const head = `<div class="rh-retry-head">↻ 重试 ${retries.length} 次</div>`;
-    const rows = retries.map((retry, index) => {
+    const rows = retries.map((retry) => {
       const reason = String(retry?.reason ?? '').trim();
       const status = Number(retry?.status);
       const hasStatus = retry?.status !== null && retry?.status !== undefined
         && Number.isFinite(status);
       const delayMs = Number(retry?.delayMs);
       const delay = Number.isFinite(delayMs) && delayMs > 0
-        ? `，等 ${esc(formatDelay(delayMs))}`
+        ? `，${esc(formatDelay(delayMs))}后重试`
         : '';
-      return `<div class="rh-retry-row"><span class="rh-no">第 ${index + 1} 次 ·</span>`
-        + `<span class="rh-retry-why">${esc(reason || '未知原因')}</span>`
+      return `<div class="rh-retry-row"><span class="rh-retry-why">${esc(reason || '未知原因')}</span>`
         + (hasStatus ? `<span class="rh-retry-status">HTTP ${esc(String(status))}</span>` : '')
         + (delay ? `<span class="rh-dim">${delay}</span>` : '')
         + '</div>';
@@ -165,9 +190,9 @@
     return `<div class="rh-retry">${head}${rows}</div>`;
   }
 
-  /** 退避时长的可读形态（秒；不足 1 秒给毫秒） */
+  /** 退避时长的可读形态（X秒；不足 1 秒给 X毫秒） */
   function formatDelay(ms) {
-    return ms >= 1000 ? `${Math.round(ms / 1000)}s` : `${Math.round(ms)}ms`;
+    return ms >= 1000 ? `${Math.round(ms / 1000)}秒` : `${Math.round(ms)}毫秒`;
   }
 
   /**
@@ -320,6 +345,12 @@
   /** 展开锚点的面板。`html` 由调用方（本模块自己的两个内容构造函数）给出 */
   function open(el, html) {
     if (!html) return;
+    // 锚点必须还在文档里：整表重绘（本页默认 1 秒一拍自动刷新）会把标签换成
+    // 新节点，而 150ms 延迟窗口里排下的这次打开拿到的可能正是被删掉的旧节点
+    // —— 游离节点的 rect 全 0，place() 会把面板摆到视口左上角，且它收不到
+    // pointerout、开了就不会自己关（实测的 bug 现象）。作废这次打开即可：
+    // 指针还停在标签上的话，浏览器补发的 pointerover 会重新排一次。
+    if (!el.isConnected) return;
     cancelTimers();
     if (anchor && anchor !== el) close();
     anchor = el;
@@ -339,6 +370,78 @@
     anchor.removeAttribute('aria-describedby');
     anchor = null;
     panel.classList.remove('open');
+  }
+
+  // ─── 整表重绘时的锚点迁移 ──────────────────────────────────
+
+  /**
+   * 列表整表重绘**前**调用（宿主在替换 `innerHTML` 之前）：定下锚点的处置意图。
+   *
+   * 只有「指针正悬着」的锚点才迁移（鼠标用户在看面板，面板该跟着新一屏走），
+   * 身份用「标签种类 + 行身份键」（`data-req-hover` 与 `data-req-id`）记下 ——
+   * 用属性而不是节点引用：整表重绘必然换节点，引用一定会失效。其余情况一律
+   * 记为收起，理由各是一条独立的边界：
+   *   · `hideTimer` 排着 = 指针已经移开、正在等 HIDE_DELAY 收起 —— 迁移过去
+   *     之后那个定时器的判据（`anchor === tag`）已不成立，会变成「该关没关」；
+   *   · 指针不在而焦点在标签上 = 键盘打开 —— 重绘会把焦点元素删掉、焦点回落
+   *     到 body，面板跟过去就成了「焦点不在标签上、面板却开着」的错位；
+   *   · 身份键缺失 = 这枚标签不是按常规渲染出来的，无从找回。
+   */
+  function beforeListRedraw() {
+    if (!anchor) return;
+    const kind = String(anchor.dataset?.reqHover || '');
+    const key = String(anchor.dataset?.reqId || '');
+    const movable = Boolean(kind && key) && anchor.matches(':hover') && !hideTimer;
+    remap = movable ? { action: 'move', kind, key } : { action: 'close' };
+  }
+
+  /**
+   * 列表整表重绘**后**调用（宿主在替换 `innerHTML` 之后）：按处置意图收尾。
+   *
+   * 迁移：锚点换人、内容重算、位置重摆 —— 面板跟着新一屏走，用户看不到任何
+   * 闪动。找不回新节点（行被挤出当前页 / 列表变空 / 出错态 / 反查不到数据）
+   * 或意图本就是收起：close()。
+   *
+   * ── 为什么不是「重绘即收起」─────────────────────────────────
+   * 本页默认 1 秒重绘一次，正盯着面板看的人会被每秒关一次、还要动一下鼠标
+   * 才重开；迁移把这件事对用户完全隐去。顺带这也是「游离锚点」这个状态的
+   * 彻底解法 —— 迁不走的（找不到新节点的）一律收起，不会留下死锚点。
+   */
+  function afterListRedraw() {
+    const pending = remap;
+    remap = null;
+    if (!pending || !anchor) return;
+    if (pending.action === 'close') {
+      close();
+      return;
+    }
+    const next = findTag(hostEl, pending.kind, pending.key);
+    // 内容一并重算而不是沿用旧 HTML：进行中的行每秒都在变（阶段、已用时），
+    // 旧 HTML 会显示上一拍的事实；entryOf 反查的本来就是当前这一屏
+    const html = next ? htmlFor(next, entryOfFn) : '';
+    if (!next || !html) {
+      close();
+      return;
+    }
+    if (next === anchor) return;   // 整表重绘必然换节点；这条兜住宿主改成局部更新后误伤
+    anchor.classList.remove('active');
+    anchor.removeAttribute('aria-describedby');
+    anchor = next;
+    next.classList.add('active');
+    next.setAttribute('aria-describedby', panel.id);
+    panel.innerHTML = html;
+    place();
+  }
+
+  /** 在新 DOM 里按「标签种类 + 行身份键」找回锚点；没有就是这一行不在本屏了 */
+  function findTag(host, kind, key) {
+    // 用遍历而不是拼属性选择器：身份键来自后端（id 或时间戳），不必让它参与
+    // 选择器解析 —— 转义漏一个字符就是一个静默查不到。一行最多两枚标签，
+    // 50 行的遍历对每 1 秒一次的重绘完全无感。
+    for (const el of host.querySelectorAll('[data-req-hover]')) {
+      if (el.dataset.reqHover === kind && el.dataset.reqId === key) return el;
+    }
+    return null;
   }
 
   /**
@@ -361,6 +464,9 @@
    */
   function bind({ host, entryOf } = {}) {
     if (!host) return;
+    // 记下宿主与反查函数：整表重绘后按身份找回锚点要用（见 afterListRedraw）
+    hostEl = host;
+    entryOfFn = entryOf;
 
     host.addEventListener('pointerover', event => {
       const tag = event.target.closest?.('[data-req-hover]');
@@ -370,15 +476,28 @@
       // 已经开着别的面板时立即切换（用户在连着看），否则等满延迟防误触
       const delay = anchor ? 0 : SHOW_DELAY;
       if (anchor) close();
+      pendingTag = tag;
       showTimer = setTimeout(() => {
         showTimer = 0;
+        pendingTag = null;
         open(tag, htmlFor(tag, entryOf));
       }, delay);
     });
 
     host.addEventListener('pointerout', event => {
       const tag = event.target.closest?.('[data-req-hover]');
-      if (!tag || anchor !== tag) return;
+      if (!tag) return;
+      // ① 还在延迟窗口里（面板没开、anchor 为 null）：取消排着的那次打开 ——
+      //    「悬一下就走」不该弹出。列表重绘把标签删掉时浏览器补发的 pointerout
+      //    也走这里：不取消的话，定时器到点会拿游离节点去 open（见 open 的判据）
+      if (pendingTag === tag) {
+        clearTimeout(showTimer);
+        showTimer = 0;
+        pendingTag = null;
+        return;
+      }
+      // ② 面板开着且锚的就是它：按 HIDE_DELAY 收起
+      if (anchor !== tag) return;
       clearTimeout(showTimer);
       showTimer = 0;
       hideTimer = setTimeout(() => {
@@ -438,8 +557,14 @@
     // `hasProcessFacts` 是唯一一个**给宿主用的判断**：那枚「重试」标签显不显示
     // 由它回答 —— 判据（换过号 **或** 重试过 **或** 有提示）需要读明细内部
     // 的字段，让宿主自己拼一遍就会有两份判据（见它的说明）。
+    //
+    // `beforeListRedraw` / `afterListRedraw` 是给宿主的**重绘通知**：整表重绘
+    // 会换掉锚点节点，必须通知本模块迁移，否则面板会拿游离节点定位
+    // （见那两个函数的说明）。
     bind,
     close,
     hasProcessFacts,
+    beforeListRedraw,
+    afterListRedraw,
   };
 })();

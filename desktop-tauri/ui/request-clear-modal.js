@@ -23,7 +23,7 @@
  * 后端 GET / DELETE / clear-preview 三条路由共用同一份筛选解析
  *（stats_api::filter_from_params），前端也不另起一套口径。
  *
- * 弹窗按需创建、关闭即移除（与 custom-models-modal.js / custom-provider-ui.js
+ * 弹窗按需创建、关闭即移除（与 confirm-dialog.js / custom-provider-ui.js
  * 同一手法）：不往 index.html 里常驻空弹窗。
  */
 (() => {

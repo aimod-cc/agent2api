@@ -582,5 +582,5 @@
 
 /* 窄窗口（与侧栏收起同断点）：四个缓存窗口退成两列，页头筛选整行铺开 */
 @media (max-width: 900px) {
-  .page[data-page="overview"] .page-head .head-actions { flex-basis: 100%; margin-left: 0; justify-content: flex-start; }
+  .page[data-page="overview"] .panel-head .head-actions { flex-basis: 100%; margin-left: 0; justify-content: flex-start; }
 }

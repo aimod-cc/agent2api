@@ -18,6 +18,7 @@ prototype/
 
 # 第三方参考项目（仅本地分析用）
 Acankao/
+desktop-tauri/web
 
 # 运行日志与截图产物
 logs/
@@ -26,6 +27,9 @@ desktop-tauri/window-shot.png
 # 发布说明草稿（只用于发布 Release，不入库）
 .release-notes-*.md
 docs/
+
+# 发版脚本下载的 CI 构建产物（scripts/release.sh）
+dist/
 
 # Docker 部署：密钥与运行数据不入库
 .env

@@ -197,16 +197,24 @@ pub async fn send(
     );
     match tokio::time::timeout(budget, builder.send()).await {
         Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) if error.is_timeout() => {
+            // `send()` 阶段的超时只可能来自连接（等待响应头由外层计时器管）：
+            // 文案给设置页旋钮名与实际生效的秒数（与通用层 send_chat_request 同一口径）
+            Err(GatewayError::with_status(
+                502,
+                format!(
+                    "Qoder 连接中超时({}秒，出口 {via})",
+                    crate::server::config::timeout_settings().connect_ms() / 1000
+                ),
+            ))
+        }
         Ok(Err(error)) => Err(GatewayError::with_status(
             502,
             format!("Qoder 上游请求失败（{via}）: {}", egress::describe_error_detail(&error)),
         )),
         Err(_elapsed) => Err(GatewayError::with_status(
             502,
-            format!(
-                "Qoder 上游响应超时（等待响应头超过 {} 秒，出口 {via}）",
-                budget.as_secs()
-            ),
+            format!("Qoder 等待响应超时({}秒，出口 {via})", budget.as_secs()),
         )),
     }
 }

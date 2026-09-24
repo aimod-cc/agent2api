@@ -222,24 +222,27 @@ body.colset-dragging { cursor: grabbing; user-select: none; }
 
 /* ── 3. 竖排读数与靠边的 grid 项 ── */
 
-/* 这些格子里是「竖着排的几行」（时间 / 提供商账号 / 用时 / 用量 / 重试标签），
+/* 这些格子里是「竖着排的几行」（时间 / 提供商账号 / 用时 / 用量），
    靠 align-items 决定整块贴哪边 —— 它们的 text-align 管不到自己的子项
    （align-items: flex-end 之类的默认值写在各自的列样式里）。
    底部的 .req-time 还自带 flex-direction: column，所以这一层同样必要。 */
 .req-row > .req-time.ta-left,
 .req-row > .req-target.ta-left,
-.req-row > .req-retry.ta-left,
 .req-row > .req-usage.ta-left { align-items: flex-start; }
 
 .req-row > .req-time.ta-center,
 .req-row > .req-target.ta-center,
-.req-row > .req-retry.ta-center,
 .req-row > .req-usage.ta-center { align-items: center; }
 
 .req-row > .req-time.ta-right,
 .req-row > .req-target.ta-right,
-.req-row > .req-retry.ta-right,
 .req-row > .req-usage.ta-right { align-items: flex-end; }
+
+/* 重试列是**横向**标签容器（两枚并排放不下才换行，见 page-requests.css），
+   所以它的三档落在主轴 justify-content 上，不在上面那一层。 */
+.req-row > .req-retry.ta-left { justify-content: flex-start; }
+.req-row > .req-retry.ta-center { justify-content: center; }
+.req-row > .req-retry.ta-right { justify-content: flex-end; }
 
 /* 用时列是「右对齐」的两行读数：grid 项默认 stretch、内容自身 align-items: flex-end，
    所以要改的是内容盒的 align-items，而不是格子的 text-align。 */

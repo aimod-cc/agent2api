@@ -167,5 +167,11 @@ $('add-social-restore')?.addEventListener('change', () => {
 });
 document.addEventListener('keydown', event => { if (event.key === 'Escape') closeModal(); });
 
+// 跨模块入口：别的页面要打开这张弹窗时走它（弹窗是全局的，调用方不必先跳账号页，
+// 见 models-panel.js 的「＋ 新建自定义提供商」）。不把 openModal / closeModal 直接
+// 留在全局：keys-panel.js 里另有一个同名的 openModal（作用域在自己的 IIFE 内），
+// 同名函数散在全局迟早有人接错线。
+window.wbAddAccountModal = { open: openModal, close: closeModal };
+
 // 登录进行状态由主进程推送，按钮复位在 web-login.js 的引擎里统一处理
 // （它是唯一知道「等待中的是哪一家」的地方，见 applyShellState）。

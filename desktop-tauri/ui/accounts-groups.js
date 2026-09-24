@@ -50,6 +50,15 @@
    * edition 决定卡片是否显示国内版 / 国际版徽章与组内二级分组；
    * identifier / expiry 是「账号标识」与「有效期」在记录里的键名
    * （workbuddy 用 uid / expiresAt，小浣熊用 userId / tokenExpiresAt）。
+   * emailAsName 表示「这家的账号就该以邮箱报名字」：账号列的账号名直接取邮箱
+   * （见 accounts-table 的 accountCell）。两家 true：
+   *   · Qoder —— 它的 name 是上游个人资料里的昵称（可能只是「Lucas Ou」这种
+   *     显示名），邮箱才是能对上号的身份；两站（国际版 / 国内版）同一套资料
+   *     接口，所以不分版本；
+   *   · AutoClaw 国际版 —— 网页登录（Zai / Google）建出来的账号，name 同样是
+   *     上游 user_name 昵称，只显示邮箱一行才认得出是谁。国内版不跟（桌面端
+   *     导入的账号名本身就是邮箱）。
+   * 缺了邮箱（老记录 / 上游没回）时账号列照旧回落到名字，不会显示成空白。
    *
    * ── Cline 两条键（两个额度池各一家）────────────────────────
    * `cline-free` 与 `cline-pass` 是同一家上游按计费通道拆出来的两个 provider
@@ -68,8 +77,8 @@
     // 两项都必须登记 —— 漏了哪一项，那一家就会掉进 GENERIC_FEATURES，
     // 症状是余额按钮消失、标识列显示成空。
     autoclaw: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
-    'autoclaw-intl': { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
-    qoder: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt' },
+    'autoclaw-intl': { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt', emailAsName: true },
+    qoder: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
     'cline-free': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
     'cline-pass': { usage: true, checkin: false, edition: false, identifier: 'account', expiry: 'expiresAt' },
   };
@@ -82,6 +91,7 @@
    */
   const GENERIC_FEATURES = {
     usage: false, checkin: false, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt',
+    emailAsName: false,
   };
 
   /** 账号所属 provider（字段缺失 / 非字符串按默认 provider 兜底，与后端 store 口径一致） */

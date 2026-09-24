@@ -531,8 +531,15 @@ async fn run_backend(
             // 小浣熊的 10 分钟 TTL 会让「点了没反应、清单没变」与坏掉无法区分。
             // 自动路径相反 —— 本来就该「有缓存用缓存」，各家 TTL 自会判定。
             if trigger == Trigger::Manual {
-                let results =
-                    crate::server::core::providers::adapter::refresh_implemented_forced(store).await;
+                // 定时任务没有「点名账号」这一维（空表 = 各家按默认选取，队首可用账号），
+                // 也不做范围收窄 —— 任务语义就是「按全量跑一轮」（收窄是「获取模型」
+                // 弹窗的界面取舍，见 api/models.rs 的 providers）
+                let results = crate::server::core::providers::adapter::refresh_implemented_forced(
+                    store,
+                    &serde_json::Map::new(),
+                    None,
+                )
+                .await;
                 let count = |status: &str| {
                     results
                         .iter()

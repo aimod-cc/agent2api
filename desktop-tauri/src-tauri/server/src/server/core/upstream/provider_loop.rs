@@ -193,13 +193,16 @@ fn transient_retry_advice(status: u16, remaining: usize) -> Option<RetryAdvice> 
 }
 
 /// 传输层失败（DNS / 代理 / 连接）的统一退避建议：与瞬时 HTTP 错误同一套设置。
-fn transport_retry_advice(remaining: usize) -> Option<RetryAdvice> {
+///
+/// 原因取错误自带的简短形态（`UpstreamRequestError::reason`）：连接超时与
+/// 等待响应头超时各自带设置页旋钮名与实际秒数，其余统一「上游连接失败」。
+fn transport_retry_advice(error: &super::request::UpstreamRequestError, remaining: usize) -> Option<RetryAdvice> {
     if remaining == 0 {
         return None;
     }
     Some(RetryAdvice {
         delay_ms: config::retry_settings().delay_ms(),
-        reason: "上游连接失败".to_string(),
+        reason: error.reason.clone(),
     })
 }
 
@@ -1682,6 +1685,7 @@ async fn send_or_cancel(
         result = send_chat_request(transport) => result,
         _ = token.cancelled() => Err(super::request::UpstreamRequestError {
             message: cancellation::MANUAL_TERMINATED.to_string(),
+            reason: cancellation::MANUAL_TERMINATED.to_string(),
         }),
     }
 }
@@ -1761,7 +1765,7 @@ async fn send_with_retry(
                 }
                 // 传输层失败（DNS/代理/连接）：按设置退避重发，吸收链路抖动；
                 // 次数用完才收敛成 502，与改造前的兜底一致
-                if let Some(advice) = transport_retry_advice(budget.remaining) {
+                if let Some(advice) = transport_retry_advice(&error, budget.remaining) {
                     budget.remaining -= 1;
                     let used = budget.used();
                     telemetry.note_attempt_retry(&advice.reason, None, advice.delay_ms);
@@ -1797,7 +1801,7 @@ async fn send_with_retry(
                 Ok(detail) => detail,
                 Err(_elapsed) => super::request::UpstreamErrorDetail {
                     code: None,
-                    message: format!("上游错误响应体读取超时（超过 {} 秒）", budget.as_secs()),
+                    message: format!("非流式响应超时({}秒)", budget.as_secs()),
                 },
             }
         };

@@ -426,14 +426,20 @@
    *
    * `mount` 取该页的操作区（元素、选择器或返回元素的函数）：工具条右侧、卡片头
    * 的操作组、或批量栏那类只放按钮的容器都行。
-   * 按钮插在**最前面**：它是「怎么看这张表」的开关，与旁边那些「对数据做什么」
+   * 按钮默认插在**最前面**：它是「怎么看这张表」的开关，与旁边那些「对数据做什么」
    * 的操作按钮不是一类，排在前面不会被误当成主操作按钮。
+   * `buttonPlacement: 'last'` 改成插到末尾 —— 模型管理页要求它排在操作按钮之后
+   * （那一排按钮有明确的主次：添加 / 刷新是主操作，列设置是辅助开关）。
    */
   function register(spec) {
     const entry = { ...spec, config: load(spec) };
     registry.set(spec.id, entry);
     const host = mountOf(spec);
-    if (host) host.insertBefore(makeButton(entry), host.firstChild);
+    const button = makeButton(entry);
+    if (host) {
+      if (spec.buttonPlacement === 'last') host.appendChild(button);
+      else host.insertBefore(button, host.firstChild);
+    }
     return {
       apply: columns => apply(spec.id, columns),
       config: () => entry.config,
@@ -494,10 +500,17 @@
    * 让一张静态表（<colgroup> + <thead> 写死在 HTML 里）的表头跟上配置：
    * 按配置顺序重排、隐藏的摘掉、对齐类重新贴一遍。
    *
+   * `viewHidden` 是**视图级**的额外隐藏集合（可选）：模型管理页选中自定义提供商时
+   * 要把「倍率」「来源」两列收起来 —— 那是内置家清单的字段，自定义家没有。它与用户
+   * 在列设置里的配置是两码事，所以叠加而不是改写配置：切回内置家时原样恢复
+   * （元素被摘掉但仍在 staticHeadOf 的缓存里，放得回去，见上面 staticHeads 的说明）。
+   * 数据行由各自的渲染函数按同一份可见列产出（models-panel 的 visibleColumns 走
+   * 同一个集合），表头与表体才不会各画一个样。
+   *
    * 数据行不在这里管 —— 它们由各自的渲染函数按同一份配置产出单元格，
    * 每次重绘自然就是对的（见 models-panel / keys-panel 的行渲染）。
    */
-  function syncStaticHead(id, table) {
+  function syncStaticHead(id, table, viewHidden) {
     const spec = registry.get(id);
     if (!spec || !table) return;
     const head = staticHeadOf(id, table);
@@ -508,7 +521,7 @@
       const th = ths.get(item.key);
       if (!th) continue;
       const col = cols.get(item.key);
-      if (!item.visible) {
+      if (!item.visible || viewHidden?.has(item.key)) {
         th.remove();
         col?.remove();
         continue;

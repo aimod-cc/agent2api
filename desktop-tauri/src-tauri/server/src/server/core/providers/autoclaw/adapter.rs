@@ -349,12 +349,16 @@ impl ProviderAdapter for AutoClawAdapter {
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
+        account_id: &'a str,
         force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     > {
         Box::pin(async move {
-            let credentials = match resolve_credentials(self.region, store, "") {
+            // `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条账号
+            // （resolve_credentials 按 id 直取；取不到时它自己给 401 文案，
+            // 这里归成「没刷」——本家还有环境变量旁路，不是一个硬失败）
+            let credentials = match resolve_credentials(self.region, store, account_id) {
                 Ok(credentials) => credentials,
                 Err(error) => {
                     logging::verbose(

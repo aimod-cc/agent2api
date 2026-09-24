@@ -40,13 +40,17 @@
    *     复选框与批量栏那颗「全选」同轴（47 = 16 + 15 + 16，算式与理由见
    *     page-accounts-table.css 的 .cell-pick）。它没有拖宽把手，这里的值
    *     只影响首屏与「恢复默认」。
+   *   · proxy 156 → 186（本轮）：格子从一枚 chip 换成下拉（选中即保存，见
+   *     accounts-table.js 的 proxyCell），选择器自带「内边距 + 箭头 + 间隔」
+   *     约 41px 的固定开销 —— 156 的文本区只剩 ~99px，节点名全被省略号吃掉；
+   *     186 留出 ~129px 装「节点名 :端口」的常见形态。
    */
   const DEFAULTS = {
     pick: 47,
     priority: 132,
     provider: 132,
     account: 300,
-    proxy: 156,
+    proxy: 186,
     connections: 56,
     status: 80,
     limits: 148,
@@ -116,14 +120,19 @@
   }
 
   /**
-   * 委托绑定：mousedown 开拖、dblclick 还原。挂在滚动容器上一次即可，
+   * 委托绑定：pointerdown 开拖、dblclick 还原。挂在滚动容器上一次即可，
    * 表格被整表重绘后监听仍然有效（委托到容器，不依赖具体节点）。
+   *
+   * 与 table-columns.js 同一套写法（指针事件 + setPointerCapture + 两道收尾
+   * 兜底），原因见那边的说明：松手若被浏览器丢掉（指针拖出窗口再松），
+   * 拖动就永远不结束，鼠标一动列宽就跟着走。
    */
   function bind(host) {
     if (!host) return;
     let dragging = null;
 
-    host.addEventListener('mousedown', event => {
+    host.addEventListener('pointerdown', event => {
+      if (event.button !== 0) return;
       const grip = event.target.closest?.('.col-grip');
       if (!grip) return;
       event.preventDefault();
@@ -136,20 +145,27 @@
       const startWidth = column.col.getBoundingClientRect().width;
       grip.classList.add('active');
       document.body.classList.add('col-resizing');
+      try { grip.setPointerCapture(event.pointerId); } catch { /* 退回全局监听 */ }
       const move = moveEvent => {
+        if (moveEvent.buttons === 0) { up(); return; }
         applyWidth(column.col, column.key, startWidth + moveEvent.clientX - startX);
       };
       const up = () => {
         grip.classList.remove('active');
         document.body.classList.remove('col-resizing');
-        window.removeEventListener('mousemove', move);
-        window.removeEventListener('mouseup', up);
+        try { grip.releasePointerCapture(event.pointerId); } catch { /* 已自动释放 */ }
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', up);
+        window.removeEventListener('blur', up);
         persist();
         // 拖完重绘一次：colgroup 由 widths() 统一生成，重绘让 DOM 与持久化状态对齐
         window.wbAccountsView?.render?.();
       };
-      window.addEventListener('mousemove', move);
-      window.addEventListener('mouseup', up);
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+      window.addEventListener('pointercancel', up);
+      window.addEventListener('blur', up);
     });
 
     host.addEventListener('dblclick', event => {

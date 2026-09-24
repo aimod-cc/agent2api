@@ -212,8 +212,12 @@ const BRIDGE_JS: &str = r#"
     // 手动刷新（网关页「刷新模型清单」按钮）：只刷支持远程目录的家、
     // 强制绕过缓存，返回 `{results, refreshed, skipped, failed, models}`
     // —— **带刷新后的聚合清单**，界面就地重绘、不必再拉一次 /api/session
-    // （理由见后端 `api::models` 的模块头）。不传 body：这条无入参
-    refreshModels: () => call('POST', '/api/models/refresh', {}),
+    // （理由见后端 `api::models` 的模块头）。
+    //
+    // 可选入参 `{accounts: {providerId: accountId}}`：「获取模型」弹窗每行的
+    // 「模型来源」下拉点名的账号（用谁去打该家的目录接口）。不传 = 各家按
+    // 默认选取（队首可用账号）；逐条结果里带 `accountId` 供界面回读。
+    refreshModels: payload => call('POST', '/api/models/refresh', payload || {}),
     // 模型管理（启停 / 映射）：写接口都返回最新 {models, mappings, reasoningLevels}
     // 映射照抄 OmniProxy 语义：对外名自由命名（允许与上游 id 同名），同一对外名
     // 可在不同提供商各建一条（主备）；provider 为空 = 旧版全局语义

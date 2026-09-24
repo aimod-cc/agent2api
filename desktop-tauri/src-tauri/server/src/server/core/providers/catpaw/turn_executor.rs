@@ -383,7 +383,7 @@ pub(super) async fn drive_stream(
             }
             Some(Err(error)) => {
                 outcome = Err(CatPawError::upstream(format!(
-                    "上游流中断: {}",
+                    "上游流式传输中断: {}",
                     egress::describe_error_detail(&error),
                 )));
                 finished = true;
@@ -450,7 +450,7 @@ pub(super) async fn drive_aggregate(
             }
             Some(Err(error)) => {
                 outcome = Err(CatPawError::upstream(format!(
-                    "上游流中断: {}",
+                    "上游流式传输中断: {}",
                     egress::describe_error_detail(&error),
                 )));
                 finished = true;

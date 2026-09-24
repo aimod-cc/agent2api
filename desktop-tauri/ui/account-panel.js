@@ -3,7 +3,8 @@
 
 /**
  * 账号编辑相关的弹窗都集中在这里，主脚本只负责挂按钮：
- *   - 单账号设置（优先级 / 启用 / 备注名 / 出网代理）
+ *   - 单账号设置（优先级 / 启用 / 备注名 / 出网代理；所属提供商是**自定义家**
+ *     时还会多一段「提供商」：名称 / 协议 / Base URL / 删除提供商）
  *   - 批量操作（启用 / 禁用 / 改代理 / 删除）
  *
  * 代理表单由 wbProxyForm 提供（与批量弹窗共用同一份实现）。
@@ -99,6 +100,7 @@
     $('account-enabled-input').checked = account.enabled !== false;
     $('account-modal-status').textContent = '';
     mountBalanceTokenField(account);
+    await mountProviderSection(account);
 
     if (!settingsProxyForm) settingsProxyForm = wbProxyForm.create($('account-proxy-form'));
     const mode = settingsProxyForm.fill(account.proxy);
@@ -187,11 +189,92 @@
     return value ? { balanceToken: value } : null;
   }
 
+  // ─── 自定义提供商的「提供商」一段 ─────────────
+
+  /**
+   * 账号所属的**自定义提供商**可以在同一个弹窗里就地改（名称 / 协议 / Base URL）
+   * 或删除；内置家不注入这一段（它们的协议与地址写在代码里，没有可改的字段）。
+   *
+   * 为什么落在这里：账号页那颗「自定义提供商」按钮与它打开的管理弹窗已整体移除
+   * （模型清单统一到「模型管理」页，提供商本身的编辑与删除只剩这一处入口，见
+   * custom-provider-ui.js 的文件头）。而改 Base URL 的动机通常正是「这个账号
+   * 连不上了」—— 在账号设置里就地改，比先退出去找一个管理入口近一步。
+   *
+   * 字段随同一个「保存」提交（见 saveSettings），不另起一颗保存按钮：
+   * 一个弹窗里两颗保存按钮是事故来源。
+   */
+  const PROVIDER_SECTION_ID = 'account-provider-section';
+  /** 名称长度上限，与后端 custom_providers::MAX_NAME_CHARS 一致（前端先挡一次） */
+  const MAX_PROVIDER_NAME_CHARS = 64;
+
+  async function mountProviderSection(account) {
+    $(PROVIDER_SECTION_ID)?.remove();
+    // 目录里查得到才算自定义家：id 前缀只说明「长得像」，而记录本身才带着
+    // 协议 / Base URL 的现值（三个字段要拿它预填）
+    const provider = await window.wbCustomProvidersUi?.find?.(providerOf(account));
+    const anchor = $('account-name-input')?.closest('.modal-section');
+    if (!provider || !anchor) return;
+
+    const options = (window.wbProviders?.PROTOCOL_OPTIONS || []).map(option =>
+      `<option value="${esc(option.value)}"${option.value === provider.protocol ? ' selected' : ''}>${esc(option.label)}</option>`).join('');
+    // 名下账号数含自己：peersOf 给的是「同 provider 的其它账号」
+    const count = peersOf(account).length + 1;
+    const section = document.createElement('div');
+    section.id = PROVIDER_SECTION_ID;
+    section.className = 'modal-section';
+    // id 挂在段上而不是某个输入框上：保存时按它找回这家（字段本身没有 id 语义）
+    section.dataset.providerId = provider.id;
+    section.innerHTML = `<h3>提供商</h3>`
+      + `<p>这一栏改的是<strong>「${esc(provider.name || provider.id)}」本身</strong>（名下 ${count} 个账号共用）。`
+      + `改协议 / Base URL 会改变它们的转发方式，正在进行的请求可能失败；模型清单与映射在「模型管理」页。</p>`
+      + `<div class="field-row"><label for="account-provider-name">名称</label>`
+      + `<input id="account-provider-name" type="text" maxlength="${MAX_PROVIDER_NAME_CHARS}" `
+      + `value="${esc(provider.name || '')}" placeholder="提供商显示名，1~${MAX_PROVIDER_NAME_CHARS} 个字符"></div>`
+      + `<div class="field-row" style="margin-top:9px"><label for="account-provider-protocol">协议</label>`
+      + `<select id="account-provider-protocol" class="custom-provider-select">${options}</select></div>`
+      + `<div class="field-row" style="margin-top:9px"><label for="account-provider-baseurl">Base URL</label>`
+      + `<input id="account-provider-baseurl" type="text" value="${esc(provider.baseUrl || '')}" `
+      + `placeholder="OpenAI 兼容填到 /v1；Anthropic 填根地址"></div>`
+      + `<div class="field-row" style="margin-top:12px">`
+      + `<button type="button" class="danger" id="account-provider-remove" `
+      + `title="删除该提供商及其名下全部账号">删除提供商</button>`
+      + `<span class="detail">级联删除名下全部账号，不可恢复</span></div>`;
+    anchor.insertAdjacentElement('afterend', section);
+    $('account-provider-remove')?.addEventListener('click', () => { void removeProvider(provider.id); });
+  }
+
+  /**
+   * 读「提供商」那一段的改动：没这一段（内置家）或三个字段都没动 → null（不提交）。
+   *
+   * 返回 `{ error }` 而不是直接提交的原因：空名称 / 空 Base URL 后端会 400，而那时
+   * **账号已经存下了** —— 用户看到「保存失败」却发现账号的改动生效了。所以先把
+   * 表单验一遍，验不过就拦在账号落库之前。
+   */
+  function readProviderPatch() {
+    const id = $(PROVIDER_SECTION_ID)?.dataset.providerId || '';
+    if (!id) return null;
+    const name = ($('account-provider-name')?.value || '').trim();
+    const protocol = $('account-provider-protocol')?.value || '';
+    const baseUrl = ($('account-provider-baseurl')?.value || '').trim();
+    if (!name) return { error: '请填写提供商名称' };
+    if (!baseUrl) return { error: '请填写提供商的 Base URL' };
+    const current = (window.wbProviders?.customList?.() || []).find(item => item.id === id);
+    if (current && current.name === name && current.protocol === protocol && current.baseUrl === baseUrl) return null;
+    return { id, name, protocol, baseUrl };
+  }
+
+  /** 删除该账号所属的自定义提供商：删掉了就把本弹窗一起关掉（账号也没了） */
+  async function removeProvider(providerId) {
+    if (panelBusy) return;
+    if (await window.wbCustomProvidersUi?.remove?.(providerId)) closeSettings();
+  }
+
   function closeSettings() {
     $('account-modal').classList.remove('open');
-    // 余额凭证行是注入的（只有 CatPaw 账号有）：顺手清掉，避免下次打开别家账号
-    // 时它还在（mountBalanceTokenField 也会先删，这里只是让关闭态也干净）
+    // 余额凭证行与「提供商」那一段都是注入的：顺手清掉，避免下次打开别家账号
+    // 时它们还在（两个 mount 也会先删，这里只是让关闭态也干净）
     $(BALANCE_TOKEN_ROW_ID)?.remove();
+    $(PROVIDER_SECTION_ID)?.remove();
     editingId = null;
   }
 
@@ -220,6 +303,16 @@
       return;
     }
 
+    // 提供商那一段（只有自定义家才有）：先在账号落库**之前**验一遍字段 ——
+    // 空名称 / 空 Base URL 会被后端 400 挡下，而那时账号已经存下了，
+    // 用户看到「保存失败」却发现账号的改动其实生效了
+    const providerPatch = readProviderPatch();
+    if (providerPatch?.error) {
+      $('account-modal-status').innerHTML =
+        `<span style="color:var(--danger)">${esc(providerPatch.error)}</span>`;
+      return;
+    }
+
     panelBusy = true;
     const button = $('account-modal-save');
     button.disabled = true;
@@ -235,6 +328,19 @@
         proxy,
         ...(balancePatch || {}),
       });
+      // 提供商那一段排在账号之后（账号是本弹窗的主角，先落库）。它失败时账号
+      // 已经存下了，所以留在弹窗里把那句话说清楚 —— 笼统报成「保存失败」会把
+      // 两件事混成一件，用户会以为账号的改动也丢了
+      if (providerPatch) {
+        try {
+          await window.wbCustomProvidersUi.update(providerPatch);
+        } catch (error) {
+          $('account-modal-status').innerHTML = `<span style="color:var(--danger)">`
+            + `账号已保存，但提供商未更新：${esc(error.message)}</span>`;
+          try { await wbApp.refresh?.(); } catch { /* 交给下一次轮询 */ }
+          return;
+        }
+      }
       // 先关窗并反馈成功：改动已经落库，刷新只是让列表卡片跟上，
       // 不该让用户对着「保存中…」再多等一次网络往返（刷新若被排队更是等不到头）。
       closeSettings();

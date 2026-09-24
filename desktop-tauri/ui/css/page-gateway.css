@@ -66,18 +66,59 @@
 /* 工具栏：提供商分段 + 状态分段 + 搜索，排成一行。
    它挂在 .panel-body 上（那条规则是 flex 纵向），这里必须显式改回横向，
    否则三个控件会各占一行并居中 */
-.models-tools { display: flex; flex-direction: row; align-items: center; justify-content: flex-start; gap: 8px; flex-wrap: wrap; }
-.models-tools .spacer { flex: 1 1 auto; }
-.models-tools .seg-item .n { font-size: 10.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
-.models-tools .seg-item.active .n { color: inherit; }
+/* 状态筛选与搜索框（都住在面板头里，见 index.html 的说明）。
+   「搜索框 + 那排按钮」包成一个整体靠右：auto 外边距只给这个整体，不给搜索框自己
+   —— 给它自己的话那个 auto 会吃掉全部剩余空间，右边那排按钮被挤到第二行。
+   搜索框 240px（模型 ID / 别名一般十几个字符，再宽是白占地方），窄窗口下可压缩到 150px。 */
+/* 右侧那排按钮（列设置 + 三颗操作）：不压缩、不内部换行 —— 允许压缩或折行的后果
+   是它把自己拆开（按钮分两行），面板头就散了。空间不够时由 .panel-head 自己的
+   flex-wrap 把整排挪到下一行。靠右由 .head-actions 自带的 margin-left:auto 完成。 */
+.page[data-page="gateway"] .panel-head .head-actions { flex: 0 0 auto; flex-wrap: nowrap; }
+/* 搜索框紧跟状态筛选（同为「看这张表」的控件），靠左；240px 是模型 ID / 别名
+   能完整显示的宽度，这一页放得下 —— 曾为挤进同一行收到 180，不必了 */
+#models-search { flex: 0 0 auto; width: 240px; }
 
 /* 刷新说明与逐家结果：常驻在表格下方，不随 toast 消失；有失败才标红 */
-.models-refresh-note { color: var(--text-3); font-size: 11.5px; line-height: 1.5; }
-.models-refresh-note:empty { display: none; }
-.models-refresh-note.err { color: var(--danger); }
+/* ─── 「获取模型」弹窗（models-fetch-modal.js）───
+   形态对照 OmniProxy 的 ModelDiscoveryModal：上面一行工具（重新获取 / 搜索 / 选择），
+   中间一张表，底部导入。表格沿用 .models-table（与模型管理页同一张脸的列宽与字号），
+   这里只补列宽与表格区的高度上限。 */
+.fm-tools { align-items: center; }
+.fm-search { flex: 0 0 auto; width: 240px; }
+.fm-wrap { max-height: min(48vh, 460px); }
+/* 列宽写在 <col> 上（合计 100%，table-layout: fixed 下按 colgroup 分配）——
+   与模型管理页同一口径：没拖过的列走这里的百分数，拖过的列由 table-columns.js
+   写 col 的 inline width 覆盖（th 上不能写宽度，它会盖过 col，拖动就失效）。
+   百分数按弹窗实际表宽折算：内置家约 872px（920 减内边距）、三列形态约 504px。 */
+#fm-table-intl .f-provider { width: 20%; }
+/* 模型来源 25%：这一格的展示名以邮箱为主（emailAsName 的家，见 models-fetch-modal
+   的 accountLabel），典型邮箱约 22 字符（如 oyl70969337@gmail.com ≈ 139px）——
+   22% 会把触发器上的文本截掉，25% 刚好装下；宽度从最宽的说明列借 */
+#fm-table-intl .f-source { width: 25%; }
+#fm-table-intl .f-state { width: 11%; }
+#fm-table-intl .f-count { width: 10%; }
+#fm-table-intl .f-note { width: 34%; }
+/* 自定义家的窄形态（三列）：勾选 40px ≈ 8%、状态 92px ≈ 18%、上游模型吃剩余 */
+#fm-table-custom .f-pick { width: 8%; }
+#fm-table-custom .f-model { width: 74%; }
+#fm-table-custom .f-state { width: 18%; }
+/* 「模型来源」列：一格一个账号下拉（宽度交给原生 select 当锚，外壳自动跟随）。
+   外壳还须显式撑满单元格：inline-flex 的 shrink-to-fit 会把外壳收到「最长选项的
+   自然宽」，长文本（邮箱）时比单元格窄出右箭头那一档，触发器里的文本反而先被
+   截断；width:100% 让外壳与单元格同宽，文本区直接按单元格宽度算 */
+.fm-table .fm-source .select-shell { width: 100%; }
+.fm-table .fm-source select { width: 100%; }
+/* 自定义提供商的窄形态：表只有「勾选 / 上游模型 / 状态」三列，用 920px 的宽表
+   右半全是空白 —— 宽度收到 60%（920 × 0.6 ≈ 552px），与内置家那张宽表区分开 */
+.modal-narrow { width: min(552px, 100%); }
+/* 内置家那张结果表里「说明」列的小字：与表格其它列同基线，不抢主信息 */
+.fm-table .detail { color: var(--text-3); font-size: 11.5px; line-height: 1.5; }
 
 /* 表格（模型管理 / 网关 Key 共用）：贴面板左右边缘，表头粘顶。
    overflow-anchor 同 .page.active：tbody 重建时不做锚定补偿，行内点开关视口不动 */
+/* 表格滚动盒（模型管理 / 网关 Key 共用）。max-height 是**内容撑高、超过才收**的
+   语义，网关 Key 页就按这个来（那页没有自己的高度骨架）。模型管理页要的是固定
+   高度（与账号页一致），由 `.mm-main > .models-table-wrap` 覆盖成 flex 吃满剩余。 */
 .models-table-wrap { overflow: auto; overflow-anchor: none; max-height: min(62vh, 720px); border-top: 1px solid var(--border); }
 
 .models-table {
@@ -143,8 +184,6 @@
   background: var(--surface);
   font-weight: 700;
 }
-/* 「未挂载的映射」分组表头：标签走警示色，与各家分组区分开 */
-.models-table .tr-orphan .prov-tag { border-color: var(--warn-bd); background: var(--warn-soft); color: var(--warn); }
 .models-table .tr-more td { padding: 4px 14px; text-align: center; }
 
 /* 模型 id：等宽加粗，悬浮出复制按钮 */
@@ -169,8 +208,14 @@
 
 /* 映射名药丸：品牌色浅底；行禁用时随行压淡并加删除线。
    纵向排列（每条绑定独占一行，参照账号页模型管理弹窗）——映射一多条，
-   横向 wrap 会挤成变宽的迷宫，竖着读每行一条才对得上「绑定列表」的心智。 */
+   横向 wrap 会挤成变宽的迷宫，竖着读每行一条才对得上「绑定列表」的心智。
+   第一行是例外：默认那条与「＋ 映射」并排（.alias-row）—— 入口按钮不是绑定，
+   让它独占一行会把每个模型行都撑高三行。 */
 .aliases { display: flex; flex-direction: column; align-items: flex-start; gap: 5px; }
+/* 默认 chip + 「＋ 映射」。max-width: 100% 让这一行在最宽处收住，放不下时
+   按钮自己折到第二行，而不是把 chip 挤扁或把列顶宽（.mm 是 minmax(0,1fr)，
+   列一被顶宽，横向滚动条就挂到面板上了）。 */
+.alias-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; max-width: 100%; }
 .alias {
   display: inline-flex;
   align-items: center;
@@ -205,9 +250,6 @@
 .alias .switch .track { width: 24px; height: 14px; }
 .alias .switch .track::after { top: 2px; left: 2px; width: 10px; height: 10px; }
 .alias .switch input:checked + .track::after { transform: translateX(10px); }
-/* 未挂载的映射（目标不在该家清单里）：警示色浅底，与正常映射的「品牌色 + 可点」
-   一眼分开 —— 它不是错误，但确实需要用户处理（换个目标，或删掉） */
-.alias.orphan { border-color: var(--warn-bd); background: var(--warn-soft); color: var(--warn); }
 .alias .x {
   height: 16px;
   width: 16px;
@@ -322,3 +364,173 @@ button.danger-text:hover:not(:disabled) { background: var(--danger-soft); color:
 /* 摘要行：与上面的说明同款小字，首行前留一点空隙（它是「当前选择」而不是
    「使用说明」，视觉上要分得开） */
 #key-restrict-summary { margin-top: 2px; }
+
+/* ─────────────────────────────────────────────
+   模型管理页：占满剩余高度，滚动只发生在列表内部
+
+   与账号页（layout.css 的 .page.active[data-page="accounts"]）同一套骨架：
+   页面本身不滚，面板吃满剩余高度，面板里只有「列表」那一块滚 —— 表格高度因此
+   与窗口绑定，而不是随模型条数伸缩（模型少时表格矮成一条、多时把整页顶长，
+   两种都不该发生）。同一页里的左栏是列表，所以它也自己滚。
+   ───────────────────────────────────────────── */
+.page.active[data-page="gateway"] {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding-bottom: var(--pad);
+}
+.page[data-page="gateway"] .panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+/* ─────────────────────────────────────────────
+   左栏（提供商导航）+ 右栏（选中那家的模型表）
+
+   左栏是**页面内的一段侧边栏**：分组标题、导航项、选中态全部沿用全局侧边栏
+   （layout.css 的 .nav-group-label / .nav-item）那一套变量与形态 —— 同一个应用里
+   只该有一种「列表导航」的语言，用户在左侧栏认得出的行高、字号、选中底色，
+   在这里应当原样成立。差别只有两处：这里的项多一个计数（模型数），
+   以及「＋ 新建自定义提供商」是动作而不是选项（虚线框）。
+
+   两栏用 grid 而不是 flex：右栏必须能收缩到 0 宽以下（minmax(0, 1fr)），
+   否则「模型映射」那一列的 chips 会把整行顶宽，横向滚动条挂到 panel 上。
+   ───────────────────────────────────────────── */
+.mm {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 218px minmax(0, 1fr);
+  /* 行高必须显式吃满容器：grid 的行高默认按内容算，不写这条时左栏与右栏
+     都只有内容高，下面的「表格区 flex:1」就没有可分配的剩余空间 */
+  grid-template-rows: minmax(0, 1fr);
+}
+.mm-main {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+/* 面板头 / 表尾：都是固定高度的两块，不参与压缩 */
+.mm-main > .panel-head,
+.mm-main > .panel-foot { flex: 0 0 auto; }
+/* 表格区：吃掉剩余高度。内容少时它照旧占满（表格下方是空白，不是滚动条），
+   内容多时自己滚 —— 「固定高度」的判据是**它不随内容变**，而不是永远出滚动条 */
+.mm-main > .models-table-wrap {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* 清掉共用的内容上限：这一页的高度由上面那条 flex 链给，不由内容给 */
+  max-height: none;
+}
+
+.prov-rail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 8px 12px;
+  border-right: 1px solid var(--sidebar-border);
+  /* 比全局侧栏浅一档（--rail-bg，见 tokens.css）：它是面板内的一段内嵌导航，
+     用侧栏同款底色会被读成侧栏的延伸，和右边的模型表也不成一块 */
+  background: var(--rail-bg);
+  /* 高度由 grid 行高给（= 面板高度），家数多了自己滚 —— 它是列表，不是内容。
+     这里**不能**加 scrollbar-gutter: stable：预留的槽仍在 padding box 内，
+     分组标题条的负外边距一旦铺进去（见 .rail-label）就是 11px 的横向溢出，
+     栏底立刻挂一条横向滚动条。原生滚动条的出现/消失只让内容宽跳 11px，
+     而这一栏的家数远不到一屏，实际几乎见不到滚动条。 */
+  overflow-y: auto;
+}
+
+/* 分组标题：做成一条**通栏的分组条**，而不是一行小字。
+   原先它逐条照搬侧边栏的 .nav-group-label（同样字号、字距、muted 色），结果是
+   它和条目同色系、只淡一档，混在列表里根本看不出「这里是两组」—— 而内置与
+   自定义的分界恰恰是这一页最要紧的一次分类，看错组就会在错的家上改模型。
+   现在：底色用 --surface-inset 抬起一层（与文档页 .ep-group 同一个手法），
+   文字提到 --sidebar-fg 并加粗，负外边距让底色通到栏边（.prov-rail 内边距 8px）。
+   字号仍压在 11px：它是标题，不能比 .pv 条目更抢眼；左右内边距取 18px
+   （= 栏内边距 8 + 条目内边距 10），标题文字与条目文字左对齐。 */
+.rail-label {
+  flex: none;
+  /* 左右各 -8px 抵消 .prov-rail 的内边距，底色通到栏边（右缘正好落在
+     padding box 右边缘；有纵向滚动条时落在滚动条左缘，都不会溢出） */
+  margin: 8px -8px 4px -8px;
+  padding: 6px 18px 5px;
+  background: var(--surface-inset);
+  color: var(--sidebar-fg);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .09em;
+}
+.rail-label:first-child { margin-top: 0; }
+.rail-empty { padding: 2px 10px 6px; color: var(--sidebar-muted); font-size: 11.5px; }
+
+/* 一家一行：与 .nav-item 同一形态（行高、圆角、字号、字重、选中态配色、
+   过渡曲线都取自那一份），差异只有右侧那个计数 */
+.pv {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  /* 通用 button 规则会带上 --shadow-1，与「平铺的导航列表」冲突（.nav-item 同样清掉） */
+  box-shadow: none;
+  color: var(--sidebar-fg);
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  transition: background .15s ease, color .15s ease;
+}
+.pv:hover:not(:disabled) { background: var(--nav-hover); color: var(--text); border-color: transparent; }
+.pv.on,
+.pv.on:hover:not(:disabled) {
+  color: var(--nav-selected-fg);
+  background: var(--nav-selected-bg);
+  border-color: var(--nav-selected-border);
+  font-weight: 600;
+}
+.pv .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv .n { flex: 0 0 auto; color: var(--sidebar-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.pv.on .n { color: inherit; }
+
+/* 「＋ 新建自定义提供商」：虚线框，与上面那些「选一家」的实心项区分开 ——
+   它是动作，不是选项；配色仍走侧边栏那一套 */
+.pv-add {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 2px;
+  padding: 8px 10px;
+  border: 1px dashed var(--sidebar-border);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--sidebar-muted);
+  font-size: 12px;
+  text-align: left;
+}
+.pv-add:hover {
+  border-color: var(--nav-selected-border);
+  background: var(--nav-hover);
+  color: var(--nav-selected-fg);
+}
+
+/* 窄窗口（约 900px 以下）改成上下堆叠：左栏在上一行，横向铺满、自己滚 */
+@media (max-width: 900px) {
+  /* 窄窗口改成上下两行：左栏一行（自己的高度上限），表格区吃掉剩下的 */
+  .mm {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+  .prov-rail {
+    max-height: 210px;
+    border-right: 0;
+    border-bottom: 1px solid var(--sidebar-border);
+  }
+}

@@ -267,14 +267,17 @@ impl ProviderAdapter for CatPawAdapter {
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
+        account_id: &'a str,
         force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     > {
         Box::pin(async move {
             // 凭证解析失败（没账号、也没桌面端登录态）→ 「没刷」而不是「失败」：
-            // 一个不用 CatPaw 的用户点刷新时，红色失败会让他以为哪里坏了
-            let credentials = match credentials::snapshot_for(store, "") {
+            // 一个不用 CatPaw 的用户点刷新时，红色失败会让他以为哪里坏了。
+            // `account_id` 非空 = 用户在弹窗里点名的那条（按 id 直取，取不到
+            // 也走「没刷」——那是「这条不可用」，不是这次刷新出错了）
+            let credentials = match credentials::snapshot_for(store, account_id) {
                 Ok(credentials) => credentials,
                 Err(error) => {
                     logging::verbose(

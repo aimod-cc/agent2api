@@ -41,7 +41,7 @@
    （那里是 #report-range 折行）。不折的话两段控件会压在标题文案上换行，
    标题与 intro 各自占一行，读起来像断了半句。 */
 @media (max-width: 900px) {
-  .page[data-page="logs"] .page-head .head-actions {
+  .page[data-page="logs"] .panel-head .head-actions {
     flex-basis: 100%;
     margin-left: 0;
     justify-content: flex-start;

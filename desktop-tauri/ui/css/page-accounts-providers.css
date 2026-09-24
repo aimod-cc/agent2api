@@ -93,6 +93,178 @@
 #add-modal .modal-section > .add-seg { align-self: flex-start; }
 #add-modal .add-seg .seg-item { height: 28px; padding: 0 12px; font-size: 12.5px; }
 
+/* ─── 添加账号弹窗：两步结构（第 1 步选家 / 第 2 步选方式填凭证）───
+   改造前是一屏里两层横向分段（上面 9 项选家、下面最多 5 项选方式），小窗口下换行、
+   找不到入口；拆成两步后每一步只回答一个问题。两个容器由 add-provider-forms.js 注入，
+   这里只管长相。 */
+.add-step[hidden] { display: none; }
+.add-step { display: flex; flex-direction: column; gap: 16px; }
+
+/* 第 1 步：提供商卡片列表（家数动态：注册表加一家就多一张，自定义家建一家多一张） */
+.add-provider-search { width: 100%; }
+.add-provider-search .input { padding-left: 30px; }
+.add-provider-grid {
+  display: grid;
+  /* 240 起步：弹窗（约 600px 内容宽）下稳定两列，宽窗口自动三列；
+     再窄的窗口落到一列 */
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+.add-provider-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  /* 覆盖全局 `button { height: 30px }`：卡片高度由内容（logo + 两行文字）决定，
+     否则会被压成 30px —— 卡片本身是 <button>，那条规则直接命中 */
+  height: auto;
+  padding: 14px 16px;
+  text-align: left;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  transition: border-color .14s ease, background .14s ease, box-shadow .14s ease;
+}
+.add-provider-card:hover { border-color: var(--primary-bd); background: var(--primary-soft); }
+.add-provider-card:focus-visible { box-shadow: var(--ring); }
+/* 「新建」那张卡横跨整行：它的说明比别家的账号数长，挤在单列宽度里会折成两行 */
+.add-provider-card.is-new { grid-column: 1 / -1; border-style: dashed; background: var(--surface-2); }
+.add-provider-logo {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #fff;
+  background: linear-gradient(150deg, var(--primary), color-mix(in srgb, var(--primary) 62%, #0b1020));
+}
+.add-provider-logo.is-new {
+  background: var(--surface-3);
+  color: var(--text-2);
+  border: 1px dashed var(--border-strong);
+  font-weight: 600;
+}
+/* 真实图标（取自各客户端安装目录内嵌的图标）：图片填满徽章。字母底的渐变
+   必须去掉 —— 图形四角透明，留着会透出蓝底；圆角与外壳一致，图自带圆角
+   与不带都自然 */
+.add-provider-logo.has-icon { background: none; }
+.add-provider-logo.has-icon img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: inherit;
+  object-fit: contain;
+}
+.add-provider-info { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 4px; }
+.add-provider-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.add-provider-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: var(--r-xs);
+  border: 1px dashed var(--border-strong);
+  color: var(--text-3);
+}
+.add-provider-meta {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.add-provider-go { flex: 0 0 auto; color: var(--text-3); font-size: 15px; }
+.add-provider-empty {
+  grid-column: 1 / -1;
+  padding: 22px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* 第 2 步的返回键：做成 .modal-head 里的一枚图标钮，与右侧关闭键对称。
+   原来它是一条独立的「‹ 上一步　已选：xxx」返回条 —— 独占一整行，而那句「已选」
+   和弹窗标题说的是同一件事（标题已经是「登录 / 添加 智谱 GLM 账号」），信息量为零
+   却把弹窗又切掉一段。收进头部后整行省掉，标题自己就是面包屑。 */
+#add-modal .add-back {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  padding: 0 0 2px;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  color: var(--text-3);
+  font-size: 19px;
+  line-height: 1;
+}
+#add-modal .add-back:hover:not(:disabled) {
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text);
+}
+#add-modal .add-back[hidden] { display: none; }
+
+/* 底部操作条：主按钮从字段流里拿出来放这里，失败提示也有了固定位置。
+   .modal-foot 自带 display:flex，[hidden] 要显式覆盖浏览器的默认样式。
+   没有块把按钮搬进来时整条收起（内置家的按钮仍在各自段落里，不受影响）。 */
+#add-modal .modal-foot[hidden] { display: none; }
+.add-foot-hint { flex: 1 1 auto; min-width: 0; font-size: 11.5px; color: var(--text-3); }
+.add-foot-hint.err { color: var(--danger); }
+.add-foot-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 8px; }
+.add-foot-actions > button[hidden] { display: none; }
+
+/* ─── 添加账号弹窗：表单网格（标签列定宽右对齐）───
+   .field-row 是「标签自然宽度 + 控件吃剩余」，四个标签宽窄不一，四个控件的左边缘
+   就四段锯齿 —— 这是表单看着散的主因。这里改成两列网格：标签列定宽 88px、右对齐，
+   控件一律落在同一条竖线上。行高 30 与全局控件同高，标签设成等高再垂直居中，
+   基线就和输入框里的文字对齐了。 */
+.add-form { display: flex; flex-direction: column; gap: 13px; }
+.add-field {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  align-items: start;
+  gap: 5px 12px;
+}
+.add-field > label {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: center;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+  height: 30px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+/* 必填只标一枚星号，不把「（必填）」塞进标签：后者让四行标签的字重与长度都不齐 */
+.add-field > label .req { color: var(--danger); font-style: normal; font-weight: 700; }
+.add-field > input,
+.add-field > select,
+.add-field > textarea { grid-column: 2; grid-row: 1; width: 100%; max-width: none; }
+/* 帮助文字常驻在控件下方（不用 placeholder —— 一输入就没了）。
+   字号 / 行高沿用 components.css 的 .hint（与设置页那些字段说明同一档），
+   这里只管把它放到控件列下面，不缩到标签列里去 —— 与 page-settings.css 的
+   `.retention-row > .hint` 是同一手法。 */
+.add-field > .hint { grid-column: 2; grid-row: 2; }
+
+/* 区块头：一行区块名 + 一行用途说明。区块名取「上游信息」这类**部位名**，
+   不再复述弹窗标题 —— 原来卡内 h3、弹窗标题、下面段落三层说同一句话。 */
+.add-panel-head { display: flex; flex-direction: column; gap: 4px; }
+.add-panel-head > span { font-size: 11.5px; line-height: 1.5; color: var(--text-3); }
+.add-panel-head b { color: var(--text); font-weight: 620; }
+
 /* 分段控件前的行内标签（如「打开方式」）：与 .field-row > label 同形制 */
 #add-modal .add-seg-label { color: var(--text-2); font-size: 12.5px; white-space: nowrap; }
 
@@ -119,74 +291,18 @@
 /* 行内文字链接（「小浣熊客户端登录态文件」）：点了在弹窗里显示完整路径 */
 .raccoon-hint-link { color: var(--primary-fg); text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
 
-/* ─── 自定义提供商的下拉（见 add-custom-provider.js / custom-provider-ui.js）───
+/* ─── 自定义提供商的下拉（见 add-custom-provider.js）────────────────
    文本输入框走全局 input 样式（flex: 1 1 auto 自动吃剩余宽度）；select 没有那条
    全局伸展，这里显式给上，否则协议 / 提供商下拉缩在内容宽度上，与同一行的
    标签之间留一大块空白。max-width 收口：Base URL 这类长值不该把弹窗撑宽。
-   不带 #add-modal 前缀：编辑弹窗（custom-provider-edit-modal）里的协议下拉
-   用的是同一个类，两处观感必须一致。 */
+   注意：添加弹窗里的那两个下拉已经走 .add-field 网格，由
+   `.add-field > select { max-width: none }` 放开到整列宽 —— 320px 会让协议下拉
+   比上下两行的输入框短一截，长选项还会被截成「OpenAI - Chat Completi…」。
+   这条 max-width 服务的是横排 .field-row 里的下拉：账号设置弹窗那段
+   「提供商」（account-panel.js 注入）就是这种排法。 */
 .custom-provider-select { flex: 1 1 auto; max-width: 320px; }
 
-/* ═══ 自定义提供商管理弹窗的列表（custom-provider-ui.js）══════════════
-   弹窗本体按需创建、关闭即移除，所以这些规则挂在 id 选择器上而不是某个
-   常驻容器里。一行一条提供商：左侧名称 + 协议/地址/账号数，右侧三项操作。
-   行与行之间用 hairline 分隔（与 .table 的行分隔同一档），最后一个不画线 ——
-   弹窗底部就是 .modal-foot，多一条线会显得没收尾。 */
+/* 自定义提供商管理弹窗的列表（.cp-*）曾在这里：那颗「自定义提供商」按钮与
+   弹窗已整体移除（模型清单统一到「模型管理」页，编辑与删除搬进账号设置的
+   「提供商」一段），相关规则随之删除。 */
 
-#custom-providers-manage-modal .modal { width: min(680px, 92vw); }
-
-.cp-list { display: flex; flex-direction: column; }
-
-.cp-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 2px;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.cp-item:last-child { border-bottom: none; }
-
-/* min-width: 0 让省略号三件套生效：Base URL 可以很长，不能把操作列顶出去 */
-.cp-main { flex: 1 1 auto; min-width: 0; }
-
-.cp-name { font-size: 12.5px; font-weight: 600; color: var(--text); }
-
-.cp-sub {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 0;
-  margin-top: 2px;
-  color: var(--text-3);
-  font-size: 11px;
-}
-
-.cp-badge {
-  flex: 0 0 auto;
-  padding: 1px 6px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-pill);
-  background: var(--surface);
-  white-space: nowrap;
-}
-
-.cp-url { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); }
-
-.cp-count { flex: 0 0 auto; white-space: nowrap; }
-
-/* 操作列：与账号表操作列同一形制（小按钮右对齐），删除是唯一不可逆的动作，悬停走危险色 */
-.cp-actions { flex: 0 0 auto; display: inline-flex; gap: 4px; }
-
-.cp-actions button {
-  height: 24px;
-  padding: 0 8px;
-  font-size: 11.5px;
-  border-radius: var(--r-sm);
-}
-
-.cp-actions button.danger:hover:not(:disabled) {
-  border-color: var(--danger-bd);
-  background: var(--danger-soft);
-  color: var(--danger);
-}

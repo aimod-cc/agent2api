@@ -227,7 +227,9 @@ impl ProviderAdapter for RaccoonAdapter {
     /// 刷新模型目录：`GET {llmBase}/model_catalog`（10 分钟缓存）。
     ///
     /// 用**小浣熊组内的当前账号**的 token（没有账号时用桌面端实时登录态，
-    /// 都没有就不带 Authorization 请求 —— 源实现同样允许无 token 拉目录）。
+    /// 都没有就不带 Authorization 请求 —— 源实现同样允许无 token 拉目录）；
+    /// `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条账号
+    /// （`snapshot_for` 按 id 直取，取不到报失败而不是回落到队首）。
     ///
     /// `force` 一路透传给 `models::refresh`：`false` 时走 10 分钟 TTL 早退
     /// （自动路径，见 `ProviderAdapter::refresh_models`），`true` 时真打上游
@@ -236,12 +238,13 @@ impl ProviderAdapter for RaccoonAdapter {
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
+        account_id: &'a str,
         force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     > {
         Box::pin(async move {
-            let (token, proxy) = match credentials::snapshot_for(store, "") {
+            let (token, proxy) = match credentials::snapshot_for(store, account_id) {
                 Ok(credentials) => {
                     // 目录刷新**不触发 token 刷新**：它只是维护动作，
                     // 让一个临期 token 在这里被续期会把日志搅乱（转发链路上

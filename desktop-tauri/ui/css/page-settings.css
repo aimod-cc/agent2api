@@ -19,7 +19,6 @@
   padding-bottom: 0;
 }
 
-.page[data-page="settings"] .page-head { flex: none; }
 
 .settings-layout {
   flex: 1;

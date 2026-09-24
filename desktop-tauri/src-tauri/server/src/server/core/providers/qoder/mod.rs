@@ -269,14 +269,21 @@ impl ProviderAdapter for QoderAdapter {
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
+        account_id: &'a str,
         force: bool,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
         Box::pin(async move {
-            let Some(record) = store.qoder_account_record("") else {
+            // 空 id = 队首可用账号（自动路径的默认）；非空 = 用户在弹窗里点名的
+            // 那条 —— 点名取不到时按「没账号」处理（本家没有可回落的环境变量
+            // 登录态），文案由上面那行「未添加账号」的回答覆盖不到，改用明确的失败。
+            let Some(record) = store.qoder_account_record(account_id) else {
                 // 自动路径每次拉目录/启动都会走到这里，所以只打 verbose：
                 // 对不用 Qoder 的用户，这不是需要他关注的事
                 logging::verbose("[Models]", "Qoder 模型目录刷新跳过：尚未添加 Qoder 账号");
-                return ModelRefreshOutcome::unchanged();
+                if account_id.is_empty() {
+                    return ModelRefreshOutcome::unchanged();
+                }
+                return ModelRefreshOutcome::failed("指定的账号不存在或不可用，请重新选择");
             };
             let Ok(credentials) = credentials::Credentials::from_payload(&record) else {
                 return ModelRefreshOutcome::failed("Qoder 账号凭证无效，请重新登录或更新 PAT");
@@ -545,7 +552,7 @@ async fn drive_aggregate(
             GatewayError::with_status(
                 502,
                 format!(
-                    "Qoder 上游流中断: {}",
+                    "Qoder 上游流式传输中断: {}",
                     crate::server::core::egress::describe_error_detail(&error)
                 ),
             )

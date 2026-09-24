@@ -390,22 +390,27 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::payload::send_body` 在按家改写模型名、注入映射绑定的等级
     /// （[`Self::reasoning_patch`]）**之后**调用一次。此时 body 顶层的等级字段
     /// 要么是客户端显式传的原值（绑定让位时），要么是绑定注入的值 ——
-    /// 实现用**本家 resolver 的同一条取值链**去读，读出来的就是上游收到的档位
-    /// （CatPaw 侧还会过一遍它自己的枚举校验，与转发行为完全同源）。
+    /// 读出来的就是上游收到的档位：覆写的家（CatPaw / Qoder）用**本家
+    /// resolver 的同一条取值链**读，与转发行为完全同源；默认实现读的是
+    /// 透传字段（见下）。
     ///
-    /// ── 为什么默认 None ────────────────────────────────────────
-    /// 与 [`Self::reasoning_patch`] 的默认 `Skip` 同一条事实：不接等级的家
-    /// （workbuddy / 小浣熊 / autoclaw / cline）没有可读的档位字段 —— 客户端
-    /// 就算传了，对那些上游也只是惰性的未知参数，把「没人消费的键」显示成
-    /// 「发出去的等级」是误导。接一家覆写一家，判据同上（有证据才接）。
+    /// ── 为什么默认读透传字段（而不是 None）─────────────────────
+    /// `send_body` 只改写 model 名、注入映射绑定的等级，**不删客户端字段**：
+    /// 客户端显式指定的等级（`reasoning_effort` 等通用键）对每一家都原样
+    /// 随发送体上行 —— 那就是实际发出去的档位，与接不接绑定是两回事
+    /// （「不接」说的是不**注入**，见 [`Self::reasoning_patch`] 的默认 `Skip`；
+    /// 客户端自己传的字段没有理由在显示上抹掉）。默认实现因此用展示侧
+    /// 读取器的并集链读发送体；「关闭思考」两档不算随行档位（与 Qoder
+    /// 覆写同一口径），不预支一个「没发出去」的值。
     ///
     /// ── 显示值与真实字节的边界 ─────────────────────────────────
-    /// 返回的是「本家会消费的档位意图值」。Qoder 的协议层还会按模型声明的
+    /// 返回的是「随请求上行的档位意图值」。Qoder 的协议层还会按模型声明的
     /// efforts 二次归一（`minimal` → `low`、不支持的档位退默认），那一步需要
     /// 模型目录上下文，发送体阶段拿不到 —— 显示的因此是意图值而不是归一终值
     /// （CatPaw 的归并在 `reasoning_patch` 内已完成，无此差异）。
-    fn outbound_reasoning(&self, _body: &Value) -> Option<String> {
-        None
+    fn outbound_reasoning(&self, body: &Value) -> Option<String> {
+        crate::server::core::model_rules::read_client_level(body)
+            .filter(|level| !crate::server::core::model_rules::reasoning_is_off(level))
     }
 
     /// 判定上游错误类型（status + 已解析的错误体）。
@@ -441,6 +446,17 @@ pub trait ProviderAdapter: Send + Sync {
     ///     与功能坏掉无法区分。缓存该不该绕过只由**谁发起**决定，因此把判断权
     ///     交给调用方（本参数），而不是让实现在内部猜。
     ///
+    /// ── `account_id` 是干什么的（第二个行为开关）───────────────
+    /// 指定用**哪个账号**的凭证去打上游目录接口（模型管理页「获取模型」弹窗
+    /// 每行的「模型来源」下拉）：
+    ///   - 空串 = 该家的默认选取：队首的可用账号（与转发默认使用的账号一致），
+    ///     没有账号时各家自己回落到环境变量 / 桌面登录态；
+    ///   - 非空 = 用户点名的那条账号。**点名了就按 id 直取**：取不到返回
+    ///     失败原因（"账号不存在或不可用"），不回落到队首 —— 那会变成
+    ///     「选了 A、用的是 B」的静默错误。
+    /// 目录接口多数是账号级的（凭证不同、可见的清单可能不同），所以界面上
+    /// 这一列要可见、可切换。
+    ///
     /// ── 失败与返回 ──────────────────────────────────────────────
     /// 刷新失败**不返回错误**：目录刷新是维护动作，失败时保留现有清单
     /// （与改造前 `refresh_with_current_account` 的取向一致 —— 只打日志）。
@@ -450,10 +466,21 @@ pub trait ProviderAdapter: Send + Sync {
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
+        account_id: &'a str,
         force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     >;
+
+    /// 模型目录刷新是否走「账号」这一维（默认 true；Cline 覆写为 false）。
+    ///
+    /// 「获取模型」弹窗每行的「模型来源」下拉据此决定显示与否：对不走账号维度
+    /// 的家（目录接口无鉴权、清单是全局的），显示一个选了也一样的下拉是误导。
+    /// 与 [`Self::refresh_models`] 的 `account_id` 参数配对 —— 那边忽略参数的
+    /// 家，这边就该声明 false（逐条结果里也不再带 `accountId`）。
+    fn refresh_uses_account(&self) -> bool {
+        true
+    }
 
     /// 本 provider 是否有**已接入的推理转发能力**（五家现在都是 true）。
     ///
@@ -1037,8 +1064,9 @@ pub async fn refresh_implemented(store: &AccountStore) {
         // 的 match 分支接错了）；只在 debug 断言，release 不 panic（panic=abort）
         debug_assert_eq!(adapter.kind(), kind);
         // 自动路径不看结果：各适配器内部已经把「成功 / 没刷 / 失败」都打进了日志
-        // （`refresh_models` 的契约就是失败不返回错误），这里再处理一遍只会重复
-        adapter.refresh_models(store, false).await;
+        // （`refresh_models` 的契约就是失败不返回错误），这里再处理一遍只会重复。
+        // 账号传空串 = 各家按默认选取（队首可用账号），自动路径没有「点名」的概念
+        adapter.refresh_models(store, "", false).await;
     }
 }
 
@@ -1078,7 +1106,23 @@ pub async fn refresh_implemented(store: &AccountStore) {
 ///
 /// 失败不抛错、逐家串行：一家的失败不影响其余家（`refresh_models` 契约本身就
 /// 失败不返回错误），串行的理由与自动路径相同（provider 个位数、日志顺序稳定）。
-pub async fn refresh_implemented_forced(store: &AccountStore) -> Vec<Value> {
+///
+/// `accounts` 是「这家用哪个账号去拉」的点名表（`{providerId: accountId}`，
+/// 来自「获取模型」弹窗每行的「模型来源」下拉）：缺失或空串 = 该家按默认选取
+/// （队首可用账号，判据同 [`AccountStore::current_entry_for_provider`]）。
+/// 逐条结果里带上 `accountId`（本次**实际**用的账号，前端据此回读那一列 ——
+/// 点名了就是它，没点名就是解析出的队首），供界面显示「这次用的是谁」。
+///
+/// `providers` 是**本次要刷的范围白名单**：`None` = 全部已实现的家（定时任务
+/// 与不带范围的调用方）；`Some(list)` = 只刷名单内的家 —— 「获取模型」弹窗按
+/// 「模型管理页实有清单的家 ∪ 有启用账号的家」收窄（见 `api/models.rs`）。
+/// 名单外与名单为空的家**既不打网络、也不进结果**：对用户在界面上根本看不到的
+/// 家（没有启用账号、清单也为空），刷它只会得到一行「缺少登录态」的噪音。
+pub async fn refresh_implemented_forced(
+    store: &AccountStore,
+    accounts: &serde_json::Map<String, Value>,
+    providers: Option<&[String]>,
+) -> Vec<Value> {
     let mut results: Vec<Value> = Vec::new();
     // 手动刷新前对缓存清单补一次种子（刷新成功落地新清单后 raccoon / workbuddy
     // 内部还会再种一次）
@@ -1090,7 +1134,19 @@ pub async fn refresh_implemented_forced(store: &AccountStore) -> Vec<Value> {
         let adapter = adapter_for(kind);
         debug_assert_eq!(adapter.kind(), kind);
         let provider_id = kind_id(kind);
+        // 范围白名单（见上方说明）：名单外直接跳过，不打网络也不进结果
+        if let Some(allowed) = providers {
+            if !allowed.iter().any(|id| id == provider_id) {
+                continue;
+            }
+        }
         let provider_label = meta(kind).label;
+        // 这家在弹窗里点名的账号（空串 = 默认选取）
+        let requested = accounts
+            .get(provider_id)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
         if !adapter.supports_model_refresh() {
             // 不支持的家**不进网络**：静态清单刷十次还是同一份，打上游只是白跑。
             // `fixed: true` 是给前端的机器可识别标记（理由见上方「结果字段」）。
@@ -1105,29 +1161,35 @@ pub async fn refresh_implemented_forced(store: &AccountStore) -> Vec<Value> {
             }));
             continue;
         }
-        let outcome = adapter.refresh_models(store, true).await;
-        if outcome.refreshed {
-            results.push(json!({
-                "provider": provider_id,
-                "providerLabel": provider_label,
-                "status": "refreshed",
-                "count": outcome.count,
-            }));
-        } else if let Some(message) = outcome.message {
-            results.push(json!({
-                "provider": provider_id,
-                "providerLabel": provider_label,
-                "status": "failed",
-                "message": message,
-            }));
+        let outcome = adapter.refresh_models(store, requested, true).await;
+        // 本次实际使用的账号：不走账号维度的家（Cline）不带这个键；点名了就用
+        // 点名的那条；没点名按同一套判据解析队首（与各家实现的默认选取一致）。
+        // 没有账号的家（如从未添加过账号）解析为 None，也不带这个键。
+        let used = if !adapter.refresh_uses_account() {
+            None
+        } else if requested.is_empty() {
+            store.current_entry_for_provider(provider_id).map(|entry| entry.id)
         } else {
-            results.push(json!({
-                "provider": provider_id,
-                "providerLabel": provider_label,
-                "status": "skipped",
-                "message": "本次刷新没有取到新清单（上游未返回可用的模型列表）",
-            }));
+            Some(requested.to_string())
+        };
+        let mut item = json!({
+            "provider": provider_id,
+            "providerLabel": provider_label,
+        });
+        if let Some(account_id) = used {
+            item["accountId"] = json!(account_id);
         }
+        if outcome.refreshed {
+            item["status"] = json!("refreshed");
+            item["count"] = json!(outcome.count);
+        } else if let Some(message) = outcome.message {
+            item["status"] = json!("failed");
+            item["message"] = json!(message);
+        } else {
+            item["status"] = json!("skipped");
+            item["message"] = json!("本次刷新没有取到新清单（上游未返回可用的模型列表）");
+        }
+        results.push(item);
     }
     results
 }

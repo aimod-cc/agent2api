@@ -9,7 +9,8 @@
  * ── 为什么单独成文件 ────────────────────────────────────────
  * accounts-view.js 已经超出单文件行数约定，而本弹窗是**单字段**的小表单，
  * 与它的职责（重绘编排、批量选择、事件委托）不相干 —— 按 confirm-dialog.js /
- * custom-models-modal.js 的既有模式单独成件，只暴露一个 open(account)。
+ * request-clear-modal.js 那类「一个弹窗一个文件」的既有模式单独成件，
+ * 只暴露一个 open(account)。
  *
  * 弹窗形态照 custom-provider-ui.js 的 openEditDialog 手法：点击时动态建、
  * 关闭即移除，不在 index.html 里常驻 —— 常驻节点会让 index.html 为每一张

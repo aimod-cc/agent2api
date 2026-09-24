@@ -355,13 +355,18 @@ impl ProviderAdapter for WorkBuddyAdapter {
     fn refresh_models<'a>(
         &'a self,
         store: &'a AccountStore,
+        account_id: &'a str,
         _force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
     > {
         Box::pin(async move {
             let auth = AuthService::for_store(store.clone());
-            let outcome = global_catalog().refresh_with_current_account(store, &auth).await;
+            // `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条账号
+            // （见 `refresh_with_current_account` 的三档选取）
+            let outcome = global_catalog()
+                .refresh_with_current_account(store, &auth, account_id)
+                .await;
             if outcome.refreshed {
                 ModelRefreshOutcome::refreshed(outcome.count)
             } else {

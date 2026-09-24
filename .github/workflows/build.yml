@@ -12,8 +12,11 @@ name: build
 #   · 手动 workflow_dispatch（在 Actions 页面选分支触发）：
 #     两个平台一起构建，产物作为 workflow artifact 下载，不发布 Release
 #   · 推送 v* tag：与 docker.yml 同时触发，一次打 tag 安装包与镜像全出；
-#     Windows/macOS 包挂 workflow artifact（GitHub Release 由本地
-#     gh release create 挂载），Gitee 侧自动创建发行版并上传安装包
+#     Windows/macOS 包只挂 workflow artifact —— GitHub Release 与 Gitee
+#     发行版都由发版收尾脚本在本地挂载（scripts/release.sh）：GitHub
+#     Release 本就不自动建；Gitee 侧因境外 runner 直连 Gitee 传附件慢且
+#     会假死（v2.7.2 实测 11MB 挂 10 分钟+），撤掉 CI 跨境上传改由本地
+#     境内直连，秒传且不再占用 CI 时长
 #
 # ── action 版本为什么都钉在大版本 v7（本次升级）─────────────────
 # 原先用 checkout@v4 / setup-node@v4 / upload-artifact@v4，三者都跑在
@@ -139,75 +142,3 @@ jobs:
           name: windows-nsis
           path: target/release/bundle/nsis/*.exe
           if-no-files-found: error
-
-  # ── Gitee 发行版 ─────────────────────────────────────────────
-  # GitHub 的 Release 与附件不在 git 数据里，镜像同步带不过去。
-  # 推 v* tag 且两个平台的包都构建成功后，在 Gitee 建同名发行版并
-  # 上传安装包，正文沿用仓库惯例：tag 所指提交的提交信息。
-  # 手动 dispatch 构建不发布（与上面两个 job 一致，只出 artifact）。
-  # API 实测备忘：① 建发行版 target_commitish 必传（文档写可选不可信）；
-  # ② 按 tag 查发行版在「无发行版」时也返回 200 + 空数组，须解析出
-  #   真实 id 再做删除；③ 附件走 multipart，字段名 file，单文件 ≤100MB。
-  gitee-release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [macos, windows]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: 下载安装包产物
-        uses: actions/download-artifact@v7
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: 发布到 Gitee
-        env:
-          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-        run: |
-          set -e
-          TAG="${GITHUB_REF_NAME}"
-          API="https://gitee.com/api/v5/repos/aimodcc/agent2api"
-          AUTH="Authorization: Bearer ${GITEE_TOKEN}"
-          NOTES=$(git log -1 --format=%B)
-
-          # ── 跨境上传的兜底（v2.7.2 实测：11MB 附件静默挂死 10 分钟+）────
-          # GitHub 托管 runner（境外）直连 Gitee（境内）的链路慢且会**假死**——
-          # curl 不带超时会永远挂着，等到 job 级超时（6 小时）才收场。
-          # 统一给每条 curl 配三层保险：
-          #   · --connect-timeout 20        连接 20 秒建不起来即失败；
-          #   · --speed-limit 1024 --speed-time 30
-          #                                 传输中途连续 30 秒低于 1KB/s 判假死
-          #                                 （允许「慢但在动」，只杀「真死」）；
-          #   · --max-time 600              单次尝试硬上限 10 分钟
-          #                                 （实测一次 11MB 成功传了约 5 分钟，
-          #                                 300 秒会误杀慢但在动的传输）；
-          #   · --retry 3 --retry-delay 5 --retry-all-errors
-          #                                 失败自动重试 3 次，仍失败则非零退出
-          #                                 —— 在 set -e 下 job 立刻可见地失败，
-          #                                 而不是无声挂起。
-          CURL=(curl -sS --connect-timeout 20 --max-time 600 \
-                --speed-limit 1024 --speed-time 30 \
-                --retry 3 --retry-delay 5 --retry-all-errors)
-
-          # 幂等：同名发行版已存在（如工作流重跑）则先删再建
-          REL_JSON=$("${CURL[@]}" -H "$AUTH" "$API/releases/tags/$TAG" || true)
-          OLD_ID=$(echo "$REL_JSON" | jq -r 'if type == "array" then (.[0].id // empty) elif type == "object" then (.id // empty) else empty end')
-          if [ -n "$OLD_ID" ] && [ "$OLD_ID" != "null" ]; then
-            echo "已存在发行版 id=$OLD_ID，先删除"
-            "${CURL[@]}" -f -X DELETE -H "$AUTH" "$API/releases/$OLD_ID"
-          fi
-
-          jq -n --arg tag "$TAG" --arg sha "$GITHUB_SHA" --arg body "$NOTES" \
-            '{tag_name:$tag, name:$tag, target_commitish:$sha, body:$body}' > /tmp/release.json
-          RELEASE_ID=$("${CURL[@]}" -f -X POST -H "$AUTH" -H "Content-Type: application/json" \
-            -d @/tmp/release.json "$API/releases" | jq -r '.id')
-          echo "Gitee 发行版已创建 id=$RELEASE_ID"
-
-          for f in dist/*; do
-            echo "上传 $(basename "$f")"
-            "${CURL[@]}" -f -X POST -H "$AUTH" -F "file=@$f" \
-              "$API/releases/$RELEASE_ID/attach_files" > /dev/null
-            echo "  ↳ $(basename "$f") 上传完成"
-          done
-          echo "Gitee 发行版附件上传完成"

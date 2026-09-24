@@ -1,15 +1,27 @@
-/* Agent2API · 模型管理页：表格渲染 + 筛选 + 启停 + 自定义模型 + 模型映射（含映射开关）+ 刷新模型清单 */
+/* Agent2API · 模型管理页：提供商导航 + 表格渲染 + 筛选 + 启停 + 自定义模型 + 模型映射（含映射开关）+ 刷新模型清单 */
 /* global workbuddyDesktop, wbApp */
 
 /**
- * 数据来自 `GET /api/models/manage`（`{models, mappings, reasoningLevels}`，含
- * 禁用的条目与关闭的映射，每条模型带 enabled / aliases，每条映射带 enabled）。
- * 本模块自持这份数据：写接口都会返回最新的同形数据，就地替换后重绘，不经过
- * app.js 的 state（那是 /api/session 的快照，轮询会整份覆盖）。
+ * ── 一个页面，两种数据源 ──────────────────────────────
+ * 左栏（`.prov-rail`）是提供商导航：**内置提供商**一组（「全部」= 各家的聚合视图，
+ * 各家是筛选视角）、**自定义提供商**一组（一家一项，一家一份清单）。选中谁，
+ * 右栏就是谁家的模型表 —— 同一个表格骨架、同一批映射 chip 控件、同一套搜索与列设置。
  *
- * 表格按提供商分组（顺序 = 后端数组顺序 = 路由优先级），每组默认只展开前
- * `GROUP_LIMIT` 行，其余折叠成一行「展开其余 N 个」；有搜索词或非「全部」筛选时
- * 不折叠 —— 用户在找东西，藏起来只会让他以为没有。
+ * 两个数据源的差别只在取数与写入，渲染完全共用：
+ *   · 内置家：`GET /api/models/manage`（`{models, mappings, reasoningLevels}`，含
+ *     禁用的条目与关闭的映射），写操作逐条即时生效（桥接的具名方法，都返回最新的
+ *     同形数据，就地替换后重绘）；
+ *   · 自定义家：本地目录缓存（`wbProviders.customList`）里该家记录的 models /
+ *     mappings，由 `models-custom-source.js` 适配成上面那个同形数据；写入是整表
+ *     替换（每次操作读当前值 → 改一处 → 提交全量），于是体验与内置家一致 ——
+ *     点一下立即生效，没有保存按钮，也没有草稿态。
+ * 本模块自持内置家那份数据，不经过 app.js 的 state（那是 /api/session 的快照，
+ * 轮询会整份覆盖）。
+ *
+ * 选中「全部」时表格按提供商分组（顺序 = 后端数组顺序 = 路由优先级），每组默认
+ * 只展开前 `GROUP_LIMIT` 行，其余折叠成一行「展开其余 N 个」；选中单家时不分组
+ * —— 标题已经写了是哪一家，再叠一条分组带是重复的。有搜索词或非「全部」的状态
+ * 筛选时也不折叠：用户在找东西，藏起来只会让他以为没有。
  *
  * 映射（照抄 OmniProxy 的模型映射语义）：对外名自由命名（**允许**与上游模型
  * ID 同名 —— 同名时该上游的原生路由优先，映射是追加的兜底路，不产生遮蔽）；
@@ -52,14 +64,6 @@
   const { esc, toast } = wbApp;
   const $ = id => document.getElementById(id);
 
-  // 提示里不点名哪几家：支持远程目录的家会变（CatPaw / AutoClaw 接入后也支持
-  // 刷新了），硬编码名单每加一家就要改一次，而漏改只会给用户一句过时说明。
-  // 「谁被跳过」由后端逐家结果里的 `fixed` 标记如实给出（见下方 describeResults）。
-  // 五家现在都有远程目录，所以「上游没有目录接口」只作为兜底情形保留措辞
-  // （将来新接入的 provider 若走固定清单，`fixed: true` 会命中它）。
-  const REFRESH_TITLE = '刷新各提供商的远程模型目录；'
-    + '使用固定模型清单的提供商（上游没有目录接口）刷新不会改变它们。'
-    + '拉到远程清单后，「来源」列会从「内置」变为「远程」';
   const GROUP_LIMIT = 8;
   /** 思考等级组件（chip 上的等级标 / 弹窗里的下拉）。住在 models-reasoning.js：
       那一块内部自洽（候选表 / 索引 / 那个下拉的读写），拆出去让本文件回到
@@ -67,21 +71,20 @@
       等级标」—— 看得到的是「少了个功能」，而不是整套面板报错。 */
   const reasoning = window.wbModelsReasoning;
 
-  /** 当前数据（null = 还没拉到） */
+  /** 当前数据（内置家；null = 还没拉到） */
   let data = null;
   let loading = false;
-  let refreshing = false;
   /**
-   * 筛选状态。初值来自上次会话的存盘（wbFilterMemory）——
-   * 提供商 / 状态 / 搜索词都记住；存坏的取值由下面的白名单与
-   * matches() 的判定兜底（认不出的状态等于「全部」）。
+   * 左栏选中的提供商：`'all'`（内置全部家）/ 某个内置家 id / 某个 `custom-` id。
+   * 初值来自上次会话的存盘（wbFilterMemory）—— 认不出的取值由 `renderRail` 的
+   * 白名单校验兜底（那家可能已经被删了，回落「全部」）。
    */
   const FILTERS_KEY = 'workbuddy-desktop-models-filters';
   const savedFilters = window.wbFilterMemory
     ? window.wbFilterMemory.load(FILTERS_KEY, { provider: 'all', state: 'all', search: '' })
     : { provider: 'all', state: 'all', search: '' };
   const MODEL_STATES = ['all', 'enabled', 'disabled', 'mapped'];
-  let providerFilter = savedFilters.provider;
+  let currentProvider = savedFilters.provider;
   let stateFilter = MODEL_STATES.includes(savedFilters.state) ? savedFilters.state : 'all';
   /** 已展开全部行的提供商集合 */
   const expanded = new Set();
@@ -110,15 +113,32 @@
     label: '模型管理表',
     columns: COLUMNS,
     mount: () => document.querySelector('.page[data-page="gateway"] .panel-head .head-actions'),
+    // 排在那排操作按钮**之后**：这一排有明确主次 —— 添加 / 刷新是主操作，
+    // 列设置是「怎么看这张表」的辅助开关，放末尾不会挤在主操作前面
+    buttonPlacement: 'last',
     // 表头重排 + 数据行按新的列集合重画（两处读同一份配置，不会各画一个样）
     onChange: () => { syncHead(); render(); },
   });
 
-  const syncHead = () => window.wbColSettings
-    ?.syncStaticHead('models', document.querySelector('table.models-table:not(.keys-table)'));
+  /**
+   * 自定义家没有「倍率」「来源」这两个概念（它们是内置家清单的字段）：选中自定义家时
+   * 这两列**按视图隐藏**，列设置里的配置本身不动 —— 切回内置家原样恢复。表头与数据行
+   * 读同一份过滤结果（见 syncHead 的第三个参数与 visibleColumns），不会各画一个样。
+   */
+  const CUSTOM_HIDDEN_COLUMNS = new Set(['rate', 'source']);
+
+  const syncHead = () => window.wbColSettings?.syncStaticHead(
+    'models',
+    document.querySelector('table.models-table:not(.keys-table)'),
+    isCustomView() ? CUSTOM_HIDDEN_COLUMNS : null,
+  );
 
   /** 该表当前可见的列（顺序即配置顺序；列设置未就绪时退回全部列） */
-  const visibleColumns = () => (colSettings ? colSettings.apply(COLUMNS) : COLUMNS);
+  const visibleColumns = () => {
+    const columns = colSettings ? colSettings.apply(COLUMNS) : COLUMNS;
+    if (!isCustomView()) return columns;
+    return columns.filter(column => !CUSTOM_HIDDEN_COLUMNS.has(column.key));
+  };
 
   /**
    * 跨整行的单元格（分组带 / 展开更多 / 空态 / 孤儿映射区）该跨几列。
@@ -136,9 +156,35 @@
   }
 
   // ─── 数据 ─────────────────────────────────
+  //
+  // 两个数据源（见文件头）：内置家读 `data`（/api/models/manage），自定义家读
+  // `customView`（由 models-custom-source.js 从目录缓存适配，render 开头重建一次）。
+  // 下面所有取数都经过 viewData()，于是渲染 / 搜索 / 两个索引 / 弹窗候选自动跟着
+  // 选中的家走，不必在每个消费点各判一次「这是哪一家」。
 
-  function models() { return Array.isArray(data?.models) ? data.models : []; }
-  function mappings() { return Array.isArray(data?.mappings) ? data.mappings : []; }
+  /** 自定义家的数据源（models-custom-source.js）；脚本缺失时降级为「选不了自定义家」 */
+  const customSource = window.wbModelsCustom;
+  /** 当前自定义家的适配数据（`null` = 还没建 / 这家已不存在） */
+  let customView = null;
+
+  /** 当前选中项是不是自定义家 */
+  function isCustomView() {
+    return Boolean(customSource?.isCustom?.(currentProvider));
+  }
+
+  /** 按当前选中项重建自定义家视图（目录缓存是权威数据，重建很便宜） */
+  function rebuildCustomView() {
+    customView = isCustomView() ? customSource.buildView(currentProvider) : null;
+  }
+
+  const EMPTY_VIEW = { models: [], mappings: [] };
+  function viewData() {
+    if (isCustomView()) return customView || EMPTY_VIEW;
+    return data || EMPTY_VIEW;
+  }
+
+  function models() { return Array.isArray(viewData().models) ? viewData().models : []; }
+  function mappings() { return Array.isArray(viewData().mappings) ? viewData().mappings : []; }
 
   /**
    * 「三元组 → 思考等级」查询闭包（由 `models-reasoning.js` 建）。
@@ -252,9 +298,14 @@
     }
   }
 
-  /** 写接口返回的最新数据直接替换 */
+  /**
+   * 写操作返回的数据就位。
+   * 内置家的写接口都返回最新的 manage_view，直接替换；自定义家走整表提交、没有
+   * 返回体（`next` 为 null）—— 它的新数据在 models-custom-source.js 里已经刷进
+   * 目录缓存，这里重绘时 `rebuildCustomView()` 会读到新值。
+   */
   function accept(next) {
-    if (next && Array.isArray(next.models)) data = next;
+    if (!isCustomView() && next && Array.isArray(next.models)) data = next;
     render();
   }
 
@@ -273,28 +324,72 @@
     if (stateFilter === 'enabled' && !bindingsOf(m).some(binding => binding.enabled !== false)) return false;
     if (stateFilter === 'disabled' && bindingsOf(m).some(binding => binding.enabled !== false)) return false;
     if (stateFilter === 'mapped' && !(m.aliases || []).length) return false;
-    if (providerFilter !== 'all' && (m.provider || '') !== providerFilter) return false;
+    if (currentProvider !== 'all' && (m.provider || '') !== currentProvider) return false;
     if (!keyword) return true;
     const hay = [m.id, m.name, ...(m.aliases || [])].join(' ').toLowerCase();
     return hay.includes(keyword);
   }
 
-  function renderProviderSeg() {
-    const seg = $('models-provider-seg');
-    if (!seg) return;
+  /** 内置各家的 id → {label, n}。从**内置全量**（`data.models`）收集，不能用
+      `models()` —— 后者跟着选中项走，选中某一家的那一刻其余各家的计数会全变 0。 */
+  function builtinRailItems() {
     const counts = new Map();
-    models().forEach(m => {
+    (Array.isArray(data?.models) ? data.models : []).forEach(m => {
       const key = m.provider || '';
-      const entry = counts.get(key) || { label: m.providerLabel || key || '未知', n: 0 };
+      if (!key) return;
+      const entry = counts.get(key) || { label: m.providerLabel || key, n: 0 };
       entry.n++;
       counts.set(key, entry);
     });
-    if (providerFilter !== 'all' && !counts.has(providerFilter)) providerFilter = 'all';
+    return counts;
+  }
+
+  /**
+   * 左栏当前展示的内置家 id（有清单的家）——「获取模型」弹窗据此组装刷新范围
+   * （见 models-fetch-modal.js 的 scopeProviders）：模型管理页看不到的家不该
+   * 出现在刷新结果里。
+   */
+  const builtinProviders = () => [...builtinRailItems().keys()];
+
+  /**
+   * 选中项白名单校验：存盘里记的那家可能已经被删了（或内置清单这次没拉到它），
+   * 认不出就回落「全部」—— 否则右栏会是一张永远空的表，而用户找不到原因。
+   */
+  function normalizeSelection() {
+    if (currentProvider === 'all') return;
+    if (builtinRailItems().has(currentProvider)) return;
+    if ((customSource?.list?.() || []).some(provider => provider.id === currentProvider)) return;
+    currentProvider = 'all';
+  }
+
+  /**
+   * 左栏：内置提供商（全部 + 各家）+ 自定义提供商（每家 + 新建）。
+   *
+   * 自定义家的计数读目录缓存里该家的 `models` 数组长度，与「这家有没有账号」无关
+   * —— 建了提供商但账号被删光时，清单照样要能管（与账号页管理弹窗同一条口径）。
+   */
+  function renderRail() {
+    const rail = $('prov-rail');
+    if (!rail) return;
+    const counts = builtinRailItems();
+    const customs = customSource?.list?.() || [];
     const total = [...counts.values()].reduce((sum, item) => sum + item.n, 0);
-    const item = (key, label, n) =>
-      `<button class="seg-item${providerFilter === key ? ' active' : ''}" data-provider="${esc(key)}">${esc(label)} <span class="n">${n}</span></button>`;
-    seg.innerHTML = item('all', '全部', total)
-      + [...counts].map(([key, entry]) => item(key, entry.label, entry.n)).join('');
+    const item = (id, label, n) => `<button type="button" class="pv${currentProvider === id ? ' on' : ''}"`
+      + ` data-provider="${esc(id)}" title="${esc(label)}">`
+      + `<span class="nm">${esc(label)}</span><span class="n">${n}</span></button>`;
+    rail.innerHTML = '<div class="rail-label">内置提供商</div>'
+      + item('all', `全部（${counts.size} 家）`, total)
+      + [...counts].map(([key, entry]) => item(key, entry.label, entry.n)).join('')
+      + '<div class="rail-label">自定义提供商</div>'
+      + (customs.length
+        ? customs.map(provider => item(
+          provider.id,
+          provider.name || provider.id,
+          Array.isArray(provider.models) ? provider.models.length : 0,
+        )).join('')
+        : '<div class="rail-empty">还没有自定义提供商</div>')
+      + '<button type="button" class="pv-add" id="rail-add-custom"'
+      + ' title="新建一个自定义提供商（同时创建它的第一个账号）">＋ 新建自定义提供商</button>';
   }
 
   /** 映射 chips（照抄 OmniProxy）：每条 chip 属于自己所在的那一行（提供商 ×
@@ -325,7 +420,7 @@
 
   function aliasChips(m) {
     const provider = m.provider || '';
-    const chips = bindingsOf(m).map(binding => {
+    const chip = binding => {
       const alias = binding.alias;
       const on = binding.enabled !== false;
       const busy = pending.has(`${alias}:${m.id}:${provider}`);
@@ -336,9 +431,17 @@
         + chipSwitchHtml(alias, m.id, provider, on, busy)
         + `<span class="t" title="${esc(alias)}">${esc(alias)}</span>${label}`
         + badgeHtml(alias, m.id, provider, busy) + remove + '</span>';
-    }).join('');
+    };
+    // 「＋ 映射」并排跟在**默认**那条右边，不单独占一行：它是这一列的入口，
+    // 不是一条绑定（绑定的排布仍是一条一行，见 .aliases 的注释）。默认绑定
+    // 永远存在（没有映射时是合成出来的那条），所以这一行永远有内容；
+    // 窄窗口下它会自己折到第二行，不挤扁 chip。
+    const [head, ...rest] = bindingsOf(m);
     const add = `<button type="button" class="alias-add" data-act="map" data-id="${esc(m.id)}" data-provider="${esc(provider)}">＋ 映射</button>`;
-    return `<div class="aliases">${chips}${add}</div>`;
+    return `<div class="aliases">`
+      + `<div class="alias-row">${head ? chip(head) : ''}${add}</div>`
+      + rest.map(chip).join('')
+      + '</div>';
   }
 
   /**
@@ -359,12 +462,17 @@
       : '<span class="rate">—</span>'}</td>`,
     source: m => `<td class="cell-source">${sourceCell(m)}</td>`,
     alias: m => `<td class="cell-alias">${aliasChips(m)}</td>`,
-    // 操作列只移除手动登记；对外名称统一在模型映射列切换。
-    act: (m, busyRow) => `<td class="cell-act r"><div class="row-actions">`
-      + (m.source === 'manual'
-        ? `<button type="button" class="sm ghost danger-text" data-act="hide" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>移除</button>`
-        : '')
-      + '</div></td>',
+    // 操作列只移除「可移除的」：内置家里是手动登记的那些（source=manual，上游
+    // 目录带来的行由清单决定存在性，开关才是它的手段），自定义家里每一行都是
+    // 用户自己登记进来的、都可以移除。对外名称统一在模型映射列切换。
+    act: (m, busyRow) => {
+      const removable = m.source === 'manual' || isCustomView();
+      return '<td class="cell-act r"><div class="row-actions">'
+        + (removable
+          ? `<button type="button" class="sm ghost danger-text" data-act="hide" data-id="${esc(m.id)}" data-provider="${esc(m.provider || '')}"${busyRow ? ' disabled' : ''}>移除</button>`
+          : '')
+        + '</div></td>';
+    },
   };
 
   function row(m) {
@@ -399,64 +507,62 @@
   }
 
   /**
-   * 挂不到任何一行的映射（后端在 `manage_view` 里算好，字段 `dangling`）。
-   *
-   * 管理页按「提供商 × 上游模型」分行，映射 chip 挂在 (provider, target) 命中的
-   * 那一行上。目标模型不在该行清单里时这条映射**没有任何行可以显示**，
-   * 于是「保存成功，列表里却找不到它」—— 必须让用户看得见、能删掉。
-   *
-   * 判据由后端算：后端直接对着它刚构建的那批行问「有没有一行接得住」，
-   * 与渲染 chip 的口径逐字同源。前端只有收窄后的广告清单，自己算会与表格
-   * 对不上（多标或漏标）。
-   *
-   * 落进这一组的两种情况，界面上都不该说成「无效」：
-   *   - 目标名字真不存在（手输打错、上游下架）→ 确实该删或该改；
-   *   - 目标模型存在、路由也认，只是**这家现在不提供它**（清单里没有）→
-   *     配置没错，只是这家此刻不广告它；删掉反而会让那个短名路由不到。
-   * 所以分组标题用「未挂载」、说明用「不在该家当前清单里」，把判断留给用户。
+   * 随选中项变化的那几处文案：三颗按钮的文案与提示、表尾。
+   * 与数据无关，所以独立成一个函数，由 render 与切换提供商两处调用。
    */
-  function orphanMappings() {
-    return mappings().filter(mapping => mapping.dangling === true);
+  function paintViewChrome() {
+    const custom = isCustomView();
+    const addButton = $('btn-add-custom-model');
+    if (addButton) addButton.textContent = '＋ 添加模型';
+    const refreshButton = $('btn-refresh-models');
+    if (refreshButton) {
+      // 文案与 title 只有一处事实来源（这里），index.html 里不写死
+      refreshButton.textContent = '获取模型';
+      refreshButton.title = custom
+        ? '从这一家的上游拉一份模型清单，勾选要哪些再导入（已添加的不会重复导入）'
+        : '刷新模型管理页里各提供商的远程模型目录，逐家结果列在弹窗里';
+    }
+    const foot = $('models-panel-foot');
+    if (foot) {
+      foot.innerHTML = custom
+        ? '自定义提供商的清单<b>只属于这一家</b>：这里的模型不会出现在其他家，别名也只在这一家内生效。要改名称 / 协议 / Base URL，去账号页「自定义提供商」→ 编辑。'
+        : '「默认」绑定就是原始模型 ID，只可开关、不可删除。原始 ID 与每个别名独立生效：关闭的名称不出现在 <code>/v1/models</code>，下游请求返回 404；其他开启的名称不受影响。';
+    }
   }
 
   function render() {
     const body = $('models');
     if (!body) return;
+    // 选中项先校验（那家可能已经被删 / 内置清单这次没拉到它），再按它重建
+    // 自定义家的视图，最后画左栏与随选中项变的文案
+    normalizeSelection();
+    rebuildCustomView();
+    renderRail();
+    paintViewChrome();
     // 重建两个索引（思考等级 + 映射开关，每次渲染一次，见各自的 rebuild 说明）
     rebuildReasoningIndex();
     rebuildMappingIndex();
-    renderProviderSeg();
     const all = models();
     const keyword = searchTerm();
     const shown = all.filter(m => matches(m, keyword));
-    // 计数：总数 / 启用数 / 映射数（不受筛选影响，是「这台网关现在的状态」）
-    const count = $('models-count');
-    if (count) {
-      // 条数只算「挂上了行的」映射；孤儿映射单独点名 —— 混在一起数会让
-      // 「25 条映射」在表格里怎么数都对不上
-      const orphans = orphanMappings().length;
-      count.textContent = all.length
-        ? `${all.length} 个上游模型 · ${all.flatMap(bindingsOf).filter(binding => binding.enabled !== false).length} 个开启的对外名称`
-          + (orphans ? ` · ${orphans} 条未挂载` : '')
-        : '';
-    }
     if (!all.length) {
-      // 一条模型都没有（没加账号）：此时把映射全列成「未挂载」只是噪音，
-      // 「请先添加账号」才是用户该看到的话
-      body.innerHTML = `<tr><td colspan="${span()}" class="empty">${data ? '暂无模型（请先添加账号）' : '加载中…'}</td></tr>`;
+      // 一条模型都没有：内置家是「还没加账号」，自定义家是「还没登记 / 还没拉取」。
+      // 说清下一步该做什么才有用
+      const empty = isCustomView()
+        ? (customView ? '这家还没有模型：点「添加模型」登记，或「获取上游模型」从上游拉取' : '该提供商已不存在（可能已被删除），请刷新列表')
+        : (data ? '暂无模型（请先添加账号）' : '加载中…');
+      body.innerHTML = `<tr><td colspan="${span()}" class="empty">${empty}</td></tr>`;
       return;
     }
-    // 孤儿映射不随启停筛选走：那个维度是「模型的状态」，
-    // 而它们连行都没有；「全部」与「有映射」两个筛选下才列出来。
-    // 但**提供商筛选要跟随** —— 见 orphanSection 的说明。
-    const orphans = (stateFilter === 'all' || stateFilter === 'mapped') ? orphanSection(keyword) : '';
     if (!shown.length) {
-      body.innerHTML = orphans
-        || `<tr><td colspan="${span()}" class="empty">没有匹配${keyword ? `「${esc(keyword)}」` : '当前筛选'}的模型</td></tr>`;
+      body.innerHTML = `<tr><td colspan="${span()}" class="empty">没有匹配${keyword ? `「${esc(keyword)}」` : '当前筛选'}的模型</td></tr>`;
       return;
     }
-    // 折叠只在「无搜索、全部状态」下生效（见文件头）
-    const collapsible = !keyword && stateFilter === 'all';
+    // 分组带只在「全部」视图里出现：选中单家时标题已经写了是哪一家，再叠一条
+    // 「WorkBuddy 3 个模型」是重复的。折叠同理 —— 它是「全部」视图里控制长度的
+    // 手段（见文件头），且只在无搜索、全部状态下生效
+    const showGroups = currentProvider === 'all';
+    const collapsible = showGroups && !keyword && stateFilter === 'all';
     const groups = new Map();
     shown.forEach(m => {
       const key = m.provider || '';
@@ -467,112 +573,45 @@
       const open = expanded.has(key) || !collapsible;
       const items = open ? group.items : group.items.slice(0, GROUP_LIMIT);
       const rest = group.items.length - items.length;
-      const head = `<tr class="tr-group"><td colspan="${span()}"><span class="prov-tag">${esc(group.label)}</span>${group.items.length} 个模型</td></tr>`;
+      const head = showGroups
+        ? `<tr class="tr-group"><td colspan="${span()}"><span class="prov-tag">${esc(group.label)}</span>${group.items.length} 个模型</td></tr>`
+        : '';
       const more = rest > 0
         ? `<tr class="tr-more"><td colspan="${span()}"><button type="button" class="sm ghost" data-act="expand" data-provider="${esc(key)}">展开其余 ${rest} 个模型 ▾</button></td></tr>`
         : (open && collapsible && group.items.length > GROUP_LIMIT
           ? `<tr class="tr-more"><td colspan="${span()}"><button type="button" class="sm ghost" data-act="collapse" data-provider="${esc(key)}">收起 ▴</button></td></tr>`
           : '');
       return head + items.map(row).join('') + more;
-    }).join('') + orphans;
-  }
-
-  /**
-   * 「挂不到行的映射」分组（见 [`orphanMappings`]）：只在有这类映射时出现，
-   * 排在各家分组之后，表头标签走警示色（`.tr-orphan`）区别于提供商分组。
-   *
-   * ── 为什么**跟随提供商筛选**（而启停筛选不跟随）──────────
-   * 顶部那个提供商分段是「我在看哪一家」的视角，用户点「Cline Free」时
-   * 期待看到的是**这一家的全部信息**。孤儿映射带 provider（旧版全局条目除外），
-   * 所以完全筛得动：不过滤的话，看 Cline Free 时会看到一屏 `cline-pass/*`
-   * 的条目，很容易被当成「Cline Free 收 pass 的模型」—— 而它们恰恰是
-   * **另一家**的。启停那一档不跟随，是因为它描述的是「模型的状态」，
-   * 而孤儿映射连行都没有，套用那些维度没有意义（见调用点）。
-   *
-   * 旧版全局条目（`provider` 为 null）在**任何一家**的筛选下都列出：它不属于
-   * 任何一家，把它藏起来才是骗人（用户会以为那条映射不见了）。
-   *
-   * ── 分成两档（后端 `carried` 字段）──────────────────────────
-   * 落进这一组的映射都挂不到行上，但原因不同、该给用户的建议也相反：
-   *   - `carried === false`：这个名字**哪儿都没有**（手输打错、上游下架）。
-   *     映射是死的，该改掉或删掉。行头标「无法路由」。
-   *   - `carried === true`：名字有效、路由认得，只是这家**现在清单里没有它**
-   *     （上游下架了那个模型、或这一家的账号还没加进来）。删掉它反而会让
-   *     那个短名路由不到。标「未广告」。
-   * 两种都列出来（都看不见行），措辞必须分开 —— 一律说「无效」会误导用户
-   * 删掉一条本来正确的配置。
-   */
-  function orphanSection(keyword) {
-    const orphans = orphanMappings().filter(mapping => {
-      // 全局条目在任何视角下都在（见函数头）；带 provider 的跟着筛选走
-      if (mapping.provider && providerFilter !== 'all' && mapping.provider !== providerFilter) {
-        return false;
-      }
-      if (!keyword) return true;
-      return `${mapping.alias} ${mapping.target}`.toLowerCase().includes(keyword);
-    });
-    if (!orphans.length) return '';
-    const head = `<tr class="tr-group tr-orphan"><td colspan="${span()}">`
-      + `<span class="prov-tag">未挂载的映射</span>${orphans.length} 条</td></tr>`;
-    const rows = orphans.map(mapping => {
-      // 展示名从**注册表**查（`wbProviders.labelOf`），不是从表格行里收集：
-      // 一条映射挂不上行时，常常正是因为那一家整个没进表格（没加账号），
-      // 而 `providerOptions()` 只认表格里出现过的 provider —— 用它就会在
-      // 最需要说清「这是哪一家」的时候回落成 provider id（`cline-pass`
-      // 这种内部标识，用户认不出）。
-      const label = mapping.provider
-        ? (window.wbProviders?.labelOf?.(mapping.provider) || mapping.provider)
-        : '任意提供商';
-      const key = `${mapping.alias}:${mapping.target}:${mapping.provider || ''}`;
-      const busy = pending.has(key);
-      const triple = `data-alias="${esc(mapping.alias)}"`
-        + ` data-target="${esc(mapping.target)}" data-provider="${esc(mapping.provider || '')}"`;
-      const del = `data-act="unmap" ${triple}`;
-      // 孤儿映射同样能改思考等级：那条绑定跟着映射走，映射在哪儿可编辑、
-      // 它的等级就在哪儿可编辑（否则挂不到行的映射反而成了改不了死角的配置）。
-      // `data-act` 必须是各自的（不能复用 del 那串）：事件委托按 data-act 分派，
-      // 一个按钮挂两个动作会让「点等级」变成「删映射」。
-      const chips = `<span class="alias orphan${mapping.enabled !== false ? '' : ' map-off'}"><span class="t">${esc(mapping.alias)}</span>`
-        + chipSwitchHtml(mapping.alias, mapping.target, mapping.provider, mapping.enabled !== false, busy)
-        + badgeHtml(mapping.alias, mapping.target, mapping.provider, busy)
-        + `<button type="button" class="x" ${del} title="删除映射 ${esc(mapping.alias)}"${busy ? ' disabled' : ''}>×</button></span>`;
-      // 两档的差异全在右半边那句小字上（表格里没有「状态」列可用，也不该为它加一列）
-      //
-      // 第二档区分「这家没加账号」与「清单里没这个模型」：前者整家不进表格
-      // （`providerOptions` 是从行里收集的，没有这家 = 它没进广告），
-      // 后者是这家有行、却没有这一行。两种的处理办法不同（去加账号 / 上游确实
-      // 下架了），所以值得分开说。
-      const hasProviderRows = providerOptions().some(item => item.id === mapping.provider);
-      // 三句文案都在这里拼好并**整体转义**：`label` 来自注册表（后端可控），
-      // 逐段拼再插进 HTML 会把转义责任散到三处
-      const why = esc(mapping.carried === false
-        ? '上游模型名不存在于任何提供商'
-        : hasProviderRows
-          ? `${label} 的清单里没有这个模型`
-          : `${label} 还没有账号，它的模型都没有列出`);
-      // 与正常行同样按可见列拼单元格（键 → HTML），否则藏起几列之后这一行
-      // 会比表体多出格子来，把整张表顶出横向滚动。它只有「名称 / 映射名 / 操作」
-      // 三格有内容，其余列按破折号占位 —— 列设置里把某一列露出来时，
-      // 这里给的是「这一行在这一维上没有值」，而不是让它整格错位。
-      const cells = {
-        model: `<td class="cell-model"><div class="mid"><span class="t">${esc(mapping.target)}</span></div>`
-          + `<div class="mname">${why}</div></td>`,
-        alias: `<td class="cell-alias">${chips}</td>`,
-        act: '<td class="cell-act r"><div class="row-actions">'
-          + `<button type="button" class="sm ghost danger-text" ${del}${busy ? ' disabled' : ''}>删除映射</button>`
-          + '</div></td>',
-      };
-      return `<tr class="off" data-id="${esc(mapping.target)}" data-provider="${esc(mapping.provider || '')}">`
-        + visibleColumns().map(column => withAlign(
-          cells[column.key] || '<td><span class="rate">—</span></td>',
-          column.align,
-        )).join('')
-        + '</tr>';
     }).join('');
-    return head + rows;
   }
 
   // ─── 行内操作 ────────────────────────────
+
+  // 写操作分派：内置家的四个写动作走桥接的具名方法（逐条即时生效，返回最新
+  // manage_view），自定义家走整表提交（models-custom-source.js，返回 null —— 它的
+  // 新数据已经刷进目录缓存，重绘时读得到）。调用点只认这四个函数，不必各自判断
+  // 「当前是哪一家」；`patch` 里没给的字段保持现值（两边的语义逐字对齐）。
+
+  /** 开关 / 新增 / 改一条绑定（alias == target 时即该模型的默认绑定） */
+  function writeBinding(provider, alias, target, patch) {
+    if (isCustomView()) return customSource.setBinding(provider, alias, target, patch);
+    return workbuddyDesktop.addModelMapping(alias, target, provider, patch.reasoning, patch.enabled);
+  }
+
+  function writeRemoveMapping(provider, alias, target) {
+    if (isCustomView()) return customSource.removeMapping(provider, alias, target);
+    return workbuddyDesktop.removeModelMapping(alias, target, provider);
+  }
+
+  function writeAddModel(provider, id) {
+    if (isCustomView()) return customSource.addModel(provider, id);
+    return workbuddyDesktop.addCustomModel(provider, id);
+  }
+
+  function writeRemoveModel(provider, id) {
+    if (isCustomView()) return customSource.removeModel(provider, id);
+    return workbuddyDesktop.removeCustomModel(provider, id);
+  }
 
   /**
    * 行内操作执行器。`key` 是防重入标记（提供商:模型 id）——同名模型在多家
@@ -616,8 +655,8 @@
       }))) return;
       void runRowAction(
         key,
-        () => workbuddyDesktop.removeCustomModel(provider, id),
-        '自定义模型已移除',
+        () => writeRemoveModel(provider, id),
+        isCustomView() ? '模型已移除' : '自定义模型已移除',
       );
       return;
     }
@@ -631,7 +670,7 @@
       }))) return;
       void runRowAction(
         `${alias}:${target}:${provider || ''}`,
-        () => workbuddyDesktop.removeModelMapping(alias, target, provider),
+        () => writeRemoveMapping(provider, alias, target),
         '映射已删除',
       );
       return;
@@ -655,7 +694,7 @@
       const enabled = input.checked;
       void runRowAction(
         `${alias}:${target}:${provider || ''}`,
-        () => workbuddyDesktop.addModelMapping(alias, target, provider, undefined, enabled),
+        () => writeBinding(provider, alias, target, { enabled }),
         enabled ? '映射已启用' : '映射已关闭',
       );
     }
@@ -743,8 +782,10 @@
 
   /**
    * 打开映射弹窗。
-   * `context` 为行内入口带的上下文（提供商 + 上游模型锁定，只填对外名）；
-   * 顶部「添加映射」按钮不传 —— 提供商与上游模型都要自己选。
+   * `context` 是行内入口带的上下文（提供商 + 上游模型锁定，只填对外名）。
+   * 入口只剩行内两处 —— 行尾「＋ 映射」新建、点别名 chip 改等级 —— 所以
+   * context 总是带着这一行的身份；不传 context 的形态（提供商与上游模型都
+   * 自己选）随顶部那颗「＋ 添加映射」一起移除了。
    *
    * 上游模型**只能是下拉**（数据来自该家当前清单）。这里曾经放开过「手动输入
    * 上游模型 ID」，已删除：对外名只有在**目标模型已被广告**时才会跟着进广告视图
@@ -786,8 +827,8 @@
     if (contextProvider && !options.some(item => item.id === contextProvider)) {
       options.push({
         id: contextProvider,
-        // 展示名走注册表（`wbProviders.labelOf`，查不到原样回显 id）——
-        // 与 orphanSection 里那句小字同一口径，不在这里另写一份 id → 名字的映射
+        // 展示名走注册表（`wbProviders.labelOf`，查不到原样回显 id），
+        // 不在这里另写一份 id → 名字的映射
         label: window.wbProviders?.labelOf?.(contextProvider) || contextProvider,
       });
     }
@@ -859,14 +900,17 @@
     $('mapping-modal-save').disabled = true;
     status.textContent = '保存中…';
     try {
-      // 第 4 个参数**总是显式给出**（空串 = 清空绑定）：
+      // `reasoning` **总是显式给出**（空串 = 清空绑定）：
       // 「三元组相同」走的也是这条接口，而用户在这个弹窗里看到的就是他要的结果 ——
       // 传 undefined（= 不改）会让「从 high 改成不覆盖」这一步静默无效。
-      accept(await workbuddyDesktop.addModelMapping(alias, target, provider, reasoning));
+      accept(await writeBinding(provider, alias, target, { reasoning }));
       mappingSaving = false;
       closeMapping();
       const suffix = reasoning ? ` · 思考等级 ${reasoning}` : '';
-      toast(editing ? `✅ 已更新 ${alias} 的思考等级` : `✅ 已添加映射 ${alias} → ${target}（${provider}）${suffix}`);
+      // 展示名走注册表 / 自定义目录（`wbProviders.labelOf`）：直接印 provider id
+      // 时，自定义家会显示成一串 `custom-3f2a91b04c7e`，用户认不出是哪一家
+      const providerLabel = window.wbProviders?.labelOf?.(provider) || provider;
+      toast(editing ? `✅ 已更新 ${alias} 的思考等级` : `✅ 已添加映射 ${alias} → ${target}（${providerLabel}）${suffix}`);
     } catch (error) {
       status.textContent = `保存失败：${error.message}`;
     } finally {
@@ -882,18 +926,23 @@
   /** 自定义模型弹窗的提供商候选。
    *
    *  与映射弹窗的 `providerOptions()` **刻意不同**：那个只列「表格里出现过的家」
-   *  （因为映射必须挂到一行上），而这里要列**全部已注册的家** —— 用户完全可能
+   *  （因为映射必须挂到一行上），而这里要列**全部可登记的家** —— 用户完全可能
    *  先给还没登录的家配好模型清单，等加上账号就生效。`wbProviders.all()` 读的是
-   *  `/api/session` 的 `accounts.providers`（注册表全量，含 count=0 的家）。
+   *  `/api/session` 的 `accounts.providers`（注册表全量，含 count=0 的家），
+   *  自定义家再补上（它们不在注册表摘要里，见 providers.js）。
    *
    *  退化路径：`wbProviders` 没加载时回落到表格里出现过的家（少几个选项，
    *  但不会让弹窗空着打不开）。 */
   function customProviderOptions() {
-    const all = window.wbProviders?.all?.();
-    if (Array.isArray(all) && all.length) {
-      return all.map(item => ({ id: item.id, label: item.label || item.id }));
+    const options = [];
+    const builtin = window.wbProviders?.all?.();
+    if (Array.isArray(builtin)) {
+      options.push(...builtin.map(item => ({ id: item.id, label: item.label || item.id })));
     }
-    return providerOptions();
+    for (const provider of (customSource?.list?.() || [])) {
+      options.push({ id: provider.id, label: provider.name || provider.id });
+    }
+    return options.length ? options : providerOptions();
   }
 
   function fillCustomProvider(keep) {
@@ -925,9 +974,13 @@
     if (status) status.textContent = '';
     const input = $('custom-model-id');
     if (input) input.value = '';
-    // 预选当前正在筛选的那一家：用户点了某家的分段再来加模型时，这就是他要的家
-    const preferred = providerFilter !== 'all' ? providerFilter : '';
-    fillCustomProvider(preferred);
+    // 选中自定义家时这家是**锁定**的：模型就登记到它名下，不必（也不该）再选一次 ——
+    // 让它在下拉里可选，用户换一家就等于在给别的家登记，而表格里根本看不到结果。
+    // 内置家则预选当前正在看的那一家：点了某家的分段再来加模型时，这就是他要的家
+    const locked = isCustomView() ? currentProvider : '';
+    fillCustomProvider(locked || (currentProvider !== 'all' ? currentProvider : ''));
+    const select = $('custom-model-provider');
+    if (select) select.disabled = Boolean(locked);
     customModelPreview();
     $('custom-model-modal').classList.add('open');
     setTimeout(() => input?.focus(), 0);
@@ -950,20 +1003,26 @@
     $('custom-model-modal-save').disabled = true;
     status.textContent = '保存中…';
     try {
-      const next = await workbuddyDesktop.addCustomModel(provider, id);
+      const next = await writeAddModel(provider, id);
       accept(next);
       customSaving = false;
       closeCustomModel();
-      // 登记成功但表格里看不到这一行时，必须说清为什么 —— 表格只列「当前有
-      // 可用登录态」的家（后端的 active_manifests 过滤），给一个还没加账号的
-      // 家登记模型不会立刻出现。不说的话用户会以为没保存成功，然后再加一遍。
-      const visible = Array.isArray(next?.models)
-        && next.models.some(item => item.id === id && (item.provider || '') === provider);
       const label = customProviderOptions().find(item => item.id === provider)?.label || provider;
-      if (visible) {
-        toast(`✅ 已登记自定义模型 ${id}（${label}）`);
+      if (isCustomView()) {
+        // 自定义家的清单就是用户自己的登记表，登记了必然出现在表里（后端不做
+        // 「这家有没有账号」的过滤），所以只有一句成功提示
+        toast(`✅ 已登记模型 ${id}（${label}）`);
       } else {
-        toast(`✅ 已登记 ${id}（${label}），但该提供商还没有可用账号，这一行要加上账号后才会显示`, 'err');
+        // 内置家：登记成功但表格里看不到这一行时，必须说清为什么 —— 表格只列
+        // 「当前有可用登录态」的家（后端的 active_manifests 过滤），给一个还没加
+        // 账号的家登记模型不会立刻出现。不说的话用户会以为没保存成功，然后再加一遍。
+        const visible = Array.isArray(next?.models)
+          && next.models.some(item => item.id === id && (item.provider || '') === provider);
+        if (visible) {
+          toast(`✅ 已登记自定义模型 ${id}（${label}）`);
+        } else {
+          toast(`✅ 已登记 ${id}（${label}），但该提供商还没有可用账号，这一行要加上账号后才会显示`, 'err');
+        }
       }
     } catch (error) {
       status.textContent = `保存失败：${error.message}`;
@@ -973,94 +1032,60 @@
     }
   }
 
-  // ─── 刷新模型清单 ─────────────────────────────
+  // ─── 获取模型（弹窗）─────────────────────────
 
-  function describeResults(result) {
-    const results = Array.isArray(result?.results) ? result.results : [];
-    const done = results.filter(item => item.status === 'refreshed');
-    const failed = results.filter(item => item.status === 'failed');
-    const skipped = results.filter(item => item.status === 'skipped');
-    const parts = [];
-    if (done.length) {
-      parts.push(`已刷新 ${done.map(item =>
-        `${item.providerLabel || item.provider}（${Number(item.count) || 0} 个）`).join('、')}`);
-    }
-    if (failed.length) {
-      const first = failed[0];
-      const more = failed.length > 1 ? `（另有 ${failed.length - 1} 家失败）` : '';
-      parts.push(`失败 ${failed.map(item => item.providerLabel || item.provider).join('、')}：`
-        + `${first.message || '原因未知'}${more}`);
-    }
-    if (skipped.length) {
-      // 「固定清单」与「本次没取到新内容」分开说；判据用后端的 `fixed` 标记而不是文案
-      const fixed = skipped.filter(item => item.fixed === true);
-      if (fixed.length) {
-        parts.push(`跳过 ${fixed.length} 家（${fixed.map(item =>
-          item.providerLabel || item.provider).join('、')} 使用固定模型清单，无可刷新）`);
-      }
-      const rest = skipped.length - fixed.length;
-      if (rest > 0) parts.push(`另有 ${rest} 家本次没有取到新清单`);
-    }
-    if (!parts.length) return '刷新完成，但没有得到任何结果';
-    return parts.join('；');
-  }
-
-  /** 逐家明细写进表格下方的小字（长期可见，toast 3.5 秒就没了） */
-  function paintNote(result) {
-    const note = $('models-refresh-note');
-    if (!note) return;
-    const results = Array.isArray(result?.results) ? result.results : [];
-    if (!results.length) {
-      note.textContent = '';
-      note.className = 'models-refresh-note';
-      return;
-    }
-    const failed = results.filter(item => item.status === 'failed').length;
-    note.className = failed ? 'models-refresh-note err' : 'models-refresh-note';
-    note.textContent = results.map(item => {
-      const label = item.providerLabel || item.provider;
-      if (item.status === 'refreshed') return `${label} ✓ ${Number(item.count) || 0} 个`;
-      if (item.status === 'failed') return `${label} ✗ ${item.message || '刷新失败'}`;
-      return `${label} — ${item.message || '未刷新'}`;
-    }).join(' · ');
-  }
-
-  async function refreshModels() {
-    if (refreshing) return;
-    const button = $('btn-refresh-models');
-    const label = button?.textContent;
-    refreshing = true;
-    if (button) {
-      button.disabled = true;
-      button.textContent = '刷新中…';
-    }
-    try {
-      const result = await workbuddyDesktop.refreshModels();
-      paintNote(result);
-      const failed = Number(result?.failed) || 0;
-      toast(describeResults(result), failed ? 'err' : 'ok');
-      // 刷新响应里的清单是 /api/session 形状（不带启停 / 映射标记），管理页重拉一次
-      await load();
-    } catch (error) {
-      const note = $('models-refresh-note');
-      if (note) {
-        note.className = 'models-refresh-note err';
-        note.textContent = `⚠️ 刷新请求失败：${error.message}`;
-      }
-      toast(`刷新失败：${error.message}`, 'err');
-    } finally {
-      refreshing = false;
-      if (button) {
-        button.disabled = false;
-        button.textContent = label || '刷新模型清单';
-      }
-    }
+  /**
+   * 「获取模型」：打开弹窗，本体在 models-fetch-modal.js（全局 wbModelsFetchModal）。
+   * 两种提供商在弹窗里走不同形态 —— 自定义家是「拉取 → 勾选 → 导入」，内置家是
+   * 「刷新各家远程目录 + 逐家结果」，见那个文件的说明。本函数只负责把上下文
+   * （选中项、展示名、成功回调）递过去，不掺和弹窗内部的事。
+   *
+   * 内置家的刷新**不针对当前选中项、也不是固定八家**：范围 = 左栏实有清单的家
+   * ∪ 有启用账号的家（弹窗里组装，见 models-fetch-modal.js 的 scopeProviders）
+   * —— 模型管理页看不到的家不该出现在结果里。因此标题只写「内置提供商」，
+   * 实际刷了哪几家由结果表逐行列出。
+   */
+  function refreshModels() {
+    const custom = isCustomView();
+    const name = custom
+      ? (customSource?.record?.(currentProvider)?.name || currentProvider)
+      : '内置提供商';
+    window.wbModelsFetchModal?.open({
+      providerId: currentProvider,
+      custom,
+      name,
+      onDone: () => render(),
+    });
   }
 
   // ─── 绑定 ─────────────────────────────
 
-  // 恢复上次的筛选：搜索框回填；提供商分段是每次渲染按 providerFilter 动态画的
-  // （renderProviderSeg），只有状态分段是一次性静态 HTML，这里补一次 active。
+  /**
+   * 切换选中的提供商。左栏点击与账号页「模型清单 →」跳转都走它。
+   * 选中项落盘（跨次启动记忆）；表头按视图重排一次（自定义家隐藏倍率 / 来源两列，
+   * 见 CUSTOM_HIDDEN_COLUMNS），其余交给 render()。
+   */
+  function selectProvider(id) {
+    currentProvider = String(id ?? '').trim() || 'all';
+    window.wbFilterMemory?.save(FILTERS_KEY, { provider: currentProvider });
+    syncHead();
+    render();
+  }
+
+  /**
+   * 「＋ 新建自定义提供商」：**就地**打开「添加账号」弹窗并直达新建表单。
+   *
+   * 弹窗本身是全局的（不在账号页里），跳页只是绕路 —— 用户在这一页点「新建」，
+   * 就该在这一页完成它。表单、创建接口与成功收尾都在 add-provider-forms /
+   * add-custom-provider 那一套里（见 wbAccountAddForms.openNewCustomForm）；
+   * 创建成功后那次 refresh 会让本页左栏重画出新家（app.js 的 render → 本页 render）。
+   */
+  function openAddCustomProvider() {
+    window.wbAccountAddForms?.openNewCustomForm?.();
+  }
+
+  // 恢复上次的筛选：搜索框回填；左栏的选中态由 renderRail 每次渲染时画
+  // （选中项就是 currentProvider），状态分段是一次性静态 HTML，这里补一次 active。
   // 搜索词变更随 input 落盘（各敲一个字写一次 localStorage，量小无感）。
   if ($('model-search')) $('model-search').value = savedFilters.search || '';
   document.querySelectorAll('#models-state-seg .seg-item').forEach(el =>
@@ -1072,12 +1097,12 @@
   });
   $('models')?.addEventListener('click', onTableClick);
   $('models')?.addEventListener('change', onTableChange);
-  $('models-provider-seg')?.addEventListener('click', event => {
-    const item = event.target.closest('.seg-item[data-provider]');
+  // 左栏：点一家切一家；「＋ 新建自定义提供商」就地打开新建弹窗（不跳页）
+  $('prov-rail')?.addEventListener('click', event => {
+    if (event.target.closest('#rail-add-custom')) { openAddCustomProvider(); return; }
+    const item = event.target.closest('.pv[data-provider]');
     if (!item) return;
-    providerFilter = item.dataset.provider;
-    window.wbFilterMemory?.save(FILTERS_KEY, { provider: providerFilter });
-    render();
+    selectProvider(item.dataset.provider);
   });
   $('models-state-seg')?.addEventListener('click', event => {
     const item = event.target.closest('.seg-item[data-state]');
@@ -1087,7 +1112,6 @@
     $('models-state-seg').querySelectorAll('.seg-item').forEach(el => el.classList.toggle('active', el === item));
     render();
   });
-  $('btn-add-mapping')?.addEventListener('click', () => openMapping());
   $('mapping-modal-close')?.addEventListener('click', closeMapping);
   $('mapping-modal-cancel')?.addEventListener('click', closeMapping);
   $('mapping-modal-save')?.addEventListener('click', () => { void saveMapping(); });
@@ -1123,23 +1147,27 @@
     if (event.target === $('custom-model-modal')) closeCustomModel();
   });
 
+  // 「获取模型」按钮：文案与 title 都由 paintViewChrome 按当前选中项写，
+  // 这里只绑事件（首屏 render 会立刻补上那两处文案）。
   const refreshButton = $('btn-refresh-models');
   if (refreshButton) {
-    refreshButton.title = REFRESH_TITLE;
     refreshButton.addEventListener('click', () => { void refreshModels(); });
   }
-  const refreshHint = $('models-refresh-hint');
-  if (refreshHint) refreshHint.textContent = REFRESH_TITLE;
 
   // visibleColumns 导出给 table-columns.js：列宽那一层要按当前可见列算
   // （覆盖值落到哪个 <col>、末列不给把手），两边读同一份配置才不会各算一个样。
   // 必须在下面的 syncHead() **之前**挂好 —— 那次同步会顺带重算列宽与把手，
   // 挂晚了它读到的是「全列」，「末列不给把手」就会判到错的那一列上。
-  window.wbModelsPanel = { render, load, refreshModels, visibleColumns };
+  //
+  // selectProvider 导出给账号页的自定义提供商弹窗（「模型清单 →」跳过来并选中该家）。
+  window.wbModelsPanel = { render, load, refreshModels, visibleColumns, selectProvider, builtinProviders };
 
   // 首屏同步一次静态表头：load() 只重画数据行，表头是本文件加载后按本地配置
   // 重排过的（顺序 / 显隐 / 对齐）—— 不补这一下，用户改过列设置后刷新页面会看到
   // 表头回到 index.html 里的原始顺序，而数据行已经是新顺序（一眼就对不上）。
+  // 先校验一次选中项：存盘里记的那家可能已经被删了，而自定义家与内置家的可见列
+  // 不同（见 CUSTOM_HIDDEN_COLUMNS），这一步决定了下面按哪一套列集合同步表头。
+  normalizeSelection();
   syncHead();
 
   // 首次进入模型管理页时 load()；app.js 的 render() 只触发重绘（数据自持）

@@ -26,7 +26,53 @@
 
   /** Clash 出口列表缓存：一次页面加载内多实例共享，避免重复请求 */
   let clashCache = null;
+  /** 并发合并用的在途 Promise（见 clashOptions）与最后一次失败原因 */
+  let clashInflight = null;
+  let clashLastError = null;
   let instanceSeq = 0;
+
+  /** 同步读 Clash 出口缓存的整份快照（`null` = 还没读到）——账号表的代理列
+      每格渲染都要它，不能在那里发请求（见 accounts-table 的 proxyCell）。 */
+  const clashSnapshot = () => clashCache;
+
+  /** 上一次读取出错的原因（成功后清空）——账号表的代理列据此显示「读取失败」
+      的说明项，而不是静默地只剩「直连 / 自定义代理…」两项。 */
+  const clashError = () => clashLastError;
+
+  /**
+   * 读一次 Clash 出口列表（模块级缓存与表单实例共享；并发调用合并成一次）。
+   *
+   * 失败**不落缓存**（原因记进 `clashLastError`）——调用方按失败处理即可，
+   * 下一次调用会重新读取：账号表那侧靠「没就绪就补拉 + 节流」自愈，
+   * Clash / IPC 恢复后最多半分钟列表就会补上。
+   *
+   * 返回值必须带 `clash` 对象，否则同样按失败处理：桥异常时可能 **resolve 出
+   * `undefined`（而不是 reject）**——不校验的话，这种失败会伪装成「没有出口」，
+   * 在账号表里就是静默地少了一批选项（连空态提示都不会有）。
+   */
+  async function clashOptions({ force = false } = {}) {
+    if (!force && clashCache) return clashCache.clash;
+    if (!clashInflight) {
+      clashInflight = (async () => {
+        try {
+          const data = await api.getProxies();
+          if (!data || typeof data !== 'object' || !data.clash) {
+            throw new Error(`代理列表响应异常（${typeof data}）`);
+          }
+          clashCache = data;
+          clashLastError = null;
+          return data;
+        } catch (error) {
+          clashLastError = error?.message || String(error);
+          throw error;
+        } finally {
+          clashInflight = null;
+        }
+      })();
+    }
+    const data = await clashInflight;
+    return data.clash;
+  }
 
   /** 账号 proxy 字段 → 表单模式 */
   function modeOf(proxy) {
@@ -128,9 +174,9 @@
     /** 拉取 Clash 出口（默认走缓存；force=true 重新读取） */
     async function loadClashOptions({ force = false, selectedUid = null } = {}) {
       try {
-        if (!clashCache || force) clashCache = await api.getProxies();
-        fillClashOptions(clashCache?.clash, selectedUid);
-        return clashCache;
+        const clash = await clashOptions({ force });
+        fillClashOptions(clash, selectedUid);
+        return clash;
       } catch (error) {
         fillClashOptions({ available: false, error: error.message });
         return null;
@@ -236,5 +282,9 @@
     };
   }
 
-  window.wbProxyForm = { create, modeOf, invalidateClashCache: () => { clashCache = null; } };
+  window.wbProxyForm = {
+    create, modeOf, clashOptions, clashSnapshot, clashError,
+    // 失效重读用：清掉缓存与失败记忆（下一次调用会真正重新读取）
+    invalidateClashCache: () => { clashCache = null; clashLastError = null; },
+  };
 })();

@@ -1,4 +1,5 @@
-/* Agent2API · 模型管理 / 网关 Key / 请求日志三张表的列宽拖动与持久化 */
+/* Agent2API · 模型管理 / 网关 Key / 请求日志，以及「获取模型」弹窗两张表的
+   列宽拖动与持久化 */
 /* global wbApp */
 
 /**
@@ -41,12 +42,14 @@
   const GRIP_HTML = `<span class="${GRIP_CLASS}" title="拖动调整列宽（双击还原）"></span>`;
 
   /**
-   * 四张表的登记：columns 的顺序就是列顺序。
+   * 六张表的登记：columns 的顺序就是列顺序。
    *
    * · table 模式：只给 key，靠表头与 <col> 上的 data-col 属性定位（不依赖列序，
    *   以后在中间插一列不会让旧数据错位）。
    * · grid 模式：给表头单元格的选择器 sel 与默认轨道 track（与 page-requests.css
    *   的 grid-template-columns 一一对应），varName 是写到容器上的变量名。
+   * · 「获取模型」弹窗的两张表是**动态表**：注册时元素还不存在（弹窗未开），
+   *   恢复 / 补把手 / 绑定都在弹窗每次重建表头后的 repaint 里发生（见下）。
    *
    * ── columnsOf：列设置与列宽的同源 ─────────────────────────────
    * 四张表都接了列设置（能藏列、能换顺序），而列宽这一层有多处要按**当前可见列**
@@ -101,6 +104,23 @@
        * 列设置那头只管显隐与顺序。
        */
       columnsOf: visibleColumnsOf(() => window.wbRequestsPanel?.visibleColumns?.()),
+    },
+    // 「获取模型」弹窗的表（models-fetch-modal.js 动态创建，关闭即移除）。
+    // 两个形态各一张表、各存一份列宽：列集合不同（内置家五列 / 自定义家三列），
+    // 混用一份覆盖值会让「拖过的 provider 列宽」串到自定义家去（那边没有这列）。
+    // 初始化时表还不存在（弹窗未开）→ 这三个函数都按「找不到 root」空转，
+    // 真正的恢复 / 补把手 / 绑定发生在弹窗每次渲染后的 repaint（见下）。
+    {
+      id: 'fetch-models',
+      mode: 'table',
+      root: '#fm-table-intl',
+      columns: ['provider', 'source', 'state', 'count', 'note'].map(key => ({ key })),
+    },
+    {
+      id: 'fetch-models-custom',
+      mode: 'table',
+      root: '#fm-table-custom',
+      columns: ['pick', 'model', 'state'].map(key => ({ key })),
     },
   ];
 
@@ -281,8 +301,15 @@
   }
 
   /**
-   * 委托绑定：mousedown 开拖、dblclick 还原。挂在表格/列表容器上一次即可，
+   * 委托绑定：pointerdown 开拖、dblclick 还原。挂在表格/列表容器上一次即可，
    * 内部节点被重绘后监听仍然有效（委托到容器，不依赖具体节点）。
+   *
+   * 用指针事件 + setPointerCapture，而不是鼠标事件：**松手必须收得到**。
+   * 鼠标事件只在窗口内派发 —— 指针拖出窗口（或拖到别的窗口 / 面板上）再松手，
+   * 那次 mouseup 会被浏览器丢掉，拖动就永远不结束。此后鼠标一动列宽就跟着走，
+   * 表现为「一按住列就自己往后拓宽」，且把手一直亮着。捕获之后事件直接回到
+   * 把手，拖出窗口也收得到；再加两道兜底（buttons 为 0 立即收尾、窗口失焦收尾），
+   * 任何情况下拖动都会结束。
    *
    * 全程按**列 key** 而不是索引定位：列设置能换顺序、能藏列，索引随时会变，
    * 而 key 是稳定的身份（宽度覆盖值也是按 key 存的，两处口径一致）。
@@ -290,8 +317,15 @@
   function bind(table) {
     const root = rootOf(table);
     if (!root) return;
+    // 动态表（弹窗里的表）每次打开都是新元素：同一个 root 不重复绑，
+    // 换过 root（旧表已随弹窗移除）就重新绑一次 —— 监听挂在旧元素上，
+    // 元素没了监听也跟着没了，不补绑的话拖动会在第二次打开后失效。
+    if (table.boundRoot === root) return;
+    table.boundRoot = root;
 
-    root.addEventListener('mousedown', event => {
+    root.addEventListener('pointerdown', event => {
+      // 只接左键：右键/中键按下会弹菜单，不该顺手把拖动开起来
+      if (event.button !== 0) return;
       const grip = event.target.closest?.(`.${GRIP_CLASS}`);
       // 委托挂在各自的表上，所以命中的把手一定在这张表里；columnOfCell 再确认它属于哪一列
       const column = columnOfCell(table, root, grip?.parentElement);
@@ -303,19 +337,30 @@
       const limit = limitOf(table, trackSpace(table, root), column.key, startWidth);
       grip.classList.add('active');
       document.body.classList.add('col-resizing');
+      // 捕获失败（合成事件、老内核）不影响功能：全局监听那条路照旧
+      try { grip.setPointerCapture(event.pointerId); } catch { /* 退回全局监听 */ }
 
       const move = moveEvent => {
+        // 兜底一：没按住任何键就不是拖动（捕获失效时事件会漏到这里）
+        if (moveEvent.buttons === 0) { up(); return; }
         applyWidth(table, column.key, clamp(startWidth + moveEvent.clientX - startX, MIN_WIDTH, limit));
       };
       const up = () => {
         grip.classList.remove('active');
         document.body.classList.remove('col-resizing');
-        window.removeEventListener('mousemove', move);
-        window.removeEventListener('mouseup', up);
+        // 指针抬起时浏览器已自动释放捕获，这里再释放一次会抛 NotFoundError
+        try { grip.releasePointerCapture(event.pointerId); } catch { /* 已自动释放 */ }
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', up);
+        window.removeEventListener('blur', up);
         persist(table);
       };
-      window.addEventListener('mousemove', move);
-      window.addEventListener('mouseup', up);
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+      window.addEventListener('pointercancel', up);
+      // 兜底二：拖到一半切窗口/切标签，收不到 pointerup 也要收尾
+      window.addEventListener('blur', up);
     });
 
     root.addEventListener('dblclick', event => {
@@ -370,10 +415,15 @@
    *
    * 列宽与把手两件事都要重对一遍 —— 轨道条数（grid 模式）、覆盖值落到哪个
    * <col>（table 模式）、以及「末列不给把手」这条规则，全都按当前可见列算。
+   *
+   * 也负责**补绑**：动态表（弹窗）注册时 root 还不存在，绑定要等到弹窗渲染
+   * 之后 —— 所以渲染方每次重建表头（把手随表头一起没了）后调一次本函数，
+   * 恢复列宽、补把手、绑事件三件事一次到位（见 bind 的说明）。
    */
   function repaint(id) {
     const table = TABLES.find(item => item.id === id);
     if (!table) return;
+    bind(table);
     paint(table);
     paintGrips(table);
   }

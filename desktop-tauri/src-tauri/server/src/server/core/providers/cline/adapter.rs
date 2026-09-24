@@ -281,6 +281,9 @@ impl ProviderAdapter for ClineAdapter {
     fn refresh_models<'a>(
         &'a self,
         _store: &'a AccountStore,
+        // Cline 的目录接口无鉴权、清单是全局的（见模块头），没有「用哪个账号
+        // 去拉」这一维 —— 弹窗里那一列对它显示为空，参数照收不用
+        _account_id: &'a str,
         _force: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
@@ -311,6 +314,12 @@ impl ProviderAdapter for ClineAdapter {
     /// Cline **有**远程模型目录（`GET {apiBase}/ai/cline/recommended-models`，实测）。
     fn supports_model_refresh(&self) -> bool {
         true
+    }
+
+    /// Cline 的目录清单是全局的、接口无鉴权：刷新不走「账号」维度
+    /// （与 `refresh_models` 忽略 account_id 配对，见那边的注释）
+    fn refresh_uses_account(&self) -> bool {
+        false
     }
 
     /// Cline **没有**「默认模型」概念：不注入 workbuddy 语义的默认模型名

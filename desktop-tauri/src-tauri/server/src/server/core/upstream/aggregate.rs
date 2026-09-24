@@ -97,7 +97,7 @@ pub async fn aggregate_frame_stream(
         Ok(result) => result,
         Err(_elapsed) => Err(GatewayError::with_status(
             502,
-            format!("上游非流式响应超时（超过 {} 秒）", budget.as_secs()),
+            format!("非流式响应超时({}秒)", budget.as_secs()),
         )),
     }
 }
@@ -131,14 +131,19 @@ async fn aggregate_frame_stream_inner(
     while let Some(item) = stream.next().await {
         let chunk = item.map_err(|error| {
             // 手动终止的旁路流给的就是原文（见上面的说明）：折成 408 的
-            // 网关错误，不加「上游流中断」前缀 —— 它不是上游的问题
+            // 网关错误，不加「上游流式传输中断」前缀 —— 它不是上游的问题
             let text = error.to_string();
             if text == cancellation::MANUAL_TERMINATED {
                 return cancellation::cancelled_error();
             }
+            // 空闲超时是保护性判定不是中断：自带完整文案（含设定秒数），
+            // 直接用（与 `ForwardStream` 的错误帧同一处理）
+            if text.starts_with(super::stall::IDLE_TIMEOUT_PREFIX) {
+                return GatewayError::with_status(502, text);
+            }
             // 错误描述已在构造时折进 io::Error（reqwest 直连在
             // `aggregate_sse_completion`、翻译流在 `ProtocolTranslateStream`）
-            GatewayError::with_status(502, format!("上游流中断: {error}"))
+            GatewayError::with_status(502, format!("上游流式传输中断: {error}"))
         })?;
         if !first_chunk_seen {
             first_chunk_seen = true;

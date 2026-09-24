@@ -417,7 +417,7 @@ fn lock_table<'a>(
 /// 与 Node 的差别：Node 用 AbortController 显式 abort（undici 主动断连），
 /// 效果一致（上游都会看到断连），只是触发路径不同。
 ///
-/// ── 上游流中断（headers 已发出）──────────────────────────────
+/// ── 上游流式传输中断（headers 已发出）────────────────────────
 /// Node 版此时补写一帧 `data: {"error": {...}}` + `data: [DONE]`（见
 /// server.mjs 551-554）。这里做同一件事：把两帧塞进流再正常结束 ——
 /// 对 OpenAI SDK 来说，这比「连接被截断」更容易识别成一次失败的补全。
@@ -502,7 +502,7 @@ impl ForwardStream {
         // 不额外起任务 —— 合成器随本流一起被丢弃，没有「唤醒谁来收尾」的
         // 悬空问题（对比：spawn 一个等待任务需要 Weak 反查防止任务泄漏）。
         // 错误项的文案就是手动终止原文，poll_next 的错误分支据此不加
-        // 「上游流中断」前缀（那会把它说成上游的问题）。
+        // 「上游流式传输中断」前缀（那会把它说成上游的问题）。
         //
         // 合成器是 `cancellation::cancellable` 而**不是** `stream::select`：
         // 后者的收尾判据是「两条都结束」，旁路流在上游正常结束时永不产出，
@@ -560,7 +560,7 @@ impl Stream for ForwardStream {
                     }
                 }
                 std::task::Poll::Ready(Some(Err(error))) => {
-                    // 上游流中断：那是**正常路径**（客户端断开、上游主动结束），
+                    // 上游流式传输中断：那是**正常路径**（客户端断开、上游主动结束），
                     // 不 panic。先把已累积的 reasoning 冲刷出去，再补上
                     // 「错误帧 + [DONE]」收尾（与 Node 一致）。
                     self.upstream_done = true;
@@ -570,14 +570,14 @@ impl Stream for ForwardStream {
                     // 错误描述已在构造时折进 io::Error（见 inner 字段说明）
                     // 手动终止的旁路流给的就是原文（见 from_translated）；
                     // 空闲守卫给的也是自带前缀的原文（见 stall::IDLE_TIMEOUT_PREFIX）
-                    // —— 两者都不加「上游流中断」前缀：那不是上游的不正常中断
+                    // —— 两者都不加「上游流式传输中断」前缀：那不是上游的不正常中断
                     let text = error.to_string();
                     let message = if text == cancellation::MANUAL_TERMINATED
                         || text.starts_with(stall::IDLE_TIMEOUT_PREFIX)
                     {
                         text
                     } else {
-                        format!("上游流中断: {error}")
+                        format!("上游流式传输中断: {error}")
                     };
                     // 只在终端：这条原因由下面的 `note_error` 进请求日志
                     // （客户端此时已收到部分内容，HTTP 状态早就是 200，

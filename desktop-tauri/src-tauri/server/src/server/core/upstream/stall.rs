@@ -14,7 +14,7 @@
 //! 产出一个 `io::Error` 错误项并结束。两个消费方各自按既有语义收尾：
 //! `ForwardStream` 补「错误帧 + [DONE]」（客户端已收到 200 与部分内容），
 //! 聚合器折成 502。文案以 [`IDLE_TIMEOUT_PREFIX`] 开头，`ForwardStream`
-//! 据此不加「上游流中断」前缀 —— 它不是中断，是保护性判定（与手动终止
+//! 据此不加「上游流式传输中断」前缀 —— 它不是中断，是保护性判定（与手动终止
 //! `cancellation::MANUAL_TERMINATED` 同一处理）。
 
 use std::pin::Pin;
@@ -78,7 +78,7 @@ impl Stream for IdleGuard {
                 Poll::Ready(()) => {
                     self.done = true;
                     Poll::Ready(Some(Err(std::io::Error::other(format!(
-                        "{IDLE_TIMEOUT_PREFIX}（超过 {} 秒无新数据）",
+                        "{IDLE_TIMEOUT_PREFIX}({}秒)",
                         self.idle.as_secs()
                     )))))
                 }

@@ -123,25 +123,22 @@
 
         <!-- ─── 报表（内部标识仍是 overview，见 app.js 的 PAGES）─── -->
         <section class="page active" data-page="overview">
-          <div class="page-head">
-            <h2>报表</h2>
-            <p class="intro">请求统计。时间范围只影响概览、缓存四窗口与按天 Token 趋势；热力图固定近 365 天、缓存趋势固定近 24 小时。本页按「定时任务」页设置的间隔自动刷新（默认 1 秒，仅在本页可见时请求）。</p>
-            <div class="head-actions">
-              <div class="seg" id="report-range" role="tablist" aria-label="报表时间范围">
-                <button class="seg-item" data-range="today">今天</button>
-                <button class="seg-item active" data-range="7">7 天</button>
-                <button class="seg-item" data-range="30">30 天</button>
-                <button class="seg-item" data-range="month">本月</button>
-                <button class="seg-item" data-range="all">全部</button>
-              </div>
-            </div>
-          </div>
-
-          <!-- ── 统计概览 ── -->
+          <!-- ── 统计概览 ──
+               时间范围控件住在这一块的面板头里：它控制的就是这一页的统计口径，
+               与旁边的「近 7 天」读数同处一行最直观（原先挂在页面标题那行）。 -->
           <section class="panel">
             <div class="panel-head">
               <h2>统计概览</h2>
               <span class="panel-sub" id="report-range-label">近 7 天</span>
+              <div class="head-actions">
+                <div class="seg" id="report-range" role="tablist" aria-label="报表时间范围">
+                  <button class="seg-item" data-range="today">今天</button>
+                  <button class="seg-item active" data-range="7">7 天</button>
+                  <button class="seg-item" data-range="30">30 天</button>
+                  <button class="seg-item" data-range="month">本月</button>
+                  <button class="seg-item" data-range="all">全部</button>
+                </div>
+              </div>
             </div>
             <div class="panel-body">
               <div class="field-grid" id="report-overview">
@@ -284,11 +281,6 @@
 
         <!-- ─── 账号 ─── -->
         <section class="page" data-page="accounts">
-          <div class="page-head">
-            <h2>账号</h2>
-            <p class="intro">所有提供商的账号排在同一条队列里：转发时从队首往下试，跳过已禁用、不支持该模型、或该模型正在限流的账号。</p>
-          </div>
-
           <section class="panel account-table">
             <!-- 工具条：提供商（动态注入）+ 两段筛选 + 主操作，收在一行 -->
             <div class="toolbar">
@@ -313,7 +305,10 @@
               <div class="actions">
                 <button id="btn-query-usage">查询余额</button>
                 <button id="btn-checkin-all">全部签到</button>
-                <button id="btn-manage-custom-providers" title="管理自定义提供商：模型清单与映射、编辑、删除">自定义提供商</button>
+                <!-- 这里曾有「自定义提供商」按钮（打开一个管理弹窗：列出全部自定义
+                     提供商，每行模型清单 / 编辑 / 删除）。模型清单统一到「模型管理」页、
+                     编辑与删除搬进账号自己的「设置」弹窗（该弹窗里那段「提供商」）之后，
+                     它列的信息与三项操作都各有归属，按钮与弹窗一并移除。 -->
                 <button id="btn-add-account-2" class="primary">添加账号</button>
               </div>
             </div>
@@ -348,65 +343,68 @@
 
         <!-- ─── 模型管理（内部标识仍是 gateway：localStorage 记忆与 CSS 选择器都依赖它）─── -->
         <section class="page" data-page="gateway">
-          <div class="page-head">
-            <h2>模型管理</h2>
-            <p class="intro">内置提供商的模型管理：原始模型 ID 作为默认绑定，与新增别名一起在「模型映射」列独立开关。关闭某个名称后，下游不能用它请求，模型列表也不再返回它。</p>
-          </div>
-
           <section class="panel">
-            <div class="panel-head">
-              <h2>模型管理</h2>
-              <span class="models-count" id="models-count"></span>
-              <div class="head-actions">
-                <button type="button" class="sm" id="btn-add-custom-model">＋ 添加自定义模型</button>
-                <button type="button" class="sm" id="btn-add-mapping">＋ 添加映射</button>
-                <!-- 「刷新模型清单」：title 由 models-panel.js 在加载时写入（含
-                     「CatPaw / AutoClaw 用固定清单」那句），只有一处事实来源 -->
-                <button type="button" class="sm" id="btn-refresh-models">刷新模型清单</button>
+            <!-- 两栏：左栏是提供商导航（内置一组 + 自定义一组，由 models-panel.js
+                 的 renderRail 按运行期数据画），右栏是选中那家的模型表。左栏取代了
+                 原来顶部的「按提供商筛选」分段控件 —— 那排按钮只能筛内置各家，
+                 自定义家挤不进去，而模型管理本该是一个页面管全部提供商。 -->
+            <div class="mm">
+              <aside class="prov-rail" id="prov-rail" aria-label="按提供商选择"></aside>
+              <div class="mm-main">
+                <div class="panel-head">
+                  <!-- 这里曾经还有一行「标题 + N 个上游模型 · N 个开启的对外名称」：
+                       标题与顶栏面包屑重复，计数是看过一眼就不再读的数字，已按需求移除。
+                       「现在看的是哪一家」由左栏的选中态表达，「这家有多少模型」由左栏
+                       每项右边的数字表达 —— 都不必在表格上方再说一遍。
+                       状态筛选与搜索框住在这一个面板头里：它们与右边那排按钮同属
+                       「对这张表做什么」，各占一行会把表格区往下推一行的位置。
+                       搜索框紧跟在状态筛选右边（同为「看这张表」的控件），右侧那排
+                       按钮由 head-actions 自己的 margin-left:auto 推到最右。 -->
+                  <div class="seg" id="models-state-seg" role="tablist" aria-label="按状态筛选">
+                    <button class="seg-item active" data-state="all">全部</button>
+                    <button class="seg-item" data-state="enabled">已启用</button>
+                    <button class="seg-item" data-state="disabled">已禁用</button>
+                    <button class="seg-item" data-state="mapped">有映射</button>
+                  </div>
+                  <span class="input-affix" id="models-search">
+                    <span class="affix">⌕</span>
+                    <input type="search" id="model-search" placeholder="搜索模型 ID / 名称 / 映射名…" autocomplete="off">
+                  </span>
+                  <div class="head-actions">
+                    <!-- 「获取模型」排在最前：它是这一页的主操作（把清单拉回来），
+                         「添加模型」是补充。点开一个弹窗（本体在 models-fetch-modal.js）——
+                         自定义家是「拉上游 → 勾选 → 导入」，内置家是「刷新各家远程目录 +
+                         逐家结果」。文案与 title 由 models-panel.js 按当前选中项写入。
+                         这里曾有「＋ 添加映射」：它打开的是同一个弹窗、只是让用户自己
+                         再选一遍提供商与上游模型，而映射天然属于某一行 —— 行内的
+                         「＋ 映射」才是入口，那一颗已移除。 -->
+                    <button type="button" class="sm" id="btn-refresh-models">获取模型</button>
+                    <button type="button" class="sm" id="btn-add-custom-model">＋ 添加模型</button>
+                  </div>
+                </div>
+                <div class="models-table-wrap">
+                  <table class="models-table">
+                    <!-- data-col：列宽拖动（table-columns.js）靠它把 <col>、<th> 与列绑定，
+                         不依赖列序 —— 以后在中间插一列，存过的列宽不会错位 -->
+                    <colgroup><col class="c-model" data-col="model"><col class="c-rate" data-col="rate"><col class="c-source" data-col="source"><col class="c-alias" data-col="alias"><col class="c-act" data-col="act"></colgroup>
+                    <thead><tr>
+                      <th data-col="model">上游模型</th><th data-col="rate">倍率</th><th data-col="source">来源</th><th data-col="alias">模型映射（原始 ID 与别名独立开关）</th><th class="r" data-col="act">操作</th>
+                    </tr></thead>
+                    <tbody id="models"><tr><td colspan="5" class="empty">暂无模型</td></tr></tbody>
+                  </table>
+                </div>
+                <!-- 表尾说明：内容随选中的提供商换（内置家 / 自定义家两种口径），
+                     由 models-panel.js 的 paintViewChrome 写 -->
+                <div class="panel-foot" id="models-panel-foot">
+                  <span>「默认」绑定就是原始模型 ID，只可开关、不可删除。原始 ID 与每个别名独立生效：关闭的名称不出现在 <code>/v1/models</code>，下游请求返回 404；其他开启的名称不受影响。</span>
+                </div>
               </div>
-            </div>
-            <div class="panel-body models-tools">
-              <div class="seg" id="models-provider-seg" role="tablist" aria-label="按提供商筛选"></div>
-              <div class="seg" id="models-state-seg" role="tablist" aria-label="按状态筛选">
-                <button class="seg-item active" data-state="all">全部</button>
-                <button class="seg-item" data-state="enabled">已启用</button>
-                <button class="seg-item" data-state="disabled">已禁用</button>
-                <button class="seg-item" data-state="mapped">有映射</button>
-              </div>
-              <div class="spacer"></div>
-              <span class="input-affix" style="width:240px;flex:0 0 auto">
-                <span class="affix">⌕</span>
-                <input type="search" id="model-search" placeholder="搜索模型 ID / 名称 / 映射名…" autocomplete="off">
-              </span>
-            </div>
-            <div class="models-table-wrap">
-              <table class="models-table">
-                <!-- data-col：列宽拖动（table-columns.js）靠它把 <col>、<th> 与列绑定，
-                     不依赖列序 —— 以后在中间插一列，存过的列宽不会错位 -->
-                <colgroup><col class="c-model" data-col="model"><col class="c-rate" data-col="rate"><col class="c-source" data-col="source"><col class="c-alias" data-col="alias"><col class="c-act" data-col="act"></colgroup>
-                <thead><tr>
-                  <th data-col="model">上游模型</th><th data-col="rate">倍率</th><th data-col="source">来源</th><th data-col="alias">模型映射（原始 ID 与别名独立开关）</th><th class="r" data-col="act">操作</th>
-                </tr></thead>
-                <tbody id="models"><tr><td colspan="5" class="empty">暂无模型</td></tr></tbody>
-              </table>
-            </div>
-            <div class="panel-body" style="padding-top:8px">
-              <div class="models-refresh-note" id="models-refresh-hint"></div>
-              <div class="models-refresh-note" id="models-refresh-note"></div>
-            </div>
-            <div class="panel-foot">
-              <span>「默认」绑定就是原始模型 ID，只可开关、不可删除。原始 ID 与每个别名独立生效：关闭的名称不出现在 <code>/v1/models</code>，下游请求返回 404；其他开启的名称不受影响。</span>
             </div>
           </section>
         </section>
 
         <!-- ─── 网关 Key ─── -->
         <section class="page" data-page="keys">
-          <div class="page-head">
-            <h2>网关 Key</h2>
-            <p class="intro">可创建多把 Key 分发给不同客户端，任一启用的 Key 即可通过鉴权；一把启用的都没有时不鉴权（仅监听 127.0.0.1，建议本机使用可不设）。</p>
-          </div>
-
           <section class="panel">
             <div class="panel-head">
               <h2>API Key 列表</h2>
@@ -435,11 +433,6 @@
              data-copy-from 委托都不用改一行）。搬家的理由见导航项上的注释。
              地址随真实端口刷新：元素 id 不变，刷新逻辑照旧命中（见 port-panel.js）。 -->
         <section class="page" data-page="docs">
-          <div class="page-head">
-            <h2>文档</h2>
-            <p class="intro">接入客户端需要的地址与协议。这里列出的地址随网关实际监听端口实时刷新，复制后直接粘进客户端的对应输入框即可。</p>
-          </div>
-
           <!-- 接口条：一行一条端点（地址随真实端口刷新，见 port-panel.js 的 paintGatewayAddress）。
                对话协议三种并列写出：客户端按自己支持的那种选一行填，三家共用同一套
                模型与账号池 —— 换协议不用换配置。 -->
@@ -523,11 +516,6 @@
              原先页头的「自动刷新」开关已迁到「定时任务」页：它改的是本页轮询的
              间隔，与那几个后台任务同属「定时」这一类，收在一处才好对照调整。 -->
         <section class="page" data-page="logs">
-          <div class="page-head">
-            <h2>运行日志</h2>
-            <p class="intro">记录登录、token 刷新、账号增删改、凭证维护、模型目录刷新、账号被标记限额（429）、自动签到、软件更新等系统事件；网关每次转发到上游的请求（含每次重试与敏感词命中）见「请求日志」页。本页的自动刷新间隔在「定时任务」页设置。</p>
-          </div>
-
           <!-- ── 视图一：系统事件 ── -->
           <section class="panel" id="logs-panel-events">
             <div class="panel-head">
@@ -591,19 +579,14 @@
              自动签到与凭证自动维护整行铺开，其余六条分两栏各三条 —— 左栏是后端
              任务（带「立即执行」），右栏是页面自动刷新（执行者是页面自己）。 -->
         <section class="page" data-page="tasks">
-          <div class="page-head">
-            <h2>定时任务</h2>
-            <p class="intro">网关在后台定期自动执行的任务。可以在这里开关、调整执行间隔，或立即执行一次。关掉某个任务只影响它自己的自动执行，不影响你在别处手动操作。</p>
-            <div class="head-actions">
-              <button id="btn-tasks-refresh">刷新</button>
-            </div>
-          </div>
-
           <section class="panel">
             <div class="panel-head">
               <h2>任务清单</h2>
               <span id="tasks-badge" class="badge">—</span>
               <span class="panel-sub">状态每 20 秒自动同步</span>
+              <div class="head-actions">
+                <button id="btn-tasks-refresh">刷新</button>
+              </div>
             </div>
             <div class="panel-body">
               <div class="task-list" id="task-list">
@@ -629,11 +612,6 @@
              调试模式开启时，「详情」列还能看到发给上游与上游返回的完整原始报文 ——
              敏感词场景下排查提示词要看的就是那一份（运行日志页不再有这些逐请求的行）。 -->
         <section class="page" data-page="requests">
-          <div class="page-head">
-            <h2>请求日志</h2>
-            <p class="intro">网关每次转发到上游的模型请求：提供商与账号、重试、状态码、模型、用时与 Token 用量，按时间倒序。可按时间、状态、提供商、模型四个维度筛选（后两个的选项是这份日志里实际出现过的值）。悬停「重试」列的标签可看每次尝试的账号、失败原因与重试明细；开启调试模式后「详情」列可查看完整的上游原始报文。本页的自动刷新间隔在「定时任务」页设置。</p>
-          </div>
-
           <section class="panel">
             <div class="panel-head">
               <h2>请求日志列表</h2>
@@ -662,14 +640,6 @@
                   <option value="ok">成功</option>
                   <option value="error">失败</option>
                 </select>
-                <!-- 仅看进行中：单颗分段开关（复用时间档位同一套 .seg 形制）。
-                     开启时 status 过滤固定发 running，与提供商 / 模型 / 时间并存，
-                     状态下拉随即停用（同一维度的互斥取值，见 requests-panel.js）；
-                     「全部删除 / 仅清空报文原文」两种删除方式在「清理」弹窗里选。 -->
-                <div class="seg">
-                  <button type="button" class="seg-item" id="btn-req-running" aria-pressed="false"
-                    title="只显示正在转发中的请求（状态列按阶段显示：连接中 / 等待响应 / 响应中 / 重试中，用时列显示已用时）">仅看进行中</button>
-                </div>
                 <!-- 提供商 / 模型两个维度：选项由 requests-panel.js 进页面时从
                      `/api/stats/requests/filters` 拉一次填进来（那是「明细里出现过
                      的值」，不是当前配置清单 —— 已删除账号所属的提供商、历史请求
@@ -680,6 +650,14 @@
                 <select id="req-model" title="按模型筛选（只列日志里出现过的；精确匹配模型名）">
                   <option value="">全部模型</option>
                 </select>
+                <!-- 仅看进行中：单颗分段开关（复用时间档位同一套 .seg 形制）。
+                     开启时 status 过滤固定发 running，与提供商 / 模型 / 时间并存，
+                     状态下拉随即停用（同一维度的互斥取值，见 requests-panel.js）；
+                     「全部删除 / 仅清空报文原文」两种删除方式在「清理」弹窗里选。 -->
+                <div class="seg">
+                  <button type="button" class="seg-item" id="btn-req-running" aria-pressed="false"
+                    title="只显示正在转发中的请求（状态列按阶段显示：连接中 / 等待响应 / 响应中 / 重试中，用时列显示已用时）">仅看进行中</button>
+                </div>
                 <div class="spacer"></div>
                 <span class="panel-sub" id="req-summary">—</span>
               </div>
@@ -702,17 +680,13 @@
 
         <!-- ─── 设置 ─── -->
         <section class="page" data-page="settings">
-          <div class="page-head">
-            <h2>设置</h2>
-            <p class="intro">桌面端的启动与托盘行为、账号数据的导入 / 导出，以及软件更新与数据保留天数。这些设置保存在本机，重启后依然生效。定时任务（自动签到、凭证维护、页面自动刷新等）在「定时任务」页。</p>
-          </div>
-
           <!-- 左侧分类导航 + 右侧内容栏：分类按 data-cat 通用匹配（见 settings-panel.js），
                新增分类只需各加一个 .settings-nav-item 与一个 .settings-pane（面板内的 id 与 DOM 顺序不变）。 -->
           <div class="settings-layout">
             <nav class="settings-nav" id="settings-nav">
               <button class="settings-nav-item active" data-cat="general">通用</button>
-              <button class="settings-nav-item" data-cat="account">账号</button>
+              <button class="settings-nav-item" data-cat="gateway">网关</button>
+              <button class="settings-nav-item" data-cat="security">安全</button>
               <button class="settings-nav-item" data-cat="data">数据</button>
               <button class="settings-nav-item" data-cat="about">关于</button>
             </nav>
@@ -763,8 +737,13 @@
                     <div class="settings-state" id="units-state">—</div>
                   </div>
                 </section>
+              </div>
 
-                <!-- ── 通用：请求超时 ──
+              <!-- ── 网关：请求超时等五项 ──
+                   全是「请求怎么发往上游」这条链路上的开关：超时 / 重试管转发行为，
+                   指纹脱敏与系统提示词是防拦截的两道闸，调试模式抓上游原始报文。 -->
+              <div class="settings-pane" data-cat="gateway">
+                <!-- ── 网关：请求超时 ──
                      四项读写的都是后端配置（经 /api/timeouts，HTTP 桥），
                      对应转发链路的四个阶段：连接 / 等待响应头 / 流式空闲 /
                      非流式响应体。默认 30 / 300 / 300 / 300 秒，范围 1~3600，
@@ -818,7 +797,7 @@
                   </div>
                 </section>
 
-                <!-- ── 通用：请求重试 ──
+                <!-- ── 网关：请求重试 ──
                      三项读写的都是后端 config.json（经 /api/retry，HTTP 桥），
                      转发层对上游瞬时错误与传输层失败按这里设置退避重发。
                      次数分两档（同一账号原地重发 / 换账号），判定见
@@ -877,34 +856,7 @@
                   </div>
                 </section>
 
-                <!-- ── 通用：调试模式 ──
-                     开关读写后端 config.json（经 /api/debug，HTTP 桥）。
-                     开启后转发层把**发给上游的请求与上游返回的响应**完整落盘
-                     （凭据类请求头一律脱敏），请求日志页的「详情」列据此展示。
-                     报文单独存一个文件，存放位置在「数据 → 保存位置」里可改。 -->
-                <section class="panel">
-                  <div class="panel-head">
-                    <h2>调试模式</h2>
-                    <span class="tip-q" data-tip="开启后，网关会把每次转发**发给上游的请求**（请求头 + 请求体）与**上游返回的响应**（状态码 + 响应头 + 响应体）完整保存到本地，供请求日志页的「详情」查看。请求头里的 Authorization、Cookie、API Key 等凭据字段一律替换成 [redacted]，不会明文落盘；请求体与响应体按原样保存（可能包含你的对话内容）。报文只保留最近 500 条，超出后丢弃最旧的。这是排障用的临时开关，不需要时建议关闭。"></span>
-                    <span id="debug-badge" class="badge">检测中…</span>
-                    <div class="head-actions">
-                      <button id="btn-debug-refresh">刷新</button>
-                    </div>
-                  </div>
-                  <div class="panel-body">
-                    <div class="settings-switches">
-                      <label class="switch">
-                        <input type="checkbox" id="settings-debug-mode">
-                        <span class="track"></span>
-                        <span>保存上游原始报文（请求头、请求体、响应头、响应体）</span>
-                      </label>
-                    </div>
-                    <div class="settings-state" id="debug-state">—</div>
-                    <div class="hint retention-note">开启后新发生的请求才会被记录（已经过去的请求补不回来）。报文单独存放，位置可在左侧「数据 → 保存位置」里更改。</div>
-                  </div>
-                </section>
-
-                <!-- ── 通用：指纹脱敏 ──
+                <!-- ── 网关：指纹脱敏 ──
                      开关读写配置（经 /api/sanitize，HTTP 桥）。
                      开启后转发层在每次出站前剥离上游内容审核的黑名单指纹：
                      表头键值整段删除、客户端 system 模板句最小改写（每句只换一个词，
@@ -932,7 +884,7 @@
                   </div>
                 </section>
 
-                <!-- ── 通用：系统提示词 ──
+                <!-- ── 网关：系统提示词 ──
                      模式与提示词文件读写后端 config.json（经 /api/prompt，HTTP 桥）。
                      custom / append 用网关自有提示词替换 / 追加 system 消息 ——
                      指纹脱敏之外的第二层防护：从源头消灭 system 来源的指纹
@@ -979,27 +931,40 @@
                     <div class="hint retention-note">改完立即生效，不用重启（下一个请求就用新模式）。降级是自动的临时状态，解除后本模式自己的提示词立刻恢复。</div>
                   </div>
                 </section>
-              </div>
 
-              <!-- ── 账号：导入 / 导出 ── -->
-              <div class="settings-pane" data-cat="account">
+                <!-- ── 网关：调试模式 ──
+                     开关读写后端 config.json（经 /api/debug，HTTP 桥）。
+                     开启后转发层把**发给上游的请求与上游返回的响应**完整落盘
+                     （凭据类请求头一律脱敏），请求日志页的「详情」列据此展示。
+                     报文统一存进 agent2api.db（只保留最近 500 条，超出后丢弃最旧），
+                     条数见「数据 → 数据存储」的「调试报文」计数。 -->
                 <section class="panel">
                   <div class="panel-head">
-                    <h2>账号导入 / 导出</h2>
-                    <span class="tip-q" data-tip="导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。"></span>
+                    <h2>调试模式</h2>
+                    <span class="tip-q" data-tip="开启后，网关会把每次转发**发给上游的请求**（请求头 + 请求体）与**上游返回的响应**（状态码 + 响应头 + 响应体）完整保存到本地，供请求日志页的「详情」查看。请求头里的 Authorization、Cookie、API Key 等凭据字段一律替换成 [redacted]，不会明文落盘；请求体与响应体按原样保存（可能包含你的对话内容）。报文只保留最近 500 条，超出后丢弃最旧的。这是排障用的临时开关，不需要时建议关闭。"></span>
+                    <span id="debug-badge" class="badge">检测中…</span>
                     <div class="head-actions">
-                      <button id="btn-settings-export">导出账号</button>
-                      <button id="btn-settings-import" class="primary">导入账号</button>
+                      <button id="btn-debug-refresh">刷新</button>
                     </div>
                   </div>
                   <div class="panel-body">
-                    <div class="danger-zone">
-                      <strong>导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义</strong>，可直接用于登录。请妥善保管，不要外传或上传到公共位置。
+                    <div class="settings-switches">
+                      <label class="switch">
+                        <input type="checkbox" id="settings-debug-mode">
+                        <span class="track"></span>
+                        <span>保存上游原始报文（请求头、请求体、响应头、响应体）</span>
+                      </label>
                     </div>
-                    <div class="io-result" id="settings-io-result" style="display:none"></div>
+                    <div class="settings-state" id="debug-state">—</div>
+                    <div class="hint retention-note">开启后新发生的请求才会被记录（已经过去的请求补不回来）。报文统一存放在本地数据库里，只保留最近 500 条（超出后丢弃最旧的），条数见左侧「数据 → 数据存储」的「调试报文」。</div>
                   </div>
                 </section>
+              </div>
 
+              <!-- ── 安全：机器人校验 / 面板登录 ──
+                   管的是「谁能打开这个面板」：ALTCHA 护公开的登录 / 注册边界，
+                   面板登录管理本设备的登录会话。与账号数据、转发行为无关。 -->
+              <div class="settings-pane" data-cat="security">
                 <!-- 机器人校验开关（ALTCHA）：护的是面板登录 / 注册（公开的认证
                      边界），读写走 HTTP 桥（/api/captcha），与桌面壳开关不同源。
                      桌面形态没有登录页场景，开关同样可见 —— 文案说明作用面。 -->
@@ -1030,10 +995,28 @@
                 </section>
               </div>
 
-              <!-- ── 数据：保留天数 ──
-                   这三项读写的都是后端 config.json（经 /api/retention，HTTP 桥），
-                   与主进程本地的 getAppSettings / saveAppSettings 不是一套。 -->
+              <!-- ── 数据：导入 / 导出 ── -->
               <div class="settings-pane" data-cat="data">
+                <section class="panel">
+                  <div class="panel-head">
+                    <h2>账号导入 / 导出</h2>
+                    <span class="tip-q" data-tip="导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。"></span>
+                    <div class="head-actions">
+                      <button id="btn-settings-export">导出账号</button>
+                      <button id="btn-settings-import" class="primary">导入账号</button>
+                    </div>
+                  </div>
+                  <div class="panel-body">
+                    <div class="danger-zone">
+                      <strong>导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义</strong>，可直接用于登录。请妥善保管，不要外传或上传到公共位置。
+                    </div>
+                    <div class="io-result" id="settings-io-result" style="display:none"></div>
+                  </div>
+                </section>
+
+                <!-- ── 数据：保留天数 ──
+                     这三项读写的都是后端 config.json（经 /api/retention，HTTP 桥），
+                     与主进程本地的 getAppSettings / saveAppSettings 不是一套。 -->
                 <section class="panel">
                   <div class="panel-head">
                     <h2>数据保留</h2>
@@ -1695,6 +1678,13 @@
        之前 —— 后者在 IIFE 里就解构 window.wbModelsReasoning（要的是那个对象本身，
        不是运行期再查一次）。它只依赖 wbApp 的 esc，所以排在 app.js 之后即可。 -->
   <script src="models-reasoning.js"></script>
+  <!-- 自定义提供商的模型清单数据源（适配 + 整表提交）：排在 models-panel.js 之前
+       —— 后者在 IIFE 里就解构 window.wbModelsCustom（同样是那个对象本身）。
+       它只依赖 wbProviders（运行期读取），所以也排在 providers.js 之后即可。 -->
+  <script src="models-custom-source.js"></script>
+  <!-- 「获取模型」弹窗：models-panel.js 在点击时运行期读 wbModelsFetchModal，
+       所以排在前或后都行；放这里是为了让「模型」这一组脚本挨在一起 -->
+  <script src="models-fetch-modal.js"></script>
   <script src="models-panel.js"></script>
   <!-- 网关 Key 页（多把 Key 的列表 / 新建 / 启停 / 删除 / 可用范围限制）：
        同样依赖 wbApp，排在 app.js 之后。选项来源里用到 wbProviders.labelOf
@@ -1759,7 +1749,9 @@
                                 重试中：徽章文案、配色类名、阶段计时）。列表与详情弹窗
                                 渲染的是同一行数据的同一格，两处必须逐字一致，所以
                                 文案集中在这一个小模块里（口径见文件头）。
-       · request-hover          列表里重试 / 敏感词两枚标签的悬停面板。requests-panel 在
+       · request-hover          列表里重试 / 敏感词两枚标签的悬停面板（整表重绘时还负责
+                                锚点迁移，宿主在重绘前后调 beforeListRedraw /
+                                afterListRedraw 通知它）。requests-panel 在
                                 加载期就调 wbRequestHover.bind 把委托挂到列表上
                                 （走可选链，未就绪时静默跳过 —— 那样整个悬停功能就没了，
                                 所以这个顺序是硬要求，与 tooltip.js 的自动增强不同）。
@@ -1796,17 +1788,14 @@
   <script src="add-qoder.js"></script>
   <script src="add-cline.js"></script>
   <script src="add-provider-forms.js"></script>
-  <!-- 自定义提供商（custom- 前缀）的三块界面。add-custom-provider.js 要向
+  <!-- 自定义提供商（custom- 前缀）的界面。add-custom-provider.js 要向
        add-provider-forms.js 注册「自定义提供商」表单块，custom-provider-ui.js
-       在加载期只绑工具栏按钮（脚本都在 body 末尾，DOM 已解析），三者的其余
-       交互都在点击时才消费全局对象（wbCustomModelsModal / wbProviders），
-       没有别的加载期依赖。 -->
+       在加载期只绑工具栏按钮（脚本都在 body 末尾，DOM 已解析），其余交互都在
+       点击时才消费全局对象（wbProviders），没有别的加载期依赖。
+       模型清单不再有自己的弹窗：模型管理页选中该家即可管（见下面
+       models-custom-source.js 与 models-panel.js），所以这里没有对应的弹窗脚本。 -->
   <script src="add-custom-provider.js"></script>
   <script src="custom-provider-ui.js"></script>
-  <!-- 自定义提供商的「模型管理」弹窗本体（管理弹窗里那颗按钮点击时才消费
-       wbCustomModelsModal，见 custom-provider-ui.js 的 handleAction）；
-       它的兜底思考等级表来自上面的 models-reasoning.js（更早加载，已满足） -->
-  <script src="custom-models-modal.js"></script>
   <script src="account-panel.js"></script>
   <!-- Markdown 渲染器：更新日志用。纯函数、无依赖，只认白名单语法（见文件头说明）；
        必须在 update-panel.js 之前加载 -->

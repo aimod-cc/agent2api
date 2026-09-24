@@ -535,6 +535,15 @@ input[type="number"] { max-width: 130px; }
 
 .modal-mask.open { display: flex; animation: mask-in .16s ease; }
 
+/* 确认弹窗是「弹窗之上的弹窗」：它从别的弹窗里发起（请求详情的「终止请求」、
+   账号设置的「删除提供商」、⋯ 菜单的「删除账号」…），而所有 .modal-mask 同为
+   30 —— 同档时谁在上面由 DOM 顺序决定，于是声明在 #confirm-modal 之后的那些
+   弹窗（#req-detail-modal / #mapping-modal / #key-modal …）会把确认框盖住：
+   用户点了「终止请求」，界面看起来毫无反应，实际确认框在底下等着。
+   抬到浮层（下拉 / 列设置 / 提示气泡，35）之上、轻提示（toast，40）之下：
+   确认框永远在最上层，但它出现时不该盖住 toast。 */
+#confirm-modal { z-index: 38; }
+
 @keyframes mask-in { from { opacity: 0; } to { opacity: 1; } }
 
 .modal {

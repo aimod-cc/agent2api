@@ -651,6 +651,23 @@
   }
 
   /**
+   * 整表重绘列表：替换 `innerHTML` 前后通知悬停面板，让它把锚点迁到新节点上
+   * （见 request-hover.js 的 beforeListRedraw / afterListRedraw）。
+   *
+   * ── 为什么重绘要通知面板（本次修复）─────────────────────────
+   * 本页默认 1 秒一拍自动刷新，每次响应都整表重绘：旧标签全部脱离文档。
+   * 而悬停面板的打开有 150ms 延迟 —— 重绘恰好落在延迟窗口里时，面板会拿
+   * 游离节点当锚点：位置量成全 0、落在视口左上角，而且游离节点收不到
+   * pointerout，开了就不会自己关。通知之后，面板按「标签种类 + 行身份键」
+   * 找回新节点，位置与内容都跟着新一屏走；这一行被挤出当前页才收起。
+   */
+  function paintList(list, html) {
+    window.wbRequestHover?.beforeListRedraw?.();
+    list.innerHTML = html;
+    window.wbRequestHover?.afterListRedraw?.();
+  }
+
+  /**
    * 渲染请求日志。errorText 有值时列表位置显示错误文案，**不动**计数与页码 ——
    * 那组读数是上一次成功加载的结果，写 0 会让人以为明细被删了；
    * 徽标退成「—」表示「现在这个读数不可信」，比给一个假数字诚实。
@@ -661,17 +678,17 @@
     if (errorText) {
       const badge = $('req-badge');
       if (badge) { badge.className = 'badge'; badge.textContent = '—'; }
-      list.innerHTML = `<div class="log-empty">${esc(errorText)}</div>`;
+      paintList(list, `<div class="log-empty">${esc(errorText)}</div>`);
       return;
     }
     renderBadge();
     renderSummary();
     renderPager();
     if (!entries.length) {
-      list.innerHTML = `<div class="log-empty">${esc(emptyText())}</div>`;
+      paintList(list, `<div class="log-empty">${esc(emptyText())}</div>`);
       return;
     }
-    list.innerHTML = headHtml() + entries.map(rowHtml).join('');
+    paintList(list, headHtml() + entries.map(rowHtml).join(''));
   }
 
   // ─── 筛选下拉（提供商 / 模型）─────────────

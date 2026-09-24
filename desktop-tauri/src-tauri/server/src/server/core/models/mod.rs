@@ -508,6 +508,8 @@ impl ModelCatalog {
     ///
     /// 「当前账号 = 队首的可用账号」（由 store 派生，与转发默认使用的账号一致），
     /// 这里直接用它的凭证与出口，保证模型目录与转发看到的是同一个账号。
+    /// `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条：按 id 直取，
+    /// **取不到就明确失败、不回落到队首**（否则清单会变成「选了 A、用的是 B」）。
     ///
     /// 返回 [`RefreshOutcome`]（本函数内部本来就算出了它，只是过去只用于打日志）：
     /// 自动路径不看返回值（照旧只写日志），**手动刷新路径**靠它如实汇报
@@ -518,21 +520,42 @@ impl ModelCatalog {
         &self,
         store: &crate::server::core::account_store::AccountStore,
         auth: &crate::server::core::auth::AuthService,
+        account_id: &str,
     ) -> RefreshOutcome {
-        // 队首账号优先（多账号时与转发一致）；没有账号时回落到默认登录态
-        // （环境变量 WORKBUDDY_TOKEN 或单账号 auth.json）
-        let (session, proxy) = match store.get_current_entry() {
-            Some(entry) => {
-                let proxy = crate::server::core::proxies::session_proxy(&entry.session);
-                (Some(entry.session), proxy)
-            }
-            None => match auth.get_current_session().await {
-                Ok(session) => (session, None),
-                Err(error) => {
-                    logging::verbose("[Models]", &format!("模型目录刷新失败: {}", error.message));
-                    return RefreshOutcome::not_refreshed(error.message);
+        // 账号选取三档：
+        //   · 点名了（`account_id` 非空）→ 按 id 直取那一条，取不到即失败（见上）；
+        //   · 没点名 → 队首账号优先（多账号时与转发一致）；
+        //   · 一条账号都没有 → 回落到默认登录态（环境变量 WORKBUDDY_TOKEN
+        //     或单账号 auth.json）。
+        let requested = account_id.trim();
+        let (session, proxy) = if requested.is_empty() {
+            match store.get_current_entry() {
+                Some(entry) => {
+                    let proxy = crate::server::core::proxies::session_proxy(&entry.session);
+                    (Some(entry.session), proxy)
                 }
-            },
+                None => match auth.get_current_session().await {
+                    Ok(session) => (session, None),
+                    Err(error) => {
+                        logging::verbose("[Models]", &format!("模型目录刷新失败: {}", error.message));
+                        return RefreshOutcome::not_refreshed(error.message);
+                    }
+                },
+            }
+        } else {
+            match store.session_for_account(requested) {
+                Some(entry) => {
+                    let proxy = crate::server::core::proxies::session_proxy(&entry.session);
+                    (Some(entry.session), proxy)
+                }
+                None => {
+                    logging::verbose(
+                        "[Models]",
+                        &format!("模型目录刷新失败：指定的账号不存在或不可用（{requested}）"),
+                    );
+                    return RefreshOutcome::not_refreshed("指定的账号不存在或不可用，请重新选择");
+                }
+            }
         };
         let Some(session) = session else {
             logging::verbose("[Models]", &format!("模型目录未更新: {REASON_NO_SESSION}"));

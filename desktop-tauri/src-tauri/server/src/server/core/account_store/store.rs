@@ -452,6 +452,24 @@ impl AccountStore {
         })
     }
 
+    /// 指定 id 的账号会话（模型目录刷新按用户在「获取模型」弹窗里点名的账号走这条）。
+    ///
+    /// 判据与 [`Self::current_entry_for_provider`] 逐条相同（启用 + 有凭证），
+    /// 差别只有「按 id 直取而不是取队首」：**用户点名了就不再替他挑** ——
+    /// 取不到返回 None，由调用方给出「这条账号不存在或不可用」的明确文案，
+    /// 而不是悄悄回落到队首（那会变成「选了 A、用的是 B」的静默错误）。
+    pub fn session_for_account(&self, account_id: &str) -> Option<CurrentEntry> {
+        let _guard = self.guard();
+        let record = self.record_by_id(&_guard, account_id)?;
+        if !record.enabled() || !record.has_credentials() {
+            return None;
+        }
+        Some(CurrentEntry {
+            id: record.id().to_string(),
+            session: self.session_from_record(&record),
+        })
+    }
+
     /// 账号记录 → auth 模块的会话形态（端点/prefixPath/platform 按 edition 兜底）。
     ///
     /// `proxy` 是该账号解析出的出口（null = 直连），计费/签到等「拿着 session

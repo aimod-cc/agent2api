@@ -16,7 +16,18 @@
 
   // ─── 添加账号弹窗：按提供商分叉 ─────────────
 
-  const ADD_PROVIDER_SEG_ID = 'add-provider-seg';
+  const ADD_PROVIDER_GRID_ID = 'add-provider-grid';
+  /** 第 1 步（选提供商）与第 2 步（选方式 + 填凭证）的容器 */
+  const ADD_STEP_PICK_ID = 'add-step-pick';
+  const ADD_STEP_FORM_ID = 'add-step-form';
+  const ADD_STEP_BACK_ID = 'add-step-back';
+  /** 底部操作条：主按钮与失败提示的落点，由需要它的块在 mount 时把自己的按钮搬进来 */
+  const ADD_FOOT_ID = 'add-foot';
+  const ADD_FOOT_ACTIONS_ID = 'add-foot-actions';
+  const ADD_FOOT_HINT_ID = 'add-foot-hint';
+  const ADD_SEARCH_ID = 'add-provider-search';
+  /** 「新建自定义提供商」那张卡片的取值（不是 provider id，只是卡片自己的标记） */
+  const NEW_PROVIDER_CARD_ID = '__new__';
   /** WorkBuddy 账号版本与网页登录区块的容器 */
   const ADD_WB_BLOCK_ID = 'add-block-workbuddy';
   const ADD_PLACEHOLDER_ID = 'add-block-placeholder';
@@ -372,7 +383,7 @@
   // 后注册口：对方在加载期调 registerAddForm，把整个块挂进弹窗，结构、
   // 交互与提交全部自治。
   //
-  // 必须声明在 syncAddProviderOptions **之前**：本文件加载末尾就会调它一次，
+  // 必须声明在 renderProviderCards **之前**：本文件加载末尾就会调它一次，
   // const 声明放在后面会踩暂时性死区（TDZ）直接抛 ReferenceError。
   const EXTRA_ADD_FORMS = [];
 
@@ -380,77 +391,133 @@
    * 挂一个后注册的表单块。配置形状（provider / label 与 ADD_FORMS 条目同名
    * 字段含义相同，其余由对方定义）：
    *   provider       块 id 与选项值的 key（如 'custom'）
-   *   label          提供商选择项与弹窗标题里的展示名
+   *   label          卡片与弹窗标题里的展示名（选中具体某一家时以那家的名字为准）
    *   buildBlock()   返回块的 HTML（结构与交互完全由对方定义）
    *   mount(block)   块进 DOM 后绑定自己的事件
-   *   onShow()       弹窗切到这一项时回调（对方借此刷新自己的动态内容）
+   *   onShow({providerId})
+   *                  第 2 步切到这一项时回调：对方借此刷新动态内容，并按
+   *                  providerId（空串 = 没有指定某一家）决定落到哪种模式
    *
-   * 块插在「即将上线」占位之前；block id 登记进 ADD_FORM_PROVIDERS 后，
-   * 显隐切换（syncAddProvider）与选项重建（syncAddProviderOptions）无需再改。
+   * 块插在第 2 步容器里、「即将上线」占位之前；block id 登记进 ADD_FORM_PROVIDERS 后，
+   * 显隐切换（syncAddProvider）与卡片重画（renderProviderCards）无需再改。
    */
   function registerAddForm(config) {
     if (!config?.provider || EXTRA_ADD_FORMS.some(item => item.provider === config.provider)) return;
     EXTRA_ADD_FORMS.push(config);
     const blockId = `add-block-${config.provider}`;
     ADD_FORM_PROVIDERS[config.provider] = blockId;
-    const body = $('add-modal')?.querySelector('.modal-body');
-    if (body && !$(blockId)) {
+    // 两步改造后 modal-body 的直接子节点只剩两个步骤容器，块一律挂进第 2 步
+    const host = $(ADD_STEP_FORM_ID) || $('add-modal')?.querySelector('.modal-body');
+    if (host && !$(blockId)) {
       const block = document.createElement('div');
       block.id = blockId;
       block.className = 'add-provider-block';
       block.hidden = true;
       block.innerHTML = config.buildBlock?.() || '';
       const placeholder = $(ADD_PLACEHOLDER_ID);
-      if (placeholder) body.insertBefore(block, placeholder);
-      else body.appendChild(block);
+      if (placeholder) host.insertBefore(block, placeholder);
+      else host.appendChild(block);
       config.mount?.(block);
     }
     // 选项里补上刚注册的这家（当前选中项不受影响：注册发生在加载期，
     // 那时弹窗还没开，addProvider 仍是缺省的 workbuddy）
-    syncAddProviderOptions();
+    renderProviderCards();
   }
 
   /**
-   * 注入添加账号弹窗的提供商选择区，并把既有 WorkBuddy 区块收进一个容器。
+   * 注入添加账号弹窗的两步结构：
+   *   第 1 步（#add-step-pick）—— 提供商卡片列表 + 搜索；
+   *   第 2 步（#add-step-form）—— 各家的表单块。
    *
-   * 为什么要把 WorkBuddy 区块挪进一个新容器：它们必须作为一个整体随「提供商」显隐，
-   * 而 modal-body 的直接子节点里混着它们与即将注入的新块。挪动只改父子关系
-   * （appendChild），节点引用与它们身上的事件监听全部保留。
+   * 为什么拆两步：改造前是一屏里两层横向分段（上面 9 项选家、下面最多 5 项选方式），
+   * 小窗口下换行、找不到入口，且「刚才选的是哪家」在长弹窗里滚两屏就看不见了。
+   * 拆开后每一步只回答一个问题。
+   *
+   * 返回键与主操作分别落在头部与底部，都不占步骤容器：
+   *   · 返回键做成 .modal-head 里的一枚图标钮（与右侧关闭键对称），标题自己带着
+   *     「给哪家加账号」，原来那条「‹ 上一步　已选：xxx」独占一行、信息还和标题重复；
+   *   · 底部操作条（.modal-foot）默认收起，谁把自己的主按钮搬进来谁点亮它 ——
+   *     内置家的按钮仍在各自段落里，不受影响。
+   *
+   * 为什么要挪动既有节点：WorkBuddy 的账号版本 / 网页登录两个 section 写在
+   * index.html 里（交互在 add-account.js），它们必须作为一个整体随「哪一家」显隐。
+   * 挪动只改父子关系（appendChild），节点引用与它们身上的事件监听全部保留。
    */
   function mountAddProviderUi() {
     const body = $('add-modal')?.querySelector('.modal-body');
-    if (!body || $(ADD_PROVIDER_SEG_ID)) return;
+    if (!body || $(ADD_STEP_PICK_ID)) return;
 
-    // ① 提供商选择区（弹窗第一块）：分段控件，选项由 syncAddProviderOptions 按摘要重建
-    const picker = document.createElement('div');
-    picker.className = 'modal-section';
-    picker.innerHTML = `<h3>提供商</h3>`
-      + `<p>选择要添加哪一家的账号。各家的凭证格式与转发路由互相独立，可同时保存多家。</p>`
-      + `<div class="seg add-seg" id="${ADD_PROVIDER_SEG_ID}" role="radiogroup"`
-      + ` aria-label="选择要添加账号的提供商"></div>`;
-    body.insertBefore(picker, body.firstChild);
-    bindSeg($(ADD_PROVIDER_SEG_ID));
+    // ① 第 1 步：提供商卡片列表（选项由 renderProviderCards 按摘要重建）
+    const pick = document.createElement('div');
+    pick.className = 'add-step';
+    pick.id = ADD_STEP_PICK_ID;
+    pick.innerHTML = `<div class="modal-section">`
+      + `<h3>选择提供商</h3>`
+      + `<p>账号属于某一家提供商。选好之后只显示这一家支持的添加方式。</p>`
+      + `<span class="input-affix add-provider-search">`
+      + `<span class="affix">⌕</span>`
+      + `<input type="search" id="${ADD_SEARCH_ID}" placeholder="搜索提供商…" autocomplete="off">`
+      + `</span>`
+      + `<div class="add-provider-grid" id="${ADD_PROVIDER_GRID_ID}" role="listbox"`
+      + ` aria-label="选择要添加账号的提供商"></div>`
+      + `</div>`;
+    body.insertBefore(pick, body.firstChild);
 
-    // ② 把既有区块（除刚插入的选择区）整体收进 WorkBuddy 容器
+    // ② 第 2 步：各家的块（返回键在头部、主操作在底部，这里只放块本身）
+    const form = document.createElement('div');
+    form.className = 'add-step';
+    form.id = ADD_STEP_FORM_ID;
+    form.hidden = true;
+    body.appendChild(form);
+
+    // ③ 返回键：插在标题前面，只在第 2 步显示（第 1 步没有上一级）
+    const head = $('add-modal')?.querySelector('.modal-head');
+    const headTitle = $('add-title');
+    if (head && headTitle && !$(ADD_STEP_BACK_ID)) {
+      const back = document.createElement('button');
+      back.type = 'button';
+      back.id = ADD_STEP_BACK_ID;
+      back.className = 'add-back';
+      back.title = '返回选择提供商';
+      back.setAttribute('aria-label', '返回选择提供商');
+      back.textContent = '‹';
+      back.hidden = true;
+      head.insertBefore(back, headTitle);
+      back.addEventListener('click', () => showAddStep('pick'));
+    }
+
+    // ④ 底部操作条：主操作从字段流里拿出来，失败提示也有了固定位置
+    const modal = $('add-modal')?.querySelector('.modal');
+    if (modal && !$(ADD_FOOT_ID)) {
+      const foot = document.createElement('div');
+      foot.className = 'modal-foot';
+      foot.id = ADD_FOOT_ID;
+      foot.hidden = true;
+      foot.innerHTML = `<span class="add-foot-hint" id="${ADD_FOOT_HINT_ID}"></span>`
+        + `<span class="add-foot-actions" id="${ADD_FOOT_ACTIONS_ID}"></span>`;
+      modal.appendChild(foot);
+    }
+
+    // ⑤ 把既有区块（除刚插入的两个步骤容器）整体收进 WorkBuddy 容器
     const workbuddy = document.createElement('div');
     workbuddy.id = ADD_WB_BLOCK_ID;
     workbuddy.className = 'add-provider-block';
     [...body.children].forEach(node => {
-      if (node !== picker) workbuddy.appendChild(node);
+      if (node !== pick && node !== form) workbuddy.appendChild(node);
     });
-    body.appendChild(workbuddy);
+    form.appendChild(workbuddy);
 
-    // ③ 各家的表单块（同一套构造，见 ADD_FORMS）
+    // ⑥ 各家的表单块（同一套构造，见 ADD_FORMS）
     for (const config of ADD_FORMS) {
       const block = document.createElement('div');
       block.id = ADD_FORM_PROVIDERS[config.provider];
       block.className = 'add-provider-block';
       block.hidden = true;
       block.innerHTML = buildProviderBlock(config);
-      body.appendChild(block);
+      form.appendChild(block);
     }
 
-    // ④ 其它 provider 的占位块（摘要里出现但后端还没有添加入口）
+    // ⑦ 其它 provider 的占位块（摘要里出现但后端还没有添加入口）
     const placeholder = document.createElement('div');
     placeholder.id = ADD_PLACEHOLDER_ID;
     placeholder.className = 'add-provider-block';
@@ -459,7 +526,14 @@
       + `<h3>该提供商账号添加功能即将上线</h3>`
       + `<p id="add-placeholder-text">该提供商的账号添加功能还在开发中，敬请期待。</p>`
       + `</div>`;
-    body.appendChild(placeholder);
+    form.appendChild(placeholder);
+
+    // ⑧ 搜索与卡片点选：只作用在步骤显隐与卡片列表上，不碰各家的块
+    $(ADD_SEARCH_ID)?.addEventListener('input', () => renderProviderCards());
+    $(ADD_PROVIDER_GRID_ID)?.addEventListener('click', event => {
+      const card = event.target.closest('.add-provider-card');
+      if (card) pickProvider(card.dataset.provider || '');
+    });
   }
 
   /**
@@ -715,27 +789,203 @@
   let addProvider = 'workbuddy';
 
   /**
+   * 当前处于哪一步：'pick' = 选提供商，'form' = 选方式 + 填凭证。
+   * 打开弹窗（以及点「上一步」）回到 'pick'；选中一家后进 'form'。
+   */
+  let addStep = 'pick';
+  /**
+   * 选中某一家自定义提供商时记下它的 id（`custom-…`）。
+   * 自定义家的表单是**一个**后注册块（内部有「新建 / 选择已有」两种模式），
+   * 这个值就是给那个块的上下文：非空时它切到「选择已有」并预选这一家。
+   * 空串 = 没有上下文（例如从「新建自定义提供商」那张卡进来，或选的是内置家）。
+   */
+  let addProviderHint = '';
+
+  /** 该提供商此刻名下的账号数（读主状态；自定义家不在摘要里，只能现算） */
+  function accountCountOf(providerId) {
+    const accounts = wbApp.getState?.()?.accounts?.accounts || [];
+    return accounts.filter(account => (account?.provider || 'workbuddy') === providerId).length;
+  }
+
+  /**
+   * 第 1 步的卡片列表数据：内置家来自 providers 摘要，自定义家来自自定义目录
+   * （每一家各一张卡 —— 它们是运行期数据，建了几家就有几张）。
+   * 「新建」那张卡**不在这个列表里**：它不是一家提供商，由 renderProviderCards
+   * 单独插在队首（见那里的说明）。
+   */
+  function providerCards() {
+    const list = window.wbProviders?.all?.() || [];
+    // 摘要还没到时先放 WorkBuddy 一张：弹窗不能因为一次状态未就绪就空着
+    const cards = list.length
+      ? list.map(item => ({
+        id: item.id,
+        label: item.label,
+        count: Number(item.count) || 0,
+        custom: false,
+      }))
+      : [{ id: 'workbuddy', label: 'WorkBuddy', count: accountCountOf('workbuddy'), custom: false }];
+    // 展示顺序微调：两个 AutoClaw 版本要挨着（两列网格里同处一行）且**国内版
+    // 在前** —— 摘要给的是注册表顺序（…CatPaw, AutoClaw, AutoClawIntl, Qoder…），
+    // 把 Qoder 挪到国内版前面即可：<CatPaw | Qoder>、<国内版 | 国际版>。
+    const from = cards.findIndex(item => item.id === 'qoder');
+    const to = cards.findIndex(item => item.id === 'autoclaw');
+    if (to >= 0 && from > to) cards.splice(to, 0, cards.splice(from, 1)[0]);
+    for (const provider of window.wbProviders?.customList?.() || []) {
+      cards.push({
+        id: provider.id,
+        label: provider.name || provider.id,
+        count: accountCountOf(provider.id),
+        custom: true,
+      });
+    }
+    return cards;
+  }
+
+  /**
+   * 内置家的真实图标：`id → assets/providers/<file>.png`，图取自各客户端
+   * 安装目录内嵌的图标（与系统里显示的为同一张；AutoClaw 国内 / 国际版、
+   * Cline 两种账号各自共用一张 —— 它们本来就是同一个客户端）。
+   * 自定义家与没收录图标的家回落到首字母徽章（见 logoHtml）。
+   */
+  const PROVIDER_ICONS = {
+    workbuddy: 'assets/providers/workbuddy.png',
+    raccoon: 'assets/providers/raccoon.png',
+    catpaw: 'assets/providers/catpaw.png',
+    autoclaw: 'assets/providers/autoclaw.png',
+    'autoclaw-intl': 'assets/providers/autoclaw.png',
+    qoder: 'assets/providers/qoder.png',
+    'cline-free': 'assets/providers/cline.png',
+    'cline-pass': 'assets/providers/cline.png',
+  };
+
+  /** 卡片图标：收录过的家出真实图标，其余仍用首字母徽章 */
+  function logoHtml(item) {
+    const icon = PROVIDER_ICONS[item.id];
+    if (icon) {
+      return `<span class="add-provider-logo has-icon"><img src="${icon}" alt="" loading="lazy"></span>`;
+    }
+    const initial = String(item.label || '?').trim().slice(0, 1).toUpperCase() || '?';
+    return `<span class="add-provider-logo">${esc(initial)}</span>`;
+  }
+
+  function cardHtml(item) {
+    return `<button type="button" class="add-provider-card" data-provider="${esc(item.id)}" role="option">`
+      + logoHtml(item)
+      + `<span class="add-provider-info">`
+      + `<span class="add-provider-name">${esc(item.label)}`
+      + `${item.custom ? '<span class="add-provider-tag">自定义</span>' : ''}</span>`
+      + `<span class="add-provider-meta">${item.count ? `${item.count} 个账号` : '还没有账号'}</span>`
+      + `</span>`
+      + `<span class="add-provider-go">›</span>`
+      + `</button>`;
+  }
+
+  /** 「新建自定义提供商」卡：落在后注册的自定义块上，由那个块切到「新建」模式 */
+  function newCardHtml() {
+    return `<button type="button" class="add-provider-card is-new" data-provider="${NEW_PROVIDER_CARD_ID}" role="option">`
+      + `<span class="add-provider-logo is-new">＋</span>`
+      + `<span class="add-provider-info">`
+      + `<span class="add-provider-name">新建自定义提供商</span>`
+      + `<span class="add-provider-meta">接入一个 OpenAI / Anthropic 兼容的上游</span>`
+      + `</span>`
+      + `<span class="add-provider-go">›</span>`
+      + `</button>`;
+  }
+
+  /**
+   * 重画第 1 步的卡片列表。每次重画都整段替换（家数是个位数，不值得做局部更新），
+   * 但**不做重排指纹**：卡片上没有正在输入的内容，焦点由浏览器在点击后自己落到
+   * 新卡片上，重画的开销可以忽略。
+   *
+   * 「新建自定义提供商」排在最前（紧贴搜索框、横跨整行）：这一步里只有它是
+   * 「动作」，其余都是「选择」；原先排在队尾时它跟着家数一起往下沉，建了几家
+   * 之后就得先滚到底才看得见。
+   * 搜索只过滤已有家；有关键词时「新建」那张卡收起来 —— 用户在找的是已有的一家。
+   */
+  function renderProviderCards() {
+    const grid = $(ADD_PROVIDER_GRID_ID);
+    if (!grid) return;
+    const keyword = ($(ADD_SEARCH_ID)?.value || '').trim().toLowerCase();
+    const cards = providerCards();
+    const hit = cards.filter(item => !keyword || item.label.toLowerCase().includes(keyword));
+    grid.innerHTML = (keyword ? '' : newCardHtml()) + hit.map(cardHtml).join('');
+    if (!hit.length && keyword) {
+      grid.innerHTML = `<div class="add-provider-empty">没有匹配「${esc(keyword)}」的提供商</div>`;
+    }
+  }
+
+  /** 切换步骤：只切两个容器的显隐，块的选择与标题由 syncAddProvider 统一收口 */
+  function showAddStep(step) {
+    addStep = step;
+    const pick = $(ADD_STEP_PICK_ID);
+    const form = $(ADD_STEP_FORM_ID);
+    const back = $(ADD_STEP_BACK_ID);
+    if (pick) pick.hidden = step !== 'pick';
+    if (form) form.hidden = step !== 'form';
+    // 返回键只在第 2 步有意义：第 1 步已经是这个弹窗的最外层
+    if (back) back.hidden = step === 'pick';
+    syncAddProvider();
+  }
+
+  /**
+   * 选中一家（或「新建」卡）并进入第 2 步。
+   *
+   * 三种取值分别落到哪一块：
+   *   · `__new__`（新建卡）→ 后注册的自定义块，且不带 hint（它自己默认「新建」模式）；
+   *   · 某个自定义家 id    → 同一个自定义块，hint 带上这家，让它切「选择已有」并预选；
+   *   · 其它（内置家 id）  → 该家自己的块。
+   */
+  function pickProvider(id) {
+    if (!id) return;
+    if (id === NEW_PROVIDER_CARD_ID) {
+      addProvider = 'custom';
+      addProviderHint = '';
+    } else if (window.wbProviders?.customList?.().some(item => item.id === id)) {
+      addProvider = 'custom';
+      addProviderHint = id;
+    } else {
+      addProvider = id;
+      addProviderHint = '';
+    }
+    showAddStep('form');
+  }
+
+  /**
+   * 刷新弹窗标题、返回条与块显隐：标题里带上 provider label，用户不必回想刚才选了什么。
+   * 未知 provider 显示占位块并说明原因 —— 不报错、不留空白。
+   *
+   * 显隐按「块 id → provider」反查（ADD_FORM_PROVIDERS），新增一家只改那张表。
+   * label 优先问 wbProviders（摘要的权威来源），自定义家问自定义目录（用户起的名字），
+   * 最后才退回 id：不能只依赖 DOM —— 卡片重画与选中态落定的时序在极端情况下会错开，
+   * 读不到时至少别把标题写成「登录 / 添加raccoon账号」。
+   */
+  /**
    * 刷新弹窗标题与块显隐：标题里带上 provider label，用户不必回想刚才选了什么。
    * 未知 provider 显示占位块并说明原因 —— 不报错、不留空白。
    *
    * 显隐按「块 id → provider」反查（ADD_FORM_PROVIDERS），新增一家只改那张表。
-   * label 优先问 wbProviders（摘要的权威来源），其次读分段控件里选中项的文案，
-   * 最后才退回 id：不能只依赖 DOM —— 选项重建与选中态落定的时序在极端情况下会错开，
+   * label 优先问 wbProviders（摘要的权威来源），自定义家问自定义目录（用户起的名字），
+   * 最后才退回 id：不能只依赖 DOM —— 卡片重画与选中态落定的时序在极端情况下会错开，
    * 读不到时至少别把标题写成「登录 / 添加raccoon账号」。
    */
   function syncAddProvider() {
-    const seg = $(ADD_PROVIDER_SEG_ID);
-    if (!seg) return;
     const id = addProvider || 'workbuddy';
     // 后注册的表单（自定义提供商）不进 wbProviders 目录，label 直接用配置里的
     const extra = EXTRA_ADD_FORMS.find(item => item.provider === id);
-    const label = extra?.label
-      || window.wbProviders?.labelOf?.(id)
-      || seg.querySelector('.seg-item.active')?.textContent?.trim()
-      || id;
+    // 从某一家自定义提供商的卡片进来：标题用那家的名字，而不是「自定义提供商」
+    const pickedCustom = addProviderHint
+      ? window.wbProviders?.customList?.().find(item => item.id === addProviderHint)?.name
+      : '';
+    const label = pickedCustom || extra?.label || window.wbProviders?.labelOf?.(id) || id;
+    // 后注册的自定义块有两种进入方式：某一家（hint 带 id）或「新建」卡（hint 为空）。
+    // 后者标题直接说「新建自定义提供商」，而不是笼统的「自定义提供商」。
+    const heading = extra && !addProviderHint ? `新建${extra.label}` : `登录 / 添加 ${label} 账号`;
     const block = ADD_FORM_PROVIDERS[id];
     const title = $('add-title');
-    if (title) title.textContent = `登录 / 添加 ${label} 账号`;
+    if (title) title.textContent = addStep === 'pick' ? '添加账号' : heading;
+    // 底部操作条默认收起：只有把自己的主按钮搬进来的块（自定义提供商）才重新点亮它
+    const foot = $(ADD_FOOT_ID);
+    if (foot) foot.hidden = true;
     for (const blockId of Object.values(ADD_FORM_PROVIDERS)) {
       if ($(blockId)) $(blockId).hidden = block !== blockId;
     }
@@ -746,45 +996,26 @@
       if (text && !block) text.textContent = `「${label}」的账号添加功能还在开发中，敬请期待。`;
     }
     // 弹窗当前显示的是后注册的块：给它一个信号，让它刷新自己的动态内容
-    //（自定义提供商要借此重读列表、同步「新建 / 选择已有」的可用性）
-    if (extra && block) extra.onShow?.();
+    //（自定义提供商要借此重读列表、切「新建 / 选择已有」并预选某一家）
+    if (extra && block) extra.onShow?.({ providerId: addProviderHint });
   }
 
-  /**
-   * 选项按 providers 摘要重建（动态：后端注册表加一家就多一项）。
-   * 用「id:label」指纹决定要不要重排 DOM：摘要每次刷新都是新数组，无脑重排会让
-   * 正在用键盘操作的那个按钮丢掉焦点（连同 :focus-visible 一起消失）。
-   * 重建后一定重新落一次选中态 —— 新按钮默认都能被 Tab 到，不落就没有 roving tabindex。
-   */
-  function syncAddProviderOptions() {
-    const seg = $(ADD_PROVIDER_SEG_ID);
-    if (!seg) return;
-    const list = window.wbProviders?.all?.() || [];
-    // 摘要还没到时先放 WorkBuddy 一项：弹窗不能因为一次状态未就绪就空着
-    const options = list.length
-      ? list.map(item => ({ id: item.id, label: item.label }))
-      : [{ id: 'workbuddy', label: 'WorkBuddy' }];
-    // 后注册的提供商（自定义提供商，见 registerAddForm）不依赖后端摘要，
-    // 永远参与选项 —— 摘要慢一拍也不能让它从分段控件里消失
-    for (const config of EXTRA_ADD_FORMS) {
-      if (!options.some(item => item.id === config.provider)) {
-        options.push({ id: config.provider, label: config.label });
-      }
+  /** 回到第 1 步并复位选中项（弹窗打开时与点「上一步」时都走这里） */
+  function resetAddStep() {
+    addProvider = 'workbuddy';
+    addProviderHint = '';
+    const search = $(ADD_SEARCH_ID);
+    if (search) search.value = '';
+    renderProviderCards();
+    showAddStep('pick');
+    // 摘要还没到（首次打开弹窗早于首屏那次 refresh）时补拉一次再重画：
+    // 否则卡片上会清一色写「还没有账号」，而账号其实早就有了。
+    // 只在这一步补 —— 已经拿到摘要时不重复发请求。
+    if (!(window.wbProviders?.all?.() || []).length) {
+      void window.wbProviders?.load?.().then(() => {
+        if (addStep === 'pick') renderProviderCards();
+      });
     }
-    const signature = options.map(item => `${item.id}:${item.label}`).join('|');
-    if (seg.dataset.signature !== signature) {
-      seg.dataset.signature = signature;
-      seg.innerHTML = options.map(item =>
-        `<button type="button" class="seg-item" data-value="${esc(item.id)}"`
-        + ` role="radio" aria-checked="false">${esc(item.label)}</button>`).join('');
-    }
-    // 选中的那家已不在摘要里（账号删光、后端摘了注册表）时退到 WorkBuddy，
-    // 它也没有就退到摘要在列的第一家 —— 否则整块都不显示，弹窗会是空的
-    if (!options.some(item => item.id === addProvider)) {
-      addProvider = options.some(item => item.id === 'workbuddy') ? 'workbuddy' : options[0].id;
-    }
-    setSegValue(seg, addProvider);
-    syncAddProvider();
   }
 
   // ─── 账号添加（数据驱动，配置见 ADD_FORMS）─────────
@@ -1029,15 +1260,11 @@
     }
   }
 
-  // 添加账号弹窗：分段控件交互、提供商切换与各家的添加方式。
+  // 添加账号弹窗：两步结构（选提供商 → 选方式填凭证）、分段控件交互与各家的添加方式。
   mountAddProviderUi();
   // WorkBuddy 的版本与打开方式由 add-account.js 处理选中项变化。
   for (const id of ['add-edition-seg', 'add-login-mode']) bindSeg($(id));
-  syncAddProviderOptions();
-  $(ADD_PROVIDER_SEG_ID)?.addEventListener(SEG_EVENT, () => {
-    addProvider = segValueOf($(ADD_PROVIDER_SEG_ID)) || 'workbuddy';
-    syncAddProvider();
-  });
+  resetAddStep();
   for (const config of ADD_FORMS) {
     const prefix = prefixOf(config);
     const seg = $(`${prefix}-method-seg`);
@@ -1062,11 +1289,11 @@
   });
 
   /**
-   * 「添加账号」按钮：打开弹窗后同步提供商选项并复位到 WorkBuddy。
+   * 「添加账号」按钮：打开弹窗后重画卡片列表并复位到第 1 步。
    *
    * add-account.js 把按钮绑到它自己的 openModal（加 .open 类、复位 WorkBuddy 表单）。
    * 这里再挂一个监听，在它之后执行（add-account.js 先加载、监听先注册，同元素同事件按注册
-   * 顺序触发），把「按摘要重建选项 + 复位提供商」补上。
+   * 顺序触发），把「按摘要重画卡片 + 回到选家那一步」补上。
    *
    * id 列表里仍留着 `btn-add-account`：报表页那个按钮已随会话状态卡片一起删除，
    * 现在只有 `btn-add-account-2`（账号页）存在。不改成写死单个 id 是因为这里用
@@ -1074,20 +1301,25 @@
    * 沿用同名约定就能自动接上，不必回来改这一处。
    */
   for (const id of ['btn-add-account', 'btn-add-account-2']) {
-    $(id)?.addEventListener('click', () => {
-      addProvider = 'workbuddy';
-      syncAddProviderOptions();
-    });
+    $(id)?.addEventListener('click', resetAddStep);
   }
 
   window.wbAccountAddForms = {
-    /** 「添加账号」弹窗打开时可用：按 providers 摘要重建选项并复位到 WorkBuddy */
-    syncAddProvider: () => {
-      addProvider = 'workbuddy';
-      syncAddProviderOptions();
+    /** 「添加账号」弹窗打开时可用：重画卡片列表并复位到第 1 步 */
+    syncAddProvider: resetAddStep,
+    /**
+     * 从模型管理页左栏的「＋ 新建自定义提供商」直达新建表单：打开弹窗、复位
+     * 第 1 步，再走「新建」那张卡的同一路径进第 2 步 —— 不跳页，也不模拟点
+     * 按钮（那要求按钮必须在场）。弹窗的开关归 add-account.js
+     * （`wbAddAccountModal.open`），步骤与表单归本文件。
+     */
+    openNewCustomForm() {
+      window.wbAddAccountModal?.open?.();
+      resetAddStep();
+      pickProvider(NEW_PROVIDER_CARD_ID);
     },
-    // 后注册口与分段控件工具：add-custom-provider.js 的「新建 / 选择已有」
-    // 模式切换复用同一套 .seg 交互（点击 / 方向键 / roving tabindex）
+    // 后注册口：add-custom-provider.js 的两种添加方式共用本文件的两步结构
+    // （返回键在头部、主按钮在底部操作条，都由它自己按 context 落到哪一种）
     registerAddForm,
     bindSeg,
     segValueOf,

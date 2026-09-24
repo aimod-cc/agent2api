@@ -134,6 +134,11 @@ function showPage(name, { persist = true } = {}) {
   if (page === 'settings') {
     window.wbSettingsPanel?.load?.();
   }
+  // 切到模型管理页时重拉一次：内置清单可能被上游刷新过，自定义家的清单可能刚在
+  // 账号页被改过（编辑 / 删除提供商），而这一页的数据是自持的、不随主状态轮询更新
+  if (page === 'gateway') {
+    void window.wbModelsPanel?.load?.();
+  }
   // 切到账号页时立刻补一次连接数：那条 2 秒轮询只在「当时就在账号页」时才发请求，
   // 切走的这段时间里缓存已经过期，不补一下会先看到几秒前的旧数字
   if (page === 'accounts') {

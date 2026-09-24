@@ -191,8 +191,9 @@ pub struct RequestEntry {
     #[serde(rename = "clientReasoning", default)]
     pub client_reasoning: String,
     /// **实际随上游请求发出**的思考等级（空串 = 没有等级随行：客户端没指定且
-    /// 映射没绑、承载家不接等级、「关闭思考」档、或一次都没发出去就失败了；
-    /// 或该行来自还没有此列的旧版本）。采集口径见
+    /// 映射没绑、「关闭思考」档、或一次都没发出去就失败了；或该行来自还没有
+    /// 此列的旧版本）。客户端显式指定的等级字段原样随发送体上行（网关不删
+    /// 客户端字段），对每一家都算「实际随请求发出的等级」。采集口径见
     /// `core::upstream::payload::send_body` —— 与 `upstream_model` 同点同时采集。
     #[serde(rename = "upstreamReasoning", default)]
     pub upstream_reasoning: String,
