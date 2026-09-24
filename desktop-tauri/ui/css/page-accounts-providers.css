@@ -212,6 +212,85 @@
   color: var(--text-3);
 }
 
+/* ─── 「导入」段：cc-switch 等工具的扫描结果 ───
+   面板顶替卡片网格的位置（互斥显隐），列表高度与网格同一上限 —— 弹窗高度
+   锁定后它内部滚动，总高不随条目数变。 */
+#add-import-panel { display: flex; flex-direction: column; gap: 8px; }
+#add-import-panel[hidden] { display: none; }
+#add-import-status { font-size: 12px; color: var(--text-2); }
+#add-import-status .add-import-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+#add-import-status .linkish {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-3);
+}
+#add-import-status .linkish:hover { color: var(--text); background: var(--surface-3); }
+.add-import-empty p { margin: 0 0 8px; line-height: 1.6; }
+#add-import-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 312px;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+.add-import-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color .14s ease, background .14s ease;
+}
+.add-import-row:hover { border-color: var(--primary-bd); background: var(--primary-soft); }
+/* 灰显行：不可导入（不支持 / 本地已存在 / 导入失败）——有原因说明，不给勾选框 */
+.add-import-row.disabled {
+  cursor: default;
+  opacity: .55;
+}
+.add-import-row.disabled:hover { border-color: var(--border); background: var(--surface); }
+.add-import-row input[type="checkbox"] { flex: 0 0 auto; width: 15px; height: 15px; }
+.add-import-dash { flex: 0 0 auto; width: 15px; text-align: center; color: var(--text-3); }
+.add-import-dash::before { content: "—"; }
+.add-import-info { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 3px; }
+.add-import-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.add-import-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0 5px;
+  border-radius: var(--r-xs);
+  border: 1px solid var(--border-strong);
+  color: var(--text-3);
+}
+.add-import-meta {
+  font-size: 11px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 第 2 步的返回键：做成 .modal-head 里的一枚图标钮，与右侧关闭键对称。
    原来它是一条独立的「‹ 上一步　已选：xxx」返回条 —— 独占一整行，而那句「已选」
    和弹窗标题说的是同一件事（标题已经是「登录 / 添加 智谱 GLM 账号」），信息量为零

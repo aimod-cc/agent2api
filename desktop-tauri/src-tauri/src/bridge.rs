@@ -209,14 +209,20 @@ const BRIDGE_JS: &str = r#"
     saveConfig: payload => call('POST', '/api/config', payload),
 
     // ── 模型清单 ──
-    // 手动刷新（网关页「刷新模型清单」按钮）：只刷支持远程目录的家、
-    // 强制绕过缓存，返回 `{results, refreshed, skipped, failed, models}`
-    // —— **带刷新后的聚合清单**，界面就地重绘、不必再拉一次 /api/session
-    // （理由见后端 `api::models` 的模块头）。
+    // 手动刷新（「获取模型」弹窗）：只刷支持远程目录的家、强制绕过缓存，
+    // 返回 `{results, refreshed, skipped, failed, models}` —— `models` 是
+    // **session 形状**的聚合清单（同 /api/session 的那份），给「就地重绘
+    // /api/session 快照」的调用方用；模型管理页那份 manage 视图（左栏计数、
+    // 行的「来源」列）不在其中 —— 它由调用方在刷新落地后自己重拉
+    // （见 models-fetch-modal.js 的 onRefreshed）。
     //
-    // 可选入参 `{accounts: {providerId: accountId}}`：「获取模型」弹窗每行的
-    // 「模型来源」下拉点名的账号（用谁去打该家的目录接口）。不传 = 各家按
-    // 默认选取（队首可用账号）；逐条结果里带 `accountId` 供界面回读。
+    // 可选入参两个键，都是新增的可选维度（老调用方不传 = 各家按默认选取 + 全部家）：
+    //   · `{accounts: {providerId: accountId}}`：「获取模型」弹窗每行的
+    //     「模型来源」下拉点名的账号（用谁去打该家的目录接口）；逐条结果里带
+    //     `accountId` 供界面回读。
+    //   · `{providers: [providerId, ...]}`：本次刷新的**范围白名单**，名单外的家
+    //     不打网络也不进结果（弹窗按「模型管理页实有清单的家 ∪ 有启用账号的家」
+    //     组装，见 models-fetch-modal.js 的 scopeProviders）。
     refreshModels: payload => call('POST', '/api/models/refresh', payload || {}),
     // 模型管理（启停 / 映射）：写接口都返回最新 {models, mappings, reasoningLevels}
     // 映射照抄 OmniProxy 语义：对外名自由命名（允许与上游 id 同名），同一对外名

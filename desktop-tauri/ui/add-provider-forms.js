@@ -34,10 +34,16 @@
   const TYPE_PRESET = 'preset';
   /** 自定义：自建上游（手动新建）与用户已建的自定义家（给这家加账号） */
   const TYPE_CUSTOM = 'custom';
-  /** 分段值归一：三个取值之外的一律按「反代」处理（DOM 被人改坏时的保守落点，
+  /** 导入：从别的工具（cc-switch / new-api / sub2api…）把已配好的供应商搬进来。
+   *  当前实现只接了 cc-switch（本机 SQLite 自动扫描），其余来源待续。
+   *  这一屏的面板与底部按钮归 add-provider-import.js，本文件只切显隐。 */
+  const TYPE_IMPORT = 'import';
+  /** 分段值归一：四个取值之外的一律按「反代」处理（DOM 被人改坏时的保守落点，
       与 resetAddStep 的复位取向一致） */
   const typeValueOf = value =>
-    (value === TYPE_PRESET || value === TYPE_CUSTOM ? value : TYPE_PROXY);
+    (value === TYPE_PRESET || value === TYPE_CUSTOM || value === TYPE_IMPORT
+      ? value
+      : TYPE_PROXY);
   /** 预置家卡片的取值前缀（不是 provider id，只是卡片自己的标记） */
   const PRESET_CARD_PREFIX = 'preset:';
   /** 「新建自定义提供商」那张卡片的取值（不是 provider id，只是卡片自己的标记） */
@@ -478,9 +484,11 @@
       + ` role="radio" aria-checked="false" tabindex="-1">预置 API</button>`
       + `<button type="button" class="seg-item" data-value="${TYPE_CUSTOM}"`
       + ` role="radio" aria-checked="false" tabindex="-1">自定义</button>`
+      + `<button type="button" class="seg-item" data-value="${TYPE_IMPORT}"`
+      + ` role="radio" aria-checked="false" tabindex="-1">导入</button>`
       + `</div>`
       + `<p class="add-type-hint" id="add-type-hint">把本机客户端的登录态包装成账号，或用官方授权页登录。</p>`
-      + `<span class="input-affix add-provider-search">`
+      + `<span class="input-affix add-provider-search" id="add-search-wrap">`
       + `<span class="affix">⌕</span>`
       + `<input type="search" id="${ADD_SEARCH_ID}" placeholder="搜索提供商…" autocomplete="off">`
       + `</span>`
@@ -523,6 +531,14 @@
         + `<span class="add-foot-actions" id="${ADD_FOOT_ACTIONS_ID}"></span>`;
       modal.appendChild(foot);
     }
+    // 「导入」段的面板与主按钮归 add-provider-import.js：面板插在卡片网格的
+    // 位置上（两者互斥显隐），「导入所选」按钮搬进刚建好的底部操作条 ——
+    // 与自定义块把自己的按钮搬进来同一手法。
+    window.wbAddImport?.mount?.({
+      host: $(ADD_PROVIDER_GRID_ID)?.parentElement,
+      before: $(ADD_PROVIDER_GRID_ID),
+      footActions: $(ADD_FOOT_ACTIONS_ID),
+    });
 
     // ⑤ 把既有区块（除刚插入的两个步骤容器）整体收进 WorkBuddy 容器
     const workbuddy = document.createElement('div');
@@ -557,10 +573,13 @@
     // ⑧ 账号类型分段、搜索与卡片点选：只作用在步骤显隐与卡片列表上，不碰各家的块
     bindSeg($(ADD_TYPE_SEG_ID));
     $(ADD_TYPE_SEG_ID)?.addEventListener(SEG_EVENT, () => {
-      // 先把选中值落进 addAccountType（renderProviderCards / syncTypeHint 都读它）
+      // 先把选中值落进 addAccountType（后面每一步都读它）
       addAccountType = typeValueOf(segValueOf($(ADD_TYPE_SEG_ID)));
       syncTypeHint();
+      syncAddStepSections();
       renderProviderCards();
+      // 导入段：面板显隐与惰性扫描在 setSegment 里，底部按钮点亮在 setActive 里
+      syncImportState();
     });
     $(ADD_SEARCH_ID)?.addEventListener('input', () => renderProviderCards());
     $(ADD_PROVIDER_GRID_ID)?.addEventListener('click', event => {
@@ -992,6 +1011,30 @@
     }
   }
 
+  // ─── 「导入」段：从外部工具批量导入供应商（面板在 add-provider-import.js）──
+  //
+  // 与其他三段不同，这一段不点卡片进表单，而是在第 1 步里直接完成：扫描
+  // （后端 GET /api/import/cc-switch，见 core::import_ccswitch）→ 勾选 →
+  // 底部「导入所选」逐个创建（复用 POST /api/custom-providers）。
+  // 面板自己的 DOM、状态与提交动作都在 add-provider-import.js 里，本文件只
+  // 报两件事：现在是不是导入段（面板显隐 + 惰性扫描）、在不在第 1 步（底部
+  // 条上的「导入所选」该不该亮）。
+
+  /** 第 1 步内两种选择方式的显隐：卡片网格（反代 / 预置 / 自定义）vs 导入面板 */
+  function syncAddStepSections() {
+    const importing = addAccountType === TYPE_IMPORT;
+    const grid = $(ADD_PROVIDER_GRID_ID);
+    const searchWrap = $('add-search-wrap');
+    if (grid) grid.hidden = importing;
+    if (searchWrap) searchWrap.hidden = importing;
+    window.wbAddImport?.setSegment?.(importing);
+  }
+
+  /** 把「导入段 + 在第 1 步」报给导入面板：它据此点亮底部条上的「导入所选」 */
+  function syncImportState() {
+    window.wbAddImport?.setActive?.(addStep === 'pick' && addAccountType === TYPE_IMPORT);
+  }
+
   /** 切换步骤：只切两个容器的显隐，块的选择与标题由 syncAddProvider 统一收口 */
   function showAddStep(step) {
     addStep = step;
@@ -1095,6 +1138,9 @@
     if (extra && block && addStep === 'form') {
       extra.onShow?.({ providerId: addProviderHint, preset: addPresetKey });
     }
+    // 回到第 1 步且停在「导入」段：把底部条重新点亮成导入按钮（上面的收起
+    // 逻辑对两步通用，这里补回导入段的可见性）
+    syncImportState();
   }
 
   /** 账号类型分段下面那行说明：随选中段变化（放在 mountAddProviderUi 之前声明，加载期就要用） */
@@ -1105,7 +1151,9 @@
       ? '用 API Key 直连上游，常用提供商的地址与协议已预置。'
       : addAccountType === TYPE_CUSTOM
         ? '自建 OpenAI / Anthropic 兼容上游，地址与协议自己填。'
-        : '把本机客户端的登录态包装成账号，或用官方授权页登录。';
+        : addAccountType === TYPE_IMPORT
+          ? '从 cc-switch 等工具导入已配好的供应商与 API Key。'
+          : '把本机客户端的登录态包装成账号，或用官方授权页登录。';
   }
 
   /**
@@ -1142,6 +1190,9 @@
     addAccountType = TYPE_PROXY;
     setSegValue($(ADD_TYPE_SEG_ID), TYPE_PROXY);
     syncTypeHint();
+    // 段的显隐一并复位：上次若停在「导入」段，面板要收起、网格要回来
+    syncAddStepSections();
+    syncImportState();
     const search = $(ADD_SEARCH_ID);
     if (search) search.value = '';
     renderProviderCards();

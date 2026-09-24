@@ -144,10 +144,7 @@ function showPage(name, { persist = true } = {}) {
   if (page === 'accounts') {
     void window.wbAccountsView?.syncConnections?.();
   }
-  // 模型管理 / 网关 Key 页各自持有数据，切进去时拉一次最新
-  if (page === 'gateway') {
-    window.wbModelsPanel?.load?.();
-  }
+  // 网关 Key 页持有数据，切进去时拉一次最新（模型管理页在上面已经拉过）
   if (page === 'keys') {
     window.wbKeysPanel?.load?.();
   }

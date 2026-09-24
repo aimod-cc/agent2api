@@ -320,9 +320,15 @@
     return ($('model-search')?.value || '').trim().toLowerCase();
   }
 
+  /** 行的启停判定：还有任一条生效的绑定（默认或别名）就算启用，全部关闭才算
+      禁用。「已启用 / 已禁用」筛选与组内排序共用这一份口径，避免两处各判各的。 */
+  function rowEnabled(m) {
+    return bindingsOf(m).some(binding => binding.enabled !== false);
+  }
+
   function matches(m, keyword) {
-    if (stateFilter === 'enabled' && !bindingsOf(m).some(binding => binding.enabled !== false)) return false;
-    if (stateFilter === 'disabled' && bindingsOf(m).some(binding => binding.enabled !== false)) return false;
+    if (stateFilter === 'enabled' && !rowEnabled(m)) return false;
+    if (stateFilter === 'disabled' && rowEnabled(m)) return false;
     if (stateFilter === 'mapped' && !(m.aliases || []).length) return false;
     if (currentProvider !== 'all' && (m.provider || '') !== currentProvider) return false;
     if (!keyword) return true;
@@ -569,6 +575,10 @@
       if (!groups.has(key)) groups.set(key, { label: m.providerLabel || key || '未知', items: [] });
       groups.get(key).items.push(m);
     });
+    // 组内排序：禁用的行沉到该组末尾，启用的排前面；Array#sort 稳定，组内
+    // 仍按后端原序（判定与「已启用 / 已禁用」筛选同一份，见 rowEnabled）
+    const disabledRank = m => Number(!rowEnabled(m));
+    groups.forEach(group => group.items.sort((a, b) => disabledRank(a) - disabledRank(b)));
     body.innerHTML = [...groups].map(([key, group]) => {
       const open = expanded.has(key) || !collapsible;
       const items = open ? group.items : group.items.slice(0, GROUP_LIMIT);
@@ -1044,6 +1054,13 @@
    * ∪ 有启用账号的家（弹窗里组装，见 models-fetch-modal.js 的 scopeProviders）
    * —— 模型管理页看不到的家不该出现在结果里。因此标题只写「内置提供商」，
    * 实际刷了哪几家由结果表逐行列出。
+   *
+   * ── 为什么内置家要回调重拉（`onRefreshed`）──────────────────
+   * 本页的数据是**自持**的（`data` 只由 load / 写操作更新），而刷新走的是弹窗里
+   * 那条 `/api/models/refresh`：目录在后端换了一份，本页手里的 manage 视图
+   * （左栏计数、行的「来源」列、新模型的行）却还是旧快照 —— 用户刚在弹窗里看到
+   * 「已刷新 9 个」，关掉弹窗回到列表还是 5 行，看起来像刷新没生效。因此在刷新
+   * 真落地后**重拉一次**（`load`），把两条取数路径重新对齐。
    */
   function refreshModels() {
     const custom = isCustomView();
@@ -1054,7 +1071,10 @@
       providerId: currentProvider,
       custom,
       name,
+      // 自定义家：导入成功 → 目录缓存已刷新，重绘即可（数据源是本地缓存）
       onDone: () => render(),
+      // 内置家：远程目录落地 → 后端清单换了，必须重拉（本地那份已过期）
+      onRefreshed: () => { void load(); },
     });
   }
 

@@ -49,6 +49,9 @@ axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "socks"] }
 serde_yaml = "0.9"
 sha2 = "0.10"
+# 「从其他工具导入」：解析 cc-switch 里 Codex 供应商的 config.toml 字符串
+# （提取激活 model_provider 的 base_url，见 core/import_ccswitch.rs）
+toml = "0.9"
 # ALTCHA 机器人校验的 challenge 签名（HMAC-SHA256，见 server/altcha.rs）
 hmac = "0.12"
 chrono = "0.4"

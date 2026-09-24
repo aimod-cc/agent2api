@@ -26,7 +26,9 @@
 
   /**
    * 当前会话，`null` = 弹窗没开：
-   * `{ providerId, custom, name }` —— `custom` 决定走哪一种形态。
+   * `{ providerId, custom, name, onDone, onRefreshed }` —— `custom` 决定走哪一种形态。
+   * 两个回调都只是「通知调用方该自己重取数了」，弹窗不替它取：`onDone` 在导入
+   * 成功后（自定义家），`onRefreshed` 在远程目录真落地后（内置家）。
    */
   let session = null;
   /** 自定义家：上游拉回来的模型 id（去重、保序） */
@@ -391,6 +393,11 @@
           providers: scopeProviders(),
         });
         renderResults(result);
+        // 真刷到新目录时通知调用方 —— 刷新落地只改了后端那份目录，模型管理页
+        // 自持的 manage 视图（左栏计数 / 行的「来源」列）读的是另一条接口
+        // （/api/models/manage），不重拉就停在旧快照，只能靠切页或重启撞上。
+        // 失败 / 跳过时不通知：清单一个字没变，重拉只会白跑一趟。
+        if (Number(result?.refreshed) > 0) session.onRefreshed?.();
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -431,12 +438,17 @@
 
   /**
    * 打开弹窗。`providerId` 是当前左栏选中的那家；`custom` 由调用方判好
-   *（它已经知道自己是哪一边），`onDone` 在导入成功后回调（调用方重绘表格）。
+   *（它已经知道自己是哪一边）。
+   *
+   * 两个回调分属两种形态，语义都是「**后端数据变了，你那边该重取一次**」——
+   * 本弹窗只负责把变化告诉调用方，不替它取数（各自的取数路径与视图都在调用方）：
+   *   · `onDone`：自定义家导入成功后（调用方重绘表格）；
+   *   · `onRefreshed`：内置家远程目录真落地后（调用方重拉 manage 视图）。
    */
-  function open({ providerId, custom, name, onDone }) {
+  function open({ providerId, custom, name, onDone, onRefreshed }) {
     if (!providerId) return;
     close();
-    session = { providerId, custom: Boolean(custom), name: name || providerId, onDone };
+    session = { providerId, custom: Boolean(custom), name: name || providerId, onDone, onRefreshed };
     buildShell();
     renderHead();
     void load();

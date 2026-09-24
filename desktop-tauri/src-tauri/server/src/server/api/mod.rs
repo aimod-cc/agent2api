@@ -49,6 +49,9 @@ pub mod debug_api;
 pub mod disconnect_guard;
 pub mod endpoints;
 pub mod health;
+// 「从其他工具导入」的扫描接口（当前来源：cc-switch；存储读取见
+// `core::import_ccswitch`）
+pub mod import_sources;
 pub mod keys_api;
 pub mod logs_api;
 pub mod model_manage;

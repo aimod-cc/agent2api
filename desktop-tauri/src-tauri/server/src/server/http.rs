@@ -336,6 +336,13 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/custom-providers/remove",
             post(api::custom_providers::remove_custom_provider),
         )
+        // ── 「从其他工具导入」（「导入」分段的数据源）──
+        // 扫描本机 cc-switch 数据库，响应携带 API Key 明文（导入动作需要），
+        // 与上面的管理接口同级敏感，挂 protected。
+        .route(
+            "/api/import/cc-switch",
+            get(api::import_sources::scan_cc_switch),
+        )
         // 模型清单的两条（第二阶段）：整表保存 / 服务端代理拉取上游清单。
         // 挂 protected 的理由与上面的管理四条相同；fetch-models 还会真打上游
         // （一次 GET {baseUrl}/models），与 /api/models/refresh 同级敏感。

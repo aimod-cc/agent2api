@@ -1787,6 +1787,11 @@
        「add-account.js → 本文件 → account-panel.js」的顺序注册（同元素同事件按注册顺序触发）。 -->
   <script src="add-qoder.js"></script>
   <script src="add-cline.js"></script>
+  <!-- 「从其他工具导入」面板（cc-switch…）。必须在 add-provider-forms.js **之前**：
+       后者加载期就跑 mountAddProviderUi，会立刻调 window.wbAddImport.mount 把面板
+       与「导入所选」按钮装进第 1 步骨架（那时 DOM 已解析）。它自己不注册表单块，
+       与 add-custom-provider.js 无顺序关系；加载期依赖只有 wbApp 与 wbProviders。 -->
+  <script src="add-provider-import.js"></script>
   <script src="add-provider-forms.js"></script>
   <!-- 自定义提供商（custom- 前缀）的界面。add-custom-provider.js 要向
        add-provider-forms.js 注册「自定义提供商」表单块，custom-provider-ui.js
