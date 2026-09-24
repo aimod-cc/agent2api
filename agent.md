@@ -43,7 +43,7 @@ git push origin vX.Y.Z
 
 | 工作流 | 产出 | 说明 |
 |---|---|---|
-| `build.yml`（build） | Windows NSIS 安装包 + macOS universal dmg + **Gitee 发行版** | `macos` / `windows` 两个 job 构建并上传 artifact（macOS 包**只能在 CI 构建**，无法从 Windows 交叉编译）；`gitee-release` job 自动在 Gitee 创建同名发行版（正文取 tag 提交信息）并上传两个安装包 |
+| `build.yml`（build） | Windows NSIS 安装包 + macOS universal dmg | `macos` / `windows` 两个 job 构建并上传 artifact（macOS 包**只能在 CI 构建**，无法从 Windows 交叉编译）；安装包只挂 artifact，两个发行版都由本地脚本挂载（见第 4 节） |
 | `docker.yml`（docker） | Docker Hub `aimodcc/agent2api:<版本>` + `:latest`（amd64 / arm64 双架构） | 手动 `workflow_dispatch` 触发时只出 `:dev` 测试 tag，不碰正式 tag |
 | `sync-gitee.yml`（sync-gitee） | Gitee 仓库镜像同步 | main 与 `v*` tag 推送后强制同步到 `gitee.com/aimodcc/agent2api` |
 
@@ -54,18 +54,25 @@ gh run list --limit 4          # 确认三个工作流都已触发
 gh run watch <run-id> --exit-status
 ```
 
-## 4. 挂 GitHub Release（人工一步）
+## 4. 发版收尾：挂 GitHub Release + 传 Gitee 发行版（本地脚本一条命令）
 
-GitHub Release **不会自动创建**，由本地 `gh` 挂载：
+两个发行版都**不由 CI 发布**：GitHub Release 本来就不会自动创建；Gitee 侧因
+GitHub 托管 runner（境外）直连 Gitee 传附件慢且会假死（v2.7.2 实测 11MB 挂
+10 分钟+，v2.7.3 的 gitee-release job 配了兜底仍翻车——dmg 上传 10 分钟
+0 字节超时），已撤掉 CI 跨境上传，改由本地境内直连：
 
 ```bash
-gh run download <build-run-id> -D dist/     # 下载 macos-universal / windows-nsis 两个产物
-gh release create vX.Y.Z --title vX.Y.Z \
-  --notes-file 更新日志.txt \
-  dist/windows-nsis/*_x64-setup.exe dist/macos-universal/*_universal.dmg
+bash scripts/release.sh vX.Y.Z            # 自动找该 tag 的成功 build run
+bash scripts/release.sh vX.Y.Z <run-id>   # 或显式指定 run
 ```
 
-Gitee 侧的发行版则是全自动的，无需人工操作。
+脚本做四件事：下载 build 的两个安装包 artifact 到 dist/ → 按 tag 提交信息
+（= 更新日志，见第 2 节）创建 / 更新 GitHub Release 并挂附件 → 在 Gitee
+建同名发行版（正文同源）并上传附件 → 打印验收提示。幂等可重跑：GitHub 侧
+`--clobber` 覆盖附件，Gitee 侧先删同名发行版再重建。
+
+Gitee 令牌：`export GITEE_TOKEN=xxx`，或写入 `~/.gitee-token`（一行纯
+token，勿提交）。
 
 ## 5. 验收清单（四端核对）
 
@@ -76,7 +83,7 @@ Gitee 侧的发行版则是全自动的，无需人工操作。
 
 ## 6. 已知坑与排查
 
-- **gitee-release 上传跨境假死**：GitHub 托管 runner（境外）直连 Gitee（境内）传附件会**静默挂死**（v2.7.2 实测 11MB 挂 10 分钟+，curl 无超时的话会挂到 6 小时 job 超时）。已加三层兜底：连接 20s 超时 / 传输中 30 秒低于 1KB/s 判假死 / 单次 10 分钟硬上限，失败自动重试 3 次（见 `build.yml` 的 `CURL` 变量说明）。若 job 最终失败，`gh run rerun <run-id> --failed` 重跑即可——该 job 幂等（先删同名发行版再重建）。
+- **Gitee 上传不走 CI（跨境假死史）**：GitHub 托管 runner（境外）直连 Gitee（境内）传附件会**静默挂死**（v2.7.2 实测 11MB 挂 10 分钟+；v2.7.3 的 gitee-release job 配了三层兜底仍翻车——dmg 上传 10 分钟 0 字节）。两轮实测后把该 job 整个撤掉，Gitee 上传收进本地脚本（见第 4 节）。别因为「想全自动」把它加回 CI——除非上传侧落在境内（如 self-hosted runner）。
 - **Gitee 附件 ≤100MB**：当前两个安装包在几 MB 量级，暂时够用；超过就换国内对象存储。
 - **更新源依赖 Gitee 附件齐全**：应用内「软件更新」支持 GitHub / Gitee 双源，Gitee 源读 `releases/latest`——所以 Gitee 发行版的附件必须传全，否则选了 Gitee 源的用户更新不到。
 - **GHCR 新包默认私有**：若以后镜像改推 GHCR，首次推送后需到包设置手动改 Public（当前推的是 Docker Hub，无此问题）。
