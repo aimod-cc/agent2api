@@ -806,7 +806,7 @@
                 <section class="panel">
                   <div class="panel-head">
                     <h2>请求重试</h2>
-                    <span class="tip-q" data-tip="请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11128 敏感词拦截），网关会等一段间隔后再发一次。次数分两档，管的是两件事：①「同一账号重试次数」在同一账号上原地重发几次 —— 一般是提示词被上游拦截、或链路瞬时抖动，等一会儿重发往往就好了；②「切换账号重试次数」这份请求最多再换几个账号试 —— 首发的那个账号不算，每换一个扣一次，不分是不是同一家（换到同一家的下一个账号也算一次），换满还失败就把错误返回给客户端。两项都设为 0 表示失败不重试、直接报错。注意账号级限额（429）不占这里的换号次数 —— 那类失败走「冷却该账号并换下一个账号」的降级，与这里的重试是两条路。另有「指定错误码不重试」名单（默认 402）：命中名单的上游状态码不再原地重发、也不换账号，错误直接返回给客户端。"></span>
+                    <span class="tip-q" data-tip="请求转发到上游失败时（服务器瞬时错误、连接失败，以及 WorkBuddy 的 11128 敏感词拦截），网关会等一段间隔后再发一次。次数分两档，管的是两件事：①「同一账号重试次数」在同一账号上原地重发几次 —— 一般是提示词被上游拦截、或链路瞬时抖动，等一会儿重发往往就好了；②「切换账号重试次数」这份请求最多再换几个账号试 —— 首发的那个账号不算，每换一个扣一次，不分是不是同一家（换到同一家的下一个账号也算一次），换满还失败就把错误返回给客户端。两项都设为 0 表示失败不重试、直接报错。注意账号级限额（429）不占这里的换号次数 —— 那类失败走「冷却该账号并换下一个账号」的降级，与这里的重试是两条路。另有「指定错误码直接换号」名单（默认 402）：命中名单的上游状态码不在同一账号重发，直接按队列换下一个账号继续试（换号也占「切换账号重试次数」），换满仍失败才把错误返回给客户端。"></span>
                     <span id="retry-badge" class="badge">检测中…</span>
                     <div class="head-actions">
                       <button id="btn-retry-refresh">刷新</button>
@@ -838,18 +838,18 @@
                         </span>
                         <div class="hint">两次重试之间的等待时间，两项共用，可填 0–300 秒。</div>
                       </div>
-                      <!-- 指定错误码不重试：GitHub Topics 同款标签输入 ——
+                      <!-- 指定错误码直接换号：GitHub Topics 同款标签输入 ——
                            回车添加一枚、点 × 删除，控件本体（.tag-input）由
                            settings-panel.js 渲染与读写（值来自 /api/retry）。 -->
                       <div class="retention-row">
-                        <label for="settings-retry-no-codes-input">指定错误码不重试</label>
+                        <label for="settings-retry-no-codes-input">指定错误码直接换号</label>
                         <div class="retention-input">
                           <div class="tag-input" id="settings-retry-no-codes">
                             <input type="text" id="settings-retry-no-codes-input" class="tag-input-field"
                                    placeholder="输入状态码，回车添加" inputmode="numeric" autocomplete="off">
                           </div>
                         </div>
-                        <div class="hint">命中这些上游状态码的失败不再重试（同一账号不重发、也不换账号，错误原样返回给客户端）。输入 100–599 的状态码后回车添加，点 × 或退格删除；默认 402（积分不足）。清空全部表示任何错误都照常重试。</div>
+                        <div class="hint">命中这些上游状态码的失败不在同一账号重发，直接换下一个账号继续试（换号占用「切换账号重试次数」，换满仍失败才把错误原样返回给客户端）。输入 100–599 的状态码后回车添加，点 × 或退格删除；默认 402（积分不足）。清空全部表示任何错误都照常重试。</div>
                       </div>
                     </div>
                     <div class="hint retention-note">保存后立即生效，不用重启；次数用尽仍失败时，错误原样返回给客户端。</div>

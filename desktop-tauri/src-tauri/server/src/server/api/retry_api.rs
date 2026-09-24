@@ -1,12 +1,12 @@
-//! GET/PUT /api/retry —— 请求重试设置（两档次数 / 间隔 / 不重试错误码）。
+//! GET/PUT /api/retry —— 请求重试设置（两档次数 / 间隔 / 指定错误码直接换号）。
 //!
 //! 转发层对上游瞬时错误与传输层失败做「睡一个间隔再原样重发」，次数分两档
 //! （见 `config.rs` 的说明）：
 //!   - `retryCount`：在**同一个账号**上原地重发几次；
 //!   - `retryCrossProviderCount`：失败后**最多换几个账号**再试（按账号计，
 //!     不分家 —— 键名是旧措辞，语义见 `config.rs`）。
-//!   - `noRetryStatusCodes`：指定上游状态码不重试（命中即原样收尾，见
-//!     `config.rs` 的 `KEY_RETRY_NO_RETRY_CODES`）。
+//!   - `noRetryStatusCodes`：指定上游状态码直接换号（不在同一账号重发，
+//!     按队列换下一个账号继续试，见 `config.rs` 的 `KEY_RETRY_NO_RETRY_CODES`）。
 //!
 //! 循环见 `upstream::provider_loop`（原地重发在 `send_with_retry`，
 //! 换账号在 `attempt_queue`）。
@@ -96,7 +96,7 @@ pub async fn put_retry(State(_state): State<ServerState>, body: Bytes) -> Respon
         }
     }
 
-    // ── 第四项：指定错误码不重试（整数数组）─────────────────────
+    // ── 第四项：指定错误码直接换号（整数数组）─────────────────────
     // 与三个数字项同一顺序：先整单校验，非法整体不落盘。允许 null / 缺省
     // （这一项不动）；空数组是合法值 = 清空名单（任何错误都照常重试）。
     if let Some(value) = object.get(KEY_RETRY_NO_RETRY_CODES) {
@@ -122,7 +122,7 @@ pub async fn put_retry(State(_state): State<ServerState>, body: Bytes) -> Respon
         logging::log(
             "[Config]",
             &format!(
-                "请求重试已更新: 同一账号 {} 次 / 最多换 {} 个账号 / 间隔 {} 秒 / 不重试错误码 {:?}",
+                "请求重试已更新: 同一账号 {} 次 / 最多换 {} 个账号 / 间隔 {} 秒 / 直接换号错误码 {:?}",
                 settings.count,
                 settings.account_switch_count,
                 settings.interval_seconds,
@@ -147,7 +147,7 @@ fn retry_json(settings: RetrySettings) -> Value {
     })
 }
 
-/// 「指定错误码不重试」的校验：整数数组、每项 100–599、最多 50 项。
+/// 「指定错误码直接换号」的校验：整数数组、每项 100–599、最多 50 项。
 ///
 /// 与 `parse_bounded_int` 同一口径：只认 JSON 数字（含 `402.0` 这种整值浮点）；
 /// 有一项非法就整单 400（不悄悄剔除），写盘前排序去重，落库形态规整。

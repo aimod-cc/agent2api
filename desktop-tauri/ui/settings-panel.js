@@ -571,7 +571,7 @@
     { key: 'retryIntervalSeconds', inputId: 'settings-retry-interval', label: '重试间隔', min: 0, max: 300 },
   ];
 
-  // ─── 指定错误码不重试（标签输入）────────────
+  // ─── 指定错误码直接换号（标签输入）────────────
   //
   // GitHub Topics 同款交互：框里是已添加的状态码徽章 + 一个行内输入框，
   // 回车添加、点 × 删除（输入框为空时退格删最后一枚）。每次增删立即 PUT
@@ -596,7 +596,7 @@
   // 清理数据的副作用，语义不同。
   //
   // `syncExtras(data | null)`：本壳只管数字框；同一面板里还有别的控件的
-  // （重试面板的「指定错误码不重试」标签输入）由各自的页面代码实现，在
+  // （重试面板的「指定错误码直接换号」标签输入）由各自的页面代码实现，在
   // 数据到达 / 不可用时被回调一次。
   function numericPanel({ fields, badgeId, consoleLabel, get, save, syncExtras }) {
     /** 最近一次读到的生效值；null = 后端不可用（此时输入框保持禁用） */
@@ -754,7 +754,7 @@
     get: () => api.getRetry(),
     save: patch => api.saveRetry(patch),
     syncExtras: data => {
-      // 「指定错误码不重试」的名单：只收 100–599 的整数项（后端已排序去重，
+      // 「指定错误码直接换号」的名单：只收 100–599 的整数项（后端已排序去重，
       // 这里不再排序 —— 顺序就是后端给的）。键缺失（旧后端）时沿用上一轮的值，
       // 不误判成「清空」；data 为 null（整块不可用）时清掉并锁住输入框。
       if (data === null) {
@@ -799,7 +799,7 @@
   const loadTimeouts = () => timeoutsPanel.load();
 
   /**
-   * 「指定错误码不重试」的界面：把 `noRetryCodes` 画成一排徽章（状态码 + ✕），
+   * 「指定错误码直接换号」的界面：把 `noRetryCodes` 画成一排徽章（状态码 + ✕），
    * 行内输入框永远留在最后（GitHub Topics 的形态）。徽章是动态的，
    * 每次增删整排重画 —— 几十枚的量级，重建比逐个增删节点省心。
    */
@@ -834,7 +834,7 @@
       // PUT 契约返回生效后的全量值（含三个数字项），交给 renderRetry 统一回填，
       // 顺带把徽章重画成后端确认的形态（排序去重后的结果）
       renderRetry(saved);
-      toast('✅ 已保存：指定错误码不重试');
+      toast('✅ 已保存：指定错误码直接换号');
     } catch (error) {
       toast(`保存失败：${error.message}`, 'err');
       await loadRetry(); // 回滚到后端的真实值
@@ -1063,7 +1063,7 @@
   $('btn-retry-refresh')?.addEventListener('click', () => loadRetry().then(() => toast('重试设置已刷新')));
   $('btn-timeouts-refresh')?.addEventListener('click', () => loadTimeouts().then(() => toast('超时设置已刷新')));
 
-  // 「指定错误码不重试」标签输入：回车添加、空输入框上退格删最后一枚、
+  // 「指定错误码直接换号」标签输入：回车添加、空输入框上退格删最后一枚、
   // 点 ×（或点框任意处聚焦输入框）。徽章是动态渲染的，删除走事件委托。
   {
     const box = $(TAG_BOX_ID);

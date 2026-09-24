@@ -376,11 +376,13 @@ pub const DEFAULT_RETRY_SWITCH_COUNT: i64 = 5;
 /// 重试间隔默认值：5 秒
 pub const DEFAULT_RETRY_INTERVAL_SECONDS: i64 = 5;
 
-/// 「指定错误码不重试」的配置键（值是 HTTP 状态码数组，如 `[402, 429]`）。
+/// 「指定错误码直接换号」的配置键（值是 HTTP 状态码数组，如 `[402, 429]`）。
 ///
-/// 命中名单的上游失败**原样收尾**：既不在同一账号上原地重发，也不换账号
-/// （含 429 降级 / 401 刷新这类特殊动作）—— 名单的语义就是「这个码没什么
-/// 可试的，直接把错误给客户端」。
+/// 键名里的 `NoRetry` 是历史措辞（最早的语义是「命中即报错」），行为后来
+/// 改成了「不在同一账号重发、直接换下一个账号」—— 键名是配置契约，改名
+/// 会让老配置读不到，保留至今。命中名单的上游失败跳过本账号：原地重发与
+/// 同账号补救（内容拦截换提示词 / 401 刷新）都不做，按队列换下一个账号
+/// 继续试，换满仍失败才把错误给客户端。
 pub const KEY_RETRY_NO_RETRY_CODES: &str = "noRetryStatusCodes";
 /// 默认名单：402（WorkBuddy 积分不足）。余额问题重发结论不变，
 /// 客户端拿到 402 才能如实体感「这个账号没钱了」。
@@ -421,7 +423,7 @@ pub struct RetrySettings {
     pub account_switch_count: i64,
     /// 两次重试之间的间隔（秒）
     pub interval_seconds: i64,
-    /// **指定错误码不重试**名单（[`KEY_RETRY_NO_RETRY_CODES`]）。
+    /// **指定错误码直接换号**名单（[`KEY_RETRY_NO_RETRY_CODES`]）。
     ///
     /// 为什么是 `Arc<[u16]>` 而不是 `Vec<u16>`：快照被逐失败请求取用，
     /// `Arc` 让克隆只付一次指针自增；判定（`no_retry`）读的是共享切片，
@@ -448,7 +450,7 @@ impl RetrySettings {
         self.account_switch_count.max(0) as usize
     }
 
-    /// 这个上游状态码是否命中「不重试」名单。
+    /// 这个上游状态码是否命中「直接换号」名单。
     pub fn no_retry(&self, status: u16) -> bool {
         self.no_retry_codes.contains(&status)
     }

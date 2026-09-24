@@ -653,14 +653,21 @@
   letter-spacing: .02em;
 }
 
+/* 一次尝试的一行：头部各段（尝试 N · 提供商 账号 →）与结局（错误摘要 / 成功 /
+   进行中）**按文本流连排**。这里刻意不用 flex：flex-wrap 的换行决策发生在
+   收缩之前，面板宽度只要比「头部 + 错误摘要」的自然宽度小一点点，错误就整块
+   跳到第二行（箭头孤零零结尾）；文本流则让换行发生在句子内部，怎么都不会
+   整块跳行。段间间距由下面各段的 margin-right 给（原来是 flex 的 gap）。 */
 .rh-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 2px 4px;
   min-width: 0;
   word-break: break-word;
 }
+
+/* 头部各段的右间距：紧接下一段文字，不能没有间隔 */
+.rh-no,
+.rh-who,
+.rh-account,
+.rh-arrow { margin-right: 4px; }
 
 /* 尝试序号 / 箭头 / 说明是次要标记：淡一档 */
 .rh-no,
@@ -676,11 +683,9 @@
   overflow-wrap: anywhere;
 }
 
-/* 失败那一行可能带 200 字符的错误摘要：允许在任意位置断行，
-   否则一条没有空格的英文报错会把面板顶宽（OmniProxy 的 overflowWrap: anywhere 同法） */
+/* 失败结局（红色）：行内文本流的一部分，紧接着箭头排。超长无空格英文靠
+   anywhere 在必要处断行，避免把面板顶宽（OmniProxy 的 overflowWrap: anywhere 同法） */
 .rh-bad {
-  flex: 1 1 0%;
-  min-width: 0;
   overflow-wrap: anywhere;
   color: var(--danger);
   font-weight: 500;
@@ -703,18 +708,18 @@
   font-weight: 600;
 }
 
+/* 重试子行同 .rh-row：文本流连排（原因 + HTTP 码 + 延迟），
+   折行发生在原因句子内部而不是把状态码整块挤下去 */
 .rh-retry-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 2px 4px;
   min-width: 0;
   word-break: break-word;
 }
 
+.rh-retry-why,
+.rh-retry-status { margin-right: 4px; }
+
 /* 重试原因可能是一句带「（11128）」的中文提示：允许断行，别顶宽面板 */
 .rh-retry-why {
-  min-width: 0;
   overflow-wrap: anywhere;
   color: var(--text-2);
 }
@@ -734,8 +739,11 @@
   overflow-wrap: anywhere;
 }
 
-/* 敏感词列表：词与次数分列，次数贴右竖着能比大小 */
+/* 敏感词列表：词与次数分列，次数贴右竖着能比大小。
+   这一行仍用 flex（不是 .rh-row 的默认文本流了，display 要自己声明）。 */
 .rh-hit {
+  display: flex;
+  align-items: baseline;
   justify-content: space-between;
   gap: 10px;
 }

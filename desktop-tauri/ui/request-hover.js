@@ -65,6 +65,24 @@
   /** 距视口边缘的安全距离，以及浮层与锚点的间距（箭头落在这段间隙里） */
   const EDGE = 8;
   const GAP = 8;
+  /**
+   * 面板宽度的下限（px）：内容再短也至少这么宽。
+   *
+   * 重试链面板里最长的一行是「尝试 N · 提供商 账号 → 失败（状态码）：错误摘要」，
+   * 头部加常见长度的错误摘要就有 400–600px —— 下限给足，常见场景整行显示。
+   * 敏感词面板是「词 × 次数」的列表，内容本身不长，用较小的基准宽度即可
+   * （铺太宽会让词与次数隔得老远，反而难读）。
+   */
+  const MIN_PANEL_WIDTH = 520;
+  const MIN_PANEL_WIDTH_SENSITIVE = 220;
+  /**
+   * 面板宽度的上限（px，还要再夹进视口可用宽度）。
+   *
+   * 内容自适应负责「够宽」，这里收住「过宽」：一条 200 字符的上游报错
+   * 能把 max-content 顶到视口满宽，而铺满整屏的一行 12px 字读起来很累 ——
+   * 超出的部分交给面板内部的换行（见 .rh-bad 的 overflow-wrap）。
+   */
+  const MAX_PANEL_WIDTH = 900;
 
   /** 命中词列表最多显示几行：这一块是「命中了什么」的快照，不是词表编辑器。
    *  按次数降序取前 N 条 —— 一份几十个词的词表被整篇命中时，
@@ -316,12 +334,14 @@
     const rect = anchor.getBoundingClientRect();
     const avail = window.innerWidth - EDGE * 2;
     // 宽度按内容自适应再夹进视口：切换路径那行可能很长（三家的中文名 + 箭头），
-    // 错误摘要更长。用 max-content 量出理想宽度，上限夹到视口可用宽度，
-    // 放不下的部分交给面板内部的换行与滚动。
+    // 错误摘要更长。用 max-content 量出理想宽度，再夹到下限（MIN_PANEL_WIDTH）
+    // 与两个上限（视口可用宽度、MAX_PANEL_WIDTH），放不下的部分交给面板内部
+    // 的换行与滚动。
     panel.style.maxWidth = 'none';
     panel.style.width = 'max-content';
     const natural = panel.offsetWidth;
-    const cap = Math.min(Math.max(220, natural), avail);
+    const minWidth = panel.dataset.kind === 'sensitive' ? MIN_PANEL_WIDTH_SENSITIVE : MIN_PANEL_WIDTH;
+    const cap = Math.min(Math.max(minWidth, natural), avail, MAX_PANEL_WIDTH);
     panel.style.maxWidth = `${cap}px`;
     panel.style.width = 'auto';
 
@@ -354,6 +374,10 @@
     cancelTimers();
     if (anchor && anchor !== el) close();
     anchor = el;
+    // 面板类型（chain / sensitive）交给 place()：两类内容的宽度下限不同，
+    // 见 MIN_PANEL_WIDTH 的说明。取自标签自己的 data-req-hover 属性
+    // （requests-panel.js 渲染时写上的，与内容构造函数的选择同一个来源）。
+    panel.dataset.kind = el.dataset.reqHover || '';
     panel.innerHTML = html;
     el.classList.add('active');
     anchor.setAttribute('aria-describedby', panel.id);
