@@ -38,7 +38,6 @@
     visibleAccounts,
     positionMap,
     moreMenuHtml,
-    usagePanelHtml: usagePanelHtmlOf,
     limitPanelHtml: limitPanelHtmlOf,
     checkinPanelHtml: checkinPanelHtmlOf,
     byPriorityOrder,
@@ -75,24 +74,34 @@
   let clashRetryAt = 0;
   /** accountId -> 活跃请求数（只留 >0 的；见下方「连接数（实时）」一节） */
   const connectionsMap = new Map();
+  /**
+   * 余额查询在途的账号 id（行上那颗「余额」按钮的去重闸）。
+   *
+   * 每次点击都要发查询，所以这颗按钮没有「展开态」可以拦住连点 ——
+   * 用这个集合代替：在途时忽略重复点击，避免同一个账号同时发几份
+   * 一模一样的上游请求（结果写的是同一份缓存，界面上看不出区别）。
+   */
+  const usageInflight = new Set();
 
   const accounts = () => wbApp.getState()?.accounts?.accounts || [];
   const snapshot = () => wbApp.getState()?.accounts;
 
   // ─── 行内面板：展开状态 ─────────────────────
-  // 面板按需展开（用户点过「限流」/「余额」/「签到」或批量操作带出结果之后），收起时 HTML 为空串。
+  // 面板按需展开（用户点过「限流」/「签到」或批量签到带出结果之后），收起时 HTML 为空串。
+  // **余额没有明细行**（本次改造）：读数直接落在余额列上（见 accounts-table.js 的
+  // usageCell），操作列那颗「余额」按钮只发查询、不翻展开态 —— 所以这里没有 'usage' 这个 kind。
   //
   // ── 这一份 Map 是「面板开着没」的**唯一判据来源** ──────────────
-  // 四个入口都只读它，谁都不自己另存一份布尔量：
-  //   · 单账号按钮（本文件绑定的 `data-action="usage"` / `"limits"`）读 `panelOpen`;
-  //   · 批量展开（余额 / 签到的工具条按钮）读 `panelsAllOpen` 决定「这次是查询还是收起」;
+  // 三个入口都只读它，谁都不自己另存一份布尔量：
+  //   · 单账号按钮（本文件绑定的 `data-action="limits"`）读 `panelOpen`;
+  //   · 批量展开（签到的工具条按钮）走 `openPanels`;
   //   · 渲染（`panelsHtml`）按它决定这一行要不要生成明细行；
   //   · 账号被删除时 `render` 顺手清理不在列表里的 id。
   // 这样「单按钮关了一行、总按钮却以为还开着」在结构上不可能发生 —— 不是靠
   // 两处判据写得一样来维持一致，而是它们本来就是同一个函数读同一份状态。
-  // 反过来说：**以后再加第三个入口，也必须走这里的三个函数**（panelOpen /
-  // setPanelOpen / panelsAllOpen），不要另起一套判据，否则这条保证就断了。
-  /** 已展开明细的账号：accountId -> Set<'limits' | 'usage' | 'checkin'> */
+  // 反过来说：**以后再加入口，也必须走这里的函数**（panelOpen / setPanelOpen /
+  // openPanelsFor），不要另起一套判据，否则这条保证就断了。
+  /** 已展开明细的账号：accountId -> Set<'limits' | 'checkin'> */
   const openPanels = new Map();
 
   const panelOpen = (accountId, kind) => openPanels.get(accountId)?.has(kind) === true;
@@ -106,35 +115,15 @@
     else openPanels.delete(accountId);
   }
 
-  /** 批量展开入口：余额 / 签到的批量动作在 usage-actions.js，展开态归本文件管 */
+  /** 批量展开入口：签到的批量动作在 usage-actions.js，展开态归本文件管 */
   function openPanelsFor(ids, kind) {
     for (const id of ids) setPanelOpen(id, kind, true);
-  }
-
-  /** 批量收起入口（`openPanelsFor` 的反操作），同一处实现，理由见上面那条注释 */
-  function closePanelsFor(ids, kind) {
-    for (const id of ids) setPanelOpen(id, kind, false);
-  }
-
-  /**
-   * 一批账号的某块明细是否**全部**已展开。
-   *
-   * 批量按钮「第二次点击 = 收起」的判据。它必须由**本文件**回答而不是让
-   * usage-actions.js 自己遍历一遍：那样就有了第二份判据，而两份判据在
-   * 「空集合算不算全开」「某个 id 不在列表里怎么算」这些边角上必然分叉。
-   *
-   * 空集合返回 false：没有目标时应当走到调用方那句「暂无可查询的账号」提示，
-   * 而不是被当成「都开着」而静默收起（`every` 在空数组上返回 true，是个坑）。
-   */
-  function panelsAllOpen(ids, kind) {
-    return ids.length > 0 && ids.every(id => panelOpen(id, kind));
   }
 
   /** 该账号当前要渲染的行内明细（未展开时为空串） */
   function panelsHtml(account) {
     let html = '';
     if (panelOpen(account.id, 'limits')) html += limitPanelHtmlOf(account);
-    if (panelOpen(account.id, 'usage')) html += usagePanelHtmlOf(account, usageMap.get(account.id));
     if (panelOpen(account.id, 'checkin')) html += checkinPanelHtmlOf(account, checkinMap.get(account.id));
     return html;
   }
@@ -185,7 +174,6 @@
         seat: positions.get(account.id) || { position: 1, total: 1 },
         picked: selectedIds.has(account.id),
         usageEntry: usageMap.get(account.id),
-        usageOpen: panelOpen(account.id, 'usage'),
         limitsOpen: panelOpen(account.id, 'limits'),
         // 连接数取实时计数缓存（缺失 = 0，connectionsHtml 会渲染成空）
         connections: connectionsOf(account.id),
@@ -294,6 +282,7 @@
     actions.refreshCaches(validIds);
     for (const id of openPanels.keys()) if (!validIds.has(id)) openPanels.delete(id);
     for (const id of connectionsMap.keys()) if (!validIds.has(id)) connectionsMap.delete(id);
+    for (const id of usageInflight) if (!validIds.has(id)) usageInflight.delete(id);
   }
 
   // ─── 连接数（实时） ─────────────────────────
@@ -597,6 +586,21 @@
         return;
       }
 
+      // ZCode「领套餐」（探测 → 确认 → 验证码 → 领取）：
+      // 整条流程在 ui/zcode-claim.js 里，这里只负责把账号对象递过去。
+      // 按钮在流程期间禁用 —— 一次领取要拖一次滑块，重复点击会开出第二个
+      // 验证码流程（共用的求解器一次只允许一个，后发起的那轮会把前一轮作废）。
+      if (action === 'zcode-claim') {
+        const account = accounts().find(item => item.id === id);
+        button.disabled = true;
+        try {
+          await window.wbZcodeClaim?.start?.(account);
+        } finally {
+          button.disabled = false;
+        }
+        return;
+      }
+
       if (action === 'move-up' || action === 'move-down') {
         button.disabled = true;
         try {
@@ -615,21 +619,23 @@
         return;
       }
       if (action === 'usage') {
-        // 点「余额」按钮即展开明细；已展开时再点则收起（当成开关用）。
-        // 这颗按钮本次改造从余额列挪进了操作列（见 accounts-table.js 的
-        // actionsCell），但**这里一行都不用改** —— 委托靠 data-action 匹配，
-        // 与它渲染在哪一格无关。批量那颗「查询余额」走的是
-        // usage-actions.js 的 queryAllUsage，两处的展开态判据是同一份
-        // （openPanels，见那边「唯一判据来源」的说明）。
-        const wasOpen = panelOpen(id, 'usage');
-        setPanelOpen(id, 'usage', !wasOpen);
-        if (wasOpen) { render(); return; }
+        // 点「余额」按钮 = 查一次余额（本次改造）：**每次点击都发查询**，
+        // 不再有「第一次展开、第二次收起」那套开关语义 —— 明细面板已经取消，
+        // 查回来的读数直接落在余额列上（见 accounts-table.js 的 usageCell），
+        // 所以这颗按钮没有「展开态」可翻。批量那颗「查询余额」同口径
+        // （usage-actions.js 的 queryAllUsage）。
+        //
+        // 同一个账号上一轮还在飞时忽略这一次点击：余额列此刻正显示「查询中…」，
+        // 用户看到的就是「已经在查了」——再发一次只会让上游多收一份重复请求，
+        // 而两个请求回来写的又是同一份缓存，界面上看不出任何区别。
+        if (usageInflight.has(id)) return;
+        usageInflight.add(id);
         usageMap.set(id, null);
         render();
         try {
           await actions.queryUsageFor(id);
-          // 缓存的四种形态（见 usage-panel.js）：undefined/null/字符串/对象，
-          // 对象里再分「未配置」与「失败」—— 提示语要跟着这个分叉走
+          // 缓存的四种形态（见 usage-actions.js 的 usageFailureOf）：undefined/null/
+          // 字符串/对象，对象里再分「未配置」与「失败」—— 提示语要跟着这个分叉走
           const failure = actions.usageFailureOf(usageMap.get(id));
           if (failure?.notConfigured) toast(failure.message, 'ok');
           else if (failure) toast(`余额查询失败：${failure.message}`, 'err');
@@ -638,6 +644,8 @@
           usageMap.set(id, `查询失败：${error.message}`);
           render();
           toast(`余额查询失败：${error.message}`, 'err');
+        } finally {
+          usageInflight.delete(id);
         }
         return;
       }
@@ -833,12 +841,10 @@
   window.wbAccountsView = {
     render,
     refreshCaches,
+    // 批量展开入口：签到那条链在 usage-actions.js，而展开态住在这里 ——
+    // 它只通过这个函数改（见文件里「唯一判据来源」那段注释）。
+    // 余额已经没有明细行，不需要它。
     openPanels: openPanelsFor,
-    // 批量「开着没」的两个判据与「收起」入口一并导出：余额批量动作的那条链
-    // 在 usage-actions.js，而展开态住在这里 —— 它只通过这些函数问与改，
-    // 不自己遍历一份副本（见文件里「唯一判据来源」那段注释）
-    closePanels: closePanelsFor,
-    panelsAllOpen,
     // 连接数：切页面回来时视图侧主动补一次（轮询只认「当时在账号页」，
     // 切走的这两分钟里数据已经过期了）
     syncConnections,

@@ -248,6 +248,28 @@ pub async fn dispatch(
                 return clear_rate_limits(&state, &id, body);
             }
         }
+        // ZCode「周末套餐」：探测（只读、不要验证码）与领取（要验证码）。
+        // 两个后缀互不包含（`/zcode-claim/preview` 不以 `/zcode-claim` 结尾），
+        // 因此这里的先后不影响命中 —— 但读的时候按「先探测后领取」排列，
+        // 与界面上用户的操作顺序一致。
+        if let Some(id) = rest.strip_suffix("/zcode-claim/captcha-config") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::zcode_claim::captcha_config(&state, &id).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/zcode-claim/preview") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::zcode_claim::preview(&state, &id).await;
+            }
+        }
+        if let Some(id) = rest.strip_suffix("/zcode-claim") {
+            let id = decode_segment(id);
+            if !id.is_empty() {
+                return super::zcode_claim::claim_plan(&state, &id, body).await;
+            }
+        }
     }
 
     // ④ PATCH / DELETE → 把剩余段当账号 id。
@@ -412,6 +434,62 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             } else {
                 store.add_cline_account(provider_id, &payload, import_name)
             }
+        }
+        // ZCode（两个地区）：**粘贴凭证**（`jwt` + `accessToken`）→ 手动添加；
+        // 「网页登录」是另一条链路（`api::session::login_start` 的 ZCode 分支 →
+        // `core::login::zcode` 的 CLI 轮询任务 → 同一个落账号入口
+        // `add_zcode_account`）。
+        //
+        // ── 为什么两个字段都要收、且只给一个也能落 ───────────────
+        // 两者服务**不同的功能**（见 `zcode::credentials` 的模块头）：
+        // `accessToken` 转发用、`jwt` 领取用，互相不能替代。用户想测哪一半
+        // 就填哪一半 —— 只给了 jwt 的账号能领取不能转发（转发会如实报缺），
+        // 反之亦然。这正是「粘贴」这条路相对网页登录的价值：
+        // 不必先过一遍 OAuth 就能单独验证领取协议。
+        //
+        // `importDesktop` 不提供：ZCode 客户端的凭证在它自己的加密存储里，
+        // 没有 auth.json 那种稳定可读的形态 —— 给了入口只会稳定失败
+        // （与 Accio 同一处境、同一处置，不要照抄 AutoClaw 那边）。
+        Some(kind @ (crate::server::core::providers::ProviderKind::Zcode
+            | crate::server::core::providers::ProviderKind::ZcodeIntl)) => {
+            let region = crate::server::core::providers::zcode::region::Region::from_kind(kind)
+                .unwrap_or(crate::server::core::providers::zcode::region::Region::Cn);
+            if import_desktop {
+                return management_error(
+                    400,
+                    format!(
+                        "ZCode {}不支持导入桌面端登录态，请用「网页登录」或粘贴凭证添加账号",
+                        region.label()
+                    ),
+                );
+            }
+            let text_field = |key: &str| {
+                payload
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let access_token = text_field("accessToken");
+            let jwt = text_field("jwt");
+            if access_token.is_empty() && jwt.is_empty() {
+                return management_error(
+                    400,
+                    "请至少填写 accessToken（用于转发）或 jwt（用于领取套餐）",
+                );
+            }
+            let credentials = crate::server::core::providers::zcode::credentials::ZcodeCredentials {
+                region,
+                access_token,
+                jwt,
+                user_id: text_field("userId"),
+                // 设备标识是领取链路的活动期要求（见 `credentials.rs` 的模块头）：
+                // 用户没给就新生成一个，随凭证落盘后跨请求稳定
+                device_mid: crate::server::core::providers::zcode::credentials::new_device_mid()
+                    .unwrap_or_default(),
+            };
+            store.add_zcode_account(&credentials, import_name, "manual")
         }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
             store.add_account(&payload, None)

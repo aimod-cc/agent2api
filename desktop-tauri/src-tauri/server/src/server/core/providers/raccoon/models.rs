@@ -49,6 +49,7 @@ use serde_json::{json, Value};
 
 use crate::server::core::model_rules;
 use crate::server::core::providers::adapter::ModelRefreshOutcome;
+use crate::server::core::providers::catalog_cache;
 use crate::server::logging;
 
 /// 静态兜底清单里的默认对话模型 id（源实现 `DEFAULT_MODEL_ID`）。
@@ -159,10 +160,22 @@ struct CatalogState {
     fetched_at: i64,
 }
 
-/// 进程级目录句柄
+/// 进程级目录句柄。首次初始化时**先从持久化缓存恢复**（上次成功拉到的远程
+/// 清单），没有再留空 —— 空状态的读取语义就是「回落到静态兜底清单」。
 fn catalog() -> &'static RwLock<CatalogState> {
     static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
-    CATALOG.get_or_init(|| RwLock::new(CatalogState::default()))
+    CATALOG.get_or_init(|| RwLock::new(restored_state()))
+}
+
+/// 首次初始化读一次持久化缓存（见 `providers::catalog_cache` 的模块头）。
+///
+/// 缓存里存的就是 `CatalogState` 的形态（`refresh` 落地的那份），所以这里只做
+/// 「搬回来」：不重新解析、也不重新归一 —— 两处各写一份映射迟早分叉。
+fn restored_state() -> CatalogState {
+    match catalog_cache::load(catalog_cache::SCOPE_RACCOON) {
+        Some(cached) => CatalogState { models: cached.models, fetched_at: cached.fetched_at },
+        None => CatalogState::default(),
+    }
 }
 
 /// 读锁；锁中毒（持锁 panic）时接管内部数据继续用（与账号存储同一策略）
@@ -322,6 +335,10 @@ pub async fn refresh(
         .collect();
     let count = models.len();
     let next = CatalogState { models, fetched_at: logging::now_ms() };
+    // 落持久化缓存（进程重启后由 `restored_state` 读回）：放在写内存状态之前，
+    // 因为 `next` 要被 `write` 消费。**不在目录锁内** —— 缓存写入要拿库连接锁，
+    // 两把锁不能嵌套（本目录的硬约束是「持锁期间不做 IO」）。
+    catalog_cache::save(catalog_cache::SCOPE_RACCOON, &next.models, next.fetched_at);
     match catalog().write() {
         Ok(mut guard) => *guard = next,
         Err(poisoned) => *poisoned.into_inner() = next,

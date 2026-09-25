@@ -230,6 +230,11 @@ impl AccountStore {
             // 续期语义两地完全一致，差别只在登录站点与区域头（那是转发与
             // 凭证层的事，公开形态不体现）
             self.to_accio_public_account(record)
+        } else if super::is_zcode_family(&record.provider()) {
+            // 两个地区（`zcode` / `zcode-intl`）共用这一份公开形态：账号字段两地
+            // 完全一致，差别只在推理域名与领取时的上游 provider 取值（那是转发
+            // 与领取层的事，公开形态只用 `edition` 把地区标出来供界面显示）
+            self.to_zcode_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

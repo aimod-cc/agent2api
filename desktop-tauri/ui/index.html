@@ -131,13 +131,10 @@
               <h2>统计概览</h2>
               <span class="panel-sub" id="report-range-label">近 7 天</span>
               <div class="head-actions">
-                <div class="seg" id="report-range" role="tablist" aria-label="报表时间范围">
-                  <button class="seg-item" data-range="today">今天</button>
-                  <button class="seg-item active" data-range="7">7 天</button>
-                  <button class="seg-item" data-range="30">30 天</button>
-                  <button class="seg-item" data-range="month">本月</button>
-                  <button class="seg-item" data-range="all">全部</button>
-                </div>
+                <!-- 时间范围分段控件由 React 岛渲染（见 ui/islands/ui.js）：
+                     语义与键盘交给 Base UI 的 RadioGroup，视觉仍是 .seg / .seg-item。
+                     这里只留挂载点；.island 让宿主不生成盒子，不影响本行的布局。 -->
+                <div class="island" id="report-range"></div>
               </div>
             </div>
             <div class="panel-body">
@@ -286,20 +283,14 @@
             <div class="toolbar">
               <div class="group">
                 <span class="label">状态</span>
-                <div class="seg" id="account-enabled-filter" role="tablist" aria-label="启用状态">
-                  <button class="seg-item active" data-enabled="all">全部 <span class="seg-count" data-count="enabledAll">0</span></button>
-                  <button class="seg-item" data-enabled="enabled">启用 <span class="seg-count" data-count="enabled">0</span></button>
-                  <button class="seg-item" data-enabled="disabled">禁用 <span class="seg-count" data-count="disabled">0</span></button>
-                </div>
+                <!-- 启用状态 / 限流状态两个筛选维度由 React 岛渲染（见 ui/islands/ui.js）：
+                     选项与计数徽标都由 accounts-filters.js 给（计数每轮刷新在变），这里只留挂载点。 -->
+                <div class="island" id="account-enabled-filter"></div>
               </div>
 
               <div class="group">
                 <span class="label">限额</span>
-                <div class="seg" id="account-limit-filter" role="tablist" aria-label="限额状态">
-                  <button class="seg-item active" data-limit="all">全部 <span class="seg-count" data-count="limitAll">0</span></button>
-                  <button class="seg-item" data-limit="normal">正常 <span class="seg-count" data-count="normal">0</span></button>
-                  <button class="seg-item" data-limit="limited">已限流 <span class="seg-count" data-count="limited">0</span></button>
-                </div>
+                <div class="island" id="account-limit-filter"></div>
               </div>
 
               <div class="actions">
@@ -364,16 +355,9 @@
                        「对这张表做什么」，各占一行会把表格区往下推一行的位置。
                        搜索框紧跟在状态筛选右边（同为「看这张表」的控件），右侧那排
                        按钮由 head-actions 自己的 margin-left:auto 推到最右。 -->
-                  <div class="seg" id="models-state-seg" role="tablist" aria-label="按状态筛选">
-                    <button class="seg-item active" data-state="all">全部</button>
-                    <button class="seg-item" data-state="enabled">已启用</button>
-                    <button class="seg-item" data-state="disabled">已禁用</button>
-                    <button class="seg-item" data-state="mapped">有映射</button>
-                  </div>
-                  <span class="input-affix" id="models-search">
-                    <span class="affix">⌕</span>
-                    <input type="search" id="model-search" placeholder="搜索模型 ID / 名称 / 映射名…" autocomplete="off">
-                  </span>
+                  <!-- 状态筛选与搜索框都由 React 岛渲染：选项 / 初值在 models-panel.js 里给 -->
+                  <div class="island" id="models-state-seg"></div>
+                  <div class="island" id="models-search"></div>
                   <div class="head-actions">
                     <!-- 「获取模型」排在最前：它是这一页的主操作（把清单拉回来），
                          「添加模型」是补充。点开一个弹窗（本体在 models-fetch-modal.js）——
@@ -534,13 +518,9 @@
             <div class="panel-body">
               <div class="log-filters">
                 <!-- 时间档位与报表页 #report-range 一致，默认「全部」= 不加时间条件（与加筛选之前的行为相同） -->
-                <div class="seg" id="logs-range" role="tablist" aria-label="事件日志时间范围">
-                  <button class="seg-item" data-range="today">今天</button>
-                  <button class="seg-item" data-range="7">7 天</button>
-                  <button class="seg-item" data-range="30">30 天</button>
-                  <button class="seg-item" data-range="month">本月</button>
-                  <button class="seg-item active" data-range="all">全部</button>
-                </div>
+                <!-- 时间档位由 React 岛渲染：选项在 logs-panel.js 里给
+                     （与报表页 #report-range 同一套档位，但默认值不同、各存各的） -->
+                <div class="island" id="logs-range"></div>
                 <select id="logs-level" title="按最低级别筛选">
                   <option value="">全部级别</option>
                   <option value="debug">debug 及以上</option>
@@ -632,13 +612,8 @@
               <div class="log-filters">
                 <!-- 时间档位与日志页同一组档位；持久化键沿用拆分前的
                      workbuddy-desktop-logs-requests-range，用户已选的档位不因拆页丢失 -->
-                <div class="seg" id="req-range" role="tablist" aria-label="请求日志时间范围">
-                  <button class="seg-item" data-range="today">今天</button>
-                  <button class="seg-item" data-range="7">7 天</button>
-                  <button class="seg-item" data-range="30">30 天</button>
-                  <button class="seg-item" data-range="month">本月</button>
-                  <button class="seg-item active" data-range="all">全部</button>
-                </div>
+                <!-- 时间档位由 React 岛渲染：选项在 requests-panel.js 里给 -->
+                <div class="island" id="req-range"></div>
                 <select id="req-status" title="按请求结果筛选">
                   <option value="">全部状态</option>
                   <option value="ok">成功</option>
@@ -1177,15 +1152,11 @@
         <div class="modal-section">
           <h3>账号版本</h3>
           <p>国内版走 copilot.tencent.com，国际版走 www.workbuddy.ai，两版账号可同时保存、按账号自动路由。</p>
-          <!-- 分段控件的交互（点击 / 左右方向键 / roving tabindex）由 add-provider-forms.js 的
-               bindSeg 统一绑定，切换后派发 wb-seg-change；这里只声明结构与初始选中项。
-               aria 用 radiogroup/radio：它表达的是「一组互斥取值里选一个」的表单语义，
-               role=tab 那套是切视图页签用的（账号页筛选栏的 tablist 子项并未带 role=tab，
-               照抄会把不完整的 ARIA 复制过来）。 -->
-          <div class="seg add-seg" id="add-edition-seg" role="radiogroup" aria-label="账号版本">
-            <button type="button" class="seg-item active" data-value="cn" role="radio" aria-checked="true" tabindex="0">国内版（WorkBuddy）</button>
-            <button type="button" class="seg-item" data-value="intl" role="radio" aria-checked="false" tabindex="-1">国际版（WorkBuddy AI）</button>
-          </div>
+          <!-- 账号版本由 React 岛渲染（见 ui/islands/ui.js）：选项在 add-account.js 里给。
+               岛用的是 radiogroup/radio 语义 —— 它表达的是「一组互斥取值里选一个」的表单语义；
+               role=tab 那套是切视图页签用的，账号页筛选栏早年那批 tablist 子项并未带 role=tab，
+               照抄会把不完整的 ARIA 复制过来，岛统一避开了这个坑。 -->
+          <div class="island" id="add-edition-seg"></div>
         </div>
 
         <div class="modal-section">
@@ -1193,10 +1164,8 @@
           <p>打开官方 WorkBuddy 登录页，完成登录后自动加入账号列表（排在全局队列最后，不改变已有账号的相对顺序）。账号昵称取自上游，无需手动填写。</p>
           <div class="field-row">
             <span class="add-seg-label">打开方式</span>
-            <div class="seg add-seg" id="add-login-mode" role="radiogroup" aria-label="网页登录的打开方式">
-              <button type="button" class="seg-item active" data-value="embedded" role="radio" aria-checked="true" tabindex="0">内嵌窗口</button>
-              <button type="button" class="seg-item" data-value="external" role="radio" aria-checked="false" tabindex="-1">系统默认浏览器</button>
-            </div>
+            <!-- 打开方式同样由 React 岛渲染：选项在 add-account.js 里给 -->
+            <div class="island" id="add-login-mode"></div>
             <!-- 恢复第三方登录入口：国际版登录页自己按上游开关把 Google / GitHub / X
                  隐藏了（见 login.rs 的 social_restore_script）。勾选后壳侧在内嵌窗口
                  里摘掉那段样式，入口就回来了。默认**不勾选**：不勾选时与官方登录页
@@ -1649,6 +1618,14 @@
        设置页的开关写它，所以排在所有业务脚本之前，它们执行时就能用上。 -->
   <script src="units.js"></script>
   <script src="app.js"></script>
+  <!-- React 岛（源码 desktop-tauri/ui-islands/，产物已随仓库提交）：分段筛选与搜索框的
+       语义、键盘交给 Base UI，视觉仍取 ui/css 的既有令牌与手写样式。
+       必须排在所有调 window.wbSegmented.mount() / window.wbInput.mount() 的模块之前 ——
+       最早是 models-panel.js，后面还有 accounts-filters.js / logs-panel.js /
+       requests-panel.js / report.js / add-provider-forms.js。它不依赖 app.js，
+       排这里只为让「岛先于使用者」一目了然。
+       两个岛打在同一份产物里：React 与 react-dom 只能有一份实例。 -->
+  <script src="islands/ui.js"></script>
   <!-- 自定义标题栏（桌面端）：主窗口去掉了系统装饰（src-tauri/lib.rs 建窗处
        decorations(false)），这里动态补一条 32px 的标题栏（左标题右三键，
        拖动与双击最大化靠 data-tauri-drag-region）。网页端没有应用窗口，
@@ -1666,7 +1643,7 @@
   <script src="filter-memory.js"></script>
   <!-- 网关页「可用模型」区块（渲染 / 本地过滤 / 刷新模型清单按钮）：必须排在
        app.js 之后 —— 它在加载期就从 window.wbApp 取 esc / toast / getState
-       （跨文件引用走 wbApp 是本项目的既有约定，见 usage-panel.js）；
+       （跨文件引用走 wbApp 是本项目的既有约定，见 accounts-table.js）；
        又必须在 app.js 末尾那次 refresh() 之前执行完 —— 所有脚本都是同步加载，
        refresh() 是异步的（首个 await 之后才轮到渲染），排在 app.js 之后即可。
        同时它自带加载期的 DOM 绑定（搜索框 input、刷新按钮 click），
@@ -1697,11 +1674,20 @@
        东西 —— 那条链路开窗口等回调，这条在本弹窗里「发码 → 填码 → 换 token」。
        必须在 add-provider-forms.js 之前 —— 加载期由它建 AutoClaw 那一份。 -->
   <script src="sms-login.js"></script>
+  <!-- 阿里云无痕验证（滑块）求解器 —— **共用模块**：AutoClaw 的 OAuth 登录与
+       ZCode 的「周末套餐领取」都要过这道风控，求解过程完全一致（只有拿到验证串
+       之后干的事不同），因此只留一份实现。
+       必须排在两个消费者（下面那行 autoclaw-oauth.js 与 zcode-claim.js）之前：
+       它们在加载期就取 `window.wbAliyunCaptcha`。 -->
+  <script src="aliyun-captcha.js"></script>
   <!-- AutoClaw 国际版的 OAuth 网页登录（Zai / Google）。单独一个文件是因为它的
        顺序与另外五家相反：点按钮后先在**本弹窗**里跑阿里云风控验证码（浏览器端
        SDK，从 o.alicdn.com 加载），拿到验证串才去换授权地址、再交壳开窗口。
        必须在 add-provider-forms.js 之前 —— 加载期由它建国际版那一份。 -->
   <script src="autoclaw-oauth.js"></script>
+  <!-- ZCode「周末套餐」的探测与领取（账号页那一列按钮）。
+       依赖 window.wbAccountsView 的列注册与 window.wbAliyunCaptcha。 -->
+  <script src="zcode-claim.js"></script>
   <script src="add-account.js"></script>
   <!-- 提供商目录：provider 摘要与「作用提供商」写入的唯一前端入口。
        必须排在所有消费者（accounts-groups / logs-panel）之前 -->
@@ -1713,8 +1699,6 @@
        （被依赖者先加载）。再往前必须在 providers.js 之后 —— providerSummaries 会问
        window.wbProviders 要 label（运行期调用，实际顺序不如上面那条硬，但保持同序更稳）。
        accounts-model 必须在 accounts-view 之前：后者引用它的判定与标签渲染。
-       usage-panel 必须在 accounts-model 之前：后者的 usagePanelHtml 转调它
-       （余额面板的两套形状渲染已拆到那个文件，见它的模块头）。
        表格化后的三个新文件（顺序都是加载期就要按名解构，不能靠运行期兜底）：
          usage-actions  余额 / 签到的动作层，必须在 accounts-view 之前
                         —— 后者在 IIFE 里就解构它的缓存 Map（要的是 Map 本身，不是副本）
@@ -1724,7 +1708,6 @@
        四个文件的引用路径与原 wbAccountsModel / wbAccountsView 保持一致
        （accounts-view.js 末尾把动作层再导出一次），app.js 等消费方一行都不用改。 -->
   <script src="accounts-groups.js"></script>
-  <script src="usage-panel.js"></script>
   <script src="accounts-model.js"></script>
   <script src="usage-actions.js"></script>
   <script src="accounts-table.js"></script>
@@ -1790,10 +1773,14 @@
   <!-- Accio 两个地区的表单配置（纯常量，无依赖）。同样必须在 add-provider-forms.js
        之前：后者在加载期读它的表单配置。 -->
   <script src="add-accio.js"></script>
-  <!-- 「从其他工具导入」面板（cc-switch…）。必须在 add-provider-forms.js **之前**：
+  <!-- ZCode 两个地区的表单配置（纯常量，无依赖）。同样必须在 add-provider-forms.js
+       之前：后者在加载期读它的表单配置。 -->
+  <script src="add-zcode.js"></script>  <!-- 「从其他工具导入」面板（cc-switch…）。必须在 add-provider-forms.js **之前**：
        后者加载期就跑 mountAddProviderUi，会立刻调 window.wbAddImport.mount 把面板
        与「导入所选」按钮装进第 1 步骨架（那时 DOM 已解析）。它自己不注册表单块，
-       与 add-custom-provider.js 无顺序关系；加载期依赖只有 wbApp 与 wbProviders。 -->
+       与 add-custom-provider.js 无顺序关系；加载期依赖只有 wbApp 与 wbProviders。
+       注：导入分段当前在界面上收起（add-provider-forms.js 的 IMPORT_SEGMENT_ENABLED），
+       于是 mount 不会被调到；脚本照旧加载，等这一屏补齐只需打开那个开关。 -->
   <script src="add-provider-import.js"></script>
   <script src="add-provider-forms.js"></script>
   <!-- 自定义提供商（custom- 前缀）的界面。add-custom-provider.js 要向

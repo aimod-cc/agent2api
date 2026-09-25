@@ -38,10 +38,21 @@
    *  当前实现只接了 cc-switch（本机 SQLite 自动扫描），其余来源待续。
    *  这一屏的面板与底部按钮归 add-provider-import.js，本文件只切显隐。 */
   const TYPE_IMPORT = 'import';
+  /**
+   * 「导入」分段是否露出。当前 **false**：这一屏还没做完整，先从界面上收起来。
+   *
+   * 收的是入口、不是实现 —— add-provider-import.js、后端 `/api/import/cc-switch`
+   * 与配套 CSS 全部原样留着，等这一屏补齐把这里改回 true 即可，不必回滚代码。
+   * 关掉之后：分段不生成 → addAccountType 到不了 TYPE_IMPORT → 导入面板不挂载、
+   * 底部「导入所选」也不会被点亮，走的就是「用户从没点过这个分段」那条路径。
+   */
+  const IMPORT_SEGMENT_ENABLED = false;
   /** 分段值归一：四个取值之外的一律按「反代」处理（DOM 被人改坏时的保守落点，
-      与 resetAddStep 的复位取向一致） */
+      与 resetAddStep 的复位取向一致）；导入分段收起时它的取值同样归到「反代」，
+      免得旧 DOM / 外部调用把界面切进一屏没有入口可回来的地方 */
   const typeValueOf = value =>
-    (value === TYPE_PRESET || value === TYPE_CUSTOM || value === TYPE_IMPORT
+    (value === TYPE_PRESET || value === TYPE_CUSTOM
+      || (IMPORT_SEGMENT_ENABLED && value === TYPE_IMPORT)
       ? value
       : TYPE_PROXY);
   /** 预置家卡片的取值前缀（不是 provider id，只是卡片自己的标记） */
@@ -255,11 +266,15 @@
           + '<br>这是国际版官方唯一的登录方式；若你已在客户端登录过，'
           + '用「导入桌面端登录态」更快。',
         // ── 两种打开方式（与 CatPaw / Qoder / Cline 同一级）──────
-        // 回调落在本机网关的 loopback 端口（见后端 oauth.rs 的模块头），
-        // 与浏览器在哪无关，因此两条路都走得通：
+        // 回调落在 z.ai 给官方客户端登记的那四个 loopback 端口上（网关登录时
+        // 临时占一个、再转回自己的回调路由，见后端
+        // providers/autoclaw/callback_server.rs 的模块头），与浏览器在哪无关，
+        // 因此两条路都走得通：
         //   · 内嵌窗口每次用**全新的临时环境**，连着加多个账号互不影响；
         //   · 系统浏览器复用你已登录的 Zai / Google 账号 —— Google 在部分
         //     环境下会拒绝内嵌窗口登录，那条路走不通时用它兜底。
+        //     （那四个端口若被官方客户端占着，内嵌窗口仍能登 —— 壳侧会把回调
+        //     截回网关；系统浏览器没有窗口可截，界面会给一句提示。）
         modes: [
           {
             value: 'embedded',
@@ -309,6 +324,10 @@
     // 同一套接口，只有登录站点与区域头不同（见 add-accio.js 的模块头与后端
     // `providers::accio::endpoints::Region`）。
     ...(window.wbAccioAddForms || []),
+    // ZCode 同为两家（国内版 / 国际版各占一个 provider）：同一个 zcode 平面
+    // （登录 / 领取），只有推理站点不同（见 add-zcode.js 的模块头与后端
+    // `providers::zcode::region::Region`）。
+    ...(window.wbZcodeAddForms || []),
   ].filter(Boolean);
 
   /** 块 id / input id 的前缀与 provider id 同名，直接复用（少一处要维护的字段） */
@@ -488,8 +507,12 @@
       + ` role="radio" aria-checked="false" tabindex="-1">预置 API</button>`
       + `<button type="button" class="seg-item" data-value="${TYPE_CUSTOM}"`
       + ` role="radio" aria-checked="false" tabindex="-1">自定义</button>`
-      + `<button type="button" class="seg-item" data-value="${TYPE_IMPORT}"`
-      + ` role="radio" aria-checked="false" tabindex="-1">导入</button>`
+      // 「导入」分段暂时收起（见 IMPORT_SEGMENT_ENABLED）：整段不生成，
+      // 后面的 syncTypeHint / syncAddStepSections 里对应分支照旧留着
+      + (IMPORT_SEGMENT_ENABLED
+        ? `<button type="button" class="seg-item" data-value="${TYPE_IMPORT}"`
+          + ` role="radio" aria-checked="false" tabindex="-1">导入</button>`
+        : '')
       + `</div>`
       + `<p class="add-type-hint" id="add-type-hint">把本机客户端的登录态包装成账号，或用官方授权页登录。</p>`
       + `<span class="input-affix add-provider-search" id="add-search-wrap">`
@@ -537,12 +560,15 @@
     }
     // 「导入」段的面板与主按钮归 add-provider-import.js：面板插在卡片网格的
     // 位置上（两者互斥显隐），「导入所选」按钮搬进刚建好的底部操作条 ——
-    // 与自定义块把自己的按钮搬进来同一手法。
-    window.wbAddImport?.mount?.({
-      host: $(ADD_PROVIDER_GRID_ID)?.parentElement,
-      before: $(ADD_PROVIDER_GRID_ID),
-      footActions: $(ADD_FOOT_ACTIONS_ID),
-    });
+    // 与自定义块把自己的按钮搬进来同一手法。分段收起时（IMPORT_SEGMENT_ENABLED）
+    // 整块不挂：那一屏没有入口，留着面板与按钮只是两处永远不会被点亮的 DOM。
+    if (IMPORT_SEGMENT_ENABLED) {
+      window.wbAddImport?.mount?.({
+        host: $(ADD_PROVIDER_GRID_ID)?.parentElement,
+        before: $(ADD_PROVIDER_GRID_ID),
+        footActions: $(ADD_FOOT_ACTIONS_ID),
+      });
+    }
 
     // ⑤ 把既有区块（除刚插入的两个步骤容器）整体收进 WorkBuddy 容器
     const workbuddy = document.createElement('div');
@@ -944,6 +970,10 @@
     // Accio 两个地区共用一张（同一个客户端、同一个品牌标）
     accio: 'assets/providers/accio.png',
     'accio-cn': 'assets/providers/accio.png',
+    // ZCode 两个地区共用一张（同一个客户端；图取自 ZCode 仓库
+    // `public/logo/icons/256x256.png`，与系统里显示的为同一张）
+    zcode: 'assets/providers/zcode.png',
+    'zcode-intl': 'assets/providers/zcode.png',
   };
 
   /** 卡片图标：收录过的家出真实图标，其余仍用首字母徽章。
@@ -1464,8 +1494,9 @@
 
   // 添加账号弹窗：两步结构（选提供商 → 选方式填凭证）、分段控件交互与各家的添加方式。
   mountAddProviderUi();
-  // WorkBuddy 的版本与打开方式由 add-account.js 处理选中项变化。
-  for (const id of ['add-edition-seg', 'add-login-mode']) bindSeg($(id));
+  // WorkBuddy 的版本与打开方式（index.html 里静态那两处）改由 React 岛渲染，
+  // 挂载与选中项变化都在 add-account.js 的 mountAddSegs 里，本文件不再绑定它们。
+  // 下面这些动态生成的分段控件仍走 bindSeg。
   resetAddStep();
   for (const config of ADD_FORMS) {
     const prefix = prefixOf(config);

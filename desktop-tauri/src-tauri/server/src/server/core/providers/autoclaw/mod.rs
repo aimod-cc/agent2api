@@ -20,13 +20,16 @@
 //!                   移植来源：`autoclaw-upstream-client.mjs` 的转发链
 //!   prompt.rs       出站 **system 提示规范化**：前置 OpenClaw 身份前缀 + 改写
 //!                   外来 harness 身份句（上游 2026-09-22 起的 system 白名单，
-//!                   实测表在该文件头）
+//!                   国内 / 国际版同闸，实测表在该文件头）
 //!   balance.rs      积分钱包 + 订阅信息查询（移植来源 `account-balance.mjs`）
 //!   checkin.rs      每日签到（**逆向**：老项目没有这条链路，接口从 AutoClaw
 //!                   桌面端的 app.asar 里读出并实测确认）
 //!   oauth.rs        **国际版**的 OAuth 网页登录（Zai / Google）：服务端那两跳
 //!                   （取授权地址 / 用码换凭证）。浏览器那一半 —— 强制风控
 //!                   验证码 —— 在 `ui/autoclaw-oauth.js`（主窗口里跑阿里云 SDK）
+//!   callback_server.rs  那条链的回调**必须**落在 z.ai 登记过的那四个端口上
+//!                   （白名单只认它们，见该文件头），这里临时占用其中一个
+//!                   并把回调转回网关自己的回调路由
 //!
 //! ── 接线现状（T-c2 已落地）──────────────────────────────────
 //! `adapter_for(AutoClaw)` 返回 [`adapter::AUTOCLAW_ADAPTER`]，`implemented_kinds()`
@@ -88,6 +91,7 @@
 
 pub mod adapter;
 pub mod balance;
+pub mod callback_server;
 pub mod catalog;
 pub mod checkin;
 pub mod crypto;

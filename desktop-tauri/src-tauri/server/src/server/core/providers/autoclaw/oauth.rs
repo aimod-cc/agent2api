@@ -50,14 +50,18 @@
 //!
 //!   - **第 ② 步（`oauth-url` 接口）**：只做非空校验，不校验形态也不校验主机。
 //!     传 `not-a-url` / `ftp://x/y` / `http://127.0.0.1:1/a` 得到的都是同一个
-//!     630014（缺验证码），没有一个被更早地拒掉 —— 客户端的端口也是运行时挑的，
-//!     「端口必须是某个固定值」这条约束并不存在。
-//!   - **登录完成后的 authorize 跳转**：Zai 的 OAuth 服务校验 `redirect_uri`
-//!     白名单。host 用 `127.0.0.1` 时窗口里直接渲染
-//!     `{"detail":"Redirect URI not registered for this client"}`（2026-09-22
-//!     实测，Google 同形态却能过 —— 两家的白名单规则不同）；`localhost` 正常。
-//!     因此 `navigate_uri` 必须与客户端逐字同款：
-//!     `http://localhost:<port>/auth/callback-{vendor}`（见 [`CALLBACK_PATH_PREFIX`]）。
+//!     630014（缺验证码），没有一个被更早地拒掉 —— 因此**这一步不能用来判断
+//!     「什么形态能过」**（早期正是把这里的宽松误当成了整体结论）。
+//!   - **登录完成后的 authorize 跳转**：Zai 的 OAuth 服务按 client 登记的
+//!     白名单逐字校验 `redirect_uri`。名单里只有官方客户端那四个 loopback
+//!     端口（`18432 / 19654 / 19723 / 53699`）上的 `http://localhost:<端口>/auth/callback-zai`
+//!     —— 端口不是那四个之一（网关自己的端口、`127.0.0.1`、路径不对……）
+//!     一律被拒，窗口里直接渲染
+//!     `{"detail":"Redirect URI not registered for this client"}`。
+//!     **Google 是另一套规则**（RFC 8252 的 loopback 宽松匹配，端口任意），
+//!     所以同一份代码「谷歌能登、Zai 登不上」—— 端口那一半由
+//!     [`callback_server`](super::callback_server) 解决（登录时临时占用一个
+//!     登记端口并把回调转回网关），本模块只负责拼对形态。
 //!
 //! 于是回调直接挂在本网关自己的监听端口上（与 CatPaw 同一手法，见
 //! `core::login::catpaw` 的模块头）：省掉一个临时监听器，也省掉「临时端口
@@ -149,13 +153,19 @@ impl Vendor {
 /// `http://localhost:<port>/auth/callback-zai|google`）。变体放在路径末段，
 /// 回调处理函数据此认出这次回调属于哪个变体。
 ///
-/// ── 为什么形态一个字都不能改（2026-09-22 实测）───────────────
+/// ── 为什么形态一个字都不能改（2026-09-22 实测，issue #11 修正）──
 /// 上游在第 ② 步（`oauth-url` 接口）对 `navigate_uri` 只做非空校验，但登录
-/// 完成、Zai 的 OAuth 服务生成 302 之前会校验 `redirect_uri` 白名单：host 用
-/// `127.0.0.1` 得到 `{"detail":"Redirect URI not registered for this client"}`
-/// （Google 链路同形态却能过 —— 两家的白名单规则不同），`localhost` 正常。
-/// 客户端的端口是运行时挑的，所以白名单不可能精确到端口；能不能精确到路径
-/// 也未实测 —— 因此**连路径都照抄客户端**，把未知规则的风险降到零。
+/// 完成、Zai 的 OAuth 服务生成 302 之前会按 client 登记的名单校验
+/// `redirect_uri`：只有官方客户端那四个端口上的这个形态能过
+/// （`http://localhost:18432|19654|19723|53699/auth/callback-zai`），
+/// 别的（网关自己的端口、`127.0.0.1`、路径不对）得到
+/// `{"detail":"Redirect URI not registered for this client"}`。
+/// Google 的名单是宽松匹配（端口任意），因此它一直能过 —— 别把 Google 的表现
+/// 当成两家的共同规则。
+///
+/// **端口由调用方给**：`callback_base` 是「这一轮的回调落点」，正常是登录时
+/// 借到的登记端口（见 `super::callback_server`），抢不到时才回落到网关自己的
+/// 端口（那时 Zai 这条路走不通，Google 不受影响）。
 ///
 /// 与 CatPaw 的 loopback 回调同一手法，但这里没有把 state 拼进 URL：
 /// 放查询串会与上游 302 带回的 `state`（上游自己生成的另一个值，见
@@ -166,9 +176,10 @@ pub const CALLBACK_PATH_PREFIX: &str = "/auth/callback-";
 
 /// 拼这次登录的回调地址（同时也是交给上游的 `navigate_uri`）。
 ///
-/// `callback_base` 是本网关自己的 loopback 基址（`http://localhost:<port>`），
-/// 由调用方给出 —— 本模块拿不到监听端口（它在 `ServerState` 上）。host 必须
-/// 是 `localhost`（理由见 [`CALLBACK_PATH_PREFIX`] 的说明）。
+/// `callback_base` 是这一轮的**回调落点基址**（`http://localhost:<端口>`），
+/// 由调用方给出（`core::login::autoclaw` 的 `callback_endpoint` 决定用哪个
+/// 端口，本模块拿不到）。host 必须是 `localhost`、端口必须是登记过的那四个
+/// 之一（理由见 [`CALLBACK_PATH_PREFIX`] 的说明）。
 pub fn navigate_uri(callback_base: &str, vendor: Vendor) -> String {
     format!(
         "{}{}{}",

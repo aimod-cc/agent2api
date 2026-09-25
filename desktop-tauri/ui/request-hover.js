@@ -76,6 +76,18 @@
   const MIN_PANEL_WIDTH = 520;
   const MIN_PANEL_WIDTH_SENSITIVE = 220;
   /**
+   * 敏感词面板在量出宽度上的宽裕系数（1.1 = 放宽一成）。
+   *
+   * 量出来的 max-content 是「恰好放得下最长一行」的宽度，一点余量都不留 ——
+   * 于是系统缩放不是整数倍时（Windows 125% / 150%），文字的实际排布宽度会比
+   * 量出的值大零点几像素，长敏感词就在最后一个词处折行，而面板右边明明还空着
+   * 一截（实测：不折行的边界正好落在量出值上）。放宽一成把这点误差补上。
+   *
+   * 重试链面板不加：它那几行是长文本流，宽一点窄一点只影响换行位置，
+   * 而它的两个宽度上一版刚按错误摘要的长度调过。
+   */
+  const SENSITIVE_WIDTH_SLACK = 1.1;
+  /**
    * 面板宽度的上限（px，还要再夹进视口可用宽度）。
    *
    * 内容自适应负责「够宽」，这里收住「过宽」：一条 200 字符的上游报错
@@ -336,14 +348,18 @@
     // 宽度按内容自适应再夹进视口：切换路径那行可能很长（三家的中文名 + 箭头），
     // 错误摘要更长。用 max-content 量出理想宽度，再夹到下限（MIN_PANEL_WIDTH）
     // 与两个上限（视口可用宽度、MAX_PANEL_WIDTH），放不下的部分交给面板内部
-    // 的换行与滚动。
+    // 的换行与滚动；敏感词面板另外放宽一成（见 SENSITIVE_WIDTH_SLACK）。
     panel.style.maxWidth = 'none';
     panel.style.width = 'max-content';
     const natural = panel.offsetWidth;
-    const minWidth = panel.dataset.kind === 'sensitive' ? MIN_PANEL_WIDTH_SENSITIVE : MIN_PANEL_WIDTH;
-    const cap = Math.min(Math.max(minWidth, natural), avail, MAX_PANEL_WIDTH);
+    const sensitive = panel.dataset.kind === 'sensitive';
+    const minWidth = sensitive ? MIN_PANEL_WIDTH_SENSITIVE : MIN_PANEL_WIDTH;
+    const base = Math.max(minWidth, natural) * (sensitive ? SENSITIVE_WIDTH_SLACK : 1);
+    const cap = Math.min(base, avail, MAX_PANEL_WIDTH);
     panel.style.maxWidth = `${cap}px`;
-    panel.style.width = 'auto';
+    // 敏感词面板把宽度直接定到这个上限（其余保持 auto）：max-width 只是上限，
+    // 内容比它窄时面板仍会缩回 max-content，放宽的一成就落不到实处。
+    panel.style.width = sensitive ? `${cap}px` : 'auto';
 
     const width = panel.offsetWidth;
     const height = panel.offsetHeight;

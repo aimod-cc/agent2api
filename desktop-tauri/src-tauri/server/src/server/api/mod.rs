@@ -70,3 +70,4 @@ pub mod storage_api;
 pub mod timeouts_api;
 pub mod update;
 pub mod upgrade_api;
+pub mod zcode_claim;

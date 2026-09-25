@@ -14,6 +14,13 @@
  *   弹窗退化成「刷新各家的远程目录 + 把逐家结果列清楚」。原先只有一句 toast
  *   （3.5 秒就没了）加表格下方一行小字，失败原因来不及看；现在收进一张表里。
  *
+ * ── 打开**不自动拉取**（本切片改的）────────────────────
+ * 拉取是**逐家打上游**（十家各一次网络请求），而用户点开这个弹窗可能只是想看
+ * 一眼各家的清单时效、或改一下「模型来源」用哪个账号。打开即拉等于把「看一眼」
+ * 也变成一次全量刷新，还让「本次结果」与「上次结果」在界面上分不清。所以：
+ * 打开只建壳 + 渲染待获取的一屏（逐家一行、账号下拉可选、更新日期照常显示），
+ * 拉取由用户点最右侧那颗「获取模型」触发（见 `open` 与 `renderPending`）。
+ *
  * 弹窗按需创建、关闭即移除（与其它弹窗同一手法），不往 index.html 里常驻空弹窗。
  */
 (() => {
@@ -39,6 +46,14 @@
   let picked = new Set();
   /** 在途标志（拉取 / 导入）：置真期间不许关窗，关掉会让「到底成没成」变成未知 */
   let busy = false;
+  /**
+   * 本次会话是否**已经拉过**一次（打开时是 false）。
+   *
+   * 弹窗打开**不自动拉取**（见 `open`），所以「拉过没有」是一份真实状态：
+   * 按钮文案（获取模型 / 重新获取）与自定义家的汇总行（尚未获取 / 已选 N…）
+   * 都读它。关窗即复位 —— 每次打开都是一次新的会话。
+   */
+  let fetched = false;
 
   /**
    * 表格的两种骨架（两个形态各一张表、各存一份列宽，见 table-columns.js 的登记）：
@@ -52,7 +67,7 @@
    */
   const TABLE_ID = { intl: 'fm-table-intl', custom: 'fm-table-custom' };
   const TABLE_COL_ID = { intl: 'fetch-models', custom: 'fetch-models-custom' };
-  const COLS_INTL = ['provider', 'source', 'state', 'count', 'note'];
+  const COLS_INTL = ['provider', 'source', 'state', 'count', 'note', 'updated'];
   const COLS_CUSTOM = ['pick', 'model', 'state'];
 
   /**
@@ -162,6 +177,9 @@
     upstream = [];
     picked = new Set();
     managed = new Set();
+    // 「拉过没有」是**每次会话**的状态（按钮文案与自定义家的汇总行读它）：
+    // 下次打开是全新的一屏待获取，不该继承上一次的
+    fetched = false;
   }
 
   /** 按当前 session 拼出弹窗壳（两种形态共用；表体各自渲染） */
@@ -180,13 +198,13 @@
         </div>
         <div class="modal-body">
           <div class="field-row fm-tools">
-            <button type="button" class="sm" id="fm-refetch" title="重新从上游拉一次">重新获取</button>
+            <span class="detail" id="fm-summary"></span>
             ${custom ? '<span class="input-affix fm-search"><span class="affix">⌕</span>'
               + '<input type="search" id="fm-search" placeholder="搜索模型 ID…" autocomplete="off"></span>' : ''}
             <div class="spacer"></div>
-            <span class="detail" id="fm-summary"></span>
             ${custom ? '<button type="button" class="sm ghost" id="fm-select-all">全选未添加</button>'
               + '<button type="button" class="sm ghost" id="fm-clear">清空</button>' : ''}
+            <button type="button" class="sm" id="fm-refetch" title="从上游拉一次">获取模型</button>
           </div>
           <div class="models-table-wrap fm-wrap">
             <table class="models-table fm-table" id="${custom ? TABLE_ID.custom : TABLE_ID.intl}">
@@ -248,16 +266,20 @@
         + '<th class="fm-state" data-col="state">状态</th>'
       : '<th data-col="provider">提供商</th><th class="fm-source" data-col="source">模型来源</th>'
         + '<th class="fm-state" data-col="state">状态</th><th class="fm-count" data-col="count">模型数</th>'
-        + '<th data-col="note">说明</th>';
+        + '<th data-col="note">说明</th><th class="fm-updated" data-col="updated">更新日期</th>';
     repaintTable();
   }
 
-  /** 汇总行：自定义家是「已选 N / 共 M」，内置家是「N 家 · 成功 X · 失败 Y」 */
+  /** 汇总行（表格左端）：自定义家是「已选 N / 共 M」，内置家是「N 家 · 成功 X · 失败 Y」 */
   function paintSummary(extra) {
     const summary = $('fm-summary');
     if (summary) {
       if (session.custom) {
-        summary.textContent = `已选 ${picked.size} 个 · 上游共 ${upstream.length} 个 · 清单已有 ${managed.size} 个`;
+        // 还没拉过时三个计数都是 0，列出来只会让人以为「上游没有模型」——
+        // 那与「还没拉」是两件事，说清楚前者要等一次拉取
+        summary.textContent = fetched
+          ? `已选 ${picked.size} 个 · 上游共 ${upstream.length} 个 · 清单已有 ${managed.size} 个`
+          : '尚未获取';
       } else if (extra) {
         summary.textContent = extra;
       }
@@ -270,7 +292,7 @@
   }
 
   function emptyRow(text) {
-    const span = session.custom ? 3 : 5;
+    const span = session.custom ? 3 : COLS_INTL.length;
     return `<tr><td colspan="${span}" class="empty">${esc(text)}</td></tr>`;
   }
 
@@ -327,7 +349,65 @@
       + '</select>';
   }
 
-  /** 内置家的表体：逐家刷新结果（提供商 / 模型来源 / 状态 / 数量 / 说明） */
+  /**
+   * 「更新日期」格：这家清单**当前**的拉取时刻。
+   *
+   * 后端逐行给 `refreshedAt`（失败 / 跳过的行是上次成功那次的时刻，0 = 从未
+   * 成功过 → 占位）—— 用「本次请求的时刻」会在失败行上撒谎，显示成刚更新过。
+   * `formatTime` 来自 app.js（全局；0 与非法值返回空串，这里换成占位符）。
+   */
+  function refreshedText(item) {
+    return formatTime(Number(item.refreshedAt) || 0) || '—';
+  }
+
+  /**
+   * 打开时的「待获取」表体 —— 弹窗**不自动拉取**，所以第一屏必须有内容。
+   *
+   * 为什么不是一张空表：①「模型来源」下拉是随结果行渲染的，结果还没有时它
+   * 就不存在 —— 用户没法先选「用哪个账号去拉」，只能先拉一次、看清用了谁、
+   * 改完再拉一次；②用户一眼能看到这次会刷哪些家（与 `scopeProviders` 同源，
+   * 也就是真正会进请求的那份名单）。
+   *
+   * 内置家逐家一行（状态「待获取」）；自定义家只有一家，给一句怎么开始的
+   * 提示 —— 那张表列的是模型清单，没有「待获取的提供商」这一层。
+   *
+   * 「更新日期」列在这一屏**照样有值**：它显示的是各家清单**当前**的时刻
+   * （从模型管理页的 manage 视图读，见 wbModelsPanel.providerRefreshedAt）——
+   * 那正是用户决定「要不要刷」的依据，等刷完才有值就太晚了。
+   */
+  function renderPending() {
+    const body = $('fm-tbody');
+    if (!body || !session) return;
+    if (session.custom) {
+      body.innerHTML = emptyRow('点右侧「获取模型」从上游拉取这家的模型清单');
+      paintSummary();
+      return;
+    }
+    const metas = window.wbProviders?.all?.() || [];
+    const scoped = new Set(scopeProviders());
+    // 按注册表顺序列（与模型管理页左栏同一序）；`all()` 只有内置家，
+    // 自定义家的 id 即使进了 scopeProviders 也不会出现在这里
+    const pending = metas.filter(item => scoped.has(item.id));
+    if (!pending.length) {
+      body.innerHTML = emptyRow('还没有可刷新的提供商：先在账号页添加一个账号');
+      paintSummary('0 家');
+      return;
+    }
+    body.innerHTML = pending.map(item => {
+      const at = formatTime(Number(window.wbModelsPanel?.providerRefreshedAt?.(item.id)) || 0);
+      return `<tr>
+        <td><div class="mid"><span class="t">${esc(item.label || item.id)}</span></div></td>
+        <td class="fm-source">${sourcePicker({ provider: item.id })}</td>
+        <td><span class="badge">待获取</span></td>
+        <td><span class="rate">—</span></td>
+        <td><span class="rate">—</span></td>
+        <td><span class="rate">${esc(at || '—')}</span></td>
+      </tr>`;
+    }).join('');
+    paintSummary(`共 ${pending.length} 家 · 点「获取模型」开始`);
+  }
+
+  /** 内置家的表体：逐家刷新结果（提供商 / 模型来源 / 状态 / 数量 / 说明 / 更新日期） */
   function renderResults(result) {
     const body = $('fm-tbody');
     if (!body || session?.custom) return;
@@ -353,6 +433,7 @@
           <td><span class="badge ${kind}">${esc(label)}</span></td>
           <td><span class="rate">${Number(item.count) ? `${Number(item.count)} 个` : '—'}</span></td>
           <td><span class="detail">${esc(note)}</span></td>
+          <td><span class="rate">${esc(refreshedText(item))}</span></td>
         </tr>`;
     }).join('');
     const done = results.filter(item => item.status === 'refreshed').length;
@@ -384,6 +465,7 @@
         managed = managedIds(session.providerId);
         // 默认勾选「未添加」的那些 —— 与 OmniProxy 同一默认值：用户点进来就是想补新的
         picked = new Set(upstream.filter(id => !managed.has(norm(id))));
+        fetched = true;
         renderRows();
       } else {
         // 「模型来源」下拉的选择与刷新范围随请求带上（范围见 scopeProviders：
@@ -392,6 +474,7 @@
           accounts: sourceMap(),
           providers: scopeProviders(),
         });
+        fetched = true;
         renderResults(result);
         // 真刷到新目录时通知调用方 —— 刷新落地只改了后端那份目录，模型管理页
         // 自持的 manage 视图（左栏计数 / 行的「来源」列）读的是另一条接口
@@ -406,7 +489,9 @@
       paintSummary('');
     } finally {
       busy = false;
-      if (button) { button.disabled = false; button.textContent = '重新获取'; }
+      // 文案按「这次有没有真的拿到一份结果」定：拉失败时按钮仍是「获取模型」
+      // （用户要的是再试一次），成功之后才是「重新获取」
+      if (button) { button.disabled = false; button.textContent = fetched ? '重新获取' : '获取模型'; }
       paintSummary();
     }
   }
@@ -440,6 +525,12 @@
    * 打开弹窗。`providerId` 是当前左栏选中的那家；`custom` 由调用方判好
    *（它已经知道自己是哪一边）。
    *
+   * **打开只建壳，不拉取** —— 拉取要用户点「获取模型」才发生。为什么：一次
+   * 拉取是**逐家打上游**（十家各一次网络请求），而用户点开这个弹窗可能只是想
+   * 看一眼上次的结果、或改一下「模型来源」用哪个账号；打开即拉等于把「看一眼」
+   * 也变成一次全量刷新，还让「本次结果」与「上次结果」在界面上分不清。
+   * 第一屏由 `renderPending` 给出待获取的家与账号下拉（见那里的说明）。
+   *
    * 两个回调分属两种形态，语义都是「**后端数据变了，你那边该重取一次**」——
    * 本弹窗只负责把变化告诉调用方，不替它取数（各自的取数路径与视图都在调用方）：
    *   · `onDone`：自定义家导入成功后（调用方重绘表格）；
@@ -451,7 +542,7 @@
     session = { providerId, custom: Boolean(custom), name: name || providerId, onDone, onRefreshed };
     buildShell();
     renderHead();
-    void load();
+    renderPending();
   }
 
   // Esc = 关闭本弹窗（只在本弹窗开着时动作，与其它弹窗的 Esc 互不干扰）

@@ -80,24 +80,37 @@
 
 /* 刷新说明与逐家结果：常驻在表格下方，不随 toast 消失；有失败才标红 */
 /* ─── 「获取模型」弹窗（models-fetch-modal.js）───
-   形态对照 OmniProxy 的 ModelDiscoveryModal：上面一行工具（重新获取 / 搜索 / 选择），
-   中间一张表，底部导入。表格沿用 .models-table（与模型管理页同一张脸的列宽与字号），
-   这里只补列宽与表格区的高度上限。 */
+   形态对照 OmniProxy 的 ModelDiscoveryModal：上面一行工具（汇总 / 搜索 / 选择 /
+   获取），中间一张表，底部导入。表格沿用 .models-table（与模型管理页同一张脸的
+   列宽与字号），这里只补列宽与表格区的高度上限。
+   工具行的左右分工：**汇总在左、动作在右**（获取模型是最右那颗）—— 用户扫一眼
+   左边就知道这次的结果（N 家 · 成功 X · 失败 Y），右边的按钮才是下一个动作。 */
 .fm-tools { align-items: center; }
 .fm-search { flex: 0 0 auto; width: 240px; }
 .fm-wrap { max-height: min(48vh, 460px); }
 /* 列宽写在 <col> 上（合计 100%，table-layout: fixed 下按 colgroup 分配）——
    与模型管理页同一口径：没拖过的列走这里的百分数，拖过的列由 table-columns.js
    写 col 的 inline width 覆盖（th 上不能写宽度，它会盖过 col，拖动就失效）。
-   百分数按弹窗实际表宽折算：内置家约 872px（920 减内边距）、三列形态约 504px。 */
-#fm-table-intl .f-provider { width: 20%; }
+   百分数按弹窗实际表宽折算：内置家约 872px（920 减内边距）、三列形态约 504px。
+
+   六列怎么分（每格还要减去 td 的左右 14px padding）：更新日期 19%（约 166px，
+   减 padding 后 138px）装下 `formatTime` 的完整输出（等宽 11.5px 下
+   2026/9/25 14:03:11 约 131px）—— 只给「日期」会在同一天的两次刷新之间
+   分不出先后，而这个弹窗的用处之一正是看清单有多旧；模型来源 25% 不动（那列
+   的下限由邮箱长度定，见下）；说明 24%（约 209px）比最长的那句「远程目录已
+   更新，「来源」列会显示为「远程」」窄一点，它会折成两行 —— `.detail` 的行高
+   就是为多行设的，折行比截断好，且只有「已刷新」的行吃这句长文案。差额由
+   提供商 / 状态 / 模型数三列各让一点：它们装的是短词（提供商名 / 两字徽章 /
+   「9 个」），让完仍够。 */
+#fm-table-intl .f-provider { width: 15%; }
 /* 模型来源 25%：这一格的展示名以邮箱为主（emailAsName 的家，见 models-fetch-modal
    的 accountLabel），典型邮箱约 22 字符（如 oyl70969337@gmail.com ≈ 139px）——
    22% 会把触发器上的文本截掉，25% 刚好装下；宽度从最宽的说明列借 */
 #fm-table-intl .f-source { width: 25%; }
-#fm-table-intl .f-state { width: 11%; }
-#fm-table-intl .f-count { width: 10%; }
-#fm-table-intl .f-note { width: 34%; }
+#fm-table-intl .f-state { width: 10%; }
+#fm-table-intl .f-count { width: 7%; }
+#fm-table-intl .f-note { width: 24%; }
+#fm-table-intl .f-updated { width: 19%; }
 /* 自定义家的窄形态（三列）：勾选 40px ≈ 8%、状态 92px ≈ 18%、上游模型吃剩余 */
 #fm-table-custom .f-pick { width: 8%; }
 #fm-table-custom .f-model { width: 74%; }
@@ -499,6 +512,49 @@ button.danger-text:hover:not(:disabled) { background: var(--danger-soft); color:
 .pv .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pv .n { flex: 0 0 auto; color: var(--sidebar-muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .pv.on .n { color: inherit; }
+
+/* 自定义家条目外层的定位容器（.pv 是 button，删除按钮不能嵌在它里面 ——
+   button 套 button 会被解析器拆开，绝对定位也跟着失去参照，见 models-panel 的
+   renderRail）。宽高都交给里面的 .pv，这一层只负责给 × 当坐标原点。 */
+.pv-row { position: relative; flex: none; }
+
+/* 条目上的删除按钮：与右侧那个计数**占同一个位置**，hover / 键盘聚焦时互换
+   —— 计数在「要删它」这一刻没有用，让位给按钮既不用加宽左栏，也不会让
+   12.5px 的名字被挤掉一截。默认隐藏（opacity 而非 display：显隐不动布局，
+   鼠标扫过一排条目时不会有跳动）。 */
+.pv-del {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  box-shadow: none;
+  color: var(--sidebar-muted);
+  font-size: 15px;
+  line-height: 1;
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity .12s ease, color .12s ease, background .12s ease;
+}
+.pv-row:hover .pv-del,
+.pv-del:focus-visible { opacity: 1; }
+/* hover 时把计数让出来（两者都在右缘，不藏计数就会叠字） */
+.pv-row:hover .pv .n { visibility: hidden; }
+/* :not(:disabled) 是为了压过 components.css 的 `button:hover:not(:disabled)`
+   —— 那条的特异性是 (0,2,1)，比单类 + :hover 高一级，不写就抢不回来 */
+.pv-del:hover:not(:disabled) {
+  color: var(--danger);
+  background: var(--nav-hover);
+  border-color: transparent;
+}
 
 /* 「＋ 新建自定义提供商」：虚线框，与上面那些「选一家」的实心项区分开 ——
    它是动作，不是选项；配色仍走侧边栏那一套 */

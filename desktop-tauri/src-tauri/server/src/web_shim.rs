@@ -440,6 +440,33 @@ pub fn shim_js() -> &'static str {
         captchaVerifyParam: String(captchaVerifyParam || ''),
       });
     },
+    // ── ZCode「周末套餐」领取（三个薄封装，直接打账号子路径接口）──────
+    // 与上面的 AutoClaw 三个方法同一形态：界面只管传参，路径与请求体形状
+    // 由这里对着后端 `api::zcode_claim` 的三个处理器写死一处。
+    //
+    // 契约（详见 `api/zcode_claim.rs` 的模块头）：
+    //   · captchaConfig 拿阿里云风控配置（前端用它初始化滑块 SDK）；
+    //     返回 `{enabled:false}` 表示上游此刻不要验证码 —— 前端**不该**弹滑块；
+    //   · preview 只读探测，返回 `{plans:[...], deployed}`；
+    //     `deployed:false` = 活动接口尚未部署（开抢前的正常状态，不是错误）；
+    //   · claim 真正领取，必须带 captchaVerifyParam；**业务失败也走 200**，
+    //     由 `ok:false` + `failure` 表达（前端据此选提示文案）。
+    zcodeClaimCaptchaConfig: function (accountId) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(accountId || ''))
+        + '/zcode-claim/captcha-config');
+    },
+    zcodeClaimPreview: function (accountId) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(accountId || ''))
+        + '/zcode-claim/preview');
+    },
+    zcodeClaim: function (accountId, planId, captchaVerifyParam, captchaRegion) {
+      return call('POST', '/api/accounts/' + encodeURIComponent(String(accountId || ''))
+        + '/zcode-claim', {
+        planId: planId ? String(planId) : '',
+        captchaVerifyParam: String(captchaVerifyParam || ''),
+        captchaRegion: captchaRegion ? String(captchaRegion) : '',
+      });
+    },
     onLoginState: function (callback) {
       loginListeners.add(callback);
       return function () { loginListeners.delete(callback); };

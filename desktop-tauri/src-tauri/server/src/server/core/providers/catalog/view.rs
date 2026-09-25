@@ -122,7 +122,9 @@ pub fn manage_view(store: &AccountStore) -> Value {
     for (kind, mut manifest) in active_manifests(store) {
         let provider = kind_id(kind);
         manifest.sort_by_key(|item| !rules.default_enabled(provider, &model_id(item)));
-        let source = if refresh_meta(kind).0 { "remote" } else { "builtin" };
+        // 一次取「远程与否 + 拉取时刻」：两者是同一处状态，分两次取会多读一次锁
+        let (remote, refreshed_at) = refresh_meta(kind);
+        let source = if remote { "remote" } else { "builtin" };
         for item in manifest {
             let id = model_id(&item);
             if id.is_empty() { continue; }
@@ -158,6 +160,10 @@ pub fn manage_view(store: &AccountStore) -> Value {
                 "isDefault": item.get("isDefault").and_then(Value::as_bool).unwrap_or(false),
                 "provider": provider, "providerLabel": super::super::label_of(provider),
                 "source": source, "enabled": enabled, "aliases": aliases,
+                // 这一家的清单是什么时候拉到的（毫秒；0 = 从未成功拉过）。
+                // 缓存恢复的清单与刚拉的清单**都是 `remote`**，时效只能靠这个
+                // 时间戳说明（见 `providers::catalog_cache` 的模块头）。
+                "refreshedAt": refreshed_at,
             }));
         }
     }

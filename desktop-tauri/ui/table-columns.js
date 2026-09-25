@@ -106,7 +106,7 @@
       columnsOf: visibleColumnsOf(() => window.wbRequestsPanel?.visibleColumns?.()),
     },
     // 「获取模型」弹窗的表（models-fetch-modal.js 动态创建，关闭即移除）。
-    // 两个形态各一张表、各存一份列宽：列集合不同（内置家五列 / 自定义家三列），
+    // 两个形态各一张表、各存一份列宽：列集合不同（内置家六列 / 自定义家三列），
     // 混用一份覆盖值会让「拖过的 provider 列宽」串到自定义家去（那边没有这列）。
     // 初始化时表还不存在（弹窗未开）→ 这三个函数都按「找不到 root」空转，
     // 真正的恢复 / 补把手 / 绑定发生在弹窗每次渲染后的 repaint（见下）。
@@ -114,7 +114,7 @@
       id: 'fetch-models',
       mode: 'table',
       root: '#fm-table-intl',
-      columns: ['provider', 'source', 'state', 'count', 'note'].map(key => ({ key })),
+      columns: ['provider', 'source', 'state', 'count', 'note', 'updated'].map(key => ({ key })),
     },
     {
       id: 'fetch-models-custom',

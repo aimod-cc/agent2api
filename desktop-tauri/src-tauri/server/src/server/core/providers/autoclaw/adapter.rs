@@ -42,12 +42,16 @@
 //!      **没有**这个头。故本适配器不再发它。
 //!   2. **system 提示词白名单**：必须以 `You are a personal assistant running
 //!      inside OpenClaw.` 开头且带 `## Tooling` 段，且不得含外来 harness 身份句
-//!      （`You are ZCode…` / `You are Claude Code…`）。见 `super::prompt`（那里
-//!      有完整的实测表）。
+//!      （`You are ZCode…` / `You are Claude Code…` / `You are Codex…` /
+//!      `You are an AI agent powered by DeepSeek Harness…`）。见 `super::prompt`
+//!      （那里有完整的实测表与改写表）。
 //!
-//! 两道闸都只在**国内版**实测过；国际版沿用同一套头集合与同一份提示规范化
-//! （两地是同一套客户端代码的两个构建，闸门形态一致的概率高，且去掉一个头 +
-//! 加一段前缀对国际版无害 —— 国际版实测 200 的那条请求本来就不带这个头）。
+//! 两道闸的实测范围不同，别混着说：**头闸**只在国内版实测过（国际版沿用同一套
+//! 头集合 —— 两地是同一套客户端代码的两个构建，且去掉一个头 + 加一段前缀对国际版
+//! 无害，国际版实测 200 的那条请求本来就不带这个头）；**system 白名单**两个地区
+//! 都实测过 —— 国际版 2026-09-24 由 issue #10 独立复现（同一账号、同一模型，只改
+//! system 一句即 200 / 406 两分），并据此追加了 `DeepSeek Harness` 身份句与新版
+//! Codex 的两条句式（首句 / 第二句，见 `super::prompt`）。
 //!
 //! ── 三处「不做什么」（与源实现对齐，别顺手补）────────────────
 //!   1. **不做消息序列的增删**（但**要**给 system 加前缀，见下）：源实现从不改
@@ -244,15 +248,26 @@ impl ProviderAdapter for AutoClawAdapter {
     /// 网关的既有口径而不是源项目的 HTTP 层口径：客户端看到的是真实状态码，
     /// 文案前缀与另外三家逐字同形。
     ///
+    /// ── 406 空响应体为什么补一句提示 ────────────────────────────
+    /// 406（空响应体）是 system 提示词闸门拒收的形态（实测表见 `super::prompt`）：
+    /// 上游不给错误体，客户端只会看到「上游返回 406: 上游错误」，无从判断该改
+    /// 什么。文案里补上 [`super::prompt::REJECT_HINT`]（切「替换」模式绕过 /
+    /// 把漏网的身份句反馈回来），与 `content_block::CONTENT_BLOCK_HINT` 同一手法。
+    /// 只在**上游没给 message** 时补 —— 上游自己给了说明的 406 以它为准。
+    ///
     /// `retry_advice` 不覆写：源实现唯一的重试是「401 刷新后重试一次」，
     /// 那是通用链路的动作（`TokenExpired` 分支），**没有 WAF / 退避码**。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
-        let raw = error_body
+        let upstream_message = error_body
             .get("message")
             .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .unwrap_or("上游错误");
-        let message = format!("上游返回 {status}: {raw}");
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let raw = upstream_message.unwrap_or("上游错误");
+        let mut message = format!("上游返回 {status}: {raw}");
+        if status == 406 && upstream_message.is_none() {
+            message.push_str(super::prompt::REJECT_HINT);
+        }
         if status == 401 {
             return UpstreamErrorClass::TokenExpired { message };
         }

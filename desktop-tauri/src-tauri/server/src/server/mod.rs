@@ -323,6 +323,12 @@ impl ServerState {
         // 结果 —— 老用户升级后第一次启动拿到的就是他真正的旧配置，
         // 下面日志裁剪天数与旧文件候选目录才不会用错值。
         let snapshot = config::init(db.clone());
+        // 模型清单的持久化缓存：把**同一个 `Db`** 传进去（与配置 / 日志库 /
+        // 账号库同一形态）。各家的远程清单在进程重启后由它读回，不再回落到
+        // 内置清单（见 `core::providers::catalog_cache` 的模块头）。
+        // 位置必须在这里：它得早于下面那次 `restore_cached_catalogs` 预热 ——
+        // 各家的目录句柄首次初始化时才读缓存，句柄先被碰到就再也读不回来了。
+        core::providers::catalog_cache::install(db.clone());
         // ── 旧文件一次性迁移：**本切片起不再自动跑** ────────────────
         // 它现在由用户在升级弹窗里点「升级」触发（`POST /api/upgrade/run`）。
         // 为什么改成手动：需求是「弹窗告诉用户换了 SQLite，点升级才开始导」——
@@ -401,6 +407,11 @@ impl ServerState {
         // 同一模式）：`core::models::global_catalog()` 与这里的 `models` 是
         // **同一实例**（共享同一把 RwLock），刷新对两边同时可见。
         let models = core::models::global_catalog();
+        // 恢复各家的持久化清单缓存：各家的目录句柄在这一步**首次初始化**
+        // （`OnceLock`），缓存也只在这一刻读得回来（见 `providers::catalog_cache`
+        // 的模块头）。必须在上面那次 `install` 之后 —— 句柄先被别处碰到的话，
+        // 它就固化在「没有缓存」的空状态上，这次预热也补不回来。
+        core::providers::adapter::restore_cached_catalogs();
         let upstream = UpstreamService::new(store.clone(), auth.clone());
 
         // ── 定时签到与软件更新（切片 6）──────────────────────────

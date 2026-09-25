@@ -26,6 +26,7 @@ use std::sync::{OnceLock, RwLock};
 
 use serde_json::{json, Value};
 
+use crate::server::core::providers::catalog_cache;
 use crate::server::logging;
 
 use super::credentials::AutoClawCredentials;
@@ -68,7 +69,8 @@ struct CatalogState {
     fetched_at: i64,
 }
 
-/// 按地区取那一格目录缓存。
+/// 按地区取那一格目录缓存。首次初始化时**先从持久化缓存恢复**（上次成功
+/// 拉到的远程清单），没有再留空 —— 空状态的读取语义就是「回落到静态路由表」。
 ///
 /// ── 为什么必须按地区分格（本次新增地区时的硬判断）────────────
 /// 两地的 `autoclaw-model-config` 是**两个站点的两份清单**：国内版目录里
@@ -80,7 +82,7 @@ struct CatalogState {
 /// 用两个独立的 `OnceLock<RwLock<_>>` 而不是 `HashMap<Region, _>`：地区的
 /// 取值是编译期已知的两个，静态格子没有锁竞争、也不需要哈希开销，
 /// 与「provider 是编译期内置的」这一既有取舍一致（见 `providers/mod.rs`
-/// 对静态注册表的说明）。
+/// 对静态注册表的说明）。持久化缓存沿用同一粒度（两个 scope 各一条）。
 fn catalog(region: Region) -> &'static RwLock<CatalogState> {
     static CN: OnceLock<RwLock<CatalogState>> = OnceLock::new();
     static INTL: OnceLock<RwLock<CatalogState>> = OnceLock::new();
@@ -88,7 +90,26 @@ fn catalog(region: Region) -> &'static RwLock<CatalogState> {
         Region::Cn => &CN,
         Region::Intl => &INTL,
     };
-    slot.get_or_init(|| RwLock::new(CatalogState::default()))
+    slot.get_or_init(|| RwLock::new(restored_state(region)))
+}
+
+/// 首次初始化读一次持久化缓存（见 `providers::catalog_cache` 的模块头）。
+///
+/// 缓存里存的就是 `CatalogState` 的形态（`refresh` 落地的那份），所以这里只做
+/// 「搬回来」：不重新归一 —— 两处各写一份映射迟早分叉。
+fn restored_state(region: Region) -> CatalogState {
+    match catalog_cache::load(cache_scope(region)) {
+        Some(cached) => CatalogState { models: cached.models, fetched_at: cached.fetched_at },
+        None => CatalogState::default(),
+    }
+}
+
+/// 地区 → 持久化缓存的 scope。两地各一条，互不覆盖（理由见 `catalog`）。
+fn cache_scope(region: Region) -> &'static str {
+    match region {
+        Region::Cn => catalog_cache::SCOPE_AUTOCLAW_CN,
+        Region::Intl => catalog_cache::SCOPE_AUTOCLAW_INTL,
+    }
 }
 
 fn read_state(region: Region) -> CatalogState {
@@ -307,6 +328,10 @@ pub async fn refresh(
     let mut state = read_state(region);
     state.models = models;
     state.fetched_at = logging::now_ms();
+    // 落持久化缓存（进程重启后由 `restored_state` 读回）：`state` 要被
+    // `write` 消费，所以先存；**不在目录锁内** —— 缓存写入要拿库连接锁，
+    // 两把锁不能嵌套。scope 与格子一一对应，两地互不覆盖。
+    catalog_cache::save(cache_scope(region), &state.models, state.fetched_at);
     match catalog(region).write() {
         Ok(mut guard) => *guard = state,
         Err(poisoned) => *poisoned.into_inner() = state,

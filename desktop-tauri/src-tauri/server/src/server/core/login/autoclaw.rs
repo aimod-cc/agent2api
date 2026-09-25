@@ -23,11 +23,20 @@
 //! 授权码由浏览器直接送到本机回调上，网关拿到就换凭证 —— 中间没有任何需要
 //! 轮询的状态（不像设备授权那样「用户确认了没有」只能靠问上游）。所以这条
 //! 链路与 CatPaw 一样：登记任务 → 等回调 → 收尾，超时由一个定时任务兜底。
+//!
+//! ── 回调**必须**落在 z.ai 登记过的那四个端口上（issue #11 的根因）──
+//! 「回调挂在网关自己的监听端口上」这个形态对 Google 成立、对 Zai **不**成立：
+//! Zai 的 OAuth 服务按 client 登记的白名单逐字校验 `redirect_uri`，名单里只有
+//! 官方客户端那四个 loopback 端口（`18432 / 19654 / 19723 / 53699`），网关端口
+//! 会被拒（`{"detail":"Redirect URI not registered for this client"}`）。因此
+//! 发起登录时先借一个登记端口（[`callback_server`]），回调落到那里再转回网关
+//! 自己的回调路由 —— 换码与落账号仍然只有网关那一份实现。
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::server::core::providers::autoclaw::callback_server::{self, CallbackListener};
 use crate::server::core::providers::autoclaw::oauth::{self, Vendor};
 use crate::server::core::providers::autoclaw::{credentials, profile, Region};
 use crate::server::errors::GatewayError;
@@ -45,9 +54,16 @@ use super::{finish_task_error, LoginService, LoginTaskHandle, LOGIN_TIMEOUT_MS};
 ///
 /// ── `navigate_uri` 为什么要留着 ─────────────────────────────
 /// 换码那一跳（`oauth-login`）要求它**与取授权地址时逐字相同**
-/// （客户端也是这么传的）。它包含本机端口与 state，回调进来时重新拼不出来
-/// （端口在 `ServerState` 上，且 state 虽然能从回调 URL 里取到、但那样拼出的
-/// 字符串未必与当初发给上游的那个一致）—— 因此存下来原样回传。
+/// （客户端也是这么传的）。它带着本机端口（登记端口或网关端口，取决于这一轮
+/// 有没有抢到登记端口），回调进来时重新拼不出来（端口在本模块手里、不在
+/// `ServerState` 上）—— 因此存下来原样回传。
+///
+/// ── `listener` 为什么要挂在这里（而不是起一个常驻监听）──────
+/// 回调**必须**落在 z.ai 登记过的那四个端口上（理由见
+/// `providers::autoclaw::callback_server` 的模块头），因此这一轮登录得临时
+/// 占一个。占来的监听器挂在这条记录上，**记录被移除 = 端口被释放** ——
+/// 三条收尾路径（回调换码、5 分钟超时、用户取消）都会移除它，因此不需要
+/// 任何额外的关闭逻辑，也不会在用户没登录时占着官方客户端的端口。
 ///
 /// `pub(super)`：`LoginService` 的字段类型要写它（那张表在 `core::login` 里）。
 ///
@@ -65,6 +81,23 @@ pub(super) struct PendingOauth {
     navigate_uri: String,
     device_id: String,
     created_at: i64,
+    /// 这一轮占用的登记端口监听器；`None` = 一个都没占到（官方客户端在跑），
+    /// 此时 `navigate_uri` 仍指向登记端口（白名单那关必须过），内嵌窗口那条
+    /// 路由壳侧把回调截回网关（见 `src/login.rs` 的 `autoclaw_callback_forward`）。
+    ///
+    /// 字段名带下划线是因为它**只被持有**（读它的地方没有）：它的价值在
+    /// `Drop` 里 —— 记录一移除，端口就还回去。
+    _listener: Option<CallbackListener>,
+}
+
+/// 这一轮登录的回调落点（[`LoginService::callback_endpoint`] 的返回值）。
+struct CallbackEndpoint {
+    /// 拼 `navigate_uri` 用的基址（登记端口或网关自己的地址）。
+    base: String,
+    /// 占到的登记端口监听器（随 `PendingOauth` 一起释放）。
+    listener: Option<CallbackListener>,
+    /// 需要用户知道的降级提示（前端 toast）；没有降级时为 `None`。
+    notice: Option<String>,
 }
 
 impl LoginService {
@@ -73,18 +106,31 @@ impl LoginService {
     /// `captcha_verify_param` 由前端跑完阿里云 SDK 得到（见
     /// `providers::autoclaw::oauth` 的模块头）—— 网关不解析它，只转交上游。
     ///
-    /// `callback_base` 是本网关自己的 loopback 基址（`http://127.0.0.1:<port>`），
-    /// 由调用方给出（本模块拿不到监听端口，它在 `ServerState` 上）。
+    /// `gateway_base` 是本网关自己的 loopback 基址（`http://localhost:<网关端口>`），
+    /// 由调用方给出（本模块拿不到监听端口，它在 `ServerState` 上）。它有两个
+    /// 用途：回调监听器的**转发目标**，以及抢不到登记端口时的**回落地址**。
+    ///
+    /// `local_browser` = 浏览器与网关在同一台机器上（桌面形态、本机 headless）。
+    /// 只有这种形态才去占登记端口：容器 / 远程部署里浏览器解析到的 `localhost`
+    /// 是**它自己**那台机器，占了也接不到回调，反而会把 Google 那条本来能走的
+    /// 路（宽松白名单 + 网关自己的端口）弄坏。判据由调用方给（见
+    /// `api::session::login_oauth_start`），本模块不猜部署形态。
+    ///
+    /// 返回 `(任务句柄, 给界面看的提示)`：提示非空时表示这一轮有需要用户知道
+    /// 的降级（登记端口一个都没抢到），前端会 toast 出来；成功走完那条链时是
+    /// `None`。
     pub async fn start_autoclaw_oauth_login(
         &self,
         region: Region,
         vendor: Vendor,
         captcha_verify_param: &str,
-        callback_base: &str,
-    ) -> Result<LoginTaskHandle, String> {
+        gateway_base: &str,
+        local_browser: bool,
+    ) -> Result<(LoginTaskHandle, Option<String>), String> {
         let state = random_hex()?;
         let device_id = oauth::new_oauth_device_id();
-        let navigate = oauth::navigate_uri(callback_base, vendor);
+        let endpoint = self.callback_endpoint(gateway_base, vendor, local_browser).await;
+        let navigate = oauth::navigate_uri(&endpoint.base, vendor);
         // 这一步要过风控，失败原因（630014 / 631002）由 oauth 模块翻成人话
         let auth_url = oauth::request_oauth_url(
             region,
@@ -111,6 +157,7 @@ impl LoginService {
                 navigate_uri: navigate,
                 device_id,
                 created_at: logging::now_ms(),
+                _listener: endpoint.listener,
             },
         );
         // 超时兜底：这条链没有后台轮询（回调是唯一入口），因此必须有人负责
@@ -120,12 +167,73 @@ impl LoginService {
         logging::log(
             "[Login]",
             &format!(
-                "发起 AutoClaw {} {}登录（等待浏览器回调…）",
+                "发起 AutoClaw {} {}登录（回调 {}，等待浏览器回调…）",
                 region.label(),
-                vendor.label()
+                vendor.label(),
+                endpoint.base
             ),
         );
-        Ok(handle)
+        Ok((handle, endpoint.notice))
+    }
+
+    /// 这一轮回调该落在哪个地址上（同时把该占的端口占住）。
+    ///
+    /// ── 判据链（顺序即优先级）──────────────────────────────────
+    /// 1. 能占到四个登记端口之一 → 就用它（白名单 + 回调都成立，两个变体通吃）；
+    /// 2. 占不到（官方客户端在跑）→ 看变体：
+    ///    - **Google**：回落到网关自己的端口。它的白名单是宽松匹配（端口任意），
+    ///      网关端口一直能过 —— 回落等于保持现状，不让一条能走的路因为抢不到
+    ///      端口而变差；
+    ///    - **Zai**：**仍然**指向登记端口（白名单那关必须过，否则 authorize
+    ///      直接拒），回调靠壳侧内嵌窗口截回网关（见 `src/login.rs` 的
+    ///      `autoclaw_callback_forward`）—— 同时给一句提示，因为「系统浏览器」
+    ///      方式没有窗口可截，那条路得先退出官方客户端；
+    /// 3. 浏览器不在本机（容器 / 远程面板）：不占端口，沿用网关自己的地址 ——
+    ///    浏览器解析到的 `localhost` 是它自己那台机器，占了也没用。Zai 在这种
+    ///    形态下本来就走不通（白名单），提示里说清替代入口。
+    async fn callback_endpoint(
+        &self,
+        gateway_base: &str,
+        vendor: Vendor,
+        local_browser: bool,
+    ) -> CallbackEndpoint {
+        if !local_browser {
+            let notice = (vendor == Vendor::Zai).then(|| {
+                "当前部署形态下网关不在浏览器所在的机器上，Zai 登录无法完成 —— \
+                 请改用 Google 登录，或用「填写凭证」/「导入桌面端登录态」"
+                    .to_string()
+            });
+            return CallbackEndpoint {
+                base: gateway_base.trim_end_matches('/').to_string(),
+                listener: None,
+                notice,
+            };
+        }
+        match CallbackListener::bind(gateway_base).await {
+            Ok(listener) => CallbackEndpoint {
+                base: format!("http://localhost:{}", listener.port()),
+                listener: Some(listener),
+                notice: None,
+            },
+            Err(reason) => {
+                logging::log("[Login]", &format!("⚠️ {reason}"));
+                if vendor == Vendor::Google {
+                    // Google 宽松，回落不影响可用性（理由见函数头）
+                    return CallbackEndpoint {
+                        base: gateway_base.trim_end_matches('/').to_string(),
+                        listener: None,
+                        notice: None,
+                    };
+                }
+                CallbackEndpoint {
+                    base: format!("http://localhost:{}", callback_server::REGISTERED_CALLBACK_PORTS[0]),
+                    listener: None,
+                    notice: Some(format!(
+                        "{reason}：内嵌窗口方式仍可正常登录，用「系统浏览器」方式请先退出它"
+                    )),
+                }
+            }
+        }
     }
 
     /// 把这次登录的额外状态记进待办表（见 `PendingOauth`）。

@@ -127,6 +127,11 @@
   const RANGES = ['today', '7', '30', 'month', 'all'];
   const DEFAULT_RANGE = 'all';
   const RANGE_LABEL = { today: '今天', 7: '近 7 天', 30: '近 30 天', month: '本月', all: '全部' };
+  /**
+   * 分段控件上的短标签。与 RANGE_LABEL 是两套，别合并：那边是摘要文字
+   * （「近 7 天」），控件里位置窄，用更短的（「7 天」）。
+   */
+  const RANGE_OPTION_LABEL = { today: '今天', 7: '7 天', 30: '30 天', month: '本月', all: '全部' };
 
   /** 只有明确存过合法档位才采纳；无值 / 读取抛错 / 值被改坏一律回落「全部」 */
   function readRange() {
@@ -942,27 +947,32 @@
 
   // ─── 事件绑定 ──────────────────────────────
 
-  // 时间档位的默认值（「全部」）写在 HTML 里，存过的值在这里纠正
-  $('req-range')?.querySelectorAll('.seg-item[data-range]').forEach(item => {
-    item.classList.toggle('active', item.dataset.range === range);
-  });
+  // 时间档位由 React 岛渲染（ui/islands/ui.js）：语义、键盘、滑块都在岛上。
+  // 档位取值仍以本文件的 range 为准 —— 岛完全受控，这里只负责灌值与回灌。
+  // 原先「HTML 预置默认值、JS 再纠正」那一步不再需要：初值直接就是 range。
+  let rangeIsland = null;
+  const rangeHost = $('req-range');
+  if (rangeHost && window.wbSegmented) {
+    rangeIsland = window.wbSegmented.mount(rangeHost, {
+      options: RANGES.map(value => ({ value, label: RANGE_OPTION_LABEL[value] })),
+      value: range,
+      ariaLabel: '请求日志时间范围',
+      onChange: setRange,
+    });
+  }
+
+  function setRange(next) {
+    const value = RANGES.includes(next) ? next : DEFAULT_RANGE;
+    if (value === range) return;
+    range = value;
+    persistRange(value);
+    rangeIsland?.setValue(value);
+    void load({ resetPage: true });
+  }
 
   // 状态下拉的选项是静态 HTML，存过的值直接回填（提供商 / 模型两个下拉
   // 的候选是异步的，走 fillFilterSelect 的 desired 入参，见 savedFilters）
   if ($('req-status')) $('req-status').value = savedFilters.status;
-
-  $('req-range')?.addEventListener('click', event => {
-    const item = event.target.closest('.seg-item[data-range]');
-    if (!item) return;
-    const next = RANGES.includes(item.dataset.range) ? item.dataset.range : DEFAULT_RANGE;
-    if (next === range) return;
-    range = next;
-    persistRange(next);
-    $('req-range')?.querySelectorAll('.seg-item[data-range]').forEach(node => {
-      node.classList.toggle('active', node.dataset.range === next);
-    });
-    void load({ resetPage: true });
-  });
 
   // 「清理」打开清理弹窗（request-clear-modal.js：两种删除方式 + 预览统计 +
   // 压缩数据库都在那边；本文件只负责把当前筛选参数给它，见 clearParams）
@@ -1010,7 +1020,7 @@
   // 实现整体拆到 **request-detail.js**（本次改造）：那一块与列表渲染零耦合
   // （自己按 id 拉报文、自己管弹窗的开合与分段状态），而本文件在加上
   // 「重试列弹层」与「详情分段」之后已到 900 行，超过项目「单文件不过 800 行」
-  // 的约定。拆分口径与项目既有先例一致（usage-panel.js 从 accounts-model.js
+  // 的约定。拆分口径与项目既有先例一致（accounts-table.js 从 accounts-view.js
   // 拆出、request-hover.js 与本文件的分工）。
   //
   // 本文件只留两件事：

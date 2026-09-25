@@ -26,33 +26,75 @@ function closeModal() {
 }
 
 /**
- * 弹窗里的选择项都是分段控件（.seg，结构见 index.html 的 #add-modal、动态部分见
- * add-provider-forms.js）：选中态就落在 DOM 上 —— 选中项带 .active 与 aria-checked="true"，
- * 取值放在 data-value。因此这里只读 / 写这一处状态，不再保留隐藏 radio 那第二份状态
- * （两份状态要靠 change 事件互相同步，edit 逻辑稍不留神就会不一致）。
- * 点击与键盘交互由 add-provider-forms.js 的 bindSeg 统一绑定（切换后派发 wb-seg-change）。
+ * 弹窗里的选择项都是分段控件，但分两条路：
+ *   · index.html 里静态的这两处（账号版本 / 打开方式）由 React 岛渲染
+ *     （ui/islands/ui.js），见下面的 mountAddSegs；
+ *   · 动态生成的那些（提供商 / 添加方式 / 地区 / 登录方式）仍归
+ *     add-provider-forms.js 的 bindSeg（切换后派发 wb-seg-change）。
+ *
+ * 岛是受控的，所以这两处的取值以 segState 为准 —— 不再从 DOM 反查：岛渲染出来的
+ * 选项上没有 .active，选中态表达为 data-checked。这反而更贴回改造前的本意
+ * （那时注释就写着「只保留一处状态，不留第二份」）。
  */
-function segValue(id) {
-  return document.querySelector(`#${id} .seg-item.active`)?.dataset.value || '';
-}
+const segState = { edition: 'cn', loginMode: 'embedded' };
 
-function setSegValue(id, value) {
-  document.querySelectorAll(`#${id} .seg-item`).forEach(item => {
-    const on = item.dataset.value === value;
-    item.classList.toggle('active', on);
-    item.setAttribute('aria-checked', String(on));
-    item.tabIndex = on ? 0 : -1;
-  });
+/** 岛句柄：setLoginMode 要靠它把值回灌进去 */
+const segIslands = { edition: null, loginMode: null };
+
+/** 弹窗里的分段条比页面上大一号，这个类名带来尺寸覆盖（见 page-accounts-providers.css） */
+const ADD_SEG_CLASS = 'add-seg';
+
+/**
+ * 挂两处静态分段控件的岛。脚本顺序上 add-account.js 排在 islands/ui.js 之后、
+ * DOM 也已解析完，所以这里可以直接挂。
+ */
+function mountAddSegs() {
+  if (!window.wbSegmented) return;
+  const editionHost = $('add-edition-seg');
+  if (editionHost) {
+    segIslands.edition = window.wbSegmented.mount(editionHost, {
+      options: [
+        { value: 'cn', label: '国内版（WorkBuddy）' },
+        { value: 'intl', label: '国际版（WorkBuddy AI）' },
+      ],
+      value: segState.edition,
+      ariaLabel: '账号版本',
+      className: ADD_SEG_CLASS,
+      // 国际版默认走系统浏览器、国内版默认内嵌窗口 —— 沿用改造前的联动
+      onChange: value => {
+        segState.edition = value;
+        setLoginMode(value === 'intl' ? 'external' : 'embedded');
+      },
+    });
+  }
+  const loginHost = $('add-login-mode');
+  if (loginHost) {
+    segIslands.loginMode = window.wbSegmented.mount(loginHost, {
+      options: [
+        { value: 'embedded', label: '内嵌窗口' },
+        { value: 'external', label: '系统默认浏览器' },
+      ],
+      value: segState.loginMode,
+      ariaLabel: '网页登录的打开方式',
+      className: ADD_SEG_CLASS,
+      // 打开方式影响第三方入口开关的可用态（要「国际版 + 内嵌窗口」同时成立），
+      // syncSocialRestoreState 内部会顺带刷新提示文案
+      onChange: value => {
+        segState.loginMode = value;
+        syncSocialRestoreState();
+      },
+    });
+  }
 }
 
 /** 弹窗里选的账号版本（cn=国内版 / intl=国际版） */
 function selectedEdition() {
-  return segValue('add-edition-seg') === 'intl' ? 'intl' : 'cn';
+  return segState.edition === 'intl' ? 'intl' : 'cn';
 }
 
 /** 网页登录的打开方式（embedded=内嵌窗口 / external=系统默认浏览器） */
 function selectedLoginMode() {
-  return segValue('add-login-mode') === 'external' ? 'external' : 'embedded';
+  return segState.loginMode === 'external' ? 'external' : 'embedded';
 }
 
 /**
@@ -73,7 +115,8 @@ function socialRestoreEnabled() {
 }
 
 function setLoginMode(mode) {
-  setSegValue('add-login-mode', mode);
+  segState.loginMode = mode === 'external' ? 'external' : 'embedded';
+  segIslands.loginMode?.setValue(segState.loginMode);
   syncLoginModeHint();
   syncSocialRestoreState();
 }
@@ -153,19 +196,17 @@ $('close-modal').addEventListener('click', closeModal);
 $('add-modal').addEventListener('click', event => { if (event.target === $('add-modal')) closeModal(); });
 $('web-login-button').addEventListener('click', () => workbuddyLogin.start());
 $('web-login-cancel').addEventListener('click', () => workbuddyLogin.cancel());
-// 版本与打开方式的分段交互由 add-provider-forms.js 绑定，这里接收选中项变化。
-// 国际版默认使用系统浏览器，国内版默认使用内嵌窗口。
-// 两个分段都会影响第三方入口开关的可用态（要「国际版 + 内嵌窗口」同时成立），
-// 所以都走 syncSocialRestoreState —— 它内部会顺带刷新提示文案。
-$('add-edition-seg').addEventListener('wb-seg-change', () => {
-  setLoginMode(selectedEdition() === 'intl' ? 'external' : 'embedded');
-});
-$('add-login-mode').addEventListener('wb-seg-change', syncSocialRestoreState);
+// 版本与打开方式这两处分段的交互已随岛走（见 mountAddSegs 里的两个 onChange）：
+// 切版本要联动打开方式（国际版默认系统浏览器、国内版默认内嵌窗口），
+// 打开方式又影响第三方入口开关的可用态，两处都会顺带刷新提示文案。
 $('add-social-restore')?.addEventListener('change', () => {
   // 勾选本身只影响发起登录时传给壳侧的值，不需要重建界面，但要让提示保持最新
   syncLoginModeHint();
 });
 document.addEventListener('keydown', event => { if (event.key === 'Escape') closeModal(); });
+
+// 挂弹窗里两处静态分段控件的岛。放在文件末尾：那时 segState / segIslands 都已初始化。
+mountAddSegs();
 
 // 跨模块入口：别的页面要打开这张弹窗时走它（弹窗是全局的，调用方不必先跳账号页，
 // 见 models-panel.js 的「＋ 新建自定义提供商」）。不把 openModal / closeModal 直接

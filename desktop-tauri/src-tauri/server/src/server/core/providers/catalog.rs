@@ -55,7 +55,14 @@ fn autoclaw_catalog_state(region: Region) -> (bool, i64) {
     )
 }
 
-fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
+/// 这一家清单的「远程与否 + 拉取时刻」。
+///
+/// 两个消费方：本模块的对外视图（`meta.source` / 管理页的「来源」列）与
+/// **适配器层的手动刷新结果**（`adapter::refresh_implemented_forced` 的
+/// `refreshedAt`，界面「更新日期」列读它）—— 后者必须走这里而不是自己按
+/// kind 拼一遍：十家的取值路径（workbuddy 的全局目录、按地区分格的三家、
+/// Cline 的池）各不相同，抄一份就是一处会漂移的知识。
+pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
     match kind {
         ProviderKind::WorkBuddy => (
             workbuddy_catalog().remote_refreshed(),
@@ -90,6 +97,11 @@ fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
                 super::accio::models::last_refreshed_at(region),
             )
         }
+        // ZCode 两个地区共用一份**静态**清单（上游没有列模型的公开接口，
+        // 见 `zcode::models` 的模块头）：永远不是远程来源，也没有刷新时刻。
+        // 这里如实回 `(false, 0)` 而不是编一个时间 —— 界面的「来源」列会显示成
+        // 内置清单，与事实相符。
+        ProviderKind::Zcode | ProviderKind::ZcodeIntl => (false, 0),
     }
 }
 

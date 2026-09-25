@@ -26,6 +26,36 @@
 //! `buildSystemPrompt` 的开头两行）—— 照抄它的好处是出站形态与官方客户端一致，
 //! 而不是我们自己编一句「看起来像」的话。
 //!
+//! ── 国际版实测（2026-09-24，issue #10）──────────────────────
+//! 同一道闸门在**国际版**（provider id `autoclaw-intl`）上被独立复现，形态与
+//! 国内版一致 —— 同一账号、同一模型、只改 system 一句即 200 / 406 两分
+//! （下表都经网关出站，前缀由本模块补）：
+//!
+//! ```text
+//!   system 内容                                                结果
+//!   ────────────────────────────────────────────────────────  ──────────────────
+//!   You are a helpful assistant.                               200
+//!   You are an AI agent powered by DeepSeek Harness.           406（空响应体）
+//!   同上，把 DeepSeek 里的 e 写成 E（大小写变体）               406
+//!   You are Codex, based on GPT-5. You are running as a
+//!     coding agent.                                            406
+//!   上面那句放进 **user** 消息、system 用中性句                200
+//!   You are ZCode, an interactive coding agent                 200（本表已改写）
+//! ```
+//!
+//! 三条结论，每一条都对应本表的一处设计：
+//!   1. 闸门**只看 system / developer 消息** —— 同一句放进 user 消息不触发，
+//!      所以改写只做在 system 上（见「边界」）；
+//!   2. 黑名单是**字面匹配**，不是语义审核 —— 所以改写产品名即可绕过；
+//!   3. 匹配**大小写不敏感** —— 所以本表的替换也必须忽略大小写，否则同一句
+//!      指纹换个大小写就漏网（原先是大小写敏感的 `str::replace`）。
+//!
+//! 客户端侧的表现形态与之吻合：首笔 system 轻量（DeepSeek Harness 的 Minimal
+//! 模式整句就是 `You are a helpful software engineer assistant.`）的请求 200，
+//! 第二笔带上完整 agent 提示词后必 406；走 `/v1/responses` 的 Codex CLI 第一笔
+//! 就带身份句（`instructions` → 首条 system，见 `core::protocol::responses`），
+//! 因此第一笔即 406。
+//!
 //! ── 本模块做什么（两条纯文本变换）──────────────────────────
 //!   1. **前置** [`IDENTITY_PREFIX`]：首条 system / developer 消息的正文前面插入
 //!      它，客户端自己的提示词**逐字保留在后面**。刻意不替换客户端提示词（用户
@@ -34,7 +64,7 @@
 //!      不变、字面匹配被破坏 —— 与 `core::sanitize` 同一手法，但**规则独立**：
 //!      那边对付的是 workbuddy 上游的内容审核指纹（插一个词就够），这条闸门更严
 //!      （连 sanitize 改写后的 "You are Claude Code, …" 都拦），所以本表是
-//!      **把产品名整个去掉**，不是插词。
+//!      **把产品名整个去掉**，不是插词；匹配**忽略大小写**（闸门自己就不敏感）。
 //!
 //! ── 边界（刻意不做的事，别顺手补）──────────────────────────
 //!   - **不动 user / assistant / tool 消息**：闸门只看系统提示词，改写用户内容
@@ -43,7 +73,10 @@
 //!     追加第二条 system 是另一条路（`core::prompt` 的 `append` 模式在做全局
 //!     提示词），本模块不掺和；
 //!   - **不碰 `tools` / `stream` / 其它字段**：tools 不是这条闸门的判据
-//!     （实测不带 tools 的 OpenClaw prompt 同样 200）。
+//!     （实测不带 tools 的 OpenClaw prompt 同样 200）；
+//!   - **不管 406 之后的动作**：分类与重试在 `adapter::classify_error`（406 空
+//!     响应体在那里补可执行提示）与 `upstream::provider_loop`；本模块只负责
+//!     「发出去的 body 里没有未覆盖的身份句」这一件事。
 //!
 //! ── 幂等性（重要）──────────────────────────────────────────
 //! 正文已经以身份句开头时**只改写、不再前置**：官方客户端的请求本身就带 OpenClaw
@@ -82,8 +115,18 @@ Available tools are policy-filtered. Names are case-sensitive; call exactly as l
 /// 再也匹配不到 `You are ZCode, an interactive coding agent`）。
 ///
 /// 每条的替换串都**不含产品名**：闸门拦的是产品名本身，插一个词（sanitize 的
-/// 手法）在这里不够用。ZCode / Claude Code / Codex 三条都实测过改写结果
-/// （`200`），不是照抄猜测。
+/// 手法）在这里不够用。
+///
+/// 匹配**忽略 ASCII 大小写**（[`replace_all_ignore_ascii_case`]）：闸门自己就是
+/// 大小写不敏感的（国际版实测：把 `DeepSeek` 里的 e 写成 E 仍 406），替换若
+/// 大小写敏感，同一句指纹换个大小写就漏网。
+///
+/// 实测口径（别把没测过的写成测过的）：
+///   - **国内版**：ZCode / Claude Code / 老 Codex CLI 三句实测过「改写后 200」；
+///   - **国际版**：`DeepSeek Harness` 与新版 Codex 首句（`You are Codex, based on
+///     GPT-5…`）实测过「原样出站 406」，**改写后的结果尚未实测**（issue #10 的
+///     报告只验到拦截侧）；Codex 第二句（`You are running as a coding agent in the
+///     Codex CLI…`）按老句同形推断会被拦，同样待实测。
 const FOREIGN_IDENTITIES: &[(&str, &str)] = &[
     (
         "You are ZCode, an interactive coding agent",
@@ -97,11 +140,36 @@ const FOREIGN_IDENTITIES: &[(&str, &str)] = &[
         "You are a coding agent running in the Codex CLI",
         "You are a coding agent running in a terminal CLI",
     ),
+    (
+        "You are running as a coding agent in the Codex CLI",
+        "You are running as a coding agent in a terminal CLI",
+    ),
     // Claude Code 的整句是 "You are Claude Code, Anthropic's official CLI tool for
     // Claude."；只改到「You are Claude Code」为止，后面的产品说明原样保留。
     ("You are Claude Code", "You are a coding assistant"),
     ("You are ZCode", "You are an interactive coding agent"),
+    // 国际版追加（issue #10）：句式照旧，只把产品名换成中性说法。
+    (
+        "You are an AI agent powered by DeepSeek Harness",
+        "You are an AI agent powered by a local coding harness",
+    ),
+    // 放最后：它最短、最通用（新版 Codex 的首句就是它），必须让上面那些更长的
+    // Codex CLI 句式先有机会命中（长在前是本表的固定纪律）。
+    ("You are Codex", "You are a coding agent"),
 ];
+
+/// 客户端可见的**提示词闸门拒收提示**：附在 `上游返回 406: 上游错误` 之后
+/// （与 `content_block::CONTENT_BLOCK_HINT` 同一取向 —— 上游连错误体都不给，
+/// 只回一句原文的话，用户既不知道是网关的问题还是自己的问题，也不知道下一步
+/// 改什么）。
+///
+/// 两条路都是用户当场能做的：切「替换」模式是绕法（system 换成网关提示词，外来
+/// 身份句随之消失）；把漏网的身份句反馈回来，是让 [`FOREIGN_IDENTITIES`] 覆盖到
+/// 它。措辞只描述用户能做的事，不描述网关做了什么（网关做了什么在请求日志的
+/// 重试链里，那里是逐请求事实）—— 与 CONTENT_BLOCK_HINT 同一条纪律。
+pub const REJECT_HINT: &str = "；上游判定 system 提示词不合规（这类拦截按逐字匹配，不是账号问题）：\
+常见原因是客户端身份句不在已覆盖的指纹里；\
+可在设置页「通用 → 系统提示词」切到「替换」模式绕过，或把漏网的 system 首句发到项目 issue 以便补进指纹表";
 
 /// 出站前规范化 body 里的系统提示词（**就地修改**）。
 ///
@@ -234,15 +302,52 @@ fn rewrite_identities_in_place(content: &mut Value) {
     }
 }
 
-/// 逐条套用 [`FOREIGN_IDENTITIES`]（`str::replace` 是**全量**替换，一条文本里
-/// 出现多次也一并改掉）。
+/// 逐条套用 [`FOREIGN_IDENTITIES`]（**全量**替换，一条文本里出现多次也一并改掉）。
+///
+/// 匹配忽略 ASCII 大小写 —— 闸门自己就不敏感（见模块头的国际版实测），替换也
+/// 必须不敏感：否则同一句指纹换个大小写就原样出站被拦。
 fn rewrite_identities(text: &mut String) {
     for (from, to) in FOREIGN_IDENTITIES {
-        if text.contains(from) {
-            let next = text.replace(from, to);
+        if let Some(next) = replace_all_ignore_ascii_case(text, from, to) {
             *text = next;
         }
     }
+}
+
+/// `from` 在 `text` 里的**全量**替换（忽略 ASCII 大小写）；一次都没命中返回
+/// `None`（调用方据此跳过写回，与「不命中就不动原串」同一取向）。
+///
+/// 替换串 `to` 里即使含 `from` 也不会死循环：每轮从匹配处**之后**继续扫，
+/// 替换出来的字节永不被重新检查。
+fn replace_all_ignore_ascii_case(text: &str, from: &str, to: &str) -> Option<String> {
+    find_ignore_ascii_case(text, from)?;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = find_ignore_ascii_case(rest, from) {
+        out.push_str(&rest[..start]);
+        out.push_str(to);
+        rest = &rest[start + from.len()..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// `from` 在 `text` 里首次出现的**字节下标**（只折叠 ASCII 大小写）。
+///
+/// 为什么不是 `text.to_lowercase()` 再找：Unicode 折叠会改变字节长度（`İ` 折叠
+/// 出来是两个字符），折叠后的下标回不到原文，切片就会错位。这里按字节滑窗加
+/// `eq_ignore_ascii_case` 比较：`from` 全是 ASCII，而 UTF-8 里非 ASCII 字符的每个
+/// 字节都 >= 0x80，折叠后不可能等于 ASCII 字节 —— 于是命中区间只可能由 ASCII
+/// 字节组成，起止点都是字符边界，切片安全（本文件 `panic=abort`，这里连一个
+/// `unwrap` 都不需要）。
+fn find_ignore_ascii_case(text: &str, from: &str) -> Option<usize> {
+    let haystack = text.as_bytes();
+    let needle = from.as_bytes();
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .find(|&start| haystack[start..start + needle.len()].eq_ignore_ascii_case(needle))
 }
 
 /// 该消息是否承载 system 级指令：角色**精确**等于 `system` 或 `developer`。

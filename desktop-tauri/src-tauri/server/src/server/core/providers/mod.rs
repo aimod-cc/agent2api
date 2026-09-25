@@ -99,6 +99,9 @@ pub mod adapter;
 pub mod accio;
 pub mod autoclaw;
 pub mod catalog;
+/// 远程模型清单的**持久化缓存**（各家的清单在进程重启后由它读回，见模块头）。
+/// 不进身份体系：它是各家的共用基础设施，只按 scope 字符串存取 JSON。
+pub mod catalog_cache;
 pub mod catpaw;
 pub mod cline;
 pub mod content_block;
@@ -113,6 +116,7 @@ pub mod raccoon;
 pub mod refresh_flight;
 pub mod router;
 pub mod workbuddy;
+pub mod zcode;
 
 use serde_json::{json, Value};
 
@@ -222,6 +226,34 @@ pub enum ProviderKind {
     /// 地区 → provider 的互查在 `accio::endpoints::Region`（`kind` /
     /// `provider_id` / `from_provider_id`），别处不要再写 `"accio-cn"` 字面量。
     AccioCn,
+    /// ZCode（智谱 / Z.AI 的编码代理客户端）**国内版**；适配实现在 `zcode/`：
+    /// 账号管理 **加推理转发**（OpenAI 兼容、Bearer 鉴权、无状态）。
+    ///
+    /// ── 这一家的特别之处：zcode 平面两地相同、推理平面两地不同 ──
+    /// 登录与「周末套餐」领取都在 ZCode 自己的服务端（`zcode.z.ai`），两地
+    /// 客户端用的是同一个域；真正跑推理的是各自开放平台的编码套餐端点
+    /// （国内 `open.bigmodel.cn` / 国际 `api.z.ai`）。所以「地区」在这一家
+    /// 只影响推理平面与账号归属 —— 与 AutoClaw（两地各一整套域名）不同。
+    ///
+    /// ── 与 [`ProviderKind::ZcodeIntl`] 同一份实现按地区参数化 ────
+    /// `zcode::adapter::ZcodeAdapter` 持有一个 `zcode::region::Region`，
+    /// 两个静态实例（`ZCODE_ADAPTER` / `ZCODE_INTL_ADAPTER`）由 `adapter_for`
+    /// 按 kind 给出。地区 → provider 的互查在 `zcode::region::Region`
+    /// （`kind` / `provider_id` / `from_provider_id`），别处不要再写
+    /// `"zcode"` / `"zcode-intl"` 这类字面量。
+    Zcode,
+    /// ZCode **国际版**（`zcode-intl`）。与 [`ProviderKind::Zcode`] 同一套协议、
+    /// 同一个 zcode 平面，只有推理平面（`api.z.ai`）与 OAuth 的 `provider`
+    /// 取值（`zai`）不同。
+    ///
+    /// ── 为什么两个地区是两家 provider（与 AutoClaw / Cline / Accio 同一思路）──
+    /// 把地区做成「一家的一个字段」的后果那三次已经各说过一遍：地区成了**账号
+    /// 的属性**，界面上混在一起、无法按地区隔离账号记录。
+    ///
+    /// ── 本家**没有签到**，接的是「周末套餐领取」────────────────
+    /// 其余各家都在 `core::auto_checkin` 的提供商清单里，本家不在 ——
+    /// 它没有签到活动，运营玩法是限时发放的体验套餐（见 `zcode::claim`）。
+    ZcodeIntl,
 }
 
 /// 一个提供商的静态元数据。
@@ -262,6 +294,11 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 合并时同名模型先归谁家 —— 国际版在前（用户装的、默认用的是它）。
     ProviderMeta { id: "accio", label: "Accio" },
     ProviderMeta { id: "accio-cn", label: "Accio 国内版" },
+    // ZCode 两个地区**相邻**排列（与 AutoClaw / Accio 同一理由：同一条产品线的
+    // 两个版本，中间隔着别家会让「找国际版」变成一次扫描）。顺序也决定模型目录
+    // 合并时同名模型先归谁家 —— 国内版在前（国内网络环境下更常被添加的那个）。
+    ProviderMeta { id: "zcode", label: "ZCode 国内版" },
+    ProviderMeta { id: "zcode-intl", label: "ZCode 国际版" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -332,6 +369,8 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "cline-pass" => Some(ProviderKind::ClinePass),
         "accio" => Some(ProviderKind::Accio),
         "accio-cn" => Some(ProviderKind::AccioCn),
+        "zcode" => Some(ProviderKind::Zcode),
+        "zcode-intl" => Some(ProviderKind::ZcodeIntl),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -360,6 +399,8 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::ClinePass => "cline-pass",
         ProviderKind::Accio => "accio",
         ProviderKind::AccioCn => "accio-cn",
+        ProviderKind::Zcode => "zcode",
+        ProviderKind::ZcodeIntl => "zcode-intl",
     }
 }
 

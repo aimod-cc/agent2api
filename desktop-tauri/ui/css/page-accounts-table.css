@@ -567,11 +567,9 @@
 
 /* 查询余额按钮（现在住在操作列里）：尺寸与悬停强调全部由下面的
    `.acct-actions button` 一组规则统一给出（那一列里的按钮本来就是同一档），
-   所以这里只留它独有的**「已展开」态** —— 与展开的面板呼应，
-   一眼看出再点一下是收起。
-   改造前这几条声明在余额列里，那时它必须自带尺寸；挪到操作列后
-   再写一遍就是重复定义，会把 .acct-actions 那组规则覆盖得各说各话。 */
-.usage-btn.open { border-color: var(--primary-bd); background: var(--primary-soft); color: var(--primary-fg); }
+   所以这里**没有它自己的声明** —— 它不再有「已展开」态（明细面板已取消，
+   每次点击都是一次查询，见 accounts-table.js 的 actionsCell），
+   也就没有 `.open` 高亮可写。 */
 
 /* 结果摘要：单行省略，完整文案在 title 里（余额数字长度不可控）。
    余额列现在只有它一个元素，不再需要 margin-top 让位给按钮 ——
@@ -614,8 +612,8 @@
   color: var(--primary-fg);
 }
 
-/* ─── 展开的明细行（积分 / 签到）───
-   整宽一行，内容由 usage-panel.js / accounts-model.js 生成（.row-panel）。
+/* ─── 展开的明细行（限流 / 签到）───
+   整宽一行，内容由 accounts-model.js 生成（.row-panel）。
    明细行自带浅凹底：它是「附属于上一行」的补充信息，不该与账号行同权重。
 
    面板自身的外观在 page-accounts.css 里**是按 .acct-card 限定**的
@@ -664,11 +662,10 @@
 
 .acct-panels .row-panel .panel-close:hover { background: var(--surface-3); border-color: transparent; color: var(--text); }
 
-.acct-panels .row-panel .big { color: var(--ok); font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .acct-panels .row-panel b { color: var(--text); font-variant-numeric: tabular-nums; }
 
 /* ─── 限流明细面板 ───
-   与余额 / 签到的 .row-panel 同形制；这里要的是块状逐行布局，覆盖它的 flex 换行。 */
+   与签到的 .row-panel 同形制；这里要的是块状逐行布局，覆盖它的 flex 换行。 */
 .acct-panels .row-panel.limit-panel { display: block; padding-right: 34px; }
 
 .limit-panel .lp-head {
@@ -724,3 +721,11 @@
    批量栏沿用 page-accounts.css 的骨架，这里只补一条：表格化之后
    「全选」有两个入口（批量栏 + 表头），表头的那个需要一点可点区域 */
 #acct-select-all { cursor: pointer; }
+
+/* ─── ZCode「领套餐」确认弹窗里的套餐清单 ───
+   清单由 ui/zcode-claim.js 生成。`.muted` 在别处只以 `.cell-expiry .muted`
+   的形式生效，弹窗里拿不到那条规则 —— 这里补一条作用域内的，否则
+   「权益 / 有效期 / 描述」那几行与套餐名同样粗细，读起来分不出主次。 */
+.zcode-claim-plans { margin: 8px 0 0; padding-left: 18px; }
+.zcode-claim-plans li + li { margin-top: 8px; }
+.zcode-claim-plans .muted { color: var(--text-3); }
