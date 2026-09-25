@@ -1,5 +1,5 @@
 /* Agent2API · 账号表格的行渲染（列定义 / 单元格 HTML / 行状态） */
-/* global wbApp, wbAccountsModel, wbUsagePanel */
+/* global wbApp, wbAccountsModel, wbUsageActions */
 
 /**
  * 账号列表的**表格渲染层**：把一行账号画成 `<tr>`，把展开的明细画成紧随其后的一行。
@@ -36,6 +36,7 @@
     isDesktopAccount,
     supportsUsage,
     supportsCheckin,
+    supportsClaim,
     checkedInToday,
     accountTags,
     editionSuffix,
@@ -80,7 +81,7 @@
   // ─── 列定义（表头、colgroup 与 colspan 的唯一来源）─────
 
   /**
-   * 列：勾选 / 优先级 / 提供商 / 账号 / 连接数 / 状态 / 限流 / 有效期 / 余额 · 积分 / 操作。
+   * 列：勾选 / 优先级 / 提供商 / 账号 / 连接数 / 状态 / 限流 / 有效期 / 余额 / 操作。
    *
    * 优先级是整张表的主线（全局队列），所以放在提供商之前、紧跟勾选列；
    * `key` 同时是 CSS 类名后缀（`cell-<key>`），默认列宽在 page-accounts-table.css
@@ -613,7 +614,7 @@
     return `<td class="cell-expiry"><span title="${esc(title)}">${esc(text)}</span></td>`;
   }
 
-  /** 数值 → 展示串（与 usage-panel.js 的同名私有函数同口径，取不到给「—」） */
+  /** 数值 → 展示串（与余额列摘要同口径，取不到给「—」） */
   function numberText(value) {
     if (value === null || value === undefined || value === '') return '—';
     const number = Number(value);
@@ -621,18 +622,51 @@
   }
 
   /**
+   * 订阅信息 → 摘要 title 里的一段文字（统一形状的 `subscription`）。
+   *
+   * `expireAt` 各家的类型不同（小浣熊给的是上游原样的字符串日期，AutoClaw 可能
+   * 给时间戳）：能解析成日期的按本地时间格式化，否则原样显示 —— 不猜、不丢。
+   *
+   * 它是**悬停明细的一部分**：余额列那一格只放「可用 N」，套餐 / 到期 / 余量
+   * 这些回答「这份余额什么时候过期」的信息全在这里（原先由已删除的余额明细面板
+   * 承担，面板取消后不能把这块信息一起丢掉）。
+   */
+  function subscriptionText(subscription) {
+    if (!subscription || typeof subscription !== 'object') return '';
+    const parts = [];
+    if (subscription.planName) parts.push(`套餐 ${String(subscription.planName)}`);
+    if (subscription.status) parts.push(`状态 ${String(subscription.status)}`);
+    const expireAt = subscription.expireAt;
+    if (expireAt !== null && expireAt !== undefined && expireAt !== '') {
+      const asNumber = Number(expireAt);
+      const text = Number.isFinite(asNumber) && asNumber > 1e11
+        ? formatTime(asNumber)
+        : String(expireAt);
+      if (text) parts.push(`到期 ${text}`);
+    }
+    if (Number.isFinite(Number(subscription.remainQuota))) {
+      parts.push(`余量 ${numberText(subscription.remainQuota)}`);
+    }
+    if (Number.isFinite(Number(subscription.totalQuota))) {
+      parts.push(`总量 ${numberText(subscription.totalQuota)}`);
+    }
+    return parts.join(' ');
+  }
+
+  /**
    * 余额结果 → 一行摘要（`{text, kind, title}`）。
    *
-   * 形状探测沿用 usage-panel.js 的判据（`totalLeft` 键 = workbuddy 既有形状，
-   * 否则看 `available` / `wallets`），**不按 provider 猜** —— provider 只决定
-   * 「谁去查」，不决定「查回来长什么样」，按 provider 分会把同一条知识写两遍。
-   * 失败与「未配置」的分流同样走 usageFailureOf，保证摘要与展开的明细面板不会
-   * 一个说红一个说灰。摘要文案刻意压到「数字 + 单位」，完整句放进 title。
+   * 形状探测按**字段**而不是按 provider（`totalLeft` 键 = workbuddy 既有形状，
+   * 否则看 `available` / `wallets`）：provider 只决定「谁去查」，不决定
+   * 「查回来长什么样」，按 provider 分会把同一条知识写两遍。
+   * 失败与「未配置」的分流走 `wbUsageActions.usageFailureOf`（判据的唯一入口，
+   * 与查询动作那边的 toast 同源）。摘要文案刻意压到「数字 + 单位」，完整句放进 title ——
+   * 余额列是这张表里最窄的几列之一，而明细（各钱包 / 套餐 / 到期）在悬停里能看全。
    */
   function usageSummary(entry) {
     if (entry === undefined) return { text: '未查询', kind: 'muted', title: '尚未查询该账号的余额' };
     if (entry === null) return { text: '查询中…', kind: 'muted', title: '正在查询' };
-    const failure = wbUsagePanel.usageFailureOf(entry);
+    const failure = wbUsageActions.usageFailureOf(entry);
     if (failure) {
       return failure.notConfigured
         ? { text: '未配置', kind: 'muted', title: `${failure.message}（去该账号的「设置」里填上查询凭证即可）` }
@@ -650,28 +684,37 @@
     if (Object.prototype.hasOwnProperty.call(entry, 'available') || Array.isArray(entry.wallets)) {
       const unit = String(entry.unit || '积分');
       const wallets = Array.isArray(entry.wallets) ? entry.wallets : [];
-      const detail = wallets.map(wallet => `${wallet?.displayName || wallet?.type || '明细'} ${numberText(wallet?.balance)}`).join(' · ');
+      // 上游给的展示串优先（带千分位 / 单位的格式化），没有才按数值拼
+      const detail = wallets
+        .map(wallet => `${wallet?.displayName || wallet?.type || '明细'} `
+          + `${wallet?.balanceView ? String(wallet.balanceView) : numberText(wallet?.balance)}`)
+        .join(' · ');
+      const subscription = subscriptionText(entry.subscription);
+      const available = `可用 ${numberText(entry.available)} ${unit}`;
       return {
-        text: `可用 ${numberText(entry.available)} ${unit}`,
+        text: available,
         kind: 'ok',
-        title: detail ? `可用 ${numberText(entry.available)} ${unit}（${detail}）` : `可用 ${numberText(entry.available)} ${unit}`,
+        title: [available, detail, subscription].filter(Boolean).join(' · '),
       };
     }
     return { text: '无数据', kind: 'muted', title: '未返回可识别的余额数据' };
   }
 
   /**
-   * 余额：只放**摘要读数**（不可点），查询按钮已移到操作列。
+   * 余额：这一列**就是**余额的展示处 —— 一行摘要读数（不可点）。
    *
-   * ── 为什么按钮挪走（本次改造）────────────────────────────────
+   * ── 为什么按钮挪到操作列（上次改造）──────────────────────────
    * 原先这一列是「一颗「积分」按钮 + 一行摘要」。按钮在余额列里的问题是
    * **它的位置与它的作用不符**：它发起的是一个网络动作（查上游余额），
    * 而这一列是读数区（有效期、状态、限流都是读数）。用户扫这一列是想看
    * 「还剩多少」，结果每行第一个东西是一颗要点的按钮。
    * 挪到操作列之后，这一列纯粹是读数，与相邻几列的语义一致。
    *
-   * 摘要仍然只做展示（不可点）：展开/收起由操作列那颗按钮负责，
-   * 同一格放两个能点的东西会让人分不清哪个是查询、哪个是展开。
+   * ── 为什么没有明细面板了（本次改造）──────────────────────────
+   * 早先点按钮会在行下弹一条明细（各钱包 / 套餐 / 到期），第二次点击收起。
+   * 那条明细与这格里的摘要说的是同一件事，而摘要是**一直在眼前**的那一份 ——
+   * 弹层则要多一次点击、多占一行高度，还会让表格在展开/收起之间跳动。
+   * 现在按钮只负责「查」，查回来的读数就落在这里（明细在悬停的 title 里）。
    */
   function usageCell(account, ctx) {
     if (!supportsUsage(account)) {
@@ -683,7 +726,7 @@
   }
 
   /**
-   * 操作：签到 / 查余额（或收起）/ 设置 / ⋯。四颗按钮，顺序固定。
+   * 操作：签到 / 查余额 / 设置 / ⋯。四颗按钮，顺序固定。
    *
    * ── 本次改造：按钮从五颗收到四颗，顺序改成「签到 → 余额 → 设置 → ⋯」──
    * 「设为首选」从行上**移进了 ⋯ 菜单**（见 accounts-model.js 的 moreMenuHtml）。
@@ -700,21 +743,13 @@
    * 按钮的显隐会随账号状态变（见下），但**顺序不跟着变**，
    * 所以「第一颗是签到」这条肌肉记忆在任何一行都成立。
    *
-   * ── 查询余额按钮（上次改造从余额列挪来）──────────────────────
-   * 文案**恒定**是「余额」，展开态表达在 `title` 与 `.open` 类上 ——
-   * 这不是随手取的，而是**列宽预算的要求**（见下）。
-   * 它原先在余额列里就是同一套做法（标签恒为「积分」，只有 title 变化）。
-   *
-   * 为什么不改成「余额 / 收起余额」两态文案（看起来更直白）：操作列是这张表里
-   * 最挤的一格（四颗按钮并排），多两个字（约 23px）只能从账号列挤。
-   * 而这一列里已经有一颗**真的**用两态文案的按钮（签到 / 已签到），那是有理由的：
-   * 「已签到」是**不可点**的状态（带 disabled），用户必须一眼看出「今天没得签了」，
-   * 藏进 title 就失去意义。余额按钮则两态都可点、且展开态本身有更强的信号
-   * （下面那行明细面板整条展开了，控件高亮着）—— 不缺这一句文案。
-   *
-   * 行为与它原先在余额列里**逐字一致**（`data-action="usage"` 的处理在
-   * accounts-view.js，那里对已展开的行走「只收起、不发请求」的分支），
-   * 所以下游一行没改 —— 改变的只有它渲染在哪一列。
+   * ── 查询余额按钮 ────────────────────────────────────────────
+   * 文案恒定是「余额」（它原先在余额列里时是「积分」）。它现在**没有展开态**：
+   * 每点一次就是查一次（本次改造去掉了「第二次点击 = 收起明细」那套开关语义，
+   * 明细面板已取消，读数直接落在余额列上，见 usageCell），所以既不需要两态文案、
+   * 也不需要 `.open` 高亮 —— 一颗「按下去就刷新隔壁那格数字」的动作按钮。
+   * 文案短这件事仍然重要：操作列是这张表里最挤的一格（四颗按钮并排），
+   * 「查询余额」四个字比「余额」多约 23px，只能从账号列挤。
    *
    * `supportsUsage` 不适用的家不渲染这颗按钮（与余额列显示破折号同一判据，
    * 两处必须同源：列里写着「该提供商没有余额查询」而操作列却给一颗能点的
@@ -743,13 +778,20 @@
         ? `<button data-action="checkin" data-id="${esc(account.id)}" disabled`
           + ` title="${esc(checkinDoneTitle(account))}">已签到</button>`
         : `<button data-action="checkin" data-id="${esc(account.id)}" title="为该账号签到">签到</button>`;
-    const open = ctx.usageOpen === true;
     const usage = supportsUsage(account)
-      ? `<button class="usage-btn${open ? ' open' : ''}" data-action="usage" data-id="${esc(account.id)}"`
-        + ` title="${esc(open ? '收起余额明细' : '查询该账号剩余余额')}">余额</button>`
+      ? `<button class="usage-btn" data-action="usage" data-id="${esc(account.id)}"`
+        + ` title="查询该账号剩余余额（读数显示在余额列）">余额</button>`
+      : '';
+    // ZCode 的「领套餐」：这一家没有签到，它的运营玩法是限时发放的体验套餐
+    // （见 ui/zcode-claim.js 的模块头）。判据走能力表（`claim` 位 +
+    // 后端给的 `canClaim`），与签到 / 余额两个按钮同一口径 —— 别在这里
+    // 再写一遍 provider id 判断，那会与 `accounts-groups.js` 各存一份事实。
+    const claim = supportsClaim(account)
+      ? `<button data-action="zcode-claim" data-id="${esc(account.id)}"`
+        + ` title="探测并领取官方的限时体验套餐（需要过一次人机验证）">领套餐</button>`
       : '';
     const settings = `<button data-action="settings" data-id="${esc(account.id)}" title="备注名 / 启用 / 代理">设置</button>`;
-    return `<td class="cell-actions"><div class="acct-actions">${checkin}${usage}${settings}`
+    return `<td class="cell-actions"><div class="acct-actions">${checkin}${claim}${usage}${settings}`
       + `<button data-action="more" data-id="${esc(account.id)}" title="更多操作">⋯</button></div></td>`;
   }
 
@@ -768,7 +810,7 @@
    * ctx（由 accounts-view.js 给）：
    *   seat             `{position, total}`：**全局队列**里的位置（序号与 ↑/↓ 边界）
    *   picked           是否被勾选
-   *   usageEntry       余额缓存条目；usageOpen 是否已展开明细
+   *   usageEntry       余额缓存条目（余额列的读数；余额没有明细行，故无展开态）
    *   limitsOpen       是否已展开限流明细
    *   connections      该账号此刻的活跃请求数（实时轮询的结果，缺失 = 0）
    *   draft            正在编辑中的优先级草稿（重绘时保住用户没提交完的输入）
@@ -802,7 +844,7 @@
   }
 
   /**
-   * 展开的明细行（限流 / 积分 / 签到）。挂在账号行**之后**的独立 `<tr>` 上而不是
+   * 展开的明细行（限流 / 签到）。挂在账号行**之后**的独立 `<tr>` 上而不是
    * 塞进某个单元格：明细是整宽内容，放进单元格会被那一列的宽度锁死。
    * 未展开时调用方根本不渲染这一行 —— 多一个空 `<tr>` 会白白多出一条分隔线。
    *

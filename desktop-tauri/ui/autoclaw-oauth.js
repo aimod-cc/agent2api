@@ -11,421 +11,57 @@
    也不能塞进 sms-login.js（那条链没有窗口与回调）。
 
    ── 「打开方式」与另外四家同款 ──────────────────────────────
-   这一家的回调落在本机网关的 loopback 端口（见后端 oauth.rs 的模块头），
-   与「哪个浏览器」无关，因此内嵌窗口与系统浏览器都走得通 —— 选择项由调用方
-   在配置里给（`modes`，见 add-provider-forms.js 的 oauthLogin），本文件只
-   通过 `config.mode()` 现读它、按它调整文案与取消入口：
+   这一家的回调落在 z.ai 给官方客户端登记的那四个 loopback 端口上（网关登录时
+   临时占一个，再转回自己的回调路由，见后端 providers/autoclaw/callback_server.rs
+   的模块头），与「哪个浏览器」无关，因此内嵌窗口与系统浏览器都走得通 ——
+   选择项由调用方在配置里给（`modes`，见 add-provider-forms.js 的 oauthLogin），
+   本文件只通过 `config.mode()` 现读它、按它调整文案与取消入口：
 
      · 内嵌窗口：独立临时环境，连着加多个账号互不影响；取消靠关窗；
      · 系统浏览器：复用你已登录的 Zai / Google 账号（Google 在部分环境下会
        拒绝内嵌窗口），但**没有窗口可关** —— 因此这一条多一个「取消等待」
        按钮（见 create 里 `paintCancel` 的说明）。
 
-   ── 验证码这一段是从官方客户端逐条移植的 ────────────────────
-   来源：AutoClaw 桌面端 `app.asar` 的渲染层（`chatStore-*.js` 里
-   `requestAliyunPopupCaptcha` / `initializeAliyunCaptcha` /
-   `captchaVerifyCallback` 三个函数），本文件保持它的结构与常量，
-   **只做三处删减**（都是客户端专属的埋点与 i18n，与登录无关）：
-     1. 去掉 `traceCaptchaEvent` 埋点（我们不上报火山）；
-     2. 去掉 i18n 查表（文案直接写中文）；
-     3. 去掉数美（shumei）那条备选 —— 上游实测只发 aliyun
-        （`captcha_supplier: "aliyun"`），留着一条永远走不到的分支只会
-        让「验证码出问题时该看哪段代码」变模糊。
-
-   ── SDK 是浏览器端 JS，为什么能原样跑在主窗口里 ─────────────
-   SDK 从 `o.alicdn.com` 加载（`AliyunCaptcha.js`）。Tauri 主窗口的 CSP 是
-   `null`（见 tauri.conf.json），没有 `script-src` 限制，因此这个外域脚本
-   能正常加载与执行 —— 这正是「直接搬过来」可行的前提。若哪天给主窗口加了
-   CSP，必须在 `script-src` 里放行 `https://o.alicdn.com` 与
-   `https://*.alicdn.com`（SDK 自己还会再拉资源），否则验证码会静默加载失败。
+   ── 验证码求解已抽到共用模块 ────────────────────────────────
+   那一段（从官方客户端逐条移植的阿里云滑块求解器）现在在
+   `ui/aliyun-captcha.js`，与 ZCode 的「周末套餐领取」共用 —— 那家同样要过
+   这道风控，只是拿到 `verifyParam` 之后直接去领取，不像这里要接着换授权地址。
+   本文件只调它的 `solve` / `cancel`，并在 `request` 回调里做「换授权地址」
+   这半步（那是本家独有的协议）。求解器为什么能跑在主窗口里、以及
+   「改主窗口 CSP 时必须放行 alicdn」那条约束，都记在那个文件的头部。
 
    依赖 app.js 的顶层全局（经典 script 的顶层声明在全局可见）：$ / toast /
-   window.workbuddyDesktop。脚本顺序见 index.html：必须在 add-provider-forms.js
-   之前 —— 后者加载期就要 create()。 */
+   window.workbuddyDesktop；以及 `window.wbAliyunCaptcha`（上面那个共用模块，
+   脚本顺序见 index.html：它必须排在本文件之前）。本文件必须在
+   add-provider-forms.js 之前 —— 后者加载期就要 create()。 */
 
 (() => {
   const $ = id => document.getElementById(id);
 
-  // ── 常量：逐字照抄客户端（改任何一个都要重新对照一遍上游）────────
-
-  const ALIYUN_CAPTCHA_SCRIPT_URL =
-    'https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js';
-  const SCRIPT_ID = 'aliyun-captcha-sdk';
-  /** SDK 挂载点（滑块面板的容器） */
-  const ELEMENT_ID = 'aliyun-captcha-element';
-  /** 触发按钮：SDK 要求传一个 button 选择器，点击它才弹出滑块。
-   *  客户端把它做成 1×1 透明不可见，由代码 `button.click()` 触发 —— 这里照做。 */
-  const BUTTON_ID = 'aliyun-captcha-trigger';
-
-  const SCRIPT_LOAD_TIMEOUT_MS = 40000;
-  const INIT_TIMEOUT_MS = 40000;
-  const VERIFY_TIMEOUT_MS = 120000;
-  /** 初始化后至少等 2.1 秒再点按钮（客户端实测：SDK 预热没完成时点击无效） */
-  const MINIMUM_WARMUP_MS = 2100;
-  /** 初始化结果最多复用 19 分钟（超过则重建，避免实例内部状态过期） */
-  const INITIALIZATION_MAX_AGE_MS = 19 * 60000;
-
-  // ── 模块级状态（客户端也是模块级的：一次只允许一个验证码流程）────
-
-  let scriptLoadPromise = null;
-  let initializationPromise = null;
-  /** 初始化键（region:prefix:sceneId:language）—— 配置变了就重建实例 */
-  let initializationKey = '';
-  /** 代际号：异步流程回来时用它判断「这一轮是否已被作废」 */
-  let initializationGeneration = 0;
-  let initializedAt = 0;
-  let captchaInstance = null;
-  /** 正在等验证码结果的那一次请求 */
-  let pendingVerification = null;
-
-  const sleep = ms => new Promise(resolve => window.setTimeout(resolve, ms));
-
   /**
-   * 语言映射（客户端的 `resolveAliyunCaptchaLanguage`）。
+   * ── 验证码求解在共用模块里（本文件不再自带一份）─────────────
+   * 这段代码原先是本文件的私有实现，现已抽到 `ui/aliyun-captcha.js`，
+   * 与 ZCode 的「周末套餐领取」共用 —— 那家同样要过这道阿里云风控，
+   * 但它拿到 `verifyParam` 之后是直接去领取，不像这里要接着换授权地址。
+   * 两处只有「拿到串之后干什么」不同，求解过程完全一致（指纹要稳定、
+   * 容器要清理、代际号要作废、取消要收尾、SDK 配置必须在加载前设好），
+   * 因此那部分只留一份。
    *
-   * 阿里云只认这几个短码，传别的会被它当成不认识而回落到英文 ——
-   * 因此必须在这里归一，不能直接把 `zh-CN` 递给 SDK。
-   */
-  function resolveAliyunCaptchaLanguage(language) {
-    const normalized = String(language || '').trim().replace(/_/g, '-').toLowerCase();
-    if (normalized === 'zh-tw' || normalized.startsWith('zh-hant')) return 'tw';
-    if (normalized.startsWith('zh')) return 'cn';
-    if (normalized.startsWith('ar')) return 'ar';
-    if (normalized.startsWith('de')) return 'de';
-    if (normalized.startsWith('es')) return 'es';
-    if (normalized.startsWith('fr')) return 'fr';
-    if (normalized.startsWith('id') || normalized.startsWith('in')) return 'in';
-    if (normalized.startsWith('it')) return 'it';
-    if (normalized.startsWith('ja')) return 'ja';
-    if (normalized.startsWith('ko')) return 'ko';
-    if (normalized.startsWith('pt')) return 'pt';
-    if (normalized.startsWith('ru')) return 'ru';
-    if (normalized.startsWith('th')) return 'th';
-    if (normalized.startsWith('tr')) return 'tr';
-    if (normalized.startsWith('vi')) return 'vi';
-    return 'en';
-  }
-
-  /** 界面当前语言（与网关设置页同一来源；取不到按英文，阿里云能兜住） */
-  const currentLanguage = () => document.documentElement.lang || 'zh-CN';
-
-  function getInitAliyunCaptcha() {
-    const value = window.initAliyunCaptcha;
-    return typeof value === 'function' ? value : null;
-  }
-
-  /** 验证码流程失败时抛的错误（带一句人话，界面直接展示） */
-  class CaptchaError extends Error {
-    constructor(message) {
-      super(message);
-      this.name = 'CaptchaError';
-    }
-  }
-
-  /** 用户主动取消（点「取消」或关弹窗）—— 与「失败」分开，界面不报红 */
-  class CaptchaCancelledError extends CaptchaError {
-    constructor() {
-      super('已取消验证码');
-      this.name = 'CaptchaCancelledError';
-    }
-  }
-
-  function removeCaptchaElements() {
-    document.getElementById(ELEMENT_ID)?.remove();
-    document.getElementById(BUTTON_ID)?.remove();
-  }
-
-  /** 作废当前实例（配置变了 / 验证码用完了要重建时调） */
-  function invalidateInitialization() {
-    const instance = captchaInstance;
-    initializationGeneration += 1;
-    captchaInstance = null;
-    initializationPromise = null;
-    initializedAt = 0;
-    removeCaptchaElements();
-    // destroy 可能不存在（SDK 老版本），调用失败也不影响我们自己的状态
-    try { instance?.destroy?.(); } catch { /* 忽略：实例已不可用 */ }
-  }
-
-  /**
-   * 备好滑块容器与触发按钮（客户端的 `ensureCaptchaElements`）。
+   * 这里只取两件事：解出验证串（`solve`）与取消等待（`cancel`）。
+   * 下面 `start()` 里的 `request` 回调就是两家分岔的那一半 ——
+   * 它拿串去调 `/api/session/login/oauth/start` 换授权地址，
+   * 并把地址借返回值带回上层。
    *
-   * 两个元素都由 SDK 按 id 找：`element` 是滑块面板的落点，`button` 是
-   * 「点它才弹」的触发器。客户端把按钮做成 1×1 透明且 `pointer-events: none`
-   * —— 这样用户看不到也点不到它，触发完全由代码控制（我们只在准备好之后
-   * 主动 `button.click()` 一次），不会出现「用户自己点出两个滑块」。
+   * `CaptchaError` / `CaptchaCancelledError` 也从那边取：本文件多处 `catch`
+   * 要按类型区分「用户取消」（不报红）与「真失败」（报错），
+   * 所以这里解构出同名常量 —— 两个类只有一个实现，`instanceof` 才成立。
    */
-  function ensureCaptchaElements() {
-    let element = document.getElementById(ELEMENT_ID);
-    if (!element) {
-      element = document.createElement('div');
-      element.id = ELEMENT_ID;
-      element.style.position = 'relative';
-      element.style.zIndex = '2147483000';
-      document.body.appendChild(element);
-    }
-    let button = document.getElementById(BUTTON_ID);
-    if (!button) {
-      button = document.createElement('button');
-      button.id = BUTTON_ID;
-      button.type = 'button';
-      button.tabIndex = -1;
-      button.setAttribute('aria-hidden', 'true');
-      button.style.position = 'fixed';
-      button.style.width = '1px';
-      button.style.height = '1px';
-      button.style.opacity = '0';
-      button.style.pointerEvents = 'none';
-      button.style.overflow = 'hidden';
-      document.body.appendChild(button);
-    }
-    return button;
-  }
-
-  /**
-   * 加载 SDK 脚本（客户端的 `loadAliyunCaptchaScript`）。
-   *
-   * `window.AliyunCaptchaConfig` 必须在脚本加载**之前**设好 —— SDK 读它决定
-   * 打哪个阿里云站点（`region` / `prefix`）。设晚了 SDK 会用一个默认站点，
-   * 表现是「验证码弹出来但一直转圈」。
-   */
-  function loadAliyunCaptchaScript(config) {
-    window.AliyunCaptchaConfig = { region: config.region, prefix: config.prefix };
-    if (getInitAliyunCaptcha()) return Promise.resolve();
-    if (scriptLoadPromise) return scriptLoadPromise;
-    scriptLoadPromise = new Promise((resolve, reject) => {
-      const existing = document.getElementById(SCRIPT_ID);
-      const script = existing || document.createElement('script');
-      let timer = 0;
-      const cleanup = () => {
-        window.clearTimeout(timer);
-        script.removeEventListener('load', onLoad);
-        script.removeEventListener('error', onError);
-      };
-      const fail = error => {
-        cleanup();
-        scriptLoadPromise = null;
-        script.remove();
-        reject(error);
-      };
-      const onLoad = () => {
-        cleanup();
-        if (getInitAliyunCaptcha()) resolve();
-        else fail(new CaptchaError('验证码组件加载异常，请重试'));
-      };
-      const onError = () => fail(new CaptchaError('验证码组件加载失败，请检查网络后重试'));
-      timer = window.setTimeout(
-        () => fail(new CaptchaError('验证码组件加载超时，请检查网络后重试')),
-        SCRIPT_LOAD_TIMEOUT_MS,
-      );
-      script.addEventListener('load', onLoad);
-      script.addEventListener('error', onError);
-      if (!existing) {
-        script.id = SCRIPT_ID;
-        script.async = true;
-        script.src = ALIYUN_CAPTCHA_SCRIPT_URL;
-        document.head.appendChild(script);
-      }
-    });
-    return scriptLoadPromise;
-  }
-
-  /** 把一次等待落定（客户端 `settlePendingVerification` 的简化版） */
-  function settlePending(pending, outcome) {
-    if (pendingVerification !== pending || pending.settled) return false;
-    pending.settled = true;
-    window.clearTimeout(pending.timer);
-    if (outcome.error) pending.reject(outcome.error);
-    else pending.resolve(outcome.value);
-    return true;
-  }
-
-  /**
-   * SDK 回调：拿到不透明验证串 → 交给上层去换授权地址（客户端的 `captchaVerifyCallback`）。
-   *
-   * 返回值必须是 `{captchaResult, bizResult}`：SDK 据此决定「这一关过了没有」。
-   * `captchaResult` 是**验证码本身**是否通过（阿里云那侧），`bizResult` 是
-   * **我们的业务**是否接受它（这里 = 上游给不给授权地址）。两个都为 true
-   * SDK 才收起滑块；否则它会让用户重试。
-   */
-  async function captchaVerifyCallback(generation, captchaVerifyParam) {
-    const pending = pendingVerification;
-    if (!pending || pending.generation !== generation) {
-      return { captchaResult: false, bizResult: false };
-    }
-    if (typeof captchaVerifyParam !== 'string' || captchaVerifyParam.length === 0) {
-      settlePending(pending, {
-        error: new CaptchaError('验证码校验失败，请重试'),
-      });
-      return { captchaResult: false, bizResult: false };
-    }
-    try {
-      // `pending.request` 是上层注入的「用这个串去换授权地址」
-      const result = await pending.request(captchaVerifyParam);
-      if (pendingVerification !== pending || pending.settled) {
-        return {
-          captchaResult: Boolean(result?.captchaResult),
-          bizResult: Boolean(result?.bizResult),
-        };
-      }
-      settlePending(pending, { value: result });
-      return {
-        captchaResult: Boolean(result?.captchaResult),
-        bizResult: Boolean(result?.bizResult),
-      };
-    } catch (error) {
-      settlePending(pending, { error });
-      return { captchaResult: false, bizResult: false };
-    }
-  }
-
-  /**
-   * 初始化 SDK 实例（客户端的 `initializeAliyunCaptcha`）。
-   *
-   * 同一个配置只初始化一次，19 分钟内复用；配置变了或过期就重建
-   * （见 `invalidateInitialization`）。`getInstance` 回调是「SDK 准备好了」
-   * 的信号 —— 它不给这个回调我们就不知道实例什么时候可用。
-   */
-  function initializeAliyunCaptcha(config) {
-    const language = resolveAliyunCaptchaLanguage(currentLanguage());
-    const key = `${config.region}:${config.prefix}:${config.sceneId}:${language}`;
-    if (initializationPromise && initializationKey === key) {
-      const inFlight = initializedAt === 0;
-      const fresh = Date.now() - initializedAt < INITIALIZATION_MAX_AGE_MS;
-      if (inFlight || fresh) return initializationPromise;
-      invalidateInitialization();
-    }
-    if (initializationKey && initializationKey !== key) invalidateInitialization();
-    initializationKey = key;
-    const generation = ++initializationGeneration;
-    initializationPromise = (async () => {
-      await loadAliyunCaptchaScript(config);
-      ensureCaptchaElements();
-      const initAliyunCaptcha = getInitAliyunCaptcha();
-      if (!initAliyunCaptcha) throw new CaptchaError('验证码组件不可用，请重试');
-      await new Promise((resolve, reject) => {
-        let settled = false;
-        let boundInstance = null;
-        const timer = window.setTimeout(() => {
-          if (settled) return;
-          settled = true;
-          reject(new CaptchaError('验证码组件初始化超时，请重试'));
-        }, INIT_TIMEOUT_MS);
-        const settle = callback => {
-          if (settled) return false;
-          settled = true;
-          window.clearTimeout(timer);
-          callback();
-          return true;
-        };
-        try {
-          initAliyunCaptcha({
-            SceneId: config.sceneId,
-            mode: 'popup',
-            element: `#${ELEMENT_ID}`,
-            button: `#${BUTTON_ID}`,
-            captchaVerifyCallback: param => captchaVerifyCallback(generation, param),
-            // 业务结果回调：上游对「验证码过了但业务没通过」的反馈走这里。
-            // 客户端也是空实现（它只关心 captchaVerifyCallback 的返回值）。
-            onBizResultCallback: () => {},
-            getInstance: instance => {
-              boundInstance = instance;
-              if (generation !== initializationGeneration) {
-                try { instance.destroy?.(); } catch { /* 忽略 */ }
-                return;
-              }
-              if (!settle(() => {
-                captchaInstance = instance;
-                initializedAt = Date.now();
-                resolve();
-              })) {
-                try { instance.destroy?.(); } catch { /* 忽略 */ }
-              }
-            },
-            slideStyle: { width: 360, height: 40 },
-            language,
-            onError: error => {
-              const pending = pendingVerification;
-              if (pending && pending.generation === generation && pending.instance === boundInstance) {
-                settlePending(pending, {
-                  error: new CaptchaError(
-                    (error && error.message) || '验证码校验失败，请重试',
-                  ),
-                });
-                return;
-              }
-              if (settled) {
-                if (generation === initializationGeneration
-                  && (!boundInstance || captchaInstance === boundInstance)) {
-                  invalidateInitialization();
-                }
-                return;
-              }
-              settle(() => reject(new CaptchaError(
-                (error && error.message) || '验证码组件不可用，请重试',
-              )));
-            },
-          });
-        } catch (error) {
-          settle(() => reject(new CaptchaError(
-            (error && error.message) || '验证码组件不可用，请重试',
-          )));
-        }
-      });
-      if (!captchaInstance) throw new CaptchaError('验证码组件不可用，请重试');
-    })();
-    return initializationPromise;
-  }
-
-  /** 等 SDK 预热完成（客户端实测：太快点击弹不出滑块） */
-  async function waitForWarmup() {
-    const remaining = MINIMUM_WARMUP_MS - (Date.now() - initializedAt);
-    if (remaining > 0) await sleep(remaining);
-  }
-
-  /**
-   * 走一次完整验证码：初始化 → 预热 → 弹滑块 → 用户拖 → 拿串换授权地址。
-   *
-   * `request` 由调用方注入：`(captchaVerifyParam) => Promise<{captchaResult, bizResult}>`
-   * —— 它是「用这个串去换授权地址」的那一步（调网关
-   * `/api/session/login/oauth/start`）。把它做成参数而不是写死在这里，
-   * 是为了让本文件只管验证码、不认识登录协议的字段名。
-   */
-  async function requestAliyunPopupCaptcha(config, request) {
-    await initializeAliyunCaptcha(config);
-    await waitForWarmup();
-    const button = ensureCaptchaElements();
-    const instance = captchaInstance;
-    if (!instance) throw new CaptchaError('验证码组件不可用，请重试');
-    const generation = initializationGeneration;
-    return new Promise((resolve, reject) => {
-      const pending = {
-        generation,
-        instance,
-        request,
-        resolve,
-        reject,
-        timer: 0,
-        settled: false,
-      };
-      pending.timer = window.setTimeout(() => {
-        settlePending(pending, {
-          error: new CaptchaError('验证码校验超时，请重试'),
-        });
-      }, VERIFY_TIMEOUT_MS);
-      pendingVerification = pending;
-      button.click();
-    });
-  }
-
-  /** 用户取消：把等待中的那次落定成「已取消」并作废实例 */
-  function cancelAliyunPopupCaptcha() {
-    const pending = pendingVerification;
-    if (!pending) return false;
-    const cancelled = settlePending(pending, { error: new CaptchaCancelledError() });
-    if (cancelled) invalidateInitialization();
-    return cancelled;
-  }
+  const {
+    solve: solveCaptcha,
+    cancel: cancelCaptcha,
+    CaptchaError,
+    CaptchaCancelledError,
+  } = window.wbAliyunCaptcha;
 
   // ── 上层：把验证码与登录流程接起来 ──────────────────────────
 
@@ -572,7 +208,7 @@
         // 用户随后真完成登录时账号加了、界面却毫无反应（三方状态错乱）。
         paintBusy(true, '请完成验证…');
         setHint('请在弹出的滑块中完成验证（官方要求的风控步骤）');
-        const started = await requestAliyunPopupCaptcha(
+        const started = await solveCaptcha(
           {
             region: captchaConfig.region || 'ga',
             prefix: captchaConfig.prefix,
@@ -584,6 +220,10 @@
             if (!authUrl) {
               throw new CaptchaError('未能获取授权地址，请重试');
             }
+            // 这一轮有降级时后端会给一句话（如「回调端口被官方客户端占着」）：
+            // 在这里提示，别等到用户按「系统浏览器」走完一遍才发现收不到回调
+            const warning = String(answer?.warning || '').trim();
+            if (warning) window.wbApp.toast(warning, 'warn');
             // bizResult 的语义 = 上游给没给授权地址（见文件头）——给了就算过，
             // SDK 收起滑块；地址与 state 由返回值带给 start()（started.answer）
             return { captchaResult: true, bizResult: true, answer };
@@ -674,7 +314,7 @@
        */
       cancel() {
         flowGeneration += 1;
-        const cancelledCaptcha = cancelAliyunPopupCaptcha();
+        const cancelledCaptcha = cancelCaptcha();
         const wasWaiting = Boolean(activeState);
         activeState = '';
         busy = false;

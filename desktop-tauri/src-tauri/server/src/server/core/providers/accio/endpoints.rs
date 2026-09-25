@@ -8,7 +8,8 @@
 //!     /api/auth/userinfo               用户资料（GET，accessToken 走 query）
 //!     /api/entitlement/quota           额度用量百分比 + 重置倒计时
 //!     /api/entitlement/currentSubscription  订阅详情
-//!     /api/llm/config/v2               模型目录（POST，body {token, supportAutoModel}）
+//!     /api/llm/config                  模型目录（POST，body {token}）—— 本网关用它
+//!     /api/llm/config/v2               模型目录的精简版（字段更少，见下）
 //!   推理网关（ADK）                https://phoenix-gw.alibaba.com/api/adk/llm
 //!     POST /generateContent?sg_k=<md5(requestId)>   SSE，Gemini 风格信封
 //!   登录站点
@@ -49,8 +50,18 @@ pub const USER_INFO_PATH: &str = "/api/auth/userinfo";
 pub const QUOTA_PATH: &str = "/api/entitlement/quota";
 /// 订阅详情
 pub const SUBSCRIPTION_PATH: &str = "/api/entitlement/currentSubscription";
-/// 模型目录
-pub const MODEL_CONFIG_PATH: &str = "/api/llm/config/v2";
+/// 模型目录（完整版）。
+///
+/// ── 为什么是 v1 而不是 v2（2026-09 实测）───────────────────
+/// 两条路径都返回同一个信封（`data` 是 provider 数组），差别在**清单本身**：
+/// 用国际版账号实测，v1 给 9 家 provider / 69 个模型 / 41 个可见，
+/// v2 只给 6 家 / 46 个 / 26 个 —— v2 **少了 deepseek、moonshot、zhipu 三家**
+/// （DeepSeek / Kimi / GLM 全都看不到）。此外 v1 每条模型多出 `protocol`
+/// 与 `group` 两个字段，前者正是思考档位落点要用的（见 `models.rs`）。
+/// 因此目录刷新打 v1，`MODEL_CONFIG_PATH_V2` 只作为回落。
+pub const MODEL_CONFIG_PATH: &str = "/api/llm/config";
+/// 模型目录的精简版（旧路径）。只在 v1 意外失败时回落一次，见 `models::refresh`
+pub const MODEL_CONFIG_PATH_V2: &str = "/api/llm/config/v2";
 
 /// OAuth 客户端 id（桌面端常量；两地逐字相同）
 pub const CLIENT_ID: &str = "accio-work";
@@ -61,6 +72,17 @@ pub const DEFAULT_TENANT: &str = "accio-agent";
 pub const DEFAULT_IAI_TAG: &str = "phoenix-desktop";
 /// 推理请求头里的客户端版本（桌面端取 appVersion；缺省给一个近版号）
 pub const DEFAULT_APP_VERSION: &str = "0.32.6";
+
+/// 推理请求头 `appKey`（**必填**，见下）。
+///
+/// ── 为什么它必须有（2026-09 实测）────────────────────────────
+/// 不带这个头打 `generateContent`，上游**不报错**，而是回一段普通文本
+/// ：「Your app version is no longer supported. Please update…」——
+/// HTTP 200、`data:` 帧，形态与正常回答完全一样，会被当成模型输出吐给下游。
+/// 带上任意**非空**取值即恢复（实测 `35298846` / `12345678` / 任意字符串
+/// 都通，空串等同于没带）—— 上游只校验「有没有」，不校验取值。
+/// 取的是 accio-manager 的默认值，与桌面端同源。`ACCIO_APP_KEY` 可覆盖。
+pub const DEFAULT_APP_KEY: &str = "35298846";
 
 /// 业务请求的默认语言（桌面端按界面语言给 `zh` / `en`，网关侧固定 en ——
 /// 额度与目录的文案不参与界面展示，语言只影响上游返回的消息文本）
@@ -182,6 +204,12 @@ pub fn gateway_base() -> String {
 /// 推理网关基址（`{gw}/api/adk/llm`）
 pub fn llm_base() -> String {
     format!("{}{}", gateway_base(), ADK_LLM_PATH)
+}
+
+/// `appKey` 请求头的取值（`ACCIO_APP_KEY` 可覆盖）。**只用于推理接口**：
+/// 业务接口（目录 / 额度 / 资料）实测带不带都一样，多带只是徒增风控面。
+pub fn app_key() -> String {
+    env_text("ACCIO_APP_KEY").unwrap_or_else(|| DEFAULT_APP_KEY.to_string())
 }
 
 /// 读一个环境变量并去掉空白；空串按「没设」处理

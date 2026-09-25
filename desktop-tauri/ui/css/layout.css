@@ -537,6 +537,11 @@ body.has-titlebar .shell {
 .panel-head .panel-sub { color: var(--text-3); font-size: 11.5px; }
 .head-actions { margin-left: auto; display: flex; gap: 7px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 
+/* React 岛挂载点（见 ui/islands/）：本身不生成盒子，岛渲染出来的根元素直接
+   参与父级布局 —— 于是「把一块原生控件换成岛」不会在页面上多出一层影响
+   间距与对齐的包裹，接入前后布局完全等价。 */
+.island { display: contents; }
+
 .panel-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
 .panel-body.flush { padding: 0; }
 

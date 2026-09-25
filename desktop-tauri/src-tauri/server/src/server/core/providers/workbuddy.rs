@@ -482,11 +482,11 @@ impl ProviderAdapter for WorkBuddyAdapter {
     /// ── 为什么形状不归一化（这是硬要求）─────────────────────────
     /// `query_credits_summary` 返回的
     /// `{kind, unlimited, totalLeft, planLeft, bonusLeft}` 是改造前就有的既有契约，
-    /// 前端积分面板（`accounts-model.js` 的 `usagePanelHtml`）一直按它渲染。
+    /// 前端一直按它渲染（余额列的读数，见 `ui/accounts-table.js` 的 `usageSummary`）。
     /// 把它包装成 trait 文档里那套 `{available, unit, wallets, subscription}`
-    /// 会让那个面板的显示退化 —— 那是明令禁止的。四家的形状在
+    /// 会让那一格的显示退化 —— 那是明令禁止的。四家的形状在
     /// `query_usage` 的文档里写清楚了：新移植的两家走统一形状，本家保持原样，
-    /// 前端按字段探测两套形状（见 `ui/usage-panel.js`）。
+    /// 前端按字段探测两套形状（`totalLeft` 键就是本家形状的判别键）。
     ///
     /// ── 与 `api::accounts` 里那条老路径的关系 ────────────────────
     /// 这里构造的 `BillingService::new(AuthService::for_store(store.clone()))`

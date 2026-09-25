@@ -84,8 +84,15 @@
     ? window.wbFilterMemory.load(FILTERS_KEY, { provider: 'all', state: 'all', search: '' })
     : { provider: 'all', state: 'all', search: '' };
   const MODEL_STATES = ['all', 'enabled', 'disabled', 'mapped'];
+  /** 状态分段控件上的标签（键与 MODEL_STATES 一一对应，顺序也照它） */
+  const MODEL_STATE_LABEL = { all: '全部', enabled: '已启用', disabled: '已禁用', mapped: '有映射' };
   let currentProvider = savedFilters.provider;
   let stateFilter = MODEL_STATES.includes(savedFilters.state) ? savedFilters.state : 'all';
+  /**
+   * 搜索关键词。搜索框岛是**非受控**的（值由浏览器持有，打字零延迟），
+   * 这里跟着 onInput 同步一份供筛选逻辑读 —— 不再从 DOM 反查。
+   */
+  let searchText = savedFilters.search || '';
   /** 已展开全部行的提供商集合 */
   const expanded = new Set();
   /** 行内操作在途标记：防同一行连点 */
@@ -285,17 +292,55 @@
       }));
   }
 
-  async function load() {
-    if (loading) return;
+  /** 在途加载的序号：force 重入时用它作废更早那次的响应（见 load 说明） */
+  let loadSeq = 0;
+
+  /**
+   * 拉内置家的 manage 清单并重绘。
+   *
+   * `force` 供「切页刷新」这类**必须落地**的调用使用：默认情况下 `loading` 守卫
+   * 会把重复调用合并掉，但切页时用户刚在账号页改过东西（加 / 删提供商），这次
+   * 刷新被吞掉就等于整页没刷新 —— 所以 force 放行并发，并用序号保证**只有最后
+   * 一次的结果生效**（先发的请求后回来时不覆盖新数据）。
+   *
+   * 失败也要重绘：左栏与自定义家的表格读的是本地目录缓存（providers.js），
+   * 它们不该跟着这次网络失败一起停更（内置家的那份保持上一份成功结果）。
+   */
+  async function load({ force = false } = {}) {
+    if (loading && !force) return;
+    const seq = ++loadSeq;
     loading = true;
     try {
-      data = await workbuddyDesktop.getModelManage();
+      const next = await workbuddyDesktop.getModelManage();
+      // 期间若有更新的一次加载发起，本次结果作废
+      if (seq !== loadSeq) return;
+      data = next;
       render();
     } catch (error) {
+      if (seq !== loadSeq) return;
+      render();
       toast(`读取模型清单失败：${error.message}`, 'err');
     } finally {
-      loading = false;
+      if (seq === loadSeq) loading = false;
     }
+  }
+
+  /**
+   * 切到本页时的整页刷新（app.js 的 showPage 转发进来），两件事：
+   *   1. **自定义提供商目录**（providers.js 的缓存）：左栏那组条目、每个家的
+   *      模型清单与「这家还在不在」全读它。提供商是运行期数据，可能在账号页
+   *      被添加 / 改名 / 删除，而这一页自持数据、不随主状态轮询更新；
+   *   2. **内置家的 manage 清单**：上游目录可能被别处的「获取模型」刷新过。
+   *
+   * 顺序不能颠倒：目录缓存是自定义家的数据源，先刷它再重绘，左栏与表格才是
+   * 同一份数据画出来的。目录刷新失败不阻断 —— 按现有缓存重绘，总比整页停更
+   * 好（`load` 的 force 保证这次一定真的重拉并重绘）。
+   */
+  async function refreshAll() {
+    try {
+      await window.wbProviders?.refreshCustom?.();
+    } catch { /* 目录偶发打不通：用现有缓存重绘，别把整页刷新拖没 */ }
+    await load({ force: true });
   }
 
   /**
@@ -317,7 +362,7 @@
   };
 
   function searchTerm() {
-    return ($('model-search')?.value || '').trim().toLowerCase();
+    return searchText.trim().toLowerCase();
   }
 
   /** 行的启停判定：还有任一条生效的绑定（默认或别名）就算启用，全部关闭才算
@@ -373,6 +418,13 @@
    *
    * 自定义家的计数读目录缓存里该家的 `models` 数组长度，与「这家有没有账号」无关
    * —— 建了提供商但账号被删光时，清单照样要能管（与账号页管理弹窗同一条口径）。
+   *
+   * 自定义家条目额外挂一颗**删除按钮**（hover 才显形，见 .pv-del 的样式）。
+   * 为什么在这里补这个入口：提供商级的编辑 / 删除唯一入口是账号设置弹窗，而它
+   * 挂在账号行上 —— 名下账号被删光的提供商因此没有任何界面能删掉它（见
+   * custom-provider-ui.js 的「已知的可达性缺口」），只剩这一页左栏还看得见它。
+   * 删除动作本身仍走 wbCustomProvidersUi.remove（二次确认 + 级联删账号 + 目录
+   * 刷新，与账号设置弹窗里那颗按钮同一条路），这里只负责把本页重画一遍。
    */
   function renderRail() {
     const rail = $('prov-rail');
@@ -380,9 +432,17 @@
     const counts = builtinRailItems();
     const customs = customSource?.list?.() || [];
     const total = [...counts.values()].reduce((sum, item) => sum + item.n, 0);
-    const item = (id, label, n) => `<button type="button" class="pv${currentProvider === id ? ' on' : ''}"`
-      + ` data-provider="${esc(id)}" title="${esc(label)}">`
-      + `<span class="nm">${esc(label)}</span><span class="n">${n}</span></button>`;
+    const item = (id, label, n, { removable = false } = {}) => {
+      const pick = `<button type="button" class="pv${currentProvider === id ? ' on' : ''}"`
+        + ` data-provider="${esc(id)}" title="${esc(label)}">`
+        + `<span class="nm">${esc(label)}</span><span class="n">${n}</span></button>`;
+      if (!removable) return pick;
+      // 删除按钮不能嵌进 .pv（button 套 button 是无效 HTML，解析器会把内层
+      // 提到外面、绝对定位跟着失去参照），所以外面套一层定位容器
+      return `<div class="pv-row">${pick}`
+        + `<button type="button" class="pv-del" data-del-provider="${esc(id)}"`
+        + ` title="删除这个自定义提供商（连同名下账号）" aria-label="删除自定义提供商">×</button></div>`;
+    };
     rail.innerHTML = '<div class="rail-label">内置提供商</div>'
       + item('all', `全部（${counts.size} 家）`, total)
       + [...counts].map(([key, entry]) => item(key, entry.label, entry.n)).join('')
@@ -392,6 +452,7 @@
           provider.id,
           provider.name || provider.id,
           Array.isArray(provider.models) ? provider.models.length : 0,
+          { removable: true },
         )).join('')
         : '<div class="rail-empty">还没有自定义提供商</div>')
       + '<button type="button" class="pv-add" id="rail-add-custom"'
@@ -494,15 +555,21 @@
 
       唯一的**条**级例外是 `manual`：用户手动登记的自定义模型（见顶部
       「＋ 添加自定义模型」）。它不属于该家清单的任何一种来源，后端逐条标出来，
-      前端照实显示。 */
+      前端照实显示。
+
+      「远程」还带一个 `refreshedAt`（后端给的毫秒时间戳）：进程重启后清单可能
+      是**从持久化缓存恢复**的，与刚拉到的都是「远程」，时效只能靠这个时间戳
+      说明 —— 没有它，用户没法判断手上这份是不是几天前的。 */
   function sourceCell(m) {
     if (m.source === 'manual') {
       return '<span class="badge tag brand" title="手动登记的上游模型；移除它会直接删掉这条登记">手动</span>';
     }
     if (m.source !== 'remote' && m.source !== 'builtin') return '<span class="rate">—</span>';
     const remote = m.source === 'remote';
+    // `formatTime` 来自 app.js（全局；0 或非法值返回空串，这里据此省略那半句）
+    const at = formatTime(Number(m.refreshedAt) || 0);
     const hint = remote
-      ? '来自上游目录接口（刷新失败时保留上一份成功结果）'
+      ? `来自上游目录接口${at ? `，清单拉取于 ${at}` : ''}；刷新失败时保留上一份成功结果`
       : '上游目录尚未拉到，用的是内置静态清单；点「刷新模型清单」可重试';
     return `<span class="badge tag${remote ? ' brand' : ''}" title="${hint}">${remote ? '远程' : '内置'}</span>`;
   }
@@ -531,7 +598,7 @@
     const foot = $('models-panel-foot');
     if (foot) {
       foot.innerHTML = custom
-        ? '自定义提供商的清单<b>只属于这一家</b>：这里的模型不会出现在其他家，别名也只在这一家内生效。要改名称 / 协议 / Base URL，去账号页「自定义提供商」→ 编辑。'
+        ? '自定义提供商的清单<b>只属于这一家</b>：这里的模型不会出现在其他家，别名也只在这一家内生效。改名称 / 协议 / Base URL 在账号页该家账号的「设置」→ 提供商一栏；整家不要了，鼠标移到左栏这家上点 × 删除（连同名下账号）。'
         : '「默认」绑定就是原始模型 ID，只可开关、不可删除。原始 ID 与每个别名独立生效：关闭的名称不出现在 <code>/v1/models</code>，下游请求返回 404；其他开启的名称不受影响。';
     }
   }
@@ -1073,8 +1140,9 @@
       name,
       // 自定义家：导入成功 → 目录缓存已刷新，重绘即可（数据源是本地缓存）
       onDone: () => render(),
-      // 内置家：远程目录落地 → 后端清单换了，必须重拉（本地那份已过期）
-      onRefreshed: () => { void load(); },
+      // 内置家：远程目录落地 → 后端清单换了，必须重拉（本地那份已过期）。
+      // force：这次重拉是「刷新已落地」的收尾，不能被一个更早的在途加载吞掉
+      onRefreshed: () => { void load({ force: true }); },
     });
   }
 
@@ -1104,33 +1172,82 @@
     window.wbAccountAddForms?.openNewCustomForm?.();
   }
 
-  // 恢复上次的筛选：搜索框回填；左栏的选中态由 renderRail 每次渲染时画
-  // （选中项就是 currentProvider），状态分段是一次性静态 HTML，这里补一次 active。
-  // 搜索词变更随 input 落盘（各敲一个字写一次 localStorage，量小无感）。
-  if ($('model-search')) $('model-search').value = savedFilters.search || '';
-  document.querySelectorAll('#models-state-seg .seg-item').forEach(el =>
-    el.classList.toggle('active', el.dataset.state === stateFilter));
+  /**
+   * 删除一个自定义提供商（左栏条目上那颗 ×）。
+   *
+   * 删除逻辑（二次确认 / 级联删账号 / 目录与账号列表刷新）全在
+   * custom-provider-ui.js 里，与账号设置弹窗那颗「删除提供商」同一实现；
+   * 这里只做两件事：转发，然后把本页重画一遍。
+   *
+   * 删掉的是**当前选中的那家**时不用特判选中态：`render` 开头的
+   * `normalizeSelection` 认不出已删的家，会自动回落「全部」。
+   */
+  async function removeCustomProvider(providerId) {
+    const api = window.wbCustomProvidersUi;
+    // 正常加载顺序下它一定在（custom-provider-ui.js 在本文件之后、账号页之前加载）。
+    // 真缺了就说一声 —— 点了 × 什么都不发生比报错更难查
+    if (!api?.remove) { toast('删除入口未就绪，请重试或重启应用', 'err'); return; }
+    if (!(await api.remove(providerId))) return;
+    // 重拉而非只重绘：该家从后端目录里消失了（它的模型不再参与路由），
+    // 内置家那份 manage 视图里的承载关系可能跟着变
+    await load({ force: true });
+  }
 
-  $('model-search')?.addEventListener('input', event => {
-    window.wbFilterMemory?.save(FILTERS_KEY, { search: event.target.value });
+  // 恢复上次的筛选：左栏的选中态由 renderRail 每次渲染时画（选中项就是
+  // currentProvider），状态分段与搜索框由 React 岛渲染（见下）。
+  // 搜索框的初值直接由岛的 value 参数带进去，不再需要「先写 DOM 再纠正」那一步。
+
+  // 搜索框交给岛（ui/islands/ui.js）：非受控，浏览器先把字上屏，这里跟着存盘与重绘。
+  // 重绘整张模型表可能不便宜，非受控正是为了不让打字等它 —— 见 input-control.tsx 的说明。
+  const searchHost = $('models-search');
+  if (searchHost && window.wbInput) {
+    window.wbInput.mount(searchHost, {
+      value: searchText,
+      placeholder: '搜索模型 ID / 名称 / 映射名…',
+      ariaLabel: '搜索模型',
+      icon: '⌕',
+      onInput: value => {
+        searchText = value;
+        // 各敲一个字写一次 localStorage，量小无感
+        window.wbFilterMemory?.save(FILTERS_KEY, { search: value });
+        render();
+      },
+    });
+  }
+
+  // 状态筛选交给岛（ui/islands/ui.js）：语义、键盘、滑块都在岛上。
+  // 取值仍以本文件的 stateFilter 为准 —— 岛完全受控，这里只负责灌值与回灌。
+  let stateIsland = null;
+  const stateHost = $('models-state-seg');
+  if (stateHost && window.wbSegmented) {
+    stateIsland = window.wbSegmented.mount(stateHost, {
+      options: MODEL_STATES.map(value => ({ value, label: MODEL_STATE_LABEL[value] })),
+      value: stateFilter,
+      ariaLabel: '按状态筛选',
+      onChange: setStateFilter,
+    });
+  }
+
+  function setStateFilter(next) {
+    const value = MODEL_STATES.includes(next) ? next : 'all';
+    if (value === stateFilter) return;
+    stateFilter = value;
+    window.wbFilterMemory?.save(FILTERS_KEY, { state: stateFilter });
+    stateIsland?.setValue(value);
     render();
-  });
+  }
+
   $('models')?.addEventListener('click', onTableClick);
   $('models')?.addEventListener('change', onTableChange);
-  // 左栏：点一家切一家；「＋ 新建自定义提供商」就地打开新建弹窗（不跳页）
+  // 左栏：点一家切一家；「＋ 新建自定义提供商」就地打开新建弹窗（不跳页）；
+  // 自定义家条目上的 × 删除该家（二次确认在 wbCustomProvidersUi 里）
   $('prov-rail')?.addEventListener('click', event => {
+    const remove = event.target.closest('[data-del-provider]');
+    if (remove) { void removeCustomProvider(remove.dataset.delProvider); return; }
     if (event.target.closest('#rail-add-custom')) { openAddCustomProvider(); return; }
     const item = event.target.closest('.pv[data-provider]');
     if (!item) return;
     selectProvider(item.dataset.provider);
-  });
-  $('models-state-seg')?.addEventListener('click', event => {
-    const item = event.target.closest('.seg-item[data-state]');
-    if (!item) return;
-    stateFilter = item.dataset.state;
-    window.wbFilterMemory?.save(FILTERS_KEY, { state: stateFilter });
-    $('models-state-seg').querySelectorAll('.seg-item').forEach(el => el.classList.toggle('active', el === item));
-    render();
   });
   $('mapping-modal-close')?.addEventListener('click', closeMapping);
   $('mapping-modal-cancel')?.addEventListener('click', closeMapping);
@@ -1174,13 +1291,32 @@
     refreshButton.addEventListener('click', () => { void refreshModels(); });
   }
 
+  /**
+   * 某家清单的最近拉取时刻（毫秒；0 = 未知 / 从未成功过）。
+   *
+   * 给「获取模型」弹窗的「更新日期」列用：那个弹窗**打开时不自动拉取**，所以
+   * 它的第一屏（待获取态）没有本次结果可显示，而用户恰恰最想先看到「各家现在
+   * 这份清单是什么时候的」再决定要不要刷。数据取自 manage 视图的 `refreshedAt`
+   * （后端逐行给的家级字段，见 `catalog::manage_view`）—— 与本页「来源」列
+   * 悬停提示里的那个时刻同源，两处不会各说一个时间。
+   */
+  function providerRefreshedAt(providerId) {
+    const rows = Array.isArray(data?.models) ? data.models : [];
+    const hit = rows.find(model => model.provider === providerId);
+    return Number(hit?.refreshedAt) || 0;
+  }
+
   // visibleColumns 导出给 table-columns.js：列宽那一层要按当前可见列算
   // （覆盖值落到哪个 <col>、末列不给把手），两边读同一份配置才不会各算一个样。
   // 必须在下面的 syncHead() **之前**挂好 —— 那次同步会顺带重算列宽与把手，
   // 挂晚了它读到的是「全列」，「末列不给把手」就会判到错的那一列上。
   //
   // selectProvider 导出给账号页的自定义提供商弹窗（「模型清单 →」跳过来并选中该家）。
-  window.wbModelsPanel = { render, load, refreshModels, visibleColumns, selectProvider, builtinProviders };
+  // providerRefreshedAt 导出给「获取模型」弹窗（见上）。
+  window.wbModelsPanel = {
+    render, load, refreshAll, refreshModels, visibleColumns, selectProvider, builtinProviders,
+    providerRefreshedAt,
+  };
 
   // 首屏同步一次静态表头：load() 只重画数据行，表头是本文件加载后按本地配置
   // 重排过的（顺序 / 显隐 / 对齐）—— 不补这一下，用户改过列设置后刷新页面会看到

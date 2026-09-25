@@ -31,6 +31,11 @@
   /** 持久化键：沿用项目既有的 workbuddy-desktop-* 前缀（主题 / 页码 / 日志开关是同一套） */
   const RANGE_KEY = 'workbuddy-desktop-report-range';
   const RANGE_LABEL = { today: '今天', 7: '近 7 天', 30: '近 30 天', month: '本月', all: '全部' };
+  /**
+   * 分段控件上的短标签。与 RANGE_LABEL 是两套，别合并：那边是概览小格的说明文字
+   * （「近 7 天」），控件里位置窄，用更短的（「7 天」）。
+   */
+  const RANGE_OPTION_LABEL = { today: '今天', 7: '7 天', 30: '30 天', month: '本月', all: '全部' };
 
   /** 热力图与折线图共用的星期行标签：只标周一 / 三 / 五，七行全写会糊成一片 */
   const WEEKDAY_ROWS = [[0, '一'], [2, '三'], [4, '五']];
@@ -1281,10 +1286,24 @@
 
   // ─── 时间范围 ──────────────────────────────
 
-  /** 把选中态刷到分段控件上（HTML 里预置的是默认值 7，存过的值在这里纠正） */
-  function syncRangeButtons() {
-    document.querySelectorAll('#report-range .seg-item[data-range]').forEach(item => {
-      item.classList.toggle('active', item.dataset.range === range);
+  /**
+   * 分段控件由 React 岛渲染（产物 ui/islands/ui.js，源码 desktop-tauri/ui-islands/）：
+   * 语义、键盘与焦点交给 Base UI 的 RadioGroup，视觉仍是 components.css 的 .seg / .seg-item。
+   *
+   * 岛是完全受控的 —— 档位取值始终以本文件的 range 为准，岛自己不留状态，
+   * 于是「点了之后要做什么」不会分裂成两处。这里只负责把值灌进去。
+   */
+  let rangeIsland = null;
+
+  /** 挂载岛。宿主或岛脚本缺失时留 null，后面的 setValue 走可选链静默跳过 */
+  function mountRangeControl() {
+    const host = $('report-range');
+    if (!host || !window.wbSegmented) return;
+    rangeIsland = window.wbSegmented.mount(host, {
+      options: RANGES.map(value => ({ value, label: RANGE_OPTION_LABEL[value] })),
+      value: range,
+      ariaLabel: '报表时间范围',
+      onChange: setRange,
     });
   }
 
@@ -1295,7 +1314,7 @@
     try {
       localStorage.setItem(RANGE_KEY, value);
     } catch { /* 存储不可用时只影响下次启动，本次会话照常 */ }
-    syncRangeButtons();
+    rangeIsland?.setValue(value);
     void load();
   }
 
@@ -1333,10 +1352,8 @@
 
   // ─── 事件绑定 ──────────────────────────────
 
-  $('report-range')?.addEventListener('click', event => {
-    const item = event.target.closest('.seg-item[data-range]');
-    if (item && !item.disabled) setRange(item.dataset.range);
-  });
+  // 时间范围的交互不再在这里绑：点击、方向键、焦点都由 React 岛内部接管
+  // （挂载见文件末尾的 mountRangeControl），档位变化经岛的 onChange 回到 setRange。
 
   // 页头原先那颗「刷新」按钮已移除：本页现在按「定时任务」页配置的间隔自动
   // 刷新（默认 1 秒，页面可见才跑），手动再点一次已经没有意义 —— 留着它反而
@@ -1345,7 +1362,9 @@
 
   // 图例不在这里画：它的档位阈值取自本次窗口的 Token 峰值，没有数据就算不出来
   // （见 heatThresholdsOf）。由 renderAll 在拿到数据后与热力图一起画。
-  syncRangeButtons();
+  // 挂载时间范围分段控件：初值直接用 range（已从 localStorage 读过），
+  // 所以不再需要「HTML 预置默认值、JS 再纠正」那一步。
+  mountRangeControl();
 
   window.wbReport = {
     load,

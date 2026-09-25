@@ -41,8 +41,9 @@
    * usage **各家都是 true**（余额 / 积分查询已扩到全部提供商）：各家的接口、鉴权、
    * 凭证来源全不相同，但都由各自的适配器实现（`ProviderAdapter::query_usage`），
    * 前端只回答「这一家有没有这个概念」。CatPaw 的余额接口要单独配置一个网页会话
-   * 凭证（token2），没配置时后端返回可识别的「未配置」、面板显示成中性提示
-   * （见 usage-panel.js）—— 所以它的按钮照样渲染，用户才有「去配置」的入口。
+   * 凭证（token2），没配置时后端返回可识别的「未配置」、余额列显示成中性提示
+   * （判据见 usage-actions.js 的 `usageFailureOf`）—— 所以它的按钮照样渲染，
+   * 用户才有「去配置」的入口。
    * checkin 是**有签到活动**的家：workbuddy（腾讯每日签到）、raccoon（桌面登录
    * 积分发放）、autoclaw（通用任务接口的 daily_signin 任务）。CatPaw / Qoder /
    * Cline 有积分但确实没有签到，所以是 false —— 这个字段决定批量签到的目标集合与
@@ -86,6 +87,32 @@
     // userId、有效期与 workbuddy 同键名（毫秒时间戳）。两项都必须登记。
     accio: { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
     'accio-cn': { usage: true, checkin: false, edition: true, identifier: 'userId', expiry: 'expiresAt', emailAsName: true },
+    // ZCode 两个地区（国内版 / 国际版）：能力一致，差别只在推理域名与账号归属。
+    //
+    // ── 这一家**没有签到**，但有一个别家没有的动作 ───────────────
+    // `checkin: false` 是事实（整家都没有签到活动），因此它不在
+    // `auto_checkin` 的提供商清单里。替代它的是「周末套餐领取」——
+    // 那是一个**独立的按钮**（探测 + 一键领取），不是签到按钮换了个文案：
+    // 签到是每天定点、无人值守；领取是分钟级探测 + 用户点一下才真领
+    // （验证码那一步要前端参与）。所以这里不给 checkin 打 true，
+    // 等领取按钮做出来时另加一个能力位，别把两者混成一个。
+    //
+    // `usage: false`：本家目前**没有**实现余额/额度查询（适配器的
+    // `query_usage` 走默认实现），所以不显示积分按钮 —— 与「未知 provider
+    // 不假定拥有」同一口径，宁可少一个按钮，也不要一个点了必然报错的入口。
+    // 将来补上 `zcode::balance` 后再改成 true。
+    //
+    // `expiry: 'expiresAt'`：与 qoder / accio 那两家 OAuth 家同键名。
+    // 这是给 `add_zcode_account` 的**契约**——落账号时要把访问令牌的过期
+    // 时间（JWT 的 `exp` 声明，毫秒）写进这个键，否则这一列会显示成空。
+    zcode: {
+      usage: false, checkin: false, claim: true, edition: true,
+      identifier: 'userId', expiry: 'expiresAt',
+    },
+    'zcode-intl': {
+      usage: false, checkin: false, claim: true, edition: true,
+      identifier: 'userId', expiry: 'expiresAt',
+    },
   };
 
   /**
@@ -267,6 +294,24 @@
   }
 
   /**
+   * 这个账号能不能「领取体验套餐」（ZCode 独有的动作）。
+   *
+   * 两道判据，缺一不可：
+   *   ① 能力位（`claim`）—— 只有 ZCode 那两家登记了它；
+   *   ② `canClaim` —— 后端公开形态给的字段，表示这个账号**确实带着套餐令牌
+   *      （jwt）**。只填了 accessToken 的账号（用于转发）没有 jwt，
+   *      界面上就不该给一个点了必然 400 的按钮。
+   *
+   * `canClaim` 缺省按 true（老响应 / 极端情况）：后端已经把它写进公开形态，
+   * 取不到时宁可让按钮出现、由后端如实报「没有套餐令牌」—— 那比「按钮消失
+   * 且没有任何解释」更容易排查。
+   */
+  function supportsClaim(account) {
+    if (!providerFeatures(providerOf(account)).claim) return false;
+    return account?.canClaim !== false;
+  }
+
+  /**
    * 可参与签到的账号（一键签到只用这批：所属家有签到活动 + 非国际版）。
    *
    * **不看 `enabled`**：禁用只表示「别用它转发」，签到是另一件事 ——
@@ -392,6 +437,7 @@
     activeLimits,
     accountEdition,
     supportsCheckin,
+    supportsClaim,
     checkedInToday,
     checkinableAccounts,
     // 筛选与队列

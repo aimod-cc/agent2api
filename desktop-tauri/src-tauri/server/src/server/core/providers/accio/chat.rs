@@ -87,12 +87,15 @@ pub fn build_plan(
         .unwrap_or_default();
     // 档位按模型自己声明的集合收敛（发一个它没声明的档位要么被忽略要么 400）
     let resolved_effort = effort.and_then(|level| protocol::resolve_effort(level, &efforts));
+    // 档位落点由目录条目的 `protocol` 决定（见 `models::EffortPlacement`）
+    let placement = super::models::EffortPlacement::from_entry(&entry);
 
     let built = protocol::build_upstream_body(
         body,
         &upstream_key,
         &credentials.access_token,
         resolved_effort.as_deref(),
+        placement,
     );
     let request_id = built
         .body
@@ -113,6 +116,10 @@ pub fn build_plan(
                 .unwrap_or_else(|| endpoints::DEFAULT_APP_VERSION.to_string()),
         ),
         ("x-package-region".to_string(), credentials.region.package_region().to_string()),
+        // **必带**：缺了它上游不报错，而是回一段「当前版本已不再支持，请升级」
+        // 的普通文本（HTTP 200 + 正常帧形态），会被当成模型输出吐给下游。
+        // 见 `endpoints::DEFAULT_APP_KEY`。
+        ("appKey".to_string(), endpoints::app_key()),
     ];
     // 设备指纹（每条账号自带一个；缺省也能发，但带上更接近真实客户端）
     if !credentials.device_id.is_empty() {

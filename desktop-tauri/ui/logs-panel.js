@@ -78,6 +78,11 @@
   const RANGES = ['today', '7', '30', 'month', 'all'];
   const DEFAULT_RANGE = 'all';
   const RANGE_LABEL = { today: '今天', 7: '近 7 天', 30: '近 30 天', month: '本月', all: '全部' };
+  /**
+   * 分段控件上的短标签。与 RANGE_LABEL 是两套，别合并：那边是摘要文字
+   * （「近 7 天」），控件里位置窄，用更短的（「7 天」）。
+   */
+  const RANGE_OPTION_LABEL = { today: '今天', 7: '7 天', 30: '30 天', month: '本月', all: '全部' };
 
   let panelBusy = false;
   let current = null;      // 最近一次事件日志查询结果
@@ -508,23 +513,28 @@
 
   // ─── 事件绑定 ──────────────────────────────
 
-  // 时间档位的默认值（「全部」）写在 HTML 里，存过的值在这里纠正
-  $('logs-range')?.querySelectorAll('.seg-item[data-range]').forEach(item => {
-    item.classList.toggle('active', item.dataset.range === eventRange);
-  });
-
-  $('logs-range')?.addEventListener('click', event => {
-    const item = event.target.closest('.seg-item[data-range]');
-    if (!item) return;
-    const next = RANGES.includes(item.dataset.range) ? item.dataset.range : DEFAULT_RANGE;
-    if (next === eventRange) return;
-    eventRange = next;
-    persistRange(EVENT_RANGE_KEY, next);
-    $('logs-range')?.querySelectorAll('.seg-item[data-range]').forEach(node => {
-      node.classList.toggle('active', node.dataset.range === next);
+  // 时间档位由 React 岛渲染（ui/islands/ui.js）：语义、键盘、滑块都在岛上。
+  // 档位取值仍以本文件的 eventRange 为准 —— 岛完全受控，这里只负责灌值与回灌。
+  // 原先「HTML 预置默认值、JS 再纠正」那一步不再需要：初值直接就是 eventRange。
+  let rangeIsland = null;
+  const rangeHost = $('logs-range');
+  if (rangeHost && window.wbSegmented) {
+    rangeIsland = window.wbSegmented.mount(rangeHost, {
+      options: RANGES.map(value => ({ value, label: RANGE_OPTION_LABEL[value] })),
+      value: eventRange,
+      ariaLabel: '事件日志时间范围',
+      onChange: setRange,
     });
+  }
+
+  function setRange(next) {
+    const value = RANGES.includes(next) ? next : DEFAULT_RANGE;
+    if (value === eventRange) return;
+    eventRange = value;
+    persistRange(EVENT_RANGE_KEY, value);
+    rangeIsland?.setValue(value);
     void load({ resetPage: true });
-  });
+  }
 
   $('btn-logs-clear').addEventListener('click', clearLogs);
   $('btn-logs-export').addEventListener('click', exportLogs);

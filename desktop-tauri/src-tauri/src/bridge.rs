@@ -194,6 +194,29 @@ const BRIDGE_JS: &str = r#"
         vendor: String(vendor || ''),
         captchaVerifyParam: String(captchaVerifyParam || ''),
       }),
+    // ── ZCode「周末套餐」领取（三个薄封装，直接打账号子路径接口）──────
+    // 与上面 AutoClaw 那三个方法同一形态，**两处必须成对存在**：本文件是
+    // 桌面壳的桥接，`server/src/web_shim.rs` 是 headless 面板的桥接 ——
+    // 只加一边时，另一形态下的界面会报「当前环境不支持领取（桥接方法缺失）」
+    // （zcode-claim.js 的 `api?.zcodeClaimPreview` 判定）。
+    //
+    // 契约（详见 `api/zcode_claim.rs` 的模块头）：
+    //   · captchaConfig 拿阿里云风控配置（前端用它初始化滑块 SDK）；
+    //     返回 `{enabled:false}` 表示上游此刻不要验证码 —— 前端**不该**弹滑块；
+    //   · preview 只读探测，返回 `{plans:[...], deployed}`；
+    //     `deployed:false` = 活动接口尚未部署（开抢前的正常状态，不是错误）；
+    //   · claim 真正领取；**业务失败也走 200**，由 `ok:false` + `failure`
+    //     表达（前端据此选提示文案）。
+    zcodeClaimCaptchaConfig: accountId =>
+      call('POST', `/api/accounts/${encodeURIComponent(String(accountId || ''))}/zcode-claim/captcha-config`),
+    zcodeClaimPreview: accountId =>
+      call('POST', `/api/accounts/${encodeURIComponent(String(accountId || ''))}/zcode-claim/preview`),
+    zcodeClaim: (accountId, planId, captchaVerifyParam, captchaRegion) =>
+      call('POST', `/api/accounts/${encodeURIComponent(String(accountId || ''))}/zcode-claim`, {
+        planId: planId ? String(planId) : '',
+        captchaVerifyParam: String(captchaVerifyParam || ''),
+        captchaRegion: captchaRegion ? String(captchaRegion) : '',
+      }),
     onLoginState: callback => on('login:state', callback),
     refreshSession: async () => {
       await call('POST', '/api/session/refresh', {});

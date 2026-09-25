@@ -62,12 +62,6 @@ pub fn finish_reason(raw: &str) -> &'static str {
     }
 }
 
-/// 模型家族判定（照抄客户端的 `me()`）：决定思考档位放顶层还是 properties。
-pub fn is_openai_family(model: &str) -> bool {
-    let lower = model.to_ascii_lowercase();
-    ["gpt", "o1-", "o3-", "o4-"].iter().any(|needle| lower.contains(needle))
-}
-
 /// 中文/英文错误文案里能认出的额度不足信号（客户端用同一类正则判「余额耗尽」）
 const QUOTA_HINTS: &[&str] = &[
     "积分",
@@ -263,11 +257,14 @@ pub struct OutboundBody {
 ///
 /// `model_code` 是**已按家解析过的发送名**（`models::resolve` 的 `upstreamKey`），
 /// `token` 是 accessToken（上游靠 body 里的这个字段鉴权）。
+/// `placement` 是思考档位的落点（由目录条目的 `protocol` 决定，见
+/// `models::EffortPlacement`）—— 不在这里按模型名猜。
 pub fn build_upstream_body(
     body: &Value,
     model_code: &str,
     token: &str,
     effort: Option<&str>,
+    placement: super::models::EffortPlacement,
 ) -> OutboundBody {
     let mut contents: Vec<Value> = Vec::new();
     let mut system_parts: Vec<String> = Vec::new();
@@ -365,13 +362,20 @@ pub fn build_upstream_body(
     // 客户端自己的归一化开关（桌面端每个请求都带它）
     properties.insert("normalized_response".to_string(), Value::String("true".to_string()));
 
-    let openai_family = is_openai_family(model_code);
+    let request_id = crate::server::core::upstream::request::new_request_id();
     let mut payload = Map::new();
     payload.insert("model".to_string(), Value::String(model_code.to_string()));
     payload.insert("tenant".to_string(), Value::String(super::endpoints::DEFAULT_TENANT.to_string()));
     payload.insert("iai_tag".to_string(), Value::String(super::endpoints::DEFAULT_IAI_TAG.to_string()));
     payload.insert("empid".to_string(), Value::String(String::new()));
-    payload.insert("request_id".to_string(), Value::String(crate::server::core::upstream::request::new_request_id()));
+    payload.insert("request_id".to_string(), Value::String(request_id.clone()));
+    // `message_id` 是**必填**（2026-09 实测）：缺了它上游回
+    // `{"error_code":"400","error_message":"invalid params"}`（HTTP 200 的帧），
+    // 而带一个非空串就正常。形态不限，这里用与 request_id 同源的随机串加前缀。
+    payload.insert(
+        "message_id".to_string(),
+        Value::String(format!("msg-{request_id}")),
+    );
     payload.insert("token".to_string(), Value::String(token.to_string()));
     payload.insert("contents".to_string(), Value::Array(contents));
     payload.insert("system_instruction".to_string(), Value::String(system_instruction));
@@ -415,11 +419,17 @@ pub fn build_upstream_body(
         if !crate::server::core::model_rules::reasoning_is_off(effort) {
             thinking = true;
             payload.insert("include_thoughts".to_string(), Value::Bool(true));
-            if openai_family {
-                // OpenAI 系：只进 properties，顶层留空（客户端 `bo` 的分法）
-                properties.insert("reasoning_effort".to_string(), Value::String(effort.to_string()));
-            } else {
-                payload.insert("reasoning_effort".to_string(), Value::String(effort.to_string()));
+            match placement {
+                // `protocol` = responses / openai：只进 properties，顶层留空
+                // （桌面端的分法；实测 GPT 系只有这一种能出思考内容）
+                super::models::EffortPlacement::Properties => {
+                    properties.insert("reasoning_effort".to_string(), Value::String(effort.to_string()));
+                }
+                // 其余（Claude / Gemini 系）：顶层。放 properties 在 Gemini 系
+                // 是硬 400（`Unknown name "reasoning_effort"`）
+                super::models::EffortPlacement::Top => {
+                    payload.insert("reasoning_effort".to_string(), Value::String(effort.to_string()));
+                }
             }
         }
     }

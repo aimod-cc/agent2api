@@ -40,6 +40,8 @@
 //!   providers/catalog.rs  聚合目录：各家清单合并成 /v1/models 的单一视图
 //!   providers/router.rs   模型名 → provider 候选链（聚合目录 + providerRoute 优先级）
 //! 前三者回答「有哪些模型」，最后一者回答「先试哪一家」。
+//! 各家清单的**持久化**（远程拉到的那份在进程重启后由它读回，不再回落到内置
+//! 清单）在 `providers/catalog_cache.rs` —— 它横跨上面三层，不属于任何一层。
 //!
 //! 约定：core 里的模块只做纯逻辑 + 文件读写 + 上游 HTTP，不认识 axum；
 //! api/ 里的 handler 负责把 HTTP 输入转成 core 调用、再把结果转成响应。

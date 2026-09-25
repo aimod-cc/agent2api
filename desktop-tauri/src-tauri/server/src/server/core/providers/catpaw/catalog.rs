@@ -36,6 +36,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::providers::catalog_cache;
 use crate::server::logging;
 
 use super::models::MODELS;
@@ -70,9 +71,22 @@ struct CatalogState {
     fetched_at: i64,
 }
 
+/// 进程级目录句柄。首次初始化时**先从持久化缓存恢复**（上次成功拉到的远程
+/// 清单），没有再留空 —— 空状态的读取语义就是「回落到静态表」。
 fn catalog() -> &'static RwLock<CatalogState> {
     static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
-    CATALOG.get_or_init(|| RwLock::new(CatalogState::default()))
+    CATALOG.get_or_init(|| RwLock::new(restored_state()))
+}
+
+/// 首次初始化读一次持久化缓存（见 `providers::catalog_cache` 的模块头）。
+///
+/// 缓存里存的就是 `CatalogState` 的形态（`refresh` 落地的那份），所以这里只做
+/// 「搬回来」：不重新归一 —— 两处各写一份映射迟早分叉。
+fn restored_state() -> CatalogState {
+    match catalog_cache::load(catalog_cache::SCOPE_CATPAW) {
+        Some(cached) => CatalogState { models: cached.models, fetched_at: cached.fetched_at },
+        None => CatalogState::default(),
+    }
 }
 
 fn read_state() -> CatalogState {
@@ -357,6 +371,10 @@ pub async fn refresh(
     let mut state = read_state();
     state.models = models;
     state.fetched_at = logging::now_ms();
+    // 落持久化缓存（进程重启后由 `restored_state` 读回）。`state` 要被
+    // `write` 消费，所以先存；**不在目录锁内** —— 缓存写入要拿库连接锁，
+    // 两把锁不能嵌套。
+    catalog_cache::save(catalog_cache::SCOPE_CATPAW, &state.models, state.fetched_at);
     match catalog().write() {
         Ok(mut guard) => *guard = state,
         Err(poisoned) => *poisoned.into_inner() = state,

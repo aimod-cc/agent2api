@@ -43,6 +43,7 @@
     isRateLimited,
     accountEdition,
     supportsCheckin,
+    supportsClaim,
     checkedInToday,
     checkinableAccounts,
     matchProvider,
@@ -95,23 +96,39 @@
    * 版本后缀：国内 / 国际。只返回文字，由调用方拼进提供商徽章 ——
    * 「WorkBuddy 国际版」是**一枚**徽章，与 AutoClaw 那种「名字自带版本」的
    * 家看起来是同一种标签，不再两枚并排。无版本的家园地返回空串。
+   *
+   * ── 名字里已经带地区的不再拼一遍（本次修正）─────────────────
+   * 徽章文字是「provider 注册名 + 后缀」，而后缀的**唯一**来源是
+   * `editionLabel`。`zcode` / `zcode-intl` / `accio-cn` 这几个 provider 的
+   * 注册名本身就以地区结尾（「ZCode 国内版」），拼出来是
+   * 「ZCode 国内版 国内版」。判据取「注册名是否已含这个后缀串」，而不是
+   * 再列一张「名字自带版本」的 provider 名单 —— 名单会随新增地区漏项，
+   * 而漏项的表现只是一个重复词，很容易长期没人报（登录窗口标题那边就是
+   * 靠一张名单挡的，两处本该一致，这里改成按事实判断）。
+   *
+   * 注意别用 `edition` 能力位去关：它还兼着「有效期列读哪个字段」的判据
+   * （见 accounts-table.js 的 expiryCell），置 false 会把有效期列改读
+   * `tokenExpiresAt`，而那对这几家是错的字段。
    */
   function editionSuffix(account) {
-    if (!providerFeatures(providerOf(account)).edition) return '';
+    const provider = providerOf(account);
+    if (!providerFeatures(provider).edition) return '';
     const edition = accountEdition(account);
-    return account.editionLabel || (edition === 'intl' ? '国际版' : '国内版');
+    const suffix = account.editionLabel || (edition === 'intl' ? '国际版' : '国内版');
+    const label = window.wbProviders?.labelOf?.(provider) || '';
+    return label.includes(suffix) ? '' : suffix;
   }
 
-  // ─── 行内面板（积分 / 签到） ─────────────────
+  // ─── 行内面板（限流 / 签到） ─────────────────
   //
-  // 面板按需展开：调用方只在用户点过「积分」/「签到」后才渲染。
+  // 面板按需展开：调用方只在用户点过「限流」/「签到」后才渲染。
   // 这里的函数是纯展示，不判断展开状态 —— entry 由调用方从缓存里取：
   //   undefined = 尚未查询，null = 查询中，string = 出错，对象 = 结果
   //
-  // 余额面板（usage）的实现搬到了 `usage-panel.js`：它现在要渲染**两套形状**
-  // （workbuddy 既有形状 + 三家统一形状）与「未配置查询」的中性态，篇幅放不进
-  // 本文件（见那个文件的模块头）。这里按名转调，消费方拿到的还是同一个
-  // `wbAccountsModel.usagePanelHtml`。
+  // 余额（usage）**没有面板**：它的读数就在余额列上（见 accounts-table.js 的
+  // usageCell），点操作列的「余额」只刷新那格数字。原先那块两套形状的明细渲染
+  // （usage-panel.js）随之删除，只剩「失败 / 未配置」的判据，那在 usage-actions.js
+  // 的 `usageFailureOf` 里（动作与呈现共用同一份）。
 
   /** 明细条右上角的关闭按钮 */
   const panelClose = kind =>
@@ -154,10 +171,6 @@
       + rows
       + `</div>`;
   }
-
-  /** 余额 / 积分明细（实现见 usage-panel.js；两套形状的渲染与判据在那里） */
-  const usagePanelHtml = (account, entry) =>
-    window.wbUsagePanel.usagePanelHtml(account, entry);
 
   function checkinPanelHtml(account, entry) {
     const close = panelClose('checkin');
@@ -339,6 +352,7 @@
     isRateLimited,
     accountEdition,
     supportsCheckin,
+    supportsClaim,
     checkedInToday,
     checkinableAccounts,
     // 筛选与队列
@@ -356,7 +370,6 @@
     moreMenuHtml,
     limitPanelHtml,
     formatResetText,
-    usagePanelHtml,
     checkinPanelHtml,
   };
 })();

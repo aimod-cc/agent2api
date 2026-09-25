@@ -63,7 +63,8 @@
 .more-menu button:disabled:hover { background: transparent; color: var(--text-3); }
 
 /* 批量栏的「按提供商计数」摘要（`WorkBuddy 14 · 小浣熊 3`）：紧跟在「共 N 个」
-   之后，同色系；窄窗口允许省略 —— 它只是补充信息，完整分组在列表组头里。 */
+   之后，同色系，**只列有账号的家**；窄窗口允许省略 —— 它只是补充信息，
+   含「暂无账号」那些家的完整清单在工具条的提供商下拉里。 */
 .provider-summary {
   max-width: 40%;
   color: var(--text-3);
@@ -90,7 +91,11 @@
    flex 列容器，不顶到起始边就会被拉成整行宽（两个选项配一条通栏边框很难看）；
    挂在 .field-row 里的（打开方式）则要保持行内联排。 */
 #add-modal .add-seg { flex-wrap: wrap; max-width: 100%; }
-#add-modal .modal-section > .add-seg { align-self: flex-start; }
+/* 账号版本那处分段现在由 React 岛渲染：.add-seg 落在挂载点（display: contents）里面，
+   而选择器只看 DOM 树、不认「布局上透明」—— 所以补一条穿透挂载点的写法，
+   否则它会被拉成整行宽（两个选项配一条通栏边框很难看）。 */
+#add-modal .modal-section > .add-seg,
+#add-modal .modal-section > .island > .add-seg { align-self: flex-start; }
 #add-modal .add-seg .seg-item { height: 28px; padding: 0 12px; font-size: 12.5px; }
 
 /* ─── 添加账号弹窗：两步结构（第 1 步选家 / 第 2 步选方式填凭证）───

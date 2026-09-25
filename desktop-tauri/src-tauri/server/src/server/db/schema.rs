@@ -126,6 +126,10 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // —— 下次点「升级」会重复导入一遍历史明细。
     "requestsMigrated",
     "dailyMigrated",
+    // 远程模型清单的持久化缓存（core::providers::catalog_cache）：整份
+    // 「各家上次成功拉到的清单」一个键（十份清单挤一个键的理由见那个模块头）。
+    // 属于「其它零散状态」——它不是配置项，配置写入绝不能动它。
+    "modelCatalogCache",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。

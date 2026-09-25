@@ -31,6 +31,7 @@ mod accio;
 mod autoclaw;
 mod catpaw;
 mod qoder;
+mod zcode;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -266,6 +267,29 @@ impl LoginService {
 
     pub fn tasks(&self) -> &LoginTasks {
         &self.tasks
+    }
+
+    /// 取消一次登录：任务表那一步见 [`LoginTasks::cancel`]，这里多做的事是
+    /// **把 AutoClaw 那条链的待办状态一起清掉**。
+    ///
+    /// ── 为什么必须在这一层清（不能只在 `LoginTasks::cancel` 里）────
+    /// 那张表（`autoclaw_oauth`）是 `LoginService` 的字段，任务表看不见它。
+    /// 而它**持有着**这一轮借来的回调端口（见 `login/autoclaw.rs` 的
+    /// `PendingOauth::_listener`）：不清就要一直占到 5 分钟超时才还回去 ——
+    /// 用户取消后往往立刻重试，那一次会因为「端口还被自己占着」而抢不到登记
+    /// 端口（Zai 就会回落成走不通的形态）。其它家在这张表里没有条目，这一步
+    /// 对它们是空操作。
+    ///
+    /// 锁序与 `start` 一致（先任务表、后待办表），且两个临界区不重叠。
+    pub fn cancel(&self, state: &str) -> bool {
+        let canceled = self.tasks.cancel(state);
+        if canceled {
+            self.autoclaw_oauth
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(state);
+        }
+        canceled
     }
 
     /// 发起一次登录任务（对应 server.mjs 的 `startLoginTask`）。

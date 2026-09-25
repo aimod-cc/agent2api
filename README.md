@@ -180,6 +180,7 @@ agent2api/
 │  │  │  │  │  ├─ adapter.rs    ProviderAdapter trait + adapter_for + implemented_kinds
 │  │  │  │  │  ├─ router.rs     模型名 → 候选 provider 集合（聚合目录）
 │  │  │  │  │  ├─ catalog.rs    聚合模型目录（清单合并 / 同名去重 / 可用性判定）
+│  │  │  │  │  ├─ catalog_cache.rs  各家远程清单的持久化缓存（重启后读回，不再回落到内置清单）
 │  │  │  │  │  ├─ refresh_flight.rs  凭证刷新的单飞去重
 │  │  │  │  │  ├─ workbuddy.rs  WorkBuddy 适配器（头集合 / system 注入 / 6004 / 11128）
 │  │  │  │  │  ├─ raccoon/      小浣熊：mod / models / credentials / jwt / oauth / balance

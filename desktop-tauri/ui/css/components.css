@@ -231,6 +231,9 @@ button.icon.sm { width: 26px; }
 
 #toast.ok { border-color: var(--ok-bd); color: var(--ok); }
 #toast.err { border-color: var(--danger-bd); color: var(--danger); }
+/* 警告（不是失败）：如 AutoClaw 网页登录抢不到官方登记端口时的降级提示 ——
+   那一轮仍能登（内嵌窗口），只是「系统浏览器」方式会收不到回调。 */
+#toast.warn { border-color: var(--warn-bd); color: var(--warn); }
 
 /* ─── 表单控件 ─── */
 input[type="text"],
@@ -424,7 +427,9 @@ input[type="number"] { max-width: 130px; }
 }
 
 /* 分段项嵌在 .seg 里，圆角要按「外圆角 - 内边距」收一号，
-   否则 24px 的项配上控制件的 12.8px 会比容器还圆，接缝处露出毛边 */
+   否则 24px 的项配上控制件的 12.8px 会比容器还圆，接缝处露出毛边。
+   user-select 显式关掉：报表页那一条由 React 岛渲染成 span（Base UI 的 Radio），
+   不像 button 那样自带「文字不可拖选」，不关掉拖一下就会把标签文字选中。 */
 .seg-item {
   display: inline-flex;
   align-items: center;
@@ -439,17 +444,67 @@ input[type="number"] { max-width: 130px; }
   font-size: 12px;
   font-weight: 500;
   white-space: nowrap;
+  user-select: none;
   transition: background .15s ease, color .15s ease;
 }
 
-/* 未选中项用中性叠加：深色叠白、浅色叠黑，同一行声明两边都成立 */
-.seg-item:hover:not(:disabled) { background: var(--nav-hover); color: var(--text); }
+/* 未选中项用中性叠加：深色叠白、浅色叠黑，同一行声明两边都成立。
+   `[data-disabled]` 是 Base UI 的禁用标记（span 没有 :disabled 伪类，只能靠属性）。 */
+.seg-item:hover:not(:disabled):not([data-disabled]) { background: var(--nav-hover); color: var(--text); }
 
 /* 选中项走品牌浅底，与导航选中态、单选卡片保持一致 */
 .seg-item.active {
   background: var(--primary-soft);
   color: var(--primary-fg);
   font-weight: 600;
+}
+
+/* ─── 滑动指示器：报表页的时间范围档位（由 React 岛渲染）───
+   与上面「选中项自己变色」是两条不同的路子：这条把底色交给一枚绝对定位的
+   滑块，切换档位时它平移过去，而不是硬切。思路取自 OmniUI 的 SegmentedControl
+   —— 组件量出选中项的矩形喂进 style（见组件里的 measure）。 */
+.seg-sliding { position: relative; }
+
+/* top / bottom 取容器的 padding，滑块才与选项上下齐平；
+   left: 0 落在容器 padding box 的原点上，组件量出的 left 正是相对这个原点。
+   首次量到值之前先藏起来，过渡也先关着 —— 否则入场时它会从左上角滑到目标位。 */
+.seg-thumb {
+  position: absolute;
+  top: 2px;
+  bottom: 2px;
+  left: 0;
+  border-radius: var(--r-sm);
+  background: var(--primary-soft);
+  pointer-events: none;
+}
+.seg-thumb[data-ready='false'] { opacity: 0; }
+.seg-thumb[data-animate='true'] {
+  transition: transform .2s ease-in-out, width .2s ease-in-out;
+}
+
+/* 选项必须压在滑块之上。
+   绝对定位的元素默认绘制在**非定位**元素之上 —— 层叠顺序里「z-index: auto 的
+   定位后代」那一档排在「行内非定位后代」之后，与 DOM 先后无关。不显式提层级的话，
+   滑块那层不透明的浅蓝会把选中项的文字整块盖掉：浅色模式下整条控件只剩一个
+   空白蓝块（账号页那两处带计数徽标的尤其明显）。 */
+.seg-sliding .seg-item {
+  position: relative;
+  z-index: 1;
+}
+
+/* 滑块版里选中项让出底色（底色归滑块画），只留文字色。
+   而且不加粗 —— 字重会改元素宽度，切换瞬间整条控件重新排版、滑块动画的
+   目标位置跟着跳一下；有滑块托底之后，靠颜色区分已经足够醒目。 */
+.seg-sliding .seg-item[data-checked] {
+  background: transparent;
+  color: var(--primary-fg);
+}
+
+/* 选中项不参与 hover 底色：滑块是独立一层，被 item 那层半透明灰蒙上去会发浑，
+   也丢掉了「这是当前档位」的持续提示。非选中项的 hover 照旧。
+   特异性与上面那条 hover 规则相同，靠位置靠后取胜，别往上挪。 */
+.seg-sliding .seg-item[data-checked]:hover:not([data-disabled]) {
+  background: transparent;
 }
 
 .seg-item .seg-count {
@@ -465,12 +520,21 @@ input[type="number"] { max-width: 130px; }
   opacity: 1;
 }
 
-.seg-item.active .seg-count { background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary-fg); }
+.seg-item.active .seg-count,
+.seg-item[data-checked] .seg-count { background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary-fg); }
 
-/* 计数为 0 的分段弱化，减少视觉噪音 */
-.seg-item.zero:not(.active) { opacity: .45; }
-.seg-item:disabled { cursor: not-allowed; opacity: .4; }
-.seg-item.active:disabled { opacity: .7; }
+/* 计数为 0 的分段弱化，减少视觉噪音。
+   `data-zero` 由岛按 count === 0 自动挂上（账号页筛选的那两处）；
+   后面半条 `:not([data-checked])` 是给滑块版留的 —— 当前选中的那一档即使计数为 0
+   也要保持正常不透明度，否则选中的空段看起来像被禁用了。
+   前半条 `.zero` 是改造前 JS 加类的写法，保留以防还有没岛化的地方在用。 */
+.seg-item.zero:not(.active),
+.seg-item[data-zero='true']:not([data-checked]) { opacity: .45; }
+.seg-item:disabled,
+.seg-item[data-disabled] { cursor: not-allowed; opacity: .4; }
+.seg-item.active:disabled,
+.seg-item[data-checked]:disabled,
+.seg-item[data-checked][data-disabled] { opacity: .7; }
 
 /* 工具条：一行收住筛选与主操作 */
 .toolbar {

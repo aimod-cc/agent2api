@@ -1,5 +1,5 @@
 /* Agent2API · 账号的余额 / 签到动作层（请求 + 结果缓存） */
-/* global workbuddyDesktop, wbApp, wbAccountsModel, wbUsagePanel, wbAccountsView */
+/* global workbuddyDesktop, wbApp, wbAccountsModel, wbAccountsView */
 
 /**
  * 账号「余额查询 / 签到」的**有状态动作层**，从 accounts-view.js 按职责拆出。
@@ -18,8 +18,10 @@
  *     以及外部的 `applyBalances`（经 wbAccountsView 转发）。
  *   · openPanels 留在 accounts-view.js：它表达的是「用户展开过哪一行」，是**视图状态**，
  *     表格重绘时要跟着行一起算，搬过来只会让两边互相回调。
+ *     **余额已经没有明细行了**（读数就在余额列上，见 usageCell），所以那份展开态
+ *     现在只服务「限流 / 签到」两块面板，本文件只在批量签到时请求展开一次。
  * 因此本文件需要重绘时**调 `window.wbAccountsView?.render?.()`** 而不是自己 import ——
- * 这与项目既有的跨文件约定一致（usage-panel.js 只做渲染、app.js 用可选链委托）。
+ * 这与项目既有的跨文件约定一致（accounts-table.js 只做渲染、app.js 用可选链委托）。
  * 反向依赖（accounts-view.js 读缓存）走本文件导出的 Map 引用：**导出的是 Map 本身而不是
  * 副本**，因为「查询中」这个中间态（写 null）必须让视图立刻看见，拷贝一份就对不上了。
  *
@@ -34,8 +36,37 @@
   const api = workbuddyDesktop;
   const { toast } = wbApp;
   const { supportsUsage, checkinableAccounts } = wbAccountsModel;
-  // 「失败 / 未配置」的唯一判据与那个标记常量在 usage-panel.js —— 判据与呈现必须同源
-  const { usageFailureOf, NOT_CONFIGURED_CODE } = wbUsagePanel;
+
+  /**
+   * 「未配置查询凭证」的标记（与后端 `providers::adapter::USAGE_NOT_CONFIGURED_CODE`
+   * 逐字一致）。这是一个**前后端契约常量**：改一边必须改另一边，
+   * 不一致的后果是那种情况退回红色「查询失败」。
+   */
+  const NOT_CONFIGURED_CODE = 'usage_not_configured';
+
+  /**
+   * 缓存条目 → 失败描述的**唯一入口**（余额列的摘要渲染与这里的 toast 播报共用
+   * 同一份判据，两处不会一个说红一个说灰）。
+   *
+   * 返回 null 表示这不是失败（还在查询中 / 是结果）；否则 `{message, notConfigured}`。
+   *
+   * ── 「未配置」为什么是中性的 ───────────────────────────────────
+   * CatPaw 的余额接口要一个**单独的**网页会话凭证（token2），没配置时后端返回
+   * `code: "usage_not_configured"`。那不是故障：账号本身完全正常、转发照跑，
+   * 只是用户还没告诉网关那个凭证长什么样。把它渲染成红色的「查询失败」会让人
+   * 去排查一个不存在的故障，所以判据用后端给的 `code` **而不是匹配文案**
+   * （措辞一改，按文案的写法就会静默退回红色）。
+   */
+  function usageFailureOf(entry) {
+    if (entry === undefined || entry === null) return null;
+    if (typeof entry === 'string') return { message: entry, notConfigured: false };
+    if (typeof entry !== 'object') return null;
+    if (!entry.error) return null;
+    return {
+      message: String(entry.error),
+      notConfigured: entry.code === NOT_CONFIGURED_CODE,
+    };
+  }
 
   /** accountId -> usage | {error, code?} | string | null(查询中) */
   const usageMap = new Map();
@@ -67,7 +98,7 @@
   }
 
   /** 后端结果行 → 缓存条目（成功给 `usage`，失败给 `{error, code?}`）。
-   *  失败行的 `code` 必须留住：usage-panel.js 按它区分「未配置查询」（中性提示）
+   *  失败行的 `code` 必须留住：`usageFailureOf` 按它区分「未配置查询」（中性提示）
    *  与真正的失败（红色）—— 只存 error 字符串会丢掉这个判据。 */
   function cacheEntryOf(row) {
     return row.usage
@@ -175,40 +206,20 @@
    * 目标集合只含「有余额概念 + 启用」：已禁用账号后端同样会跳过，
    * 界面若把它算进分母，播报的「已更新 N/M」会与真实条数对不上。
    *
-   * ── 第二次点击 = 收起（本次改造）────────────────────────────
-   * 与单账号那颗「积分」按钮同一套判据：目标是同一批账号时，若它们已经
-   * 全部展开着，这一次点击就是收起（`wbAccountsView.panelsAllOpen`），
-   * 不发请求、不动按钮文案。
-   *
-   * 判据为什么必须问视图侧、不能在这里自己算：面板展开态（`openPanels`）
-   * 住在 accounts-view.js，单账号按钮的「再点一次收起」正是直接读写它。
-   * 若这里另写一份（比如「usageMap 里都有值」），就会与那一份分叉 ——
-   * 最典型的场景是：用户单点某行收起它，累计几次之后总按钮以为「都还开着」，
-   * 于是那一下点击只收起了它自己看到的那一份，而单按钮早就关掉的行不动 ——
-   * 界面上表现为「按了没反应」。所以两个入口读**同一个函数**：
-   * 一致性来自「同一份状态 + 同一个读法」，不是来自两处判据写得一样。
-   *
-   * 收起路径不碰 usageMap：已查到的那一轮结果原样留着（收起只是不看，不是丢弃），
-   * 所以再点一次回来时不需要重新请求就又能看到数字。
+   * ── 每次点击都是一次查询（本次改造）──────────────────────────
+   * 原先这颗按钮第二次点击是「收起全部明细行」。余额的明细面板已经取消
+   * （读数就在余额列上，见 accounts-table.js 的 usageCell），所以「展开态」
+   * 这个概念对它不再存在 —— 点几下就是查几次，与单账号那颗「余额」按钮同口径。
    */
   async function queryAllUsage() {
     if (usageBusy) return;
     const targets = accounts().filter(account => supportsUsage(account) && account.enabled !== false);
     if (!targets.length) { toast('暂无可查询余额的账号', 'err'); return; }
-    const ids = targets.map(a => a.id);
-    // 收起分支（与单账号按钮的 `wasOpen` 那条同形）：不置 usageBusy、不改按钮文案、
-    // 一个请求都不发 —— 只翻展开态再重绘一次
-    if (window.wbAccountsView?.panelsAllOpen?.(ids, 'usage')) {
-      window.wbAccountsView?.closePanels?.(ids, 'usage');
-      repaint();
-      return;
-    }
     usageBusy = true;
     const button = document.getElementById('btn-query-usage');
     if (button) { button.disabled = true; button.textContent = '查询中…'; }
-    // 先把结果区展开（null = 查询中）再重绘：不展开的话结果回来了却无处可看
+    // 先写「查询中」再重绘：余额列立刻显示查询中，结果回来了直接换成读数
     targets.forEach(a => usageMap.set(a.id, null));
-    openUsagePanels(ids);
     repaint();
     try {
       const rows = (await queryUsageFor(null))?.results || [];
@@ -229,14 +240,6 @@
       usageBusy = false;
       if (button) { button.disabled = false; button.textContent = '查询余额'; }
     }
-  }
-
-  /**
-   * 展开一批账号的「余额」明细行。由视图侧提供实现（面板展开态归它管），
-   * 没提供时静默跳过 —— 结果是缓存里的，用户点一下那行操作列的「余额」照样能看到。
-   */
-  function openUsagePanels(ids) {
-    window.wbAccountsView?.openPanels?.(ids, 'usage');
   }
 
   /**
@@ -310,8 +313,8 @@
   }
 
   window.wbUsageActions = {
-    // 两个缓存 Map 按**引用**导出：视图侧读它们渲染面板，而「查询中」（写 null）
-    // 这个中间态要让视图立刻看到，拷贝一份就对不上了
+    // 两个缓存 Map 按**引用**导出：视图侧读它们渲染余额列读数与签到面板，
+    // 而「查询中」（写 null）这个中间态要让视图立刻看到，拷贝一份就对不上了
     usageMap,
     checkinMap,
     refreshCaches,

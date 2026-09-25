@@ -173,6 +173,7 @@ agent2api/
 │  │  │  │  │  ├─ adapter.rs    ProviderAdapter trait + adapter_for + implemented_kinds
 │  │  │  │  │  ├─ router.rs     Model name → set of candidate providers (aggregate catalog)
 │  │  │  │  │  ├─ catalog.rs    Aggregate model catalog (list merging / same-name dedup / availability)
+│  │  │  │  │  ├─ catalog_cache.rs  Persistent cache of each provider's remote list (restored on restart instead of falling back to the built-in list)
 │  │  │  │  │  ├─ refresh_flight.rs  Single-flight dedup for credential refresh
 │  │  │  │  │  ├─ workbuddy.rs  WorkBuddy adapter (header set / system injection / 6004 / 11128)
 │  │  │  │  │  ├─ raccoon/      Raccoon: mod / models / credentials / jwt / oauth / balance

@@ -46,6 +46,12 @@
   /** providers 摘要（后端注册表顺序；缺失时由账号列表派生，见 accounts-model） */
   const summaries = () => providerSummaries(snapshot());
 
+  /** 两个分段维度的岛句柄（见 mountSegs）；挂载失败时留 null，后面走可选链 */
+  let enabledIsland = null;
+  let limitIsland = null;
+  /** 筛选变化后的重绘入口。岛在 bind() 之前就挂载了，所以先存一层转发 */
+  let notifyChange = () => {};
+
   // ─── 动态注入：提供商筛选器与计数摘要 ───────
   //
   // 用 select 而不是像状态/限额那样的分段按钮：提供商数量是**动态**的（后端注册表
@@ -85,16 +91,66 @@
     count.insertAdjacentElement('afterend', span);
   }
 
-  /** 两处追加式注入必须在 bind 之前完成（提供商下拉的 change 要挂得上） */
+  /** 两处追加式注入与岛挂载都必须在 bind 之前完成（前者的 change、后者的 onChange 要接得上） */
   function mount() {
     mountProviderFilter();
     mountProviderSummary();
-    // 把存过的「启用状态」落到分段按钮上。限流与提供商两个维度的控件
-    // 每次 syncAll 都会按 state 纠正（syncLimitAvailability / syncProviderUi），
-    // 只有这一组是一次性静态 HTML、没人同步它，这里补一次。
-    document.querySelectorAll('#account-enabled-filter .seg-item').forEach(item => {
-      item.classList.toggle('active', item.dataset.enabled === state.enabled);
-    });
+    mountSegs();
+  }
+
+  /**
+   * 两个维度的选项。计数取自 filterCounts —— 与「可见列表」同一份实现。
+   * 限流组的「正常 / 已限流」在启用状态筛成「禁用」时不存在，置灰（岛渲染成
+   * disabled）；counts 传 null（首屏数据还没到）时一律画 0，与改造前 HTML 预置的 0 一致。
+   */
+  function segOptions(counts, limitOff) {
+    const n = key => counts?.[key] ?? 0;
+    return {
+      enabled: [
+        { value: 'all', label: '全部', count: n('enabledAll') },
+        { value: 'enabled', label: '启用', count: n('enabled') },
+        { value: 'disabled', label: '禁用', count: n('disabled') },
+      ],
+      limit: [
+        { value: 'all', label: '全部', count: n('limitAll') },
+        { value: 'normal', label: '正常', count: n('normal'), disabled: limitOff },
+        { value: 'limited', label: '已限流', count: n('limited'), disabled: limitOff },
+      ],
+    };
+  }
+
+  /**
+   * 挂两个分段岛（ui/islands/ui.js）。取值与计数都以本文件为准 ——
+   * 岛完全受控，这里只负责灌值与回灌。首屏计数先按 0 画，随后由 syncAll 推上真实值。
+   */
+  function mountSegs() {
+    if (!window.wbSegmented) return;
+    const initial = segOptions(null, false);
+    const enabledHost = $('account-enabled-filter');
+    if (enabledHost) {
+      enabledIsland = window.wbSegmented.mount(enabledHost, {
+        options: initial.enabled,
+        value: state.enabled,
+        ariaLabel: '启用状态',
+        onChange: value => pickSeg('enabled', value),
+      });
+    }
+    const limitHost = $('account-limit-filter');
+    if (limitHost) {
+      limitIsland = window.wbSegmented.mount(limitHost, {
+        options: initial.limit,
+        value: state.limit,
+        ariaLabel: '限额状态',
+        onChange: value => pickSeg('limit', value),
+      });
+    }
+  }
+
+  /** 岛上切了档位：落盘 + 重绘（重绘入口由 bind 传入） */
+  function pickSeg(key, value) {
+    state[key] = value;
+    persist();
+    notifyChange();
   }
 
   // ─── 每次重绘前归一化 ───────────────────────
@@ -118,49 +174,44 @@
       }
       if (select.value !== state.provider) select.value = state.provider;
     }
+    // 摘要只列**有账号**的家：这一段回答的是「账号分别落在谁家」，
+    // 而「Cline Pass 0」这类只占宽度、不提供信息（尤其注册表里家数一多，
+    // 半行都被这些 0 挤掉）。完整清单仍在下拉里，含 0 的家，筛选口径不变。
     const summary = $(PROVIDER_SUMMARY_ID);
-    if (summary) summary.textContent = all.length
-      ? list.map(item => `${item.label} ${item.count}`).join(' · ')
-      : '';
+    if (summary) {
+      summary.textContent = list
+        .filter(item => item.count > 0)
+        .map(item => `${item.label} ${item.count}`)
+        .join(' · ');
+    }
   }
 
   /**
    * 限流维度与启用状态联动：状态筛成「禁用」时正常/有限流都不存在，于是把限流复位为
-   * 「全部」并禁用该组分段。
+   * 「全部」。置灰不在这里做 —— 它由 segOptions 的 disabled 表达，随选项一起推给岛。
    */
   function syncLimitAvailability() {
-    const disabledOnly = state.enabled === 'disabled';
-    if (disabledOnly && state.limit !== 'all') state.limit = 'all';
-    const group = $('account-limit-filter');
-    if (!group) return;
-    group.querySelectorAll('.seg-item').forEach(item => {
-      item.disabled = disabledOnly && item.dataset.limit !== 'all';
-      item.classList.toggle('active', item.dataset.limit === state.limit);
-    });
+    if (state.enabled === 'disabled' && state.limit !== 'all') state.limit = 'all';
   }
 
   /**
-   * 更新各筛选分段的计数徽标：key 取自 HTML 上的 data-count（各维度的「全部」
-   * 是 enabledAll / limitAll，代表「另外几个维度已选条件下的合计」）。
-   * 口径来自 accounts-model 的 filterCounts —— 与「可见列表」同一份实现。
+   * 把最新的计数与禁用态推给两个岛，顺带把归一化过的 state 回灌一次
+   * （syncLimitAvailability 可能改过 state.limit，不回灌控件会停在旧档位上）。
+   * 计数口径来自 accounts-model 的 filterCounts —— 与「可见列表」同一份实现。
    */
-  function syncCounts(all) {
-    const counts = filterCounts(all, state, summaries());
-    document.querySelectorAll('.seg-item').forEach(item => {
-      const badge = item.querySelector('.seg-count');
-      const key = badge?.dataset.count;
-      if (!badge || !key) return;
-      const value = counts[key] ?? 0;
-      badge.textContent = String(value);
-      item.classList.toggle('zero', value === 0);
-    });
+  function syncSegOptions(all) {
+    const options = segOptions(filterCounts(all, state, summaries()), state.enabled === 'disabled');
+    enabledIsland?.setOptions(options.enabled);
+    limitIsland?.setOptions(options.limit);
+    enabledIsland?.setValue(state.enabled);
+    limitIsland?.setValue(state.limit);
   }
 
   /** 重绘前的一次性归一化：三段顺序不能换（限流的可用性依赖状态已归一） */
   function syncAll(all) {
     syncLimitAvailability();
     syncProviderUi(all);
-    syncCounts(all);
+    syncSegOptions(all);
   }
 
   // ─── 事件绑定 ───────────────────────────────
@@ -170,21 +221,8 @@
    * 筛选条件一变就要重绘列表，而重绘入口在那边；本文件不反向引用视图。
    */
   function bind(onChange) {
-    // 启用状态 / 限流：两个分段按钮维度，可任意组合
-    const bindSeg = (containerId, attr) => {
-      $(containerId)?.addEventListener('click', event => {
-        const item = event.target.closest(`.seg-item[data-${attr}]`);
-        if (!item) return;
-        state[attr] = item.dataset[attr];
-        persist();
-        document.querySelectorAll(`#${containerId} .seg-item`).forEach(node => {
-          node.classList.toggle('active', node === item);
-        });
-        onChange();
-      });
-    };
-    bindSeg('account-enabled-filter', 'enabled');
-    bindSeg('account-limit-filter', 'limit');
+    // 两个分段维度的交互在岛上（见 mountSegs），这里只把重绘入口转交给它
+    notifyChange = onChange;
 
     // 提供商下拉（动态注入的节点，所以在这里显式绑定；select.js 负责外观增强）
     $(PROVIDER_FILTER_ID)?.addEventListener('change', event => {

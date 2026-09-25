@@ -81,6 +81,7 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
 
+use crate::server::core::providers::catalog_cache;
 use crate::server::logging;
 
 use super::credentials;
@@ -173,10 +174,92 @@ pub struct ModelEntry {
     pub reasoning: bool,
 }
 
-/// 进程级清单缓存（远程刷新落地在这里；没刷新过时为空，`list()` 回落静态表）
+/// 条目 → 持久化缓存的 JSON 形态（`pool` 写 provider id 字符串，与账号记录
+/// 里的 `provider` 同一套写法；缓存层只存 JSON，不认识本模块的结构体）。
+fn entry_to_value(entry: &ModelEntry) -> Value {
+    json!({
+        "id": entry.id,
+        "name": entry.name,
+        "pool": entry.pool.provider_id(),
+        "contextWindow": entry.context_window,
+        "reasoning": entry.reasoning,
+    })
+}
+
+/// 缓存 JSON → 条目。缺字段时按静态表同一套兜底（`pool_of` / `context_window_for`
+/// / `reasoning_for`）—— 缓存是自家写的，走到兜底说明值被手工改过或来自更早的
+/// 版本，**不丢弃整条**：宁可少一个字段的精度，也不要让模型整个消失。
+fn entry_from_value(value: &Value) -> Option<ModelEntry> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?
+        .to_string();
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or(&id)
+        .to_string();
+    // 池归属读缓存里的字段（`Pool::from_provider_id` 与写入侧同一套 id 字符串），
+    // 缺字段 / 坏值才按前缀兜底 —— 猜前缀正是模块头第 2 条记的那个 bug 的成因
+    let pool = value
+        .get("pool")
+        .and_then(Value::as_str)
+        .and_then(Pool::from_provider_id)
+        .unwrap_or_else(|| pool_of(&id));
+    let context_window = value
+        .get("contextWindow")
+        .and_then(Value::as_i64)
+        .filter(|window| *window > 0)
+        .unwrap_or_else(|| context_window_for(&id));
+    let reasoning = value
+        .get("reasoning")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| reasoning_for(&id));
+    Some(ModelEntry { id, name, pool, context_window, reasoning })
+}
+
+/// 进程级清单缓存（远程刷新落地在这里；没刷新过时为空，`list()` 回落静态表）。
+///
+/// 首次初始化时**先从持久化缓存恢复**（见 `providers::catalog_cache` 的模块头），
+/// 所以 `REMOTE` 的初值不是恒定的 `None` —— 两个 slot 都要走下面的访问器。
 static REMOTE: OnceLock<Mutex<Option<Vec<ModelEntry>>>> = OnceLock::new();
 /// 上一次成功刷新的时间（毫秒）
 static REFRESHED_AT: OnceLock<Mutex<i64>> = OnceLock::new();
+
+/// 从持久化缓存恢复（进程内只读一次库，两个 slot 共用这份结果）。
+///
+/// 缓存里存的就是 `ModelEntry` 的形态（`refresh` 落地的那份），所以这里只做
+/// 「搬回来」；池归属也直接读缓存里那个字段，不重新按前缀猜 —— 猜前缀正是
+/// 模块头第 2 条记的那个 bug 的成因。
+fn restored() -> &'static (Option<Vec<ModelEntry>>, i64) {
+    static RESTORED: OnceLock<(Option<Vec<ModelEntry>>, i64)> = OnceLock::new();
+    RESTORED.get_or_init(|| match catalog_cache::load(catalog_cache::SCOPE_CLINE) {
+        Some(cached) => {
+            let entries: Vec<ModelEntry> =
+                cached.models.iter().filter_map(entry_from_value).collect();
+            if entries.is_empty() {
+                (None, 0)
+            } else {
+                (Some(entries), cached.fetched_at)
+            }
+        }
+        None => (None, 0),
+    })
+}
+
+/// 远程清单 slot（懒初始化：先看持久化缓存，没有再留空）
+fn remote_slot() -> &'static Mutex<Option<Vec<ModelEntry>>> {
+    REMOTE.get_or_init(|| Mutex::new(restored().0.clone()))
+}
+
+/// 上次刷新时刻 slot（与清单同源，见 `restored`）
+fn refreshed_at_slot() -> &'static Mutex<i64> {
+    REFRESHED_AT.get_or_init(|| Mutex::new(restored().1))
+}
 
 /// 静态兜底清单（远程刷新失败 / 尚未刷新时用）。
 ///
@@ -330,8 +413,7 @@ fn reasoning_for(model_id: &str) -> bool {
 /// 两个池，缓存也共用一份（两个 provider 只是各自过滤它），因此这里不需要
 /// 「谁来拉」的信息。
 pub fn entries() -> Vec<ModelEntry> {
-    if let Some(remote) = REMOTE
-        .get_or_init(|| Mutex::new(None))
+    if let Some(remote) = remote_slot()
         .lock()
         .ok()
         .and_then(|guard| guard.clone())
@@ -401,8 +483,7 @@ pub fn ids_of(pool: Pool) -> Vec<String> {
 
 /// 上一次成功远程刷新的时间（毫秒）；0 = 从未刷新过
 pub fn last_refreshed_at() -> i64 {
-    REFRESHED_AT
-        .get_or_init(|| Mutex::new(0))
+    refreshed_at_slot()
         .lock()
         .map(|guard| *guard)
         .unwrap_or(0)
@@ -410,8 +491,7 @@ pub fn last_refreshed_at() -> i64 {
 
 /// 是否远程刷新过（聚合目录的 `meta.source` 用）
 pub fn remote_refreshed() -> bool {
-    REMOTE
-        .get_or_init(|| Mutex::new(None))
+    remote_slot()
         .lock()
         .map(|guard| guard.is_some())
         .unwrap_or(false)
@@ -458,11 +538,17 @@ pub async fn refresh() -> Result<usize, String> {
     }
     let count = parsed.len();
     let snapshot = parsed.clone();
-    if let Ok(mut guard) = REMOTE.get_or_init(|| Mutex::new(None)).lock() {
+    let now = logging::now_ms();
+    // 先落持久化缓存（进程重启后由 `restored` 读回）。**不在 slot 锁内** ——
+    // 缓存写入要拿库连接锁，两把锁不能嵌套；两个池共用这一份清单，
+    // 所以缓存也只有一条（scope = cline）。
+    let cached: Vec<Value> = snapshot.iter().map(entry_to_value).collect();
+    catalog_cache::save(catalog_cache::SCOPE_CLINE, &cached, now);
+    if let Ok(mut guard) = remote_slot().lock() {
         *guard = Some(snapshot);
     }
-    if let Ok(mut guard) = REFRESHED_AT.get_or_init(|| Mutex::new(0)).lock() {
-        *guard = logging::now_ms();
+    if let Ok(mut guard) = refreshed_at_slot().lock() {
+        *guard = now;
     }
     Ok(count)
 }
