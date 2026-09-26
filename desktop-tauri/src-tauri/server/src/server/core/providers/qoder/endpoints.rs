@@ -98,9 +98,16 @@ impl Region {
 /// 两站都认，未登录时都 302 到各自的 `/users/sign-in?oauth_callback=…`。
 pub const DEVICE_LOGIN_PATH: &str = "/device/selectAccounts";
 pub const DEVICE_POLL_PATH: &str = "/api/v1/deviceToken/poll";
+/// 设备流（`drt-`）刷新令牌的续期端点，与 [`DEVICE_POLL_PATH`] 同族同主机
+/// （都在 [`Region::open_api`] 上）。请求体是 snake_case 的 `refresh_token`，
+/// 响应里访问令牌在 `device_token`。
+pub const DEVICE_REFRESH_PATH: &str = "/api/v1/deviceToken/refresh";
 pub const EXCHANGE_PATH: &str = "/api/v1/jobToken/exchange";
 pub const USER_INFO_PATH: &str = "/api/v1/userinfo";
 pub const USAGE_PATH: &str = "/api/v2/quota/usage";
+/// 非设备流（既不是 `pat|` 也不是 `drt-`）的续期端点，走 [`Region::center`]。
+/// 设备令牌打到这里会被 403 `Request discarded`，所以 `refresh.rs` 先按前缀
+/// 分流到 [`DEVICE_REFRESH_PATH`]，这里只兜剩下的那一族。
 pub const REFRESH_PATH: &str = "/algo/api/v3/user/refresh_token";
 
 pub fn open_api_headers(token: Option<&str>) -> Vec<(String, String)> {

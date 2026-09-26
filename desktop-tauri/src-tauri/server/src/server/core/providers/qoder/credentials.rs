@@ -112,6 +112,17 @@ impl Credentials {
         }
     }
 
+    /// 设备流刷新令牌（`drt-`），非设备流返回 None。
+    ///
+    /// 续期端点要**按令牌前缀**分流而不是按「有没有 PAT」分流：`drt-` 属于设备流，
+    /// 只有 openapi 主机上的 `deviceToken/refresh` 认它，发到 `center()` 那条路上
+    /// 稳定 403。本仓库的打包串里 `pat|…` 与 `drt-…` 同样占据段首、天然互斥，
+    /// 所以这里不需要额外消歧。
+    pub fn device_refresh(&self) -> Option<&str> {
+        let value = self.oauth_refresh();
+        if value.starts_with("drt-") { Some(value) } else { None }
+    }
+
     pub fn can_refresh(&self) -> bool {
         self.pat().is_some() || !self.oauth_refresh().is_empty()
     }
