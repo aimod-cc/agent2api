@@ -104,6 +104,17 @@ fn response_id() -> String {
 ///
 /// 冷却键与编排层同源（`rateLimits[model]`，账号记录内的键天然带了 provider
 /// 维度），因此界面上的「限流」列与自动降级逻辑对两家表现一致。
+///
+/// ── **排队态绝不在这里落冷却**（后来者请注意）──────────────────
+/// 上游用 HTTP 403 承载排队语义（业务码 10605 / `isQueued`，见
+/// `protocol::UpstreamKind::Queued`）。排队是**上游的容量状态**，不是这个账号
+/// 的额度出了问题：等几秒上游就会正常处理，而这里一旦落冷却，这个健康账号会被
+/// 从候选链里摘掉 10 分钟（`mark_rate_limited` 的兜底时长）—— 用户看到的是
+/// 「明明没限额却被标记限流，而且换了个账号才好」。
+///
+/// 判据因此走 [`protocol::UpstreamKind::marks_account_limited`] 而不是在这里
+/// 内联一个 `matches!`：那个方法只有一处，且新加变体时编译器会逼出一个明确
+/// 答案。**不要往那个 matches 里手滑补上 `Queued`。**
 fn record_limited(
     store: &AccountStore,
     account_id: &str,
@@ -112,7 +123,8 @@ fn record_limited(
     kind: protocol::UpstreamKind,
     message: &str,
 ) {
-    if !matches!(kind, protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate) {
+    // 只有真实的额度/限流才落冷却（排队态不在这一档，理由见上）
+    if !kind.marks_account_limited() {
         return;
     }
     if account_id.is_empty() {
@@ -166,17 +178,66 @@ impl ProviderAdapter for QoderAdapter {
     /// 非 2xx 的上游响应分类。
     ///
     /// **注意**：Qoder 的业务错误不体现在 HTTP 状态码上（永远是 200，错误在
-    /// SSE 信封里），所以这一层只处理真正的传输/网关层错误；流内的业务错误
+    /// SSE 信封里），所以这一层主要处理真正的传输/网关层错误；流内的业务错误
     /// 由 `forward_conversation` 直接转成带状态码的网关错误交回编排层。
+    /// **但国际版的排队响应恰恰走 HTTP 403**（见下），所以这一层也不能漏判。
+    ///
+    /// ── `raw` 口径为什么不看签名就统一了（也不该为此改签名）──────────
+    /// 改造前这里只取 `error_body["message"]`，而 `chat::http_error` 是把
+    /// **完整响应文本**交给 `classify_upstream_error` 的 —— 同一个分类器，
+    /// 两条链路喂进去的文本不一样。排队特征埋在「message 里套 JSON 字符串」
+    /// 的第二三层，只取 `message` 字段时特征是能看见的（外层 message 就是那个
+    /// 转义串），但**业务码 10605 与内层字段在 message 被上游换成一句话描述时
+    /// 就全看不见了**；而 `http_error` 那条路因为拿的是完整原文，反而能兜住。
+    /// 两条口径不一致的下场是：同一条上游响应，按哪条链路进来会得到不同的分类。
+    ///
+    /// 统一的做法是**在函数内部把完整文本自己拼出来**（`error_body.to_string()`
+    /// 为主，`message` 字段为辅），而不是去改 trait 签名：`classify_error`
+    /// 是 [`ProviderAdapter`] 的契约方法，改签名要动 `adapter.rs` 的 trait 定义
+    /// **以及全部 11 个实现者的方法声明**（含 CLI 侧自定义 provider 的转发实现），
+    /// 而收益仅仅是「把拼文本这件事挪出函数」—— `error_body: &Value` 本来就
+    /// 带着构造完整文本所需的全部信息，没有任何实现需要看到 `&str`
+    /// （不像 `build_chat_request` 那样真的需要额外参数）。
+    /// 改签名的波及面见下面 `classify_error` 的调用点：全部走
+    /// `adapter.classify_error(status, &error_body)`，没有一处需要 `&str`。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
-        let raw = error_body
+        // 完整文本优先（含嵌套的结构化字段），message 只作兜底：两者的并集
+        // 既能覆盖「上游把排队细节放在结构化字段里」，也能覆盖「message 里是
+        // 一句自然语言、结构化字段反而为空」的形态
+        let full_text = error_body.to_string();
+        let message_field = error_body
             .get("message")
             .and_then(Value::as_str)
             .filter(|text| !text.is_empty())
-            .unwrap_or("上游错误");
-        let classified = protocol::classify_upstream_error(status, raw);
-        let message = format!("上游返回 {status}: {raw}");
+            .unwrap_or("");
+        // `message` 为空（非 JSON 响应体、或响应体里根本没有 message 字段）时
+        // 退回**完整文本**：改造前这里退回的是占位串「上游错误」，但那会让
+        // 分类丢掉全部特征（一个没有 message 字段的响应体，其排队/额度信息
+        // 恰恰只在其它字段里）。退回完整文本既保住了文案的可读性
+        // （`上游返回 403: {"code":...}` 至少能看到上游给了什么），
+        // 也保住了分类（特征不会因为「没有 message 字段」而消失）。
+        let raw = if message_field.is_empty() {
+            full_text.as_str()
+        } else {
+            message_field
+        };
+        // 分类拿**完整文本**喂进去（不是上面那句给客户端看的 `raw`）：
+        // `raw` 优先取 message 是为了文案好看，而分类要的是「特征有没有出现」——
+        // 两者用途不同，所以这里是两条独立取数，不能图省事共用一份
+        let classified = protocol::classify_upstream_error(status, &full_text);
+        // 文案用**分类器给出的那句**（排队时它比 `上游返回 403: {...转义串...}`
+        // 有用得多：后者对用户就是一堆乱码），其余档保持改造前的逐字口径
+        let message = match classified.kind {
+            protocol::UpstreamKind::Queued => classified.message.clone(),
+            _ => format!("上游返回 {status}: {raw}"),
+        };
         match classified.kind {
+            // ── 排队态：**不是错误**，绝不能落 TokenExpired ──────────────
+            // 走到这里说明上游用 HTTP 403 承载排队（业务码 10605 / isQueued）。
+            // 映射成 `Queued` 而不是 `TokenExpired` 的原因见 `UpstreamErrorClass`
+            // 里那个变体的说明（一句话：403 在这里是容量信号不是鉴权信号，
+            // 归成 TokenExpired 会让编排层白刷一次凭证、并让用户跑去重新登录）。
+            protocol::UpstreamKind::Queued => UpstreamErrorClass::Queued { message },
             protocol::UpstreamKind::Auth => UpstreamErrorClass::TokenExpired { message },
             protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate => {
                 UpstreamErrorClass::QuotaLimited {
@@ -457,19 +518,17 @@ impl ProviderAdapter for QoderAdapter {
             if !response.status().is_success() {
                 // 只有失败响应才读体（成功的是 SSE 流，读了就没流了）
                 let status = response.status().as_u16();
-                let error = chat::http_error(status, response).await;
-                // 限额信号落冷却（见 `record_limited`）：编排层在会话式路径上
-                // 看不到分类，只有适配器知道这一条是额度类错误
-                if error.status_code == 429 {
-                    record_limited(
-                        store,
-                        &account_id,
-                        &model_name,
-                        status,
-                        protocol::UpstreamKind::Quota,
-                        &error.message,
-                    );
-                }
+                // `http_error` 把「网关错误 + 上游语义分类」一起交回来：body 在
+                // 它内部就被读走了（`response.text()`），出了那个函数就再也拿不到
+                // 原文，也就无从（重新）分类 —— 交出来是唯一不丢事实的做法。
+                // 「该不该落冷却 / 落哪一档」因此可以用真实分类判断，而不是拿
+                // **网关错误**的状态码反推（那不是上游码，改造前就是这么写的：
+                // `if error.status_code == 429` + 写死 `Quota`；上游的 403 排队
+                // 响应一旦也被映成非 200，那个判据就会把排队账号错判成额度账号）。
+                let (error, kind) = chat::http_error(status, response).await;
+                // 把**真实分类**交给记账：排队态走到这里也不会落冷却
+                // （`record_limited` 内部按 `marks_account_limited` 一票否决）
+                record_limited(store, &account_id, &model_name, status, kind, &error.message);
                 return Err(error);
             }
 
@@ -582,6 +641,28 @@ async fn drive_aggregate(
                     ));
                     break 'outer;
                 }
+                // ── 排队态：**不落冷却、不换账号**，交回编排层原样透传 ────
+                // 走到这里说明上游的排队特征藏在 200 信封的内层 body 里
+                // （见 `SseEvent::Queued` 与 stream.rs 的说明）。它与额度错误
+                // 的处置**必须不同**：不调 `record_limited`（排队不是账号问题，
+                // 落冷却会把健康账号踢出候选链 10 分钟），也不换账号
+                // （换谁都在同一个队列里）。
+                //
+                // 但这里仍要 `break` + 交回编排层：非流式路径此刻还没下发任何
+                // 字节，把它变成一个带 503 的 `Err` 交给编排层，由编排层按它
+                // 对 503 的既有处置原样透传 —— 用户立刻看到「正在排队，请稍后
+                // 重试」，而不是对着一个空回答发呆。
+                SseEvent::Queued { message } => {
+                    business_failure = Some(chat::business_error(
+                        // 状态码取 503（与 chat::http_error / business_error 同一口径）
+                        503,
+                        protocol::UpstreamKind::Queued,
+                        "",
+                        &message,
+                        None,
+                    ));
+                    break 'outer;
+                }
                 SseEvent::Chunk(chunk) => {
                     translator.consume(&chunk, Some(&telemetry));
                 }
@@ -590,8 +671,21 @@ async fn drive_aggregate(
     }
     if business_failure.is_none() {
         for data in lines.finish() {
-            if let SseEvent::Chunk(chunk) = stream::parse_sse_line(&data) {
-                translator.consume(&chunk, Some(&telemetry));
+            match stream::parse_sse_line(&data) {
+                SseEvent::Chunk(chunk) => {
+                    translator.consume(&chunk, Some(&telemetry));
+                }
+                // 尾行里的排队态（上游没以换行收尾时）：与主循环同一处置
+                SseEvent::Queued { message } => {
+                    business_failure = Some(chat::business_error(
+                        503,
+                        protocol::UpstreamKind::Queued,
+                        "",
+                        &message,
+                        None,
+                    ));
+                }
+                _ => {}
             }
         }
     }

@@ -37,7 +37,7 @@ use crate::server::logging;
 
 use super::chat::Translator;
 use super::stream::{self, SseEvent};
-use super::{chat, record_limited, LimitContext};
+use super::{chat, protocol, record_limited, LimitContext};
 
 /// 流式首帧预读：把上游拉到**第一个内容帧**（或流结束）才决定返回什么。
 ///
@@ -114,6 +114,24 @@ pub(super) async fn prefetch_stream_head(
                         &raw,
                         &message,
                         pricing_url.as_deref(),
+                    ));
+                }
+                // ── 首帧就是排队态：交回编排层，**不落冷却、不换账号** ────
+                // 与非流式路径同一处置（见 `drive_aggregate` 里那段说明）：
+                // 此刻还没有任何字节下发，把队列状态如实报给用户才是正解。
+                // 换号是纯浪费（所有账号共享同一个上游队列）。
+                //
+                // 这里**不调** `record_limited`：排队不是账号额度问题，
+                // 落 10 分钟冷却会把一个健康账号踢出候选链（见 `record_limited`
+                // 的文档，那里对这件事有一条专门的警告）。
+                SseEvent::Queued { message } => {
+                    return Err(chat::business_error(
+                        // 503 = 「服务暂时不可用、稍后重试」（不是 429/401）
+                        503,
+                        protocol::UpstreamKind::Queued,
+                        "",
+                        &message,
+                        None,
                     ));
                 }
                 SseEvent::Chunk(chunk) => {
@@ -269,6 +287,23 @@ pub(super) async fn drive_stream(
                         return;
                     }
                 }
+                // ── 流中途出现排队态 ────────────────────────────────
+                // 与 `Error` 的区别只在于**记账**：排队不落冷却（它不是账号
+                // 额度问题）。但"错误只能随流下发"这条约束是一样的 —— HTTP 头
+                // 早已发出，换号不再可能（见 `Error` 分支的说明）。
+                // 客户端会收到一帧带排队文案的 error + [DONE]，
+                // 它按 503 的语义退避重试即可。
+                SseEvent::Queued { message } => {
+                    let error = chat::business_error(
+                        503,
+                        protocol::UpstreamKind::Queued,
+                        "",
+                        &message,
+                        None,
+                    );
+                    failed = Some(error.message);
+                    break 'outer;
+                }
             }
         }
     }
@@ -296,6 +331,17 @@ pub(super) async fn drive_stream(
                         &raw,
                         &message,
                         pricing_url.as_deref(),
+                    );
+                    failed = Some(error.message);
+                }
+                // 尾行里的排队态：与主循环同一处置（不落冷却、随流下发）
+                SseEvent::Queued { message } => {
+                    let error = chat::business_error(
+                        503,
+                        protocol::UpstreamKind::Queued,
+                        "",
+                        &message,
+                        None,
                     );
                     failed = Some(error.message);
                 }

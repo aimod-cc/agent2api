@@ -557,12 +557,40 @@ pub enum UpstreamKind {
     Quota,
     /// 触发限流（可换账号重试）
     Rate,
+    /// 上游排队中（**等一会儿就好**，不是错误）
+    ///
+    /// ── 为什么要单独一档，而不是并进 Unknown / Auth ────────────────
+    /// 国际版用 **HTTP 403** 承载排队语义，body 里的业务码是 10605、特征字段是
+    /// `isQueued: true`。改造前 403 一律被当成鉴权问题，于是：
+    ///   1. 编排层把排队响应当成 401 → `TokenExpired` → **强制刷新凭证 + 同账号
+    ///      重试**，对着一个「只是排队」的响应白刷一次 token；
+    ///   2. 用户看到「登录态失效或权限不足」，于是跑去重新登录 —— 而正确动作
+    ///      是**等一会儿再发**。
+    /// 因此它必须在「不是错误」这个意义上与其余各档彻底分开：不落冷却、不刷凭证、
+    /// 不换账号，只等。
+    Queued,
     /// 鉴权失败（刷新后可重试）
     Auth,
     /// 上游服务异常（可重试）
     Server,
     /// 其它（换账号也没用）
     Unknown,
+}
+
+impl UpstreamKind {
+    /// 这一档**能不能**落账号冷却（`record_limited` 的判据）。
+    ///
+    /// ── 为什么把它做成方法而不是让调用方各写一个 matches! ──────────
+    /// 「哪些档算限额」这个判断现在有三个消费点（`record_limited`、流式预读的
+    /// 落库点、透传驱动里的落库点），将来还可能再加。写在方法里只写一份，
+    /// 且**新加变体时编译器会在这里逼出一个明确答案** —— 而不是让后来者在某个
+    /// 调用点上「顺手补一个」把排队态也冷却掉。
+    ///
+    /// 排队态**明确不在**这一档：它不是账号额度用完了，等几秒上游就会正常处理，
+    /// 给它挂 10 分钟冷却等于把一个正常账号从候选链里踢出去。
+    pub fn marks_account_limited(self) -> bool {
+        matches!(self, UpstreamKind::Quota | UpstreamKind::Rate)
+    }
 }
 
 /// 分类结果的文案与可重试性
@@ -597,11 +625,93 @@ fn pricing_url_of(raw: &str) -> Option<String> {
     None
 }
 
-/// 分类上游错误（源实现 `classifyUpstreamError` 的判定链，逐条对应）
-pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
+/// 排队响应的业务码（国际版上游用它承载「排队中」语义）。
+///
+/// 上游把这三层转义塞进一个 HTTP 403 里：
+/// ```text
+/// {"code":"403","message":"{\"code\":\"10605\",\"message\":
+///   \"{\\\"isQueued\\\":true,\\\"modelKey\\\":\\\"qfmodel\\\",
+///      \\\"queueCount\\\":0,\\\"queueType\\\":\\\"p3\\\"}\"}"}
+/// ```
+/// 注意外层 `code` 是 **403**（照抄 HTTP 状态码），真正的业务码 `10605` 埋在
+/// 第二层。**不能拿外层 code 当业务码**：`classify_upstream_error` 的兜底那条
+/// 认的是字符串 `"code":112`，口径与这里不同，别混。
+const QUEUE_CODE: &str = "10605";
+
+/// 是否命中「上游排队中」的特征。
+///
+/// ── 判据为什么是这些字面量、且对**任意一层**都成立 ───────────────
+/// 排队语义可能出现在外层 `message` 里（HTTP 403 那条链路），也可能直接出现在
+/// SSE 信封的内层 body 里（`isQueued` 在第二层、信封码却是 200 那条链路）。
+/// 两条链路拿到的文本层级不同（一个是完整原文，一个是内层字符串），但
+/// **排队特征字面量在两种形态下都还在** —— 所以判据只认特征串本身，
+/// 不要求先剥几层转义。
+///
+/// `queueType` / `modelKey` 是**观测到的**伴随字段，不作为判据（它们也可能出现在
+/// 别处的诊断信息里）；真正定性的只有 `isQueued` 与业务码 10605 ——
+/// 前者是上游自己声明的布尔，后者是同一件事的机器码，取并集是为了兜住
+/// 「上游改了字段名但码没变」与「码变了但字段没变」两种漂移。
+pub fn is_queue_signal(text: &str) -> bool {
+    let lowered = text.to_lowercase();
+    lowered.contains("\"isqueued\":true")
+        || lowered.contains("\"isqueued\": true")
+        || text.contains(QUEUE_CODE)
+}
+
+/// 排队时给客户端看的那句话。
+///
+/// ── 为什么必须说清「等一会儿就好、不用重新登录」──────────────────
+/// 改造前这条响应被归成鉴权失败，文案是「上游拒绝访问，可能是登录态失效或
+/// 权限不足」—— 用户照着这句话去重新登录，而问题根本不在凭据上。
+/// 排队是**上游的容量状态**，与账号无关：会自己好。
+pub fn queue_message(text: &str) -> String {
+    let queue_count = queue_count_of(text);
+    match queue_count {
+        Some(count) if count > 0 => {
+            format!("上游模型繁忙，正在排队（前方 {count} 个请求），请稍后重试")
+        }
+        _ => "上游模型繁忙，正在排队，请稍后重试".to_string(),
+    }
+}
+
+/// 从（可能是多层转义的）文本里抠出 `queueCount`。
+///
+/// 递归剥两层字符串转义：观测到的排队响应是「JSON 里套 JSON 字符串、再套 JSON
+/// 字符串」的三层形态，`queueCount` 在最里层。这里不追求通用性 —— 只覆盖上游
+/// 实际会发的层数，剥不动就返回 None（文案退化成不带排队长度的版本，不影响判定）。
+pub fn queue_count_of(text: &str) -> Option<i64> {
+    let mut current = text.to_string();
+    for _ in 0..3 {
+        if let Ok(value) = serde_json::from_str::<Value>(&current) {
+            if let Some(count) = value.get("queueCount").and_then(Value::as_i64) {
+                return Some(count);
+            }
+            if let Some(inner) = value.get("message").and_then(Value::as_str) {
+                current = inner.to_string();
+                continue;
+            }
+            if let Some(inner) = value.get("body").and_then(Value::as_str) {
+                current = inner.to_string();
+                continue;
+            }
+        }
+        break;
+    }
+    None
+}
+
+/// 是否命中「额度类」的特征串（源实现的 quota_signals 清单与 pricingUrl 链接）。
+///
+/// 从 `classify_upstream_error` 里拆出来单独一个函数：那条判定链本身要它，
+/// 分类器之外的调用方（例如将来别处要判「这条响应像不像额度问题」）也应当
+/// 复用它 —— 两处各抄一份清单的话，上游改文案时只有一处会跟上，
+/// 另一处开始把「该充值」误判成别的档。
+pub fn has_quota_signal(text: &str) -> bool {
     let body = text.to_lowercase();
-    let pricing = pricing_url_of(text);
-    let quota_signals = [
+    if pricing_url_of(text).is_some() {
+        return true;
+    }
+    [
         "pricingurl",
         "insufficient",
         "no_quota",
@@ -613,12 +723,31 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
         "subscription",
         "plan",
         "trial",
-    ];
-    if pricing.is_some() || quota_signals.iter().any(|signal| body.contains(signal)) {
+    ]
+    .iter()
+    .any(|signal| body.contains(signal))
+}
+
+/// 分类上游错误（源实现 `classifyUpstreamError` 的判定链，逐条对应）。
+pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
+    let body = text.to_lowercase();
+    let pricing = pricing_url_of(text);
+    // 额度判据走上面那个共用函数（不在这里内联一份清单，理由见它的文档）
+    if has_quota_signal(text) {
         return ClassifiedError {
             kind: UpstreamKind::Quota,
             message: "当前账号额度不足或套餐不支持该模型".to_string(),
             pricing_url: pricing,
+        };
+    }
+    // 排队判在额度之后、鉴权之前：理由与「403 先看语义再看状态码」同源 ——
+    // 语义特征比状态码可靠。顺序也不能更早：额度响应里若恰好同时出现排队字样
+    // （不观察，但防御），「该充值」才是用户真正要处理的那件事。
+    if is_queue_signal(text) {
+        return ClassifiedError {
+            kind: UpstreamKind::Queued,
+            message: queue_message(text),
+            pricing_url: None,
         };
     }
     if status == 429 || body.contains("rate limit") || body.contains("too many") {
@@ -636,7 +765,7 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
         };
     }
     if status == 403 {
-        // 走到这里说明没有配额特征，按权限问题处理
+        // 走到这里说明没有配额特征、也不是排队，按权限问题处理
         return ClassifiedError {
             kind: UpstreamKind::Auth,
             message: "上游拒绝访问，可能是登录态失效或权限不足".to_string(),

@@ -244,6 +244,15 @@ fn fallback_retry_advice(
         UpstreamErrorClass::QuotaLimited { .. }
         | UpstreamErrorClass::TokenExpired { .. }
         | UpstreamErrorClass::ContentBlocked { .. } => None,
+        // ── 排队态**不**原地重发 ─────────────────────────────────
+        // 「换账号前先原地重发」的理由（见上）在这里不成立：排队的成因是上游
+        // 此刻的容量，睡一个间隔再发一次仍会撞上同一个队列 —— 原地重发只是把
+        // 请求拖长（D4-2 的 25 秒端到端时延就是这类叠加的结果），并不会让它
+        // 更快成功。正确动作是把队列状态立刻交给客户端，退避提示写在**文案**里
+        // （「请约 N 秒后重试」），状态码用 503 作标准信号；本层不写 `Retry-After`
+        // 响应头（`GatewayError` 没有承载响应头的通道，取舍见 `adapter.rs` 的
+        // `Queued` 变体声明）。
+        UpstreamErrorClass::Queued { .. } => None,
         UpstreamErrorClass::Fatal { .. } => Some(RetryAdvice {
             delay_ms: config::retry_settings().delay_ms(),
             reason: format!("上游错误（HTTP {status}），换账号前先原地重发"),
@@ -1875,6 +1884,16 @@ async fn send_with_retry(
             UpstreamErrorClass::TokenExpired { message } => {
                 GatewayError::with_status(status as i32, message.clone())
                     .with_optional_code(detail.code)
+            }
+            // ── 排队态：503（不是 429、也不是 401）──────────────────────
+            // 状态码**不取上游那个**：上游用 403 承载排队（见 qoder 适配器），
+            // 而 403 对客户端意味着「你没权限」—— 照搬会得到与改造前同一种
+            // 误导（用户跑去重新登录）。503 才是「服务暂时不可用、稍后重试」。
+            //
+            // 退避提示在文案里而不在 `Retry-After` 头里：`GatewayError` 没有
+            // 承载响应头的通道（理由见 `UpstreamErrorClass::Queued` 的说明）。
+            UpstreamErrorClass::Queued { message } => {
+                GatewayError::with_status(503, message.clone())
             }
         };
         return Err(OutboundFailure { class, error });

@@ -28,7 +28,9 @@
 
 use serde_json::Value;
 
-use super::protocol::{classify_upstream_error, THINK_TAGS, UpstreamKind};
+use super::protocol::{
+    classify_upstream_error, is_queue_signal, queue_message, THINK_TAGS, UpstreamKind,
+};
 
 /// 上游 SSE 里解析出的一条事件（源实现 `parseSseLine` 的返回联合）
 pub enum SseEvent {
@@ -50,6 +52,25 @@ pub enum SseEvent {
         message: String,
         /// 额度类错误带出的定价页链接
         pricing_url: Option<String>,
+    },
+    /// **上游排队中**：信封码是 200，排队特征只藏在内层 body 里。
+    ///
+    /// ── 为什么必须有这一档（不然会被当成正文吐给用户）────────────
+    /// 这是第二条漏判链路：上游有时返回 HTTP 200 + SSE 信封、信封的
+    /// `statusCodeValue` **也是 200**，只把 `isQueued` / `queueCount` / 业务码
+    /// 10605 放在内层 body 里。不在这里拦住的话，解析会落到下面那条「取 inner
+    /// → 当 chunk」的常规路径：内层 JSON 里没有 `choices`，`Translator::consume`
+    /// 会照常吃掉它（无 choices 就返回空 delta 列表），**排队信息被当作一次
+    /// 什么都没有的回答**：客户端既看不到排队提示，也等不到内容 —— 表现为
+    /// 「请求成功但回答是空的」。
+    ///
+    /// 与 `Error` 分开而不是塞进 `Error`：`Error` 的语义是「上游业务失败」，
+    /// 消费侧（`piping` / `drive_aggregate`）对它的处置是落冷却 + 交回编排层换号
+    /// —— 那两者对排队都是错的（排队不罚账号、换号也没用）。单列一档，
+    /// 让编译器在每个 match 点上逼出一个「排队该怎么办」的明确答案。
+    Queued {
+        /// 分类后的人话（说清「等一会儿就好、与登录态无关」）
+        message: String,
     },
 }
 
@@ -75,6 +96,11 @@ pub fn parse_sse_line(data: &str) -> SseEvent {
                 None => String::new(),
             };
             let classified = classify_upstream_error(status as u16, &raw);
+            // 信封码非 200 **也可能**是排队（上游换了承载方式）：分类器判出来后
+            // 走 Queued 那条出口，别让它掉进 `Error` 被当成额度错误落冷却
+            if classified.kind == UpstreamKind::Queued {
+                return SseEvent::Queued { message: classified.message };
+            }
             return SseEvent::Error {
                 status: status as u16,
                 kind: classified.kind,
@@ -101,6 +127,26 @@ pub fn parse_sse_line(data: &str) -> SseEvent {
         },
         other => other.clone(),
     };
+    // ── 第二条漏判链路：信封码是 200、排队特征只在内层 body 里 ──────
+    // 位置很关键：必须在上面把 `inner` 解成 `chunk` **之后**、在返回
+    // `SseEvent::Chunk` **之前**判定。放在解 JSON 之后（而不是直接对 inner
+    // 字符串判）是因为排队特征可能藏在**再内一层**的字符串里（上游同样会
+    // 多层转义），解出来的 `chunk` 才是能看到最内层的形态；`is_queue_signal`
+    // 本身也容忍多层，两条一起兜。
+    //
+    // 判据不看 `statusCodeValue`（这里已经是 200 了）—— 只看特征串，
+    // 理由见 `protocol::is_queue_signal` 的说明。
+    {
+        let probe = chunk.to_string();
+        let signal = is_queue_signal(&probe)
+            || match inner {
+                Value::String(text) => is_queue_signal(text),
+                _ => false,
+            };
+        if signal {
+            return SseEvent::Queued { message: queue_message(&probe) };
+        }
+    }
     SseEvent::Chunk(chunk)
 }
 

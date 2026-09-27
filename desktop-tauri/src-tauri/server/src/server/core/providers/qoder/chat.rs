@@ -219,22 +219,37 @@ pub async fn send(
     }
 }
 
-/// 把**失败**的上游响应转成客户端可用的错误。
+/// 把**失败**的上游响应转成客户端可用的错误，**连同上游语义分类一起返回**。
 ///
-/// ── 为什么返回裸错误而不是 `Option`（调用方已经判过状态了）────────
+/// ── 为什么返回 `(错误, 分类)` 而不是裸错误 ──────────────────────
+/// 调用方（`forward_conversation` 的非 2xx 分支）要拿分类做记账决策
+/// （「这一条该不该落账号冷却」）。body 在**本函数内部**就被读走了
+/// （`response.text()`），出了这个函数原文再也拿不到 —— 让调用方自己去
+/// 重新分类是不可能的（它只有一句已经拼好的文案）。把它交出来是唯一不丢
+/// 事实的做法：分类与文案出自同一次解析，两者必然一致。
+///
+/// ── 为什么不返回 `Option`（调用方已经判过状态了）────────────────
 /// 成功响应是**流式**的：`response.text()` 会把整条 SSE 拉完并丢掉流句柄，
 /// 调用方就再也拿不到字节流。所以「要不要读体」这个判断必须留在调用方
 /// （它先看 `is_success()`）。若本函数返回 `Option`，编译器会看到一条
 /// 「读完了体、又没返回错误、继续用那个已被移动的 response」的路径 ——
 /// 那是**不可达但类型上成立**的分支，只能靠调用方 `unwrap` 才能消掉，
-/// 而 release 是 panic=abort，不能 unwrap。返回裸错误即让类型如实反映契约：
-/// 「调用我 = 我已经不成功」。
-pub async fn http_error(status: u16, response: reqwest::Response) -> GatewayError {
+/// 而 release 是 panic=abort，不能 unwrap。返回 `(错误, 分类)` 这个非 `Option`
+/// 的元组即让类型如实反映契约：「调用我 = 我已经不成功」（成功的判据归调用方，
+/// 本函数只负责把失败说清楚，顺带把分类交给它）。
+pub async fn http_error(
+    status: u16,
+    response: reqwest::Response,
+) -> (GatewayError, protocol::UpstreamKind) {
     let text = response.text().await.unwrap_or_default();
     let classified = protocol::classify_upstream_error(status, &text);
     let detail: String = text.chars().take(300).collect();
+    // 排队态的文案用分类器给的那句（说清「等一会儿就好、与登录态无关」）：
+    // 拼 `上游原文` 只会把三层转义的 JSON 糊到用户脸上，反而看不出该干什么
     let message = if classified.message.is_empty() {
         format!("上游返回 {status}: {detail}")
+    } else if classified.kind == protocol::UpstreamKind::Queued {
+        classified.message.clone()
     } else {
         let pricing = classified
             .pricing_url
@@ -243,13 +258,20 @@ pub async fn http_error(status: u16, response: reqwest::Response) -> GatewayErro
             .unwrap_or_default();
         format!("上游请求失败：{}{pricing}（上游原文：{detail}）", classified.message)
     };
-    // 额度/限流用 429、鉴权用 401：编排层按这两档决定「换账号」与「刷新后重试」
+    // 额度/限流用 429、鉴权用 401：编排层按这两档决定「换账号」与「刷新后重试」。
+    // 排队映射成 503：它是标准的「服务暂时不可用、稍后重试」语义
+    // （**不是** 429 —— 429 在本项目里是额度/限流，会触发换账号 + 账号冷却，
+    // 而排队与账号无关，换号解决不了任何问题）。
     let mapped = match classified.kind {
         protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate => 429,
         protocol::UpstreamKind::Auth => 401,
+        protocol::UpstreamKind::Queued => 503,
         _ => 502,
     };
-    GatewayError::with_status(mapped, message).with_optional_code(Some(status as i64))
+    (
+        GatewayError::with_status(mapped, message).with_optional_code(Some(status as i64)),
+        classified.kind,
+    )
 }
 
 /// 上游帧 → 客户端帧 的翻译状态（流式与非流式共用同一套累积逻辑）。
@@ -618,9 +640,20 @@ pub fn delta_json(delta: &TranslatedDelta) -> Value {
 /// （见 `protocol::classify_upstream_error` 的说明）。所以编排层要看的**不是**
 /// 上游的业务码，而是「这条错误该触发哪个动作」：
 ///   额度 / 限流 → **429**（编排层据此标记该账号冷却并换下一个账号）；
+///   排队        → **503**（**既不是** 429 也不是 401，见下）；
 ///   鉴权        → **401**（编排层据此刷新凭证后同账号重试一次）；
 ///   其余        → 502（原样透传给客户端）。
 /// 直接拿业务码当状态码会把「该充值」变成「登录失效」，客户端与用户都会走错方向。
+///
+/// ── 排队为什么必须是 503（这一档是本函数最容易被改错的地方）────────
+/// 排队与另外两档的**动作**都不同：
+///   - 不是 429：429 在本项目里等于「这个账号对模型已限额」→ 落 10 分钟冷却 +
+///     换下一个账号。排队是上游**容量**状态，与账号无关，换号解决不了问题，
+///     还会把一个健康账号白白踢出候选链；
+///   - 不是 401：401 会触发 `TokenExpired` 的「强制刷新凭证 + 同账号重试」，
+///     对着排队响应刷凭证是纯浪费（改造前的实际行为）。
+/// 503 是 HTTP 里「服务暂时不可用、稍后重试」的标准语义，编排层对它的既有处置
+/// 正是「不罚账号、原样透传」—— 客户端据此退避重试即可。
 pub fn business_error(
     status: u16,
     kind: protocol::UpstreamKind,
@@ -631,6 +664,10 @@ pub fn business_error(
     let detail: String = raw.chars().take(300).collect();
     let message = if message.is_empty() {
         format!("上游返回 {status}: {detail}")
+    } else if kind == protocol::UpstreamKind::Queued {
+        // 排队文案直接给分类器那句（不带「上游原文」—— 原文是三层转义的
+        // JSON，糊给用户没有任何信息量，反而盖住了「稍后重试」这个结论）
+        message.to_string()
     } else {
         let pricing = pricing_url.map(|url| format!(" 套餐与额度：{url}")).unwrap_or_default();
         format!("上游请求失败：{message}{pricing}（上游原文：{detail}）")
@@ -638,6 +675,7 @@ pub fn business_error(
     let mapped = match kind {
         protocol::UpstreamKind::Quota | protocol::UpstreamKind::Rate => 429,
         protocol::UpstreamKind::Auth => 401,
+        protocol::UpstreamKind::Queued => 503,
         _ => 502,
     };
     GatewayError::with_status(mapped, message).with_optional_code(Some(status as i64))
