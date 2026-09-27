@@ -86,11 +86,13 @@ pub(crate) fn load_all(conn: &Connection) -> rusqlite::Result<Vec<StoredAccount>
 pub(crate) fn load_by_id(conn: &Connection, id: &str) -> rusqlite::Result<Option<StoredAccount>> {
     let mut stmt = conn.prepare("SELECT data FROM accounts WHERE id = ?1")?;
     let mut rows = stmt.query(params![id])?;
-    while let Some(row) = rows.next()? {
-        let text: String = row.get(0)?;
-        return Ok(decode_data(&text));
+    match rows.next()? {
+        Some(row) => {
+            let text: String = row.get(0)?;
+            Ok(decode_data(&text))
+        }
+        None => Ok(None),
     }
-    Ok(None)
 }
 
 /// 某个 provider 的全部账号（按物理顺序）。
