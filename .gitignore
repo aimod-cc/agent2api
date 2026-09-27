@@ -34,3 +34,6 @@ dist/
 # Docker 部署：密钥与运行数据不入库
 .env
 data/
+# curl 调试产物（本地抓面板会话时的 -c / -D 输出，含会话 cookie 与响应头，禁止入库）
+c[0-9].txt
+h[0-9].txt
