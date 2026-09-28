@@ -651,37 +651,140 @@ impl LoginService {
                 codearts::Callback::Failed(status, message) => Err(GatewayError::with_status(i32::from(status), message)),
             };
         }
-        if kind != ProviderKind::Raccoon {
-            return Err(GatewayError::with_status(400, "该登录任务不接收授权码回调"));
+        // Trae 的上游回调地址带随机 loopback 端口，远程浏览器无法直接访问
+        // 容器内监听器。手工粘贴时仍把**原始 query**注入同一个 listener，
+        // 由原有 `Session::complete` 继续完成换证与落账号，避免复制另一套
+        // Trae 登录逻辑。
+        if kind == ProviderKind::Trae {
+            let parsed = url::Url::parse(callback_url).map_err(|_| {
+                GatewayError::with_status(400, "Trae 登录回调地址无效")
+            })?;
+            if parsed.path() != crate::server::core::providers::trae::oauth::CALLBACK_PATH {
+                return Err(GatewayError::with_status(400, "Trae 登录回调地址无效"));
+            }
+            let query = parsed.query().unwrap_or_default();
+            let session = self
+                .trae_login()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(state)
+                .cloned()
+                .ok_or_else(|| GatewayError::with_status(404, "Trae 登录上下文已结束，请重新发起"))?;
+            session
+                .submit_callback(query)
+                .map_err(|message| GatewayError::with_status(400, message))?;
+            return Ok(String::new());
         }
-        let code = match oauth::parse_callback_code(callback_url, state) {
-            Ok(code) => code,
-            Err(error) => {
-                // 校验失败也要落定任务：否则前端会一直等到 5 分钟超时
-                finish_task_error(&handle, &error.message);
-                logging::log("[Login]", &format!("❌ 网页登录回调校验失败: {}", error.message));
-                return Err(error);
+        // Accio 的回调是标准 `code/state` 查询串。与 public callback 路由
+        // 共用同一收尾函数，保证 PKCE pending、一次性消费和幂等语义一致。
+        if matches!(kind, ProviderKind::Accio | ProviderKind::AccioCn) {
+            let parsed = url::Url::parse(callback_url).map_err(|_| {
+                GatewayError::with_status(400, "Accio 登录回调地址无效")
+            })?;
+            let params: std::collections::HashMap<String, String> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            let code = params.get("code").map(String::as_str).unwrap_or("");
+            let callback_state = params.get("state").map(String::as_str).unwrap_or("");
+            if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+                return Err(GatewayError::with_status(400, format!("授权被拒绝（{error}）")));
             }
-        };
-        match adapter_for(kind).exchange_login_code(&self.store, &code, state).await {
-            Ok(account_id) => {
-                let session = json!({
-                    "accountUid": account_id,
-                    "nickname": Value::Null,
-                    "edition": task.edition,
-                    "provider": task.provider,
-                });
-                handle.update(|task| {
-                    task.done = true;
-                    task.session = Some(session);
-                    task.finished_at = Some(logging::now_ms());
-                });
-                Ok(account_id)
+            if callback_state.trim() != state {
+                return Err(GatewayError::with_status(400, "回调地址与当前 Accio 登录任务不匹配"));
             }
-            Err(error) => {
-                finish_task_error(&handle, &error.message);
-                logging::log("[Login]", &format!("❌ 网页登录换取凭证失败: {}", error.message));
-                Err(error)
+            let result = self.finish_accio_login(code, callback_state).await;
+            if result.is_err() {
+                self.drop_accio_pending(state);
+            }
+            return result;
+        }
+        // AutoClaw OAuth 回调 URL 里没有网关自己的 task state，手工提交时由
+        // 请求体的 state 先锁定这次任务，再按回调路径识别 Zai / Google。
+        if crate::server::core::providers::autoclaw::Region::from_provider_id(&task.provider).is_some() {
+            let parsed = url::Url::parse(callback_url).map_err(|_| {
+                GatewayError::with_status(400, "AutoClaw 登录回调地址无效")
+            })?;
+            let Some(vendor_id) = parsed
+                .path()
+                .strip_prefix(crate::server::core::providers::autoclaw::oauth::CALLBACK_PATH_PREFIX)
+            else {
+                return Err(GatewayError::with_status(400, "AutoClaw 登录回调地址无效"));
+            };
+            let vendor = crate::server::core::providers::autoclaw::oauth::Vendor::from_id(vendor_id)
+                .ok_or_else(|| GatewayError::with_status(400, "无法识别 AutoClaw 登录方式"))?;
+            let params: std::collections::HashMap<String, String> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+                return Err(GatewayError::with_status(400, format!("授权被拒绝（{error}）")));
+            }
+            let upstream_state = params.get("state").map(String::as_str).unwrap_or("");
+            let code = params.get("code").map(String::as_str).unwrap_or("");
+            let Some((pending_state, _)) = self.find_autoclaw_pending_for_vendor(vendor) else {
+                return Err(GatewayError::with_status(404, "AutoClaw 登录上下文已结束，请重新发起"));
+            };
+            if pending_state != state {
+                return Err(GatewayError::with_status(400, "回调地址与当前 AutoClaw 登录任务不匹配"));
+            }
+            return self
+                .finish_autoclaw_oauth_callback(vendor, upstream_state, code)
+                .await;
+        }
+        // CatPaw 正常情况下由服务端 poll-token 兜底完成；若上游仍把 token
+        // 放进可复制的查询串，这里也复用 public callback 的收尾逻辑。
+        if kind == ProviderKind::CatPaw {
+            let parsed = url::Url::parse(callback_url).map_err(|_| {
+                GatewayError::with_status(400, "CatPaw 登录回调地址无效")
+            })?;
+            let params: std::collections::HashMap<String, String> = parsed
+                .query_pairs()
+                .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                .collect();
+            let token = params.get("token").map(String::as_str).unwrap_or("");
+            let callback_state = params.get("state").map(String::as_str).unwrap_or(state);
+            if !params.get("state").map(String::as_str).unwrap_or("").trim().is_empty()
+                && callback_state.trim() != state
+            {
+                return Err(GatewayError::with_status(400, "回调地址与当前 CatPaw 登录任务不匹配"));
+            }
+            self.finish_catpaw_login(token, callback_state).await.map(|_| String::new()).map_err(|message| {
+                GatewayError::with_status(400, message)
+            })
+        } else {
+            if kind != ProviderKind::Raccoon {
+                return Err(GatewayError::with_status(400, "该登录任务不接收授权码回调"));
+            }
+            let code = match oauth::parse_callback_code(callback_url, state) {
+                Ok(code) => code,
+                Err(error) => {
+                    // 校验失败也要落定任务：否则前端会一直等到 5 分钟超时
+                    finish_task_error(&handle, &error.message);
+                    logging::log("[Login]", &format!("❌ 网页登录回调校验失败: {}", error.message));
+                    return Err(error);
+                }
+            };
+            match adapter_for(kind).exchange_login_code(&self.store, &code, state).await {
+                Ok(account_id) => {
+                    let session = json!({
+                        "accountUid": account_id,
+                        "nickname": Value::Null,
+                        "edition": task.edition,
+                        "provider": task.provider,
+                    });
+                    handle.update(|task| {
+                        task.done = true;
+                        task.session = Some(session);
+                        task.finished_at = Some(logging::now_ms());
+                    });
+                    Ok(account_id)
+                }
+                Err(error) => {
+                    finish_task_error(&handle, &error.message);
+                    logging::log("[Login]", &format!("❌ 网页登录换取凭证失败: {}", error.message));
+                    Err(error)
+                }
             }
         }
     }

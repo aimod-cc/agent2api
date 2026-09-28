@@ -25,10 +25,10 @@
 //! `GET /api/session/login/wait?state=` 直到 done（与桌面壳的等待语义一致，
 //! 返回最终 session；取消/错误原样上抛）。适用面（对齐各上游回调机制）：
 //!   · WorkBuddy / Qoder / Cline：设备授权轮询，网页端完全可用；
-//!   · AutoClaw（OAuth）/ CatPaw：回调打**本机网关 loopback 端口** ——
-//!     浏览器与网关同机（compose 本地映射）时可用，远程面板不可用；
-//!   · 小浣熊：自定义协议回调（office-raccoon://），浏览器无法转交，
-//!     网页端用「填写凭证」。
+//!   · AutoClaw（OAuth）：优先接收 loopback 回调，远程面板由网页端粘贴
+//!     最终回调地址兜底；CatPaw 由服务端 poll-token 兜底；
+//!   · 小浣熊 / Trae / Accio / CodeArts：回调地址可能落到浏览器自己的
+//!     loopback 或自定义协议，网页端自动提供“粘贴回调地址”兜底。
 //!
 //! ── 壳特有命令的降级 ────────────────────────────────────────
 //! 窗口主题、托盘、改端口、软件更新安装、桌面设置、文件对话框导入导出
@@ -153,6 +153,65 @@ pub fn shim_js() -> &'static str {
       + 'style="color:#7fa7ff;word-break:break-all;">' + url + '</a>',
       '已完成，关闭'
     );
+  }
+
+  function closeWebOverlay() {
+    var overlay = document.getElementById('a2a-web-overlay');
+    if (overlay) overlay.remove();
+  }
+
+  // 这些提供商的授权页会把浏览器导航到 loopback / 自定义协议地址。
+  // Docker 远程面板里该地址属于浏览器所在电脑，不能自动回到容器，
+  // 因此让用户把地址栏的最终 URL 粘回受保护接口。
+  function needsManualCallback(provider) {
+    return provider === 'raccoon' || provider === 'trae'
+      || provider === 'accio' || provider === 'accio-cn'
+      || provider === 'codearts' || provider === 'autoclaw-intl';
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  async function waitForManualCallback(provider, state, authUrl) {
+    var label = provider === 'raccoon' ? '小浣熊'
+      : provider === 'trae' ? 'Trae'
+      : provider.indexOf('accio') === 0 ? 'Accio'
+      : provider === 'codearts' ? 'CodeArts' : 'AutoClaw';
+    while (true) {
+      var callbackUrl = await ensureOverlay(
+        label + '需要粘贴回调地址',
+        '<div style="margin-bottom:10px;">授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
+        + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。</div>'
+        + '<div style="margin-bottom:10px;">如果授权页没有打开，请先点击：<a href="'
+        + escapeHtml(authUrl) + '" target="_blank" rel="noopener" style="color:#7fa7ff;word-break:break-all;">'
+        + escapeHtml(authUrl) + '</a></div>'
+        + '<input type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:…/callback?..." '
+        + 'style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #3a3b3f;'
+        + 'border-radius:6px;background:#26272b;color:#e8e8e8;">',
+        '提交回调地址'
+      );
+      callbackUrl = String(callbackUrl || '').trim();
+      if (!callbackUrl) continue;
+      try {
+        await call('POST', '/api/session/login/callback', {
+          state: state,
+          callbackUrl: callbackUrl,
+        });
+        // Trae 是把 query 注入现有 listener 后异步换证；其它几家也统一
+        // 以 /wait 的最终状态为准，避免把“已收到回调”误报成“已登录”。
+        return await pollWait(state);
+      } catch (error) {
+        await ensureOverlay(
+          '回调提交失败',
+          '<div style="margin-bottom:4px;">' + escapeHtml(error && error.message ? error.message : error)
+          + '</div><div>请确认复制的是授权完成后的完整地址，再重新提交。</div>',
+          '重新填写'
+        );
+      }
+    }
   }
 
   // ── 错误归一（与桌面 bridge 的 asError 同语义）─────────────
@@ -329,9 +388,18 @@ pub fn shim_js() -> &'static str {
         try { second = window.open(authUrl, '_blank'); } catch (e) { /* 落到链接兜底 */ }
         if (!second) showLinkFallback(authUrl);
       }
+      if (needsManualCallback(provider)) {
+        // 同时保留自动轮询：同机部署仍会自动完成，远程 Docker 则由用户
+        // 粘贴地址；先完成的一方结束流程，finally 会关闭残留覆盖层。
+        return await Promise.race([
+          pollWait(started.state),
+          waitForManualCallback(provider, started.state, authUrl),
+        ]);
+      }
       return await pollWait(started.state);
     } finally {
       if (popup && !popup.closed) { try { popup.close(); } catch (e) { /* 无害 */ } }
+      closeWebOverlay();
       loginActive = false;
       loginProvider = '';
       emitLogin();
@@ -479,6 +547,12 @@ pub fn shim_js() -> &'static str {
         edition: edition || 'cn',
         provider: target,
       }));
+    },
+    submitLoginCallback: function (state, callbackUrl) {
+      return call('POST', '/api/session/login/callback', {
+        state: String(state || ''),
+        callbackUrl: String(callbackUrl || ''),
+      });
     },
     getLoginState: function () {
       return Promise.resolve({ active: loginActive, provider: loginProvider });

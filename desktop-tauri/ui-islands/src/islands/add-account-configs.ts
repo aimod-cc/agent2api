@@ -98,9 +98,8 @@ const RACCOON: ProviderConfig = {
   label: '小浣熊',
   addButton: '添加小浣熊账号',
   // 网页登录（后端 providers::raccoon::oauth）：官方登录页 + 一次性授权码回调。
-  // 只给内嵌窗口，没有「打开方式」这一级 —— 回调是自定义协议深链
-  // （office-raccoon://auth/callback），系统浏览器模式下要靠系统注册该协议才回得来
-  // （那是小浣熊官方客户端装的，装了才有），给了这个选项只会让用户选完永远等不到回调。
+  // 桌面端仍优先用内嵌窗口；网页端 / Docker 远程面板会在授权完成后
+  // 提示用户粘贴 office-raccoon:// 回调地址，不依赖本机协议注册。
   webLogin: {
     noteHtml: '在<strong>内嵌窗口</strong>里完成官方登录，成功后自动加入账号列表。',
     button: '打开网页登录',
@@ -122,9 +121,8 @@ const CATPAW: ProviderConfig = {
   // （即 X-Passport-Token）、uid / userId / loginName、name；没有刷新机制
   provider: 'catpaw',
   label: 'CatPaw',
-  // 网页登录：美团 passport 授权页 + 上游把 token 推回本机网关的 loopback 回调。
-  // 回调落点与「哪个浏览器」无关，因此系统浏览器完全走得通，而且它是内嵌窗口走不通
-  // 时的兜底（美团 passport 的扫码 / 第三方账号登录在部分环境下会拒绝内嵌窗口）。
+  // 网页登录：美团 passport 授权页 + loopback 回调；服务端同时轮询 poll-token，
+  // 因此 Docker / 远程面板不依赖浏览器访问容器内的 loopback 端口。
   webLogin: {
     noteHtml: '用 CatPaw 账号完成登录（美团 passport），成功后自动加入账号列表。',
     button: '打开 CatPaw 网页登录',
@@ -282,11 +280,11 @@ function accioForm(spec: { provider: string; label: string; site: string; siteNo
   return {
     provider,
     label,
-    // OAuth 2.0 授权码 + PKCE：回调落在本机 loopback 端口，与浏览器在哪无关，
-    // 因此内嵌窗口与系统浏览器两条路都走得通（与 CatPaw / AutoClaw 国际版同一形态）
+    // OAuth 2.0 授权码 + PKCE：同机直接接收 loopback；Docker / 远程面板
+    // 由网页 shim 提示粘贴最终回调地址（与 CodeArts 同一兜底形态）。
     webLogin: {
       noteHtml: `打开 Accio <b>${label}</b>的官方登录页（<code>${site}</code>）并用你的 Accio 账号登录：`
-        + '登录成功后官方页面会跳回本机，网关自动用一次性授权码换取凭证并加入账号列表'
+        + '登录成功后官方页面会跳回本机；同机自动完成，Docker / 远程面板按提示粘贴回调地址即可'
         + '（授权码只在本机传给网关，界面不显示明文 token）。',
       button: `打开 Accio ${label}登录页`,
       busyText: `等待 Accio ${label}登录完成…`,
@@ -368,7 +366,7 @@ function zcodeForm(spec: { provider: string; label: string; site: string; planNo
  * 地址里给的 `port`。所以浏览器与网关在同一台机器时两次回调（先 secret+redirect、
  * 再 code）都能落地；不在同一台时浏览器跳的是它自己的 127.0.0.1，到不了网关。
  * 那种部署（网关跑在 NAS / 服务器上）的用法写在下面的提示里，两条通道都通：
- *   · 地址栏里那条 localhost 地址**改成网关地址**再回车 —— 带 `code` 就直接落账；
+ *   · Docker / 远程面板直接把地址栏中的最终回调地址粘贴回网页 shim —— 带 `code` 就直接落账；
  *   · 只带 `secret` 时网关会转去走 ticket 轮询通道，代价是**拿不到 refresh token**
  *     （约一小时后要重新登录一次），界面上这句提示是照实说的。
  *
@@ -391,8 +389,7 @@ const CODEARTS: ProviderConfig = {
   webLogin: {
     noteHtml: '打开华为云 CodeArts 的官方授权页登录：登录完成后官方页面会把浏览器带回<b>网关自己的</b> '
       + '<code>/oauth/callback</code>，网关用一次性授权码换取临时凭据并加入账号列表。'
-      + '<br>网关跑在另一台机器上时（NAS / 服务器），浏览器跳的是它自己的 127.0.0.1 —— '
-      + '把地址栏里那条地址的主机端口改成网关的（如 <code>http://192.168.1.58:3065/oauth/callback?…</code>）再回车即可。',
+      + '<br>网关跑在另一台机器上时，网页端会提示把地址栏中的最终回调地址直接粘贴回面板。',
     button: '打开 CodeArts 授权页',
     busyText: '等待 CodeArts 登录完成…',
     modes: [
@@ -405,7 +402,7 @@ const CODEARTS: ProviderConfig = {
         value: 'external',
         label: '系统浏览器',
         hint: '将用系统默认浏览器打开授权页（会复用浏览器里已登录的华为云账号）；'
-          + '浏览器与网关不在同一台机器时，按上方说明把回调地址改成网关地址再走一遍',
+          + '浏览器与网关不在同一台机器时，按上方说明把最终回调地址粘贴回面板',
       },
     ],
   },
@@ -454,23 +451,21 @@ const TRAE: ProviderConfig = {
   desktop: false,
   webLogin: {
     noteHtml: '打开 <b>Trae SOLO</b> 的官方授权页（<code>trae.cn</code>）并用你的 Trae 账号登录：'
-      + '授权完成后官方页面会跳回<b>本机</b>的一个临时端口，网关自动用一次性授权码换取凭证并加入账号列表'
-      + '（授权码只在本机传给网关，界面不显示明文 token）。',
+      + '授权完成后官方页面会跳回<b>本机</b>的一个临时端口；同机部署自动接收，Docker / 远程面板请按提示复制地址栏回调地址。',
     button: '打开 Trae 授权页',
     busyText: '等待 Trae 授权完成…',
     modes: [
       {
         value: 'embedded',
         label: '内嵌窗口（推荐）',
-        hint: '将打开内嵌窗口；授权完成后自动加入账号列表。关掉窗口即取消等待。'
+        hint: '将打开内嵌窗口；授权完成后自动加入账号列表。远程面板可粘贴回调地址。关掉窗口即取消等待。'
           + '链接 5 分钟内有效，超时或未点就会作废（可重新发起）',
       },
       {
         value: 'external',
         label: '系统浏览器',
         hint: '将用系统默认浏览器打开授权页（会复用浏览器里已登录的 Trae 账号）；'
-          + '完成后自动加入账号列表。<b>浏览器必须与网关在同一台机器上</b>'
-          + '（回调地址被上游钉成 127.0.0.1 的一个本机端口）',
+          + '同机完成后自动加入，Docker / 远程面板按提示粘贴地址栏回调地址。',
       },
     ],
   },
@@ -479,8 +474,7 @@ const TRAE: ProviderConfig = {
     + '（本家 <b>refreshToken 一次一换</b>：换发一次旧的即作废，所以两份程序别同时刷同一个账号）。'
     + '<br>手工粘贴时请连 <b>machineId / deviceId</b> 一起填：上游把它们与登录时上传的设备公钥绑在一起判设备，'
     + '凭空换一对会撞 <code>2xxxx</code> 那族设备绑定拒绝。'
-    + '<br>没有这三样时的正路是用上方的「网页登录」；容器 / 远程部署形态本机收不到回调，'
-    + '只能在有浏览器的机器上登录后把凭据粘进来。',
+    + '<br>没有这三样时的正路是用上方的「网页登录」；容器 / 远程部署形态按提示粘贴地址栏回调地址即可。',
   fields: [
     { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: 'Cloud-IDE-JWT（三段点分）' },
     { key: 'refreshToken', label: 'refreshToken', rows: 2, optional: true, placeholder: '可选；填了才能到期自动续期' },

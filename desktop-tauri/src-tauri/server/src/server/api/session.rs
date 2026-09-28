@@ -4,7 +4,7 @@
 //!   POST   /api/session/login/start     发起无头登录，最多等 15 秒拿 authUrl
 //!   GET    /api/session/login/wait      轮询登录结果 ?state=
 //!   POST   /api/session/login/cancel    取消登录（关弹窗/用户放弃）
-//!   POST   /api/session/login/callback  提交网页登录回调（壳侧登录窗口捕获）
+//!   POST   /api/session/login/callback  提交网页登录回调（壳侧捕获或远程面板粘贴）
 //!   POST   /api/session/refresh         刷新当前账号 token
 //!   POST   /api/session/logout          清除登录态（删掉当前账号）
 //!   POST   /auth/login                  同步登录（等完成才响应）

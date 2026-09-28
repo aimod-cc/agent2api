@@ -52,6 +52,8 @@ use super::oauth::{Callback, CALLBACK_PATH};
 pub struct CallbackListener {
     port: u16,
     shutdown: watch::Sender<bool>,
+    /// 远程浏览器粘贴回调地址时，复用真实 HTTP 回调的投递通道。
+    sender: std::sync::Mutex<Option<mpsc::UnboundedSender<String>>>,
     inbox: tokio::sync::Mutex<mpsc::UnboundedReceiver<String>>,
 }
 
@@ -70,7 +72,7 @@ impl CallbackListener {
             .port();
         let (shutdown, receiver) = watch::channel(false);
         let (sender, inbox) = mpsc::unbounded_channel();
-        let app = router(sender);
+        let app = router(sender.clone());
         spawn_server(listener, app.clone(), receiver.clone());
         // 浏览器把 localhost 解析成 ::1 时也要有人接（多数环境先试 IPv4，
         // 但 macOS / 双栈 Docker 上出现过只连 ::1 的情况）。拿不到不影响。
@@ -78,7 +80,12 @@ impl CallbackListener {
             spawn_server(v6, app, receiver);
         }
         logging::log("[Login]", &format!("Trae OAuth 回调已监听 127.0.0.1:{port}{CALLBACK_PATH}"));
-        Ok(Self { port, shutdown, inbox: tokio::sync::Mutex::new(inbox) })
+        Ok(Self {
+            port,
+            shutdown,
+            sender: std::sync::Mutex::new(Some(sender)),
+            inbox: tokio::sync::Mutex::new(inbox),
+        })
     }
 
     /// 这一轮占到的端口（拼 `auth_callback_url` 用）。
@@ -95,6 +102,10 @@ impl CallbackListener {
     /// 都要显式 close 一次（幂等：`watch` 重复置位没有副作用）。
     /// close 之后 `next_callback` 会以 `None` 结束，等待方据此退出。
     pub fn close(&self) {
+        self.sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
         let _ = self.shutdown.send(true);
     }
 
@@ -105,6 +116,26 @@ impl CallbackListener {
     pub async fn next_callback(&self) -> Option<String> {
         let mut guard = self.inbox.lock().await;
         guard.recv().await
+    }
+
+    /// 从受保护的网关接口注入一条用户粘贴的回调 query。
+    ///
+    /// 注入仍经过与真实 HTTP 回调相同的 `Callback::resolves_login` 判定，
+    /// 因此空地址和浏览器噪音不会消耗这一轮登录。
+    pub fn submit_callback(&self, query: &str) -> Result<(), String> {
+        let callback = Callback::from_query(query);
+        if !callback.resolves_login() {
+            return Err("回调地址没有携带可用的 Trae 授权信息".to_string());
+        }
+        let sender = self
+            .sender
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| "Trae 登录任务已结束，请重新发起".to_string())?;
+        sender
+            .send(query.to_string())
+            .map_err(|_| "Trae 登录任务已结束，请重新发起".to_string())
     }
 }
 
@@ -249,6 +280,20 @@ mod tests {
         let (status, body) = hit(listener.port(), "/authorize?error=access_denied").await;
         assert_eq!(200, status);
         assert!(body.contains("Login failed"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_remote_callback_can_be_injected_without_opening_the_loopback_port() {
+        let listener = CallbackListener::bind().await.expect("本机端口应当能绑上");
+        listener
+            .submit_callback("authCode=AC-REMOTE&loginHost=api.trae.com.cn")
+            .expect("有效回调应能注入");
+        let query = tokio::time::timeout(Duration::from_secs(2), listener.next_callback())
+            .await
+            .expect("注入回调应当唤醒等待方")
+            .expect("通道不该关闭");
+        assert_eq!("authCode=AC-REMOTE&loginHost=api.trae.com.cn", query);
+        assert!(listener.submit_callback("scope=solo").is_err(), "噪音不能注入");
     }
 
     #[tokio::test]

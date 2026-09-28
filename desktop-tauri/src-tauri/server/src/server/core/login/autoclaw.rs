@@ -262,7 +262,7 @@ impl LoginService {
     /// 锁序：先在待办表的锁内收集候选（state + 发起时间），**释放后再**查任务
     /// 表 —— 两张表各是独立锁，不在一张锁的临界区里去碰另一张，避免与
     /// `start`（先任务后待办）形成反向嵌套。
-    fn find_pending_for_vendor(&self, vendor: Vendor) -> Option<(String, LoginTaskHandle)> {
+    pub(crate) fn find_autoclaw_pending_for_vendor(&self, vendor: Vendor) -> Option<(String, LoginTaskHandle)> {
         let mut candidates: Vec<(String, i64)> = {
             let table = self.autoclaw_oauth.lock().unwrap_or_else(|error| error.into_inner());
             table
@@ -336,7 +336,7 @@ impl LoginService {
         if code.is_empty() {
             return Err(GatewayError::with_status(400, "回调没有携带授权码"));
         }
-        let Some((state, handle)) = self.find_pending_for_vendor(vendor) else {
+        let Some((state, handle)) = self.find_autoclaw_pending_for_vendor(vendor) else {
             return Err(GatewayError::with_status(
                 404,
                 "这次登录已取消或已过期，请重新发起",

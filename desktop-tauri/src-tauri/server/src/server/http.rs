@@ -302,10 +302,10 @@ pub fn panel_router(state: ServerState) -> Router {
         .route("/api/session/login/start", post(api::session::login_start))
         .route("/api/session/login/wait", get(api::session::login_wait))
         .route("/api/session/login/cancel", post(api::session::login_cancel))
-        // 网页登录的回调入口：壳侧登录窗口把 `office-raccoon://auth/callback?…`
-        // 原样 POST 到这里（Tauri 不能像 Electron 那样在会话里注册协议处理器，
-        // 见 api::session::login_callback 的说明）。与其他 login/* 一样在
-        // protected 组 —— 它写账号库，必须过 API Key。
+          // 网页登录的回调入口：壳侧登录窗口或远程网页面板把回调地址原样
+          // POST 到这里（Tauri 不能像 Electron 那样在会话里注册协议处理器，
+          // 见 api::session::login_callback 的说明）。与其他 login/* 一样在
+          // protected 组 —— 它写账号库，必须过 API Key。
         .route("/api/session/login/callback", post(api::session::login_callback))
         // AutoClaw 的手机号验证码登录（**不是**网页登录，见 api::session 模块头）：
         // 上游没有授权码 / 回调这条路，登录就是「发码 → 用码换 token」两次请求，
