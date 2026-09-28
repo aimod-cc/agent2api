@@ -57,6 +57,33 @@ pub fn shim_js() -> &'static str {
     } catch (e) { /* 隐私模式等：留在内存即可 */ }
   }
 
+  // ── 面板双令牌的本地保管（PANEL_AUTH）──────────────────────
+  // HttpOnly cookie 在「宿主中转」入口（fnOS docker 管理页这类面板跳板）
+  // 下发/回带都会被掐掉：登录 POST 能到、Set-Cookie 回不来，主页第一个
+  // 请求就 401 被踢回登录页。因此登录/刷新接口把裸令牌同时放进响应体
+  // （见 panel.rs issue_response），前端存这里，后续请求带
+  // `x-panel-token` / `x-panel-refresh` 头。直连环境下 cookie 照常下发
+  // 且服务端优先认它，这套头是纯增量，互不干扰。
+  var PANEL_AUTH = 'agent2api.panelAuth';
+  function readPanelAuth() {
+    try { return JSON.parse(localStorage.getItem(PANEL_AUTH) || 'null'); }
+    catch (e) { return null; }
+  }
+  function storedPanelToken(kind) {
+    var auth = readPanelAuth();
+    var value = auth && auth[kind];
+    if (typeof value === 'string' && value) return value;
+    return '';
+  }
+  function storePanelAuth(access, refresh) {
+    try {
+      localStorage.setItem(PANEL_AUTH, JSON.stringify({ access: access, refresh: refresh }));
+    } catch (e) { /* 隐私模式等：留在本次调用链即可 */ }
+  }
+  function clearPanelAuth() {
+    try { localStorage.removeItem(PANEL_AUTH); } catch (e) { /* 无害 */ }
+  }
+
   // ── 覆盖层（Key 输入 / 链接兜底）：原生 DOM，界面样式不依赖 ──
   function ensureOverlay(titleText, bodyHtml, confirmText) {
     return new Promise(function (resolve) {
@@ -146,6 +173,15 @@ pub fn shim_js() -> &'static str {
   async function httpCall(method, path, body, retried) {
     var headers = { 'Accept': 'application/json' };
     if (apiKey) headers['x-api-key'] = apiKey;
+    // 面板会话的头部回退（见 PANEL_AUTH 段）：有存令牌就带上；
+    // refresh/logout 只在 /api/panel/ 路径发 refresh，对齐
+    // refresh cookie 的 Path=/api/panel 语义。
+    var panelAccess = storedPanelToken('access');
+    if (panelAccess) headers['x-panel-token'] = panelAccess;
+    if (path.indexOf('/api/panel/') === 0) {
+      var panelRefresh = storedPanelToken('refresh');
+      if (panelRefresh) headers['x-panel-refresh'] = panelRefresh;
+    }
     var init = { method: method, headers: headers };
     var wantsBody = method === 'POST' || method === 'PUT' || method === 'PATCH'
       || !(body === null || body === undefined);
@@ -170,6 +206,9 @@ pub fn shim_js() -> &'static str {
       if (errorType === 'panel_login_required') {
         var refreshed = await tryRefresh();
         if (refreshed) return httpCall(method, path, body, true);
+        // 续期失败 = 会话链真的没了：清掉本地令牌再跳登录页，
+        // 否则下次进来还带着死 token，永远是同一轮失败。
+        clearPanelAuth();
         window.location.href = '/login';
         // 页面即将整页跳转，返回一个挂起的承诺占位
         return new Promise(function () {});
@@ -200,12 +239,30 @@ pub fn shim_js() -> &'static str {
     return httpCall(method, path, body === undefined ? null : body);
   }
 
-  // access 短效令牌过期后的静默续期：refresh cookie（path 限 /api/panel）
-  // 会由浏览器自动带上；成功 = 新双令牌已落 cookie，原请求可重试。
+  // access 短效令牌过期后的静默续期。中转环境里 refresh cookie 到不了
+  // 服务端，改为带 `x-panel-refresh` 头，并显式带 `x-panel-auth-mode: body`
+  // 要求新令牌进响应体（服务端只认这个标记，直连环境响应体与旧行为
+  // 逐字节一致）；响应体里的新令牌回写 PANEL_AUTH（轮换后旧 refresh 已
+  // 作废，不回存下次必失败）。cookie 模式（本地没存过令牌，即不带
+  // x-panel-refresh）下轮换随 Set-Cookie 完成，body 里没有令牌 ——
+  // resp.ok 即续期成功，不能按失败处理。
   async function tryRefresh() {
     try {
-      var resp = await fetch('/api/panel/refresh', { method: 'POST' });
-      return resp.ok;
+      var headers = { 'Accept': 'application/json' };
+      var refreshToken = storedPanelToken('refresh');
+      if (refreshToken) {
+        headers['x-panel-refresh'] = refreshToken;
+        headers['x-panel-auth-mode'] = 'body';
+      }
+      var resp = await fetch('/api/panel/refresh', { method: 'POST', headers: headers });
+      if (!resp.ok) return false;
+      var payload = await resp.json();
+      var data = payload && payload.data;
+      if (data && typeof data.accessToken === 'string' && data.accessToken
+        && typeof data.refreshToken === 'string' && data.refreshToken) {
+        storePanelAuth(data.accessToken, data.refreshToken);
+      }
+      return true;
     } catch (e) {
       return false;
     }
@@ -317,6 +374,8 @@ pub fn shim_js() -> &'static str {
   async function downloadFile(method, path, filename) {
     var headers = { 'Accept': '*/*' };
     if (apiKey) headers['x-api-key'] = apiKey;
+    var panelAccess = storedPanelToken('access');
+    if (panelAccess) headers['x-panel-token'] = panelAccess;
     var response = await fetch(path, { method: method, headers: headers });
     if (!response.ok) throw new Error('导出失败（HTTP ' + response.status + '）');
     var blob = await response.blob();
@@ -661,7 +720,11 @@ pub fn shim_js() -> &'static str {
     saveRetention: function (patch) { return call('PUT', '/api/retention', patch); },
 
     // ── 面板登录（headless 托管面板才有「登录面板」的概念）──
-    panelLogout: function () { return call('POST', '/api/panel/logout', {}); },
+    panelLogout: async function () {
+      await call('POST', '/api/panel/logout', {});
+      // 服务端已撤销会话链；本地保管的双令牌一并清掉。
+      clearPanelAuth();
+    },
 
     // ── 机器人校验开关（登录 / 注册的 ALTCHA proof-of-work）──
     getCaptchaSetting: function () { return call('GET', '/api/captcha'); },

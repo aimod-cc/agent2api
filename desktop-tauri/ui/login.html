@@ -72,10 +72,54 @@
       var button = $('submit');
       var isSetup = false;
 
-      // 已登录（access 会话有效）→ 直接进面板；401 → 留在本页
-      fetch('/api/session').then(function (resp) {
-        if (resp.ok) window.location.href = '/';
-      }).catch(function () { /* 未登录，留在本页 */ });
+      // ── 面板双令牌（agent2api.panelAuth，与 web_shim 的 PANEL_AUTH 段同键）──
+      // 「宿主中转」入口（fnOS docker 管理页这类面板跳板）会把 HttpOnly cookie
+      // 掐掉：登录 POST 能到、Set-Cookie 回不来，面板会话只能靠请求头。登录页
+      // 本身不走 web_shim，这里备一份同键的存取。
+      var PANEL_AUTH = 'agent2api.panelAuth';
+      function readPanelToken(kind) {
+        try {
+          var auth = JSON.parse(localStorage.getItem(PANEL_AUTH) || 'null');
+          var value = auth && auth[kind];
+          return typeof value === 'string' && value ? value : '';
+        } catch (e) { return ''; }
+      }
+      function storePanelTokens(access, refresh) {
+        try {
+          localStorage.setItem(PANEL_AUTH, JSON.stringify({ access: access, refresh: refresh }));
+        } catch (e) { /* 隐私模式等：存不了就只能依赖 cookie */ }
+      }
+
+      // ── 会话传输探测：cookie 在本环境能不能往返 ─────────────────
+      // fnOS docker 管理页这类宿主中转入口会把 Set-Cookie/Cookie 掐掉。
+      // 服务端种一枚 60 秒探针 cookie（GET /api/panel/cookie-probe 连打
+      // 两发，第二发能读到它 = roundtrip:true）。探测通过 → 纯 cookie
+      // 会话：登录请求不带任何标记，响应体没有令牌（与直连旧行为一致，
+      // JS 读不到任何令牌）；失败 → 登录请求带 x-panel-auth-mode: body，
+      // 令牌才进响应体，存 localStorage 走头部回退。探测测的是本环境的
+      // 真实传输，不猜代理行为 —— 哪天中转把 cookie 修好了会自动回归。
+      var headerMode = false;
+      var probeDone = fetch('/api/panel/cookie-probe?step=1', { cache: 'no-store' })
+        .then(function () {
+          return fetch('/api/panel/cookie-probe?step=2', { cache: 'no-store' });
+        })
+        .then(function (resp) { return resp.json(); })
+        .then(function (payload) {
+          var data = payload && payload.data;
+          headerMode = !!(data && !data.roundtrip);
+        })
+        .catch(function () { headerMode = true; }); // 探测都发不出去：按中转处理，保登录可用
+
+      // 已登录（access 会话有效）→ 直接进面板；401 → 留在本页。
+      // 手里存有令牌就带上：中转环境 cookie 缺席，服务端靠这个头认会话。
+      (function () {
+        var headers = {};
+        var token = readPanelToken('access');
+        if (token) headers['x-panel-token'] = token;
+        fetch('/api/session', { headers: headers }).then(function (resp) {
+          if (resp.ok) window.location.href = '/';
+        }).catch(function () { /* 未登录，留在本页 */ });
+      })();
 
       // ── ALTCHA 官方 widget（proof-of-work，协议见 server::altcha）──
       // 点一下「我不是机器人」→ widget 领题并在后台算 → 绿勾「验证成功」，
@@ -118,19 +162,31 @@
         tip.textContent = '无法连接网关，请确认服务已启动';
       });
 
-      function doSubmit(username, password) {
+      async function doSubmit(username, password) {
+        await probeDone; // 极端情况：提交赶在探测回来前，等它定完模式再发
         button.disabled = true;
         errorEl.textContent = '';
         var body = { username: username, password: password };
         if (captchaPayload) body.captcha = captchaPayload;
+        var headers = { 'Content-Type': 'application/json' };
+        if (headerMode) headers['x-panel-auth-mode'] = 'body';
         fetch(isSetup ? '/api/panel/setup' : '/api/panel/login', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: headers,
           body: JSON.stringify(body),
         }).then(function (resp) {
           return resp.json().then(function (payload) { return { ok: resp.ok, payload: payload }; });
         }).then(function (result) {
           if (result.ok) {
+            // 响应体里有没有令牌由服务端按我们的标记决定：中转模式才有。
+            // 有就先存进 localStorage 再跳面板（面板与登录页同源，读得到
+            // 同一份）；纯 cookie 模式下 body 里没有令牌，这里不落任何东西，
+            // 会话只存在于 HttpOnly cookie。
+            var data = result.payload && result.payload.data;
+            if (data && typeof data.accessToken === 'string' && data.accessToken
+              && typeof data.refreshToken === 'string' && data.refreshToken) {
+              storePanelTokens(data.accessToken, data.refreshToken);
+            }
             window.location.href = '/';
             return;
           }

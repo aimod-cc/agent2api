@@ -64,8 +64,57 @@ pub async fn captcha_challenge() -> Response {
     }
 }
 
-fn issue_response(session: access::IssuedSession) -> Response {
-    let mut response = ok_json(serde_json::json!({ "loggedIn": true }));
+/// 客户端要求「令牌进响应体」的请求头（值固定 `body`）。服务端不做任何
+/// 来源/环境猜测：标记由前端在传输探测（`cookie_probe`）失败后显式给出。
+const TOKEN_BODY_MODE: &str = "x-panel-auth-mode";
+
+fn tokens_in_body(headers: &HeaderMap) -> bool {
+    headers
+        .get(TOKEN_BODY_MODE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("body"))
+}
+
+/// `GET /api/panel/cookie-probe` —— 会话传输探测（登录页加载时连打两发）。
+///
+/// 挂 public：探测发生在登录之前。第一发**没有**探针 cookie：种一枚 60 秒
+/// 寿命的 `PROBE_COOKIE` 并回 `roundtrip:false`；第二发浏览器若存得下、发
+/// 得回，服务端读到它回 `roundtrip:true` —— 本环境的 cookie 传输（含
+/// Set-Cookie 下发）完好，登录响应不需要令牌进 body。第二发仍 `false`
+/// （中转剥 Set-Cookie / 浏览器拒存第三方 cookie / 隐私模式）＝ cookie 走
+/// 不通，前端才带 `x-panel-auth-mode: body` 登录。测的是环境的真实传输，
+/// 不猜代理行为：哪天中转把 cookie 修好了，直连形态自动回归。
+pub async fn cookie_probe(headers: HeaderMap) -> Response {
+    if access::cookie_value(&headers, access::PROBE_COOKIE).is_some() {
+        return ok_json(serde_json::json!({ "roundtrip": true }));
+    }
+    let cookie = format!(
+        "{}={}; Path=/; Max-Age=60; HttpOnly; SameSite=Lax",
+        access::PROBE_COOKIE,
+        access::random_hex(16)
+    );
+    let mut response = ok_json(serde_json::json!({ "roundtrip": false }));
+    if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    response
+}
+
+fn issue_response(session: access::IssuedSession, tokens_in_body: bool) -> Response {
+    // 令牌进不进响应体由客户端的显式标记决定（见 `tokens_in_body`）：
+    // 带 `x-panel-auth-mode: body` 的是「探测到 cookie 走不通」的环境
+    // （fnOS docker 管理页这类宿主中转入口），前端把 body 里的令牌存
+    // localStorage、后续请求走 `x-panel-token` 头（见 access::session_valid
+    // 的说明与 web_shim 的 PANEL_AUTH 段）；不带标记的直连环境与旧版
+    // 逐字节一致 —— 令牌只在 HttpOnly cookie 里，JS 读不到。带标记的
+    // 环境令牌因此 JS 可读：面板是同源可信代码，用可用性换掉的那部分
+    // XSS 面只在「cookie 本来就不可用」的世界里发生。
+    let mut payload = serde_json::json!({ "loggedIn": true });
+    if tokens_in_body {
+        payload["accessToken"] = session.access_token.into();
+        payload["refreshToken"] = session.refresh_token.into();
+    }
+    let mut response = ok_json(payload);
     for cookie in [session.access_cookie, session.refresh_cookie] {
         if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
             response.headers_mut().append(SET_COOKIE, value);
@@ -88,6 +137,7 @@ pub async fn panel_status() -> Response {
 /// 密码要求：至少 8 位。bcrypt 哈希只落库（`kv` 的 `panelAdmin`），明文
 /// 不留痕。注册成功直接签发会话 —— 用户注册完就进面板，不再输一次。
 pub async fn panel_setup(
+    headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Bytes,
 ) -> Response {
@@ -122,7 +172,7 @@ pub async fn panel_setup(
                 "[Security]",
                 &format!("✅ 管理员「{username}」注册完成（{}）", addr.ip()),
             );
-            issue_response(access::IssuedSession::new_session())
+            issue_response(access::IssuedSession::new_session(), tokens_in_body(&headers))
         }
         Ok(false) => management_error(409, "管理员账号已存在，无需重复注册"),
         Err(reason) => {
@@ -134,6 +184,7 @@ pub async fn panel_setup(
 
 /// `POST /api/panel/login` —— 账号密码换双令牌。
 pub async fn panel_login(
+    headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Bytes,
 ) -> Response {
@@ -161,7 +212,7 @@ pub async fn panel_login(
     }
     access::clear_login_failures(addr.ip());
     logging::log("[Security]", &format!("✅ 面板登录成功（{}）", addr.ip()));
-    issue_response(access::IssuedSession::new_session())
+    issue_response(access::IssuedSession::new_session(), tokens_in_body(&headers))
 }
 
 /// `POST /api/panel/refresh` —— 用长效 refresh 轮换出新的双令牌。
@@ -169,15 +220,15 @@ pub async fn panel_login(
 /// 前端在 access 过期（401）后先静默调这里，成功则原请求重试、用户无感；
 /// refresh 也失效（过期 / 重放检测触发）才真正跳登录页。
 pub async fn panel_refresh(headers: HeaderMap) -> Response {
-    let Some(session) = access::rotate_session(refresh_cookie_of(&headers)) else {
+    let Some(session) = access::rotate_session(access::refresh_token_of(&headers)) else {
         return management_error(401, "登录已过期，请重新登录");
     };
-    issue_response(session)
+    issue_response(session, tokens_in_body(&headers))
 }
 
 /// `POST /api/panel/logout` —— 撤销当前会话链（双 cookie 一并清除）。
 pub async fn panel_logout(headers: HeaderMap) -> Response {
-    access::revoke_session(refresh_cookie_of(&headers), &headers);
+    access::revoke_session(access::refresh_token_of(&headers), &headers);
     let mut response = ok_json(serde_json::json!({ "loggedIn": false }));
     for name in [access::ACCESS_COOKIE, access::REFRESH_COOKIE] {
         let clear = format!("{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
@@ -186,23 +237,6 @@ pub async fn panel_logout(headers: HeaderMap) -> Response {
         }
     }
     response
-}
-
-/// refresh token 的取值：cookie 的 Path 限定在 /api/panel，浏览器只在
-/// 本组接口上携带；顺手接受 Authorization: Bearer（App/脚本场景）。
-fn refresh_cookie_of(headers: &HeaderMap) -> Option<&str> {
-    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
-        if let Ok(text) = value.to_str() {
-            if let Some(token) = text.strip_prefix("Bearer ") {
-                if !token.trim().is_empty() {
-                    return Some(token.trim());
-                }
-            }
-        }
-    }
-    headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|value| value.to_str().ok())
 }
 
 fn management_error(status: i32, message: &str) -> Response {
