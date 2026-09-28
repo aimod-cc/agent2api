@@ -367,9 +367,13 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   // ZCode 系的套餐通道（别的家没有这个概念，选择器也不渲染）：后端只认
   // coding-plan / start-plan 两个枚举，这里直接用归一后的值做受控状态
   const isZcodeFamily = providerOf(account) === 'zcode' || providerOf(account) === 'zcode-intl'
-  const [planMode, setPlanMode] = React.useState(
-    isZcodeFamily ? (account?.planMode === 'start-plan' ? 'start-plan' : 'coding-plan') : '',
-  )
+  const [planMode, setPlanMode] = React.useState(() => {
+    if (!isZcodeFamily) return ''
+    // 缺省 / auto / 认不出的旧值都归到「自动」——后端缺字段即自动档
+    return account?.planMode === 'start-plan' || account?.planMode === 'coding-plan'
+      ? String(account.planMode)
+      : 'auto'
+  })
   const [busy, setBusy] = React.useState(false)
   const [status, setStatus] = React.useState<React.ReactNode>('')
   const [provider, setProvider] = React.useState<{ id: string; name?: string; protocol?: string; baseUrl?: string } | null>(null)
@@ -567,10 +571,13 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
                 <RadioGroup value={planMode} onValueChange={value => setPlanMode(String(value))}
                   className='flex-row items-center gap-5' aria-label='套餐通道'>
                   <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+                    <RadioGroupItem value='auto' />自动（体验套餐优先）
+                  </Label>
+                  <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
                     <RadioGroupItem value='coding-plan' />编码套餐
                   </Label>
                   <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
-                    <RadioGroupItem value='start-plan' />体验套餐（start-plan）
+                    <RadioGroupItem value='start-plan' />体验套餐
                   </Label>
                 </RadioGroup>
               </div>

@@ -446,6 +446,32 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::request::read_upstream_error`），因为「怎么读一个 HTTP 错误体」
     /// 是协议层的事、与哪一家无关。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass;
+
+    /// 主通道失败后的**备用通道**请求计划（同一账号就地重试一次）。
+    ///
+    /// 编排层在「本轮还没用过备用通道」时拿着失败原因问一次：给出计划 =
+    /// 立刻按它重发（同一条尝试明细，登记一次重试原因）；None = 没有备用
+    /// 通道（默认）或这个失败不该回退，错误照既有动作链走。
+    /// `failed_protocol` 是刚失败那一次的上游协议（主/备用由此区分），
+    /// `class` 是已归一的错误分类（内容拦截这类「换网也没用」的失败据此
+    /// 排除），`failure` 是给客户端的最终错误形态（状态码 + 文案）。
+    ///
+    /// 目前唯一的使用方是 ZCode 的双通道：自动档体验套餐先试，撞上不可用
+    /// （额度耗尽 / JWT 失效等 4xx）就地回退编码套餐通道 —— 两张网是两个
+    /// 独立额度池，一边耗尽时另一边往往还有量（见 `zcode` 的模块头）。
+    /// 判定与计划构造全部留在适配器里 —— 「哪张网认哪份凭证」是 provider
+    /// 专属知识。
+    fn fallback_chat_plan(
+        &self,
+        _session: &Value,
+        _body: &Value,
+        _failed_protocol: ChatUpstreamProtocol,
+        _class: &UpstreamErrorClass,
+        _failure: &GatewayError,
+    ) -> Option<ChatRequestPlan> {
+        None
+    }
+
     /// 取可用 access token（含临期主动刷新；刷新结果回写 store）。
     ///
     /// `account_id` 为空串表示「没有指定账号」：用默认登录态

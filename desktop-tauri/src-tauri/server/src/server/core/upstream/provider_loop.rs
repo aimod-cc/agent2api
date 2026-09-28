@@ -78,7 +78,7 @@ use serde_json::{json, Value};
 use crate::server::config;
 use crate::server::core::custom_providers;
 use crate::server::core::protocol::strip_internal_fields;
-use crate::server::core::providers::adapter::{
+use crate::server::core::providers::adapter::{ ChatRequestPlan,
     adapter_for, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
 };
 use crate::server::core::providers::custom::forward as custom_forward;
@@ -747,6 +747,10 @@ async fn attempt_queue(
         // ——不存在「一直重发」的路径。
         let started_at = logging::now_ms();
         let mut refreshed = false;
+        // 备用通道的重发计划（见 `ProviderAdapter::fallback_chat_plan`）：
+        // Some = 下一轮发送循环直接用它，不再问 build_chat_request。
+        // 一次性 —— 备用通道自己再失败就按既有动作链收尾，不二次回退。
+        let mut fallback_plan: Option<ChatRequestPlan> = None;
         let (response, wire_model, plan_protocol) = loop {
             // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
             // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
@@ -771,14 +775,17 @@ async fn attempt_queue(
             // 会把它渲染成「无结果记录」）—— 明明有一个明确的失败原因。
             // 所以先给明细定稿，再把错误抛出：明细条数与 attempts 的一一对应
             // 在此也成立（那是本字段的全部前提，见模块头）。
-            let plan = match adapter.build_chat_request(&session, body, ctx.client_headers) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    ctx.telemetry.finish_last_attempt(
-                        Some(i64::from(error.status_code)),
-                        Some(&error.message),
-                    );
-                    return Err(error);
+            let plan = match fallback_plan.take() {
+                Some(plan) => plan,
+                None => match adapter.build_chat_request(&session, body, ctx.client_headers) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        ctx.telemetry.finish_last_attempt(
+                            Some(i64::from(error.status_code)),
+                            Some(&error.message),
+                        );
+                        return Err(error);
+                    }
                 }
             };
             // 序列化失败只可能是内部数据坏了（适配器给出的 body 里含不可序列化的
@@ -981,6 +988,33 @@ async fn attempt_queue(
                                      （请检查该账号的 refreshToken 是否仍有效）"
                                 ),
                             );
+                        }
+                    }
+                    // ── 动作 2.5：备用通道回退（主通道「结构性不可用」时）────
+                    // 与动作 0 / 动作 2 同一性质：同一个账号、同一条尝试明细，
+                    // 换的是**请求计划**（哪张网、哪份凭证）而不是账号或 body。
+                    // 判定（该不该回退）与计划构造全部在适配器里（见
+                    // `ProviderAdapter::fallback_chat_plan`）；给不出（没有备用
+                    // 通道 / 信号不对 / 凭证缺失）就落空，错误照下面的动作链走。
+                    // 一次性：备用通道自己再失败，按普通错误收尾，不二次回退。
+                    if fallback_plan.is_none() {
+                        if let Some(plan) =
+                            adapter.fallback_chat_plan(&session, body, plan_protocol, &failure.class, &failure.error)
+                        {
+                            fallback_plan = Some(plan);
+                            ctx.telemetry.note_attempt_retry(
+                                "主通道不可用（上游按编码套餐判账），改走备用通道重试一次",
+                                Some(i64::from(failure.error.status_code)),
+                                0,
+                            );
+                            logging::console_line(
+                                "[Upstream]",
+                                &format!(
+                                    "⚠️ {}，改走备用通道重试一次",
+                                    failure.error.message
+                                ),
+                            );
+                            continue;
                         }
                     }
                     // ── 这一轮的结局已定（不会再重发同一个账号）→ 记明细 ────

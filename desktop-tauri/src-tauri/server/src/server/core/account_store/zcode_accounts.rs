@@ -17,7 +17,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::server::core::providers::zcode::adapter::{PLAN_MODE_CODING, PLAN_MODE_START};
+use crate::server::core::providers::zcode::adapter::{PLAN_MODE_AUTO, PLAN_MODE_CODING, PLAN_MODE_START};
 use crate::server::core::providers::zcode::credentials::ZcodeCredentials;
 use crate::server::core::providers::zcode::region::Region;
 use crate::server::core::providers::{kind_id, ProviderKind};
@@ -282,8 +282,9 @@ impl AccountStore {
         let next: Option<String> = match value {
             Value::Null => None,
             other => {
-                // 大小写不敏感地归一到两个枚举值；认不出的一律 400（静默回落
-                // 会让「切到体验套餐」悄悄失效，用户对着 429 排查半天）
+                // 大小写不敏感地归一到三个枚举值；认不出的一律 400（静默回落
+                // 会让「切到体验套餐」悄悄失效，用户对着 429 排查半天）。
+                // auto = 移除字段：缺省即自动档，记录里不留第三种形态。
                 let normalized = match other
                     .as_str()
                     .map(str::trim)
@@ -293,13 +294,14 @@ impl AccountStore {
                 {
                     Some(PLAN_MODE_START) => PLAN_MODE_START.to_string(),
                     Some(PLAN_MODE_CODING) => PLAN_MODE_CODING.to_string(),
+                    Some(PLAN_MODE_AUTO) => String::new(),
                     _ => {
                         return Err(AccountStoreError::bad_request(
-                            "套餐通道只认 coding-plan / start-plan",
+                            "套餐通道只认 auto / coding-plan / start-plan",
                         ))
                     }
                 };
-                Some(normalized)
+                (!normalized.is_empty()).then_some(normalized)
             }
         };
         let current = record
@@ -321,7 +323,7 @@ impl AccountStore {
             }
             None => {
                 record.remove("planMode");
-                changes.push("套餐通道 → 编码套餐（缺省）".to_string());
+                changes.push("套餐通道 → 自动（编码套餐先试，不可用回退体验套餐）".to_string());
             }
         }
         record.set_updated_at(logging::now_ms());
@@ -407,6 +409,11 @@ mod tests {
             store.zcode_account_record(&id).unwrap()["planMode"].as_str().unwrap_or("")
         );
 
+        // auto：显式回自动档 —— 字段整个移除（缺省即自动，记录里不留第三种形态）
+        store.update_zcode_plan_mode(&id, &json!("START-PLAN")).unwrap();
+        store.update_zcode_plan_mode(&id, &json!("AUTO")).unwrap();
+        assert!(store.zcode_account_record(&id).unwrap().get("planMode").is_none());
+
         // 回落缺省：Null 把键整个移除（老账号的形状）
         store.update_zcode_plan_mode(&id, &Value::Null).unwrap();
         assert!(store.zcode_account_record(&id).unwrap().get("planMode").is_none());
@@ -421,7 +428,7 @@ mod tests {
         let id = added["id"].as_str().unwrap().to_string();
         let error = store.update_zcode_plan_mode(&id, &json!("weekend")).err().expect("非法值该被拒");
         assert_eq!(400, error.status_code);
-        assert!(error.message.contains("coding-plan"), "{}", error.message);
+        assert!(error.message.contains("auto"), "{}", error.message);
     }
 
     /// 不存在的 id（含「存在但不是 ZCode」的归属错位）一律 404 —— 与

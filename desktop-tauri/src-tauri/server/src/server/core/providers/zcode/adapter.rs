@@ -28,6 +28,9 @@
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic。
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use axum::http::HeaderMap;
 use serde_json::Value;
 
@@ -43,10 +46,43 @@ use super::models;
 use super::region::Region;
 use crate::server::core::protocol::anthropic_outbound;
 
-/// 账号 `planMode` 字段的两个取值（账号级套餐通道，见 `build_chat_request`）。
-/// 缺省 / 空值 / 认不出 = 编码套餐通道（与历史账号逐字兼容）。
+/// 账号 `planMode` 字段的取值（账号级套餐通道，见 `build_chat_request`）。
+/// `auto`（以及缺省 / 空值 / 认不出）= 自动档：编码套餐先试，撞上「套餐已
+/// 到期」就地回退体验套餐并记住；两个显式值 = 钉死通道（不参与回退）。
+pub const PLAN_MODE_AUTO: &str = "auto";
 pub const PLAN_MODE_CODING: &str = "coding-plan";
 pub const PLAN_MODE_START: &str = "start-plan";
+
+/// 体验套餐通道「已知不可用」的账号备忘（进程内，TTL 见
+/// [`START_ROUTE_MEMO_TTL`]，键 = 登录 JWT）。
+///
+/// ── 为什么自动档还需要一份备忘 ──────────────────────────────
+/// 自动档体验套餐先试：没有备忘的话，赠额度用完 / JWT 失效后，每条请求都
+/// 先白吃一次体验套餐的失败往返再回退（延迟翻倍、尝试明细里一条失败噪声）。
+/// 备忘让后续请求直接走编码套餐。TTL 到期后重新试体验套餐 —— 用户领了新
+/// 套餐自然回主通道，没领就再记一次；赠额度闲置十天半月也不会被「用掉」，
+/// 10 分钟的试探成本可以忽略。记账键是登录 JWT（账号唯一且跨请求稳定；
+/// 进程内私有结构，不落盘）。
+static START_ROUTE_DEAD: std::sync::OnceLock<Mutex<HashMap<String, std::time::Instant>>> =
+    std::sync::OnceLock::new();
+const START_ROUTE_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn start_route_dead(key: &str) -> bool {
+    let Ok(map) = start_route_memo().lock() else {
+        return false;
+    };
+    map.get(key).is_some_and(|at| at.elapsed() < START_ROUTE_MEMO_TTL)
+}
+
+fn memo_start_route_dead(key: &str) {
+    if let Ok(mut map) = start_route_memo().lock() {
+        map.insert(key.to_string(), std::time::Instant::now());
+    }
+}
+
+fn start_route_memo() -> &'static Mutex<HashMap<String, std::time::Instant>> {
+    START_ROUTE_DEAD.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// ZCode 适配器（无状态；地区是唯一的状态，构造期固定）
 pub struct ZcodeAdapter {
@@ -75,6 +111,39 @@ impl ZcodeAdapter {
         self.region
             .env_override("OPENAI_BASE_URL")
             .unwrap_or_else(|| self.region.openai_base_url().to_string())
+    }
+
+    /// 编码套餐通道的请求计划（自动档的兜底、钉死编码套餐的唯一通道）。
+    fn build_coding_plan_request(
+        &self,
+        account: &Value,
+        body: &Value,
+    ) -> Result<ChatRequestPlan, GatewayError> {
+        let token = account
+            .get("auth")
+            .and_then(|auth| auth.get("accessToken"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if token.is_empty() {
+            return Err(GatewayError::with_status(
+                401,
+                "ZCode 账号缺少推理凭证，请重新登录",
+            ));
+        }
+        let mut headers: Vec<(String, String)> = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Accept".to_string(), "*/*".to_string()),
+            ("Authorization".to_string(), format!("Bearer {token}")),
+        ];
+        headers.extend(identity_headers());
+        Ok(ChatRequestPlan {
+            protocol: ChatUpstreamProtocol::OpenAI,
+            url: format!("{}/chat/completions", self.openai_base_url()),
+            headers,
+            body: body.clone(),
+        })
     }
 
     /// 体验套餐（start-plan）通道的请求计划。
@@ -136,6 +205,7 @@ impl ZcodeAdapter {
             body: payload,
         })
     }
+
 }
 
 impl ProviderAdapter for ZcodeAdapter {
@@ -172,43 +242,91 @@ impl ProviderAdapter for ZcodeAdapter {
         body: &Value,
         _client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError> {
-        // ── 套餐通道分流（账号级字段 `planMode`，缺省 = 编码套餐）────────
+        // ── 套餐通道分流（账号级字段 `planMode`，缺省 = 自动档）────────
         // start-plan 的额度不挂在编码套餐 API Key 上（见 `region::
         // start_plan_anthropic_url` 的说明）：走体验套餐通道时，请求改打
         // zcode.z.ai 的 Anthropic 网关、鉴权用登录 JWT，body 翻成 Anthropic
         // messages —— 回程翻译由编排层按 `protocol` 位接线。
+        //
+        // 自动档（缺省 / auto / 认不出的值）的次序：**体验套餐先试**（赠
+        // 额度不用就过期，先把它花掉；编码套餐是稳定的兜底）—— 撞上不可用
+        // 由编排层问一次 `fallback_chat_plan` 就地回退编码套餐；备忘记着
+        // 「这份 JWT 的体验套餐已判死」时跳过注定失败的往返直接走编码套餐
+        // （见 `START_ROUTE_DEAD`）。手里没有 JWT（粘贴凭证只填了一半）时
+        // 体验套餐根本打不了，直接走编码套餐。
         let plan_mode = account
             .get("planMode")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if plan_mode.eq_ignore_ascii_case(PLAN_MODE_START) {
-            return self.build_start_plan_request(account, body);
-        }
-        let token = account
-            .get("auth")
-            .and_then(|auth| auth.get("accessToken"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim()
             .to_string();
-        if token.is_empty() {
-            return Err(GatewayError::with_status(
-                401,
-                "ZCode 账号缺少推理凭证，请重新登录",
-            ));
+        if plan_mode.eq_ignore_ascii_case(PLAN_MODE_START) {
+            return self.build_start_plan_request(account, body);
         }
-        let mut headers: Vec<(String, String)> = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-            ("Accept".to_string(), "*/*".to_string()),
-            ("Authorization".to_string(), format!("Bearer {token}")),
-        ];
-        headers.extend(identity_headers());
-        Ok(ChatRequestPlan {
-            protocol: ChatUpstreamProtocol::OpenAI,
-            url: format!("{}/chat/completions", self.openai_base_url()),
-            headers,
-            body: body.clone(),
-        })
+        let jwt = account
+            .get("jwt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let pinned_coding = plan_mode.eq_ignore_ascii_case(PLAN_MODE_CODING);
+        if !pinned_coding && !jwt.is_empty() && !start_route_dead(&jwt) {
+            return self.build_start_plan_request(account, body);
+        }
+        return self.build_coding_plan_request(account, body);
+    }
+
+
+    /// 自动档的回退判定与计划构造（编排层在主通道失败后问一次）。
+    ///
+    /// 三道闸，全部通过才回退：
+    ///   1. **失败的是体验套餐通道** —— 自动档主通道就是它（`failed_protocol`
+    ///      是 Anthropic）；编码套餐通道自己就是兜底，它的失败没有更兜底的网；
+    ///   2. **没钉死通道** —— 用户点名 coding-plan / start-plan 时说了算；
+    ///   3. **不是内容拦截** —— 审核按内容判，同一份 body 换哪张网都会被拦
+    ///      （与动作 0「不换账号」同一理由：换网只会白扔另一张网的额度）。
+    ///
+    /// 回退成立 = 给出编码套餐计划 + 记备忘（见 `START_ROUTE_DEAD`）。只认
+    /// 4xx（套餐耗尽 / JWT 失效这类「这张网现在进不去」）：5xx 是上游抖动，
+    /// 不值得为它把账号钉在另一张网上十分钟。手里没有 accessToken（编码
+    /// 套餐凭证也缺）时落空，原错误照常上抛。
+    fn fallback_chat_plan(
+        &self,
+        session: &Value,
+        body: &Value,
+        failed_protocol: ChatUpstreamProtocol,
+        class: &UpstreamErrorClass,
+        failure: &GatewayError,
+    ) -> Option<ChatRequestPlan> {
+        if failed_protocol != ChatUpstreamProtocol::Anthropic {
+            return None;
+        }
+        let plan_mode = session
+            .get("planMode")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if plan_mode.eq_ignore_ascii_case(PLAN_MODE_START)
+            || plan_mode.eq_ignore_ascii_case(PLAN_MODE_CODING)
+        {
+            return None;
+        }
+        if matches!(class, UpstreamErrorClass::ContentBlocked { .. }) {
+            return None;
+        }
+        if !(400..500).contains(&failure.status_code) {
+            return None;
+        }
+        let plan = self.build_coding_plan_request(session, body).ok()?;
+        let jwt = session
+            .get("jwt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if !jwt.is_empty() {
+            memo_start_route_dead(jwt);
+        }
+        Some(plan)
     }
 
     /// 上游错误分类。
@@ -442,12 +560,13 @@ mod tests {
         assert!(plan.body["messages"].as_array().is_some_and(|items| !items.is_empty()));
     }
 
-    /// 认不出的 planMode 一律回落编码套餐通道（store 侧已把非法值 400 挡住，
-    /// 这里钉的是适配器自身的兜底：手工编辑落进来的脏值不打爆转发）。
+    /// 认不出的 planMode 一律按自动档走（体验套餐优先）；手里没有 JWT 时
+    /// 体验套餐打不了，回落编码套餐 —— store 侧已把非法值 400 挡住，这里钉
+    /// 的是适配器自身的兜底：手工编辑落进来的脏值不打爆转发。
     #[test]
     fn an_unknown_plan_mode_falls_back_to_the_coding_route() {
         let plan = ZCODE_ADAPTER
-            .build_chat_request(&session(Some("plan-x"), "jwt-test"), &chat_body(), &HeaderMap::new())
+            .build_chat_request(&session(Some("plan-x"), ""), &chat_body(), &HeaderMap::new())
             .unwrap();
         assert_eq!(ChatUpstreamProtocol::OpenAI, plan.protocol);
         assert!(plan.url.contains("open.bigmodel.cn"));
@@ -464,4 +583,149 @@ mod tests {
         assert!(error.message.contains("JWT"), "{}", error.message);
         assert!(error.message.contains("重新登录") || error.message.contains("粘贴"), "{}", error.message);
     }
+
+    // ── 自动档的回退（fallback_chat_plan：体验套餐失败 → 编码套餐兜底）──
+
+    /// 自动档主通道 = 体验套餐：它不可用（赠额度耗尽的 429 / JWT 失效的 401
+    /// 等 4xx）就回退编码套餐 —— 两张网是两个独立额度池，一边耗尽时另一边
+    /// 往往还有量。本条同时验证备忘写入：回退后下一条请求直接走编码套餐。
+    #[test]
+    fn an_unusable_start_route_falls_back_to_coding() {
+        let session = json!({
+            "auth": { "accessToken": "ak-fb" },
+            "jwt": "jwt-fb",
+        });
+        let class = UpstreamErrorClass::QuotaLimited {
+            reset_at: None,
+            message: "上游返回 429: 体验套餐额度已用完".to_string(),
+            upstream_code: None,
+            status: 429,
+        };
+        let failure = GatewayError::with_status(429, "上游返回 429: 体验套餐额度已用完");
+        let plan = ZCODE_ADAPTER
+            .fallback_chat_plan(
+                &session,
+                &chat_body(),
+                ChatUpstreamProtocol::Anthropic,
+                &class,
+                &failure,
+            )
+            .expect("体验套餐不可用必须回退编码套餐");
+        assert_eq!(ChatUpstreamProtocol::OpenAI, plan.protocol);
+        assert_eq!(
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+            plan.url
+        );
+
+        // 备忘生效：自动档的下一条请求直接走编码套餐，不再白吃一次失败往返
+        let next = ZCODE_ADAPTER
+            .build_chat_request(&session, &chat_body(), &HeaderMap::new())
+            .unwrap();
+        assert_eq!(ChatUpstreamProtocol::OpenAI, next.protocol);
+    }
+
+    /// 钉死的通道不回退：用户点名了用哪张网，点名的网打不通就把错误如实
+    /// 亮出来 —— 悄悄回退会违背点名（两档都要钉）。
+    #[test]
+    fn a_pinned_channel_never_falls_back() {
+        let class = UpstreamErrorClass::QuotaLimited {
+            reset_at: None,
+            message: "上游返回 429: 体验套餐额度已用完".to_string(),
+            upstream_code: None,
+            status: 429,
+        };
+        let failure = GatewayError::with_status(429, "上游返回 429: 体验套餐额度已用完");
+        for mode in ["coding-plan", "start-plan"] {
+            let session = json!({
+                "auth": { "accessToken": "ak-pin" },
+                "jwt": "jwt-pin",
+                "planMode": mode,
+            });
+            assert!(
+                ZCODE_ADAPTER
+                    .fallback_chat_plan(
+                        &session,
+                        &chat_body(),
+                        ChatUpstreamProtocol::Anthropic,
+                        &class,
+                        &failure,
+                    )
+                    .is_none(),
+                "planMode={mode} 不该回退"
+            );
+        }
+    }
+
+    /// 回退的三条边界：内容拦截不回退（审核按内容判，换网只会白扔另一张网
+    /// 的额度，动作 0 已经先处理过）；失败的本来就是编码套餐通道（它自己
+    /// 就是兜底，没有更兜底的网）；5xx 是上游抖动，不为它把账号钉在另一张
+    /// 网上十分钟。
+    #[test]
+    fn unrelated_failures_do_not_fall_back() {
+        let session = json!({
+            "auth": { "accessToken": "ak-fb2" },
+            "jwt": "jwt-fb2",
+        });
+        let failure = GatewayError::with_status(400, "上游返回 400: 审核未通过");
+        for class in [
+            UpstreamErrorClass::ContentBlocked {
+                status: 400,
+                message: "上游返回 400: 审核未通过".to_string(),
+                upstream_code: None,
+            },
+            UpstreamErrorClass::QuotaLimited {
+                reset_at: None,
+                message: "上游返回 429: 体验套餐额度已用完".to_string(),
+                upstream_code: None,
+                status: 429,
+            },
+        ] {
+            let failed = match class {
+                UpstreamErrorClass::ContentBlocked { .. } => ChatUpstreamProtocol::Anthropic,
+                _ => ChatUpstreamProtocol::OpenAI,
+            };
+            assert!(
+                ZCODE_ADAPTER
+                    .fallback_chat_plan(&session, &chat_body(), failed, &class, &failure)
+                    .is_none(),
+                "该失败不该触发回退"
+            );
+        }
+        // 5xx：上游抖动，不回退
+        let class = UpstreamErrorClass::Fatal {
+            status: 502,
+            message: "上游返回 502".to_string(),
+            upstream_code: None,
+        };
+        let failure = GatewayError::with_status(502, "上游返回 502");
+        assert!(
+            ZCODE_ADAPTER
+                .fallback_chat_plan(
+                    &session,
+                    &chat_body(),
+                    ChatUpstreamProtocol::Anthropic,
+                    &class,
+                    &failure,
+                )
+                .is_none()
+        );
+    }
+
+    /// 自动档的主通道就是体验套餐：手里有 JWT 就先打它（赠额度不用就过期）。
+    #[test]
+    fn auto_mode_tries_the_start_plan_first() {
+        let session = json!({
+            "auth": { "accessToken": "ak-auto" },
+            "jwt": "jwt-auto",
+        });
+        let plan = ZCODE_ADAPTER
+            .build_chat_request(&session, &chat_body(), &HeaderMap::new())
+            .unwrap();
+        assert_eq!(ChatUpstreamProtocol::Anthropic, plan.protocol);
+        assert_eq!(
+            "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages",
+            plan.url
+        );
+    }
+
 }
