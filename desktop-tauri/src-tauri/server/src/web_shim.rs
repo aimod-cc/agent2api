@@ -177,7 +177,11 @@ pub fn shim_js() -> &'static str {
     // refresh/logout 只在 /api/panel/ 路径发 refresh，对齐
     // refresh cookie 的 Path=/api/panel 语义。
     var panelAccess = storedPanelToken('access');
-    if (panelAccess) headers['x-panel-token'] = panelAccess;
+    if (panelAccess) {
+      headers['x-panel-token'] = panelAccess;
+      // Authorization 是标准头：连自定义请求头都剥的中转也会放它过去
+      headers['Authorization'] = 'Bearer ' + panelAccess;
+    }
     if (path.indexOf('/api/panel/') === 0) {
       var panelRefresh = storedPanelToken('refresh');
       if (panelRefresh) headers['x-panel-refresh'] = panelRefresh;
@@ -375,7 +379,10 @@ pub fn shim_js() -> &'static str {
     var headers = { 'Accept': '*/*' };
     if (apiKey) headers['x-api-key'] = apiKey;
     var panelAccess = storedPanelToken('access');
-    if (panelAccess) headers['x-panel-token'] = panelAccess;
+    if (panelAccess) {
+      headers['x-panel-token'] = panelAccess;
+      headers['Authorization'] = 'Bearer ' + panelAccess;
+    }
     var response = await fetch(path, { method: method, headers: headers });
     if (!response.ok) throw new Error('导出失败（HTTP ' + response.status + '）');
     var blob = await response.blob();

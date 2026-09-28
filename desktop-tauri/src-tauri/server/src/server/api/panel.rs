@@ -69,10 +69,20 @@ pub async fn captcha_challenge() -> Response {
 const TOKEN_BODY_MODE: &str = "x-panel-auth-mode";
 
 fn tokens_in_body(headers: &HeaderMap) -> bool {
-    headers
+    // 显式标记：前端探测到 cookie 走不通后自己要求的
+    if headers
         .get(TOKEN_BODY_MODE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.eq_ignore_ascii_case("body"))
+    {
+        return true;
+    }
+    // 探针 cookie 不在场 = 这个环境的 cookie 传输已被掐掉（宿主中转剥
+    // Set-Cookie / Cookie 任一侧都会走到这里）。前端标记要穿过中转才能到
+    // 服务器 —— 中转连自定义请求头一起剥时，标记就哑了；探针 cookie 的
+    // 缺席是**服务器自己能看见**的同一事实，不依赖任何请求头穿过中转。
+    // 直连环境探针 cookie 长效（90 天）恒在场，响应体保持与旧版逐字一致。
+    access::cookie_value(headers, access::PROBE_COOKIE).is_none()
 }
 
 /// `GET /api/panel/cookie-probe` —— 会话传输探测（登录页加载时连打两发）。
@@ -88,10 +98,15 @@ pub async fn cookie_probe(headers: HeaderMap) -> Response {
     if access::cookie_value(&headers, access::PROBE_COOKIE).is_some() {
         return ok_json(serde_json::json!({ "roundtrip": true }));
     }
+    // 长效（90 天）：它发下去之后是「这台浏览器的 cookie 通道完好」的
+    // 持续标志 —— 登录 / 刷新时服务器靠它的**在场**区分直连与中转环境
+    // （见 `tokens_in_body`），60 秒寿命会让刷新场景误判成中转。
+    // 值是匿名随机串，服务端只判「有/无」从不校验，长期驻留无会话语义。
     let cookie = format!(
-        "{}={}; Path=/; Max-Age=60; HttpOnly; SameSite=Lax",
+        "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
         access::PROBE_COOKIE,
-        access::random_hex(16)
+        access::random_hex(16),
+        90 * 24 * 3600
     );
     let mut response = ok_json(serde_json::json!({ "roundtrip": false }));
     if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
@@ -211,7 +226,24 @@ pub async fn panel_login(
         return management_error(401, "账号或密码不正确");
     }
     access::clear_login_failures(addr.ip());
-    logging::log("[Security]", &format!("✅ 面板登录成功（{}）", addr.ip()));
+    // 判定依据跟着日志走：中转环境下「令牌到底走没走响应体」是排查
+    // 「登录成功却被弹回登录页」的第一个分叉点 —— 标记头有没有穿过来、
+    // 探针 cookie 在不在场，一眼定位是中转剥头还是剥 cookie。
+    let marker = headers
+        .get(TOKEN_BODY_MODE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "无".to_string());
+    let probe_present = access::cookie_value(&headers, access::PROBE_COOKIE).is_some();
+    logging::log(
+        "[Security]",
+        &format!(
+            "✅ 面板登录成功（{}）令牌进响应体={} 标记头={marker} 探针cookie={}",
+            addr.ip(),
+            tokens_in_body(&headers),
+            if probe_present { "有" } else { "无" },
+        ),
+    );
     issue_response(access::IssuedSession::new_session(), tokens_in_body(&headers))
 }
 
@@ -241,4 +273,49 @@ pub async fn panel_logout(headers: HeaderMap) -> Response {
 
 fn management_error(status: i32, message: &str) -> Response {
     errors::management_error(status, message)
+}
+
+#[cfg(test)]
+mod tokens_in_body_tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// 直连环境（探针 cookie 在场、无标记）：响应体与旧版逐字一致，
+    /// 令牌只存在于 HttpOnly cookie，JS 读不到。
+    #[test]
+    fn a_direct_environment_keeps_tokens_out_of_the_body() {
+        let headers = headers_with(&[
+            ("cookie", "agent2api-panel-probe=abc; other=x"),
+        ]);
+        assert!(!tokens_in_body(&headers));
+    }
+
+    /// 中转剥了 cookie（探针不在场）→ 令牌进响应体，**哪怕前端标记头没穿过
+    /// 来** —— 服务器自己能看见 cookie 缺席，不依赖自定义请求头穿过中转。
+    #[test]
+    fn a_cookie_stripping_environment_gets_tokens_in_the_body() {
+        let headers = headers_with(&[]);
+        assert!(tokens_in_body(&headers));
+    }
+
+    /// 前端标记照常生效（探测失败后自己要求的）。
+    #[test]
+    fn the_explicit_marker_always_wins() {
+        let headers = headers_with(&[
+            ("x-panel-auth-mode", "body"),
+            ("cookie", "agent2api-panel-probe=abc"),
+        ]);
+        assert!(tokens_in_body(&headers));
+    }
 }
