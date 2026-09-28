@@ -456,7 +456,12 @@ pub async fn login_callback(State(state): State<ServerState>, body: Bytes) -> Re
         .submit_login_callback(&task_state, &callback_url)
         .await
     {
-        Ok(account_id) => ok_json(json!({ "accountId": account_id })),
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(account_id)) => {
+            ok_json(json!({ "accountId": account_id }))
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(next_url)) => {
+            ok_json(json!({ "continue": true, "nextUrl": next_url }))
+        }
         Err(error) => management_error(error.status_code, error.message),
     }
 }

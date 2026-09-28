@@ -107,6 +107,17 @@ pub struct LoginTaskHandle {
     ticket: u64,
 }
 
+/// 手工提交网页登录回调后的结果。
+///
+/// CodeArts 的第一跳只有 `secret`，必须先把浏览器送回 portal 才能拿到最终
+/// `code`；远程网页端不能依赖 public callback 路由替它跳转，因此把下一跳地址
+/// 显式交回受保护接口的调用方。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginCallbackSubmission {
+    Completed(String),
+    ContinueTo(String),
+}
+
 impl LoginTaskHandle {
     fn lock(&self) -> MutexGuard<'_, LoginTaskState> {
         match self.inner.lock() {
@@ -601,7 +612,7 @@ impl LoginService {
         &self,
         state: &str,
         callback_url: &str,
-    ) -> Result<String, GatewayError> {
+    ) -> Result<LoginCallbackSubmission, GatewayError> {
         let state = state.trim();
         if state.is_empty() {
             return Err(GatewayError::with_status(400, "缺少 state，无法确认这次回调归属"));
@@ -618,7 +629,7 @@ impl LoginService {
         }
         if task.done {
             // 幂等：同一个回调被送来两次（深链 + 导航各触发一次）不是错误
-            return Ok(String::new());
+            return Ok(LoginCallbackSubmission::Completed(String::new()));
         }
         // provider 由任务记着，不由调用方决定（见 LoginTaskState::provider）
         let Some(kind) = kind_from_id(&task.provider) else {
@@ -643,11 +654,10 @@ impl LoginService {
                 })
                 .unwrap_or_default();
             return match self.finish_codearts_login(&params).await {
-                codearts::Callback::ContinueTo(_) => Err(GatewayError::with_status(
-                    400,
-                    "这条回调地址要浏览器自己去跳（网关没法替它跳转），请把地址栏里最终那条地址再粘一次",
-                )),
-                codearts::Callback::Accepted(account_id, _) => Ok(account_id.unwrap_or_default()),
+                codearts::Callback::ContinueTo(url) => Ok(LoginCallbackSubmission::ContinueTo(url)),
+                codearts::Callback::Accepted(account_id, _) => {
+                    Ok(LoginCallbackSubmission::Completed(account_id.unwrap_or_default()))
+                }
                 codearts::Callback::Failed(status, message) => Err(GatewayError::with_status(i32::from(status), message)),
             };
         }
@@ -673,7 +683,7 @@ impl LoginService {
             session
                 .submit_callback(query)
                 .map_err(|message| GatewayError::with_status(400, message))?;
-            return Ok(String::new());
+            return Ok(LoginCallbackSubmission::Completed(String::new()));
         }
         // Accio 的回调是标准 `code/state` 查询串。与 public callback 路由
         // 共用同一收尾函数，保证 PKCE pending、一次性消费和幂等语义一致。
@@ -697,7 +707,7 @@ impl LoginService {
             if result.is_err() {
                 self.drop_accio_pending(state);
             }
-            return result;
+            return result.map(LoginCallbackSubmission::Completed);
         }
         // AutoClaw OAuth 回调 URL 里没有网关自己的 task state，手工提交时由
         // 请求体的 state 先锁定这次任务，再按回调路径识别 Zai / Google。
@@ -730,7 +740,8 @@ impl LoginService {
             }
             return self
                 .finish_autoclaw_oauth_callback(vendor, upstream_state, code)
-                .await;
+                .await
+                .map(LoginCallbackSubmission::Completed);
         }
         // CatPaw 正常情况下由服务端 poll-token 兜底完成；若上游仍把 token
         // 放进可复制的查询串，这里也复用 public callback 的收尾逻辑。
@@ -749,9 +760,10 @@ impl LoginService {
             {
                 return Err(GatewayError::with_status(400, "回调地址与当前 CatPaw 登录任务不匹配"));
             }
-            self.finish_catpaw_login(token, callback_state).await.map(|_| String::new()).map_err(|message| {
-                GatewayError::with_status(400, message)
-            })
+            self.finish_catpaw_login(token, callback_state)
+                .await
+                .map(|_| LoginCallbackSubmission::Completed(String::new()))
+                .map_err(|message| GatewayError::with_status(400, message))
         } else {
             if kind != ProviderKind::Raccoon {
                 return Err(GatewayError::with_status(400, "该登录任务不接收授权码回调"));
@@ -778,7 +790,7 @@ impl LoginService {
                         task.session = Some(session);
                         task.finished_at = Some(logging::now_ms());
                     });
-                    Ok(account_id)
+                    Ok(LoginCallbackSubmission::Completed(account_id))
                 }
                 Err(error) => {
                     finish_task_error(&handle, &error.message);

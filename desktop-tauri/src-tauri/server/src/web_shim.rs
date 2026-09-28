@@ -196,10 +196,16 @@ pub fn shim_js() -> &'static str {
       callbackUrl = String(callbackUrl || '').trim();
       if (!callbackUrl) continue;
       try {
-        await call('POST', '/api/session/login/callback', {
+        var submitted = await call('POST', '/api/session/login/callback', {
           state: state,
           callbackUrl: callbackUrl,
         });
+        if (submitted && submitted.nextUrl) {
+          // CodeArts 第一跳只有 secret，需要先打开 portal 的下一跳；下一轮
+          // 再粘贴浏览器最终回调地址即可完成换码。
+          authUrl = String(submitted.nextUrl);
+          continue;
+        }
         // Trae 是把 query 注入现有 listener 后异步换证；其它几家也统一
         // 以 /wait 的最终状态为准，避免把“已收到回调”误报成“已登录”。
         return await pollWait(state);
