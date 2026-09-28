@@ -94,7 +94,9 @@ pub fn panel_router(state: ServerState) -> Router {
         // 会话传输探测（登录页连打两发）：同为 public —— 探测在登录之前，
         // 只种/读一枚 60 秒寿命的探针 cookie，不建立会话、不校验值
         // （见 api::panel::cookie_probe）
-        .route("/api/panel/cookie-probe", get(api::panel::cookie_probe))
+        // any 而不是 get：探针要与登录**同动词**（POST）—— 有的中转按方法
+        // 区别对待 Set-Cookie，只测 GET 会误报「cookie 通道完好」
+        .route("/api/panel/cookie-probe", any(api::panel::cookie_probe))
         // CatPaw 网页登录的 loopback 回调：**上游浏览器直接 POST 到这里**
         // （redirect 指向本网关自己的 loopback 端口，见 core::login::catpaw），
         // 所以它必须免鉴权 —— 调用方是美团 passport 页面，它没有我们的 API Key。

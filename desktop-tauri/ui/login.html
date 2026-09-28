@@ -99,9 +99,11 @@
       // 令牌才进响应体，存 localStorage 走头部回退。探测测的是本环境的
       // 真实传输，不猜代理行为 —— 哪天中转把 cookie 修好了会自动回归。
       var headerMode = false;
-      var probeDone = fetch('/api/panel/cookie-probe?step=1', { cache: 'no-store' })
+      // 两发都用 POST：探针要与登录**同动词** —— 有的中转按方法区别对待
+      // Set-Cookie，只测 GET 会误报「cookie 通道完好」
+      var probeDone = fetch('/api/panel/cookie-probe?step=1', { method: 'POST', cache: 'no-store' })
         .then(function () {
-          return fetch('/api/panel/cookie-probe?step=2', { cache: 'no-store' });
+          return fetch('/api/panel/cookie-probe?step=2', { method: 'POST', cache: 'no-store' });
         })
         .then(function (resp) { return resp.json(); })
         .then(function (payload) {
@@ -115,7 +117,11 @@
       (function () {
         var headers = {};
         var token = readPanelToken('access');
-        if (token) headers['x-panel-token'] = token;
+        if (token) {
+          headers['x-panel-token'] = token;
+          // Authorization 是标准头：连自定义请求头都剥的中转也会放它过去
+          headers['Authorization'] = 'Bearer ' + token;
+        }
         fetch('/api/session', { headers: headers }).then(function (resp) {
           if (resp.ok) window.location.href = '/';
         }).catch(function () { /* 未登录，留在本页 */ });
