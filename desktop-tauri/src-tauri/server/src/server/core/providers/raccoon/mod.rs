@@ -61,7 +61,9 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
-use super::adapter::{ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass};
+use super::adapter::{
+    ChatRequestPlan, ChatUpstreamProtocol, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+};
 use super::content_block;
 use super::{kind_id, ProviderKind};
 
@@ -123,6 +125,7 @@ impl ProviderAdapter for RaccoonAdapter {
             ("Authorization".to_string(), format!("Bearer {token}")),
         ];
         Ok(ChatRequestPlan {
+            protocol: ChatUpstreamProtocol::OpenAI,
             url: format!("{}/chat/completions", self.llm_base_url()),
             headers,
             body: body.clone(),

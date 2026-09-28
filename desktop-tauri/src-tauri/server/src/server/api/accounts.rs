@@ -981,9 +981,21 @@ pub async fn patch_account(state: &ServerState, id: &str, body: &Bytes) -> Respo
             Err(error) => return store_error(error),
         }
     }
+    // ZCode 的套餐通道（`planMode`）同样是**这一家独有**的字段（体验套餐走
+    // zcode.z.ai 的 Anthropic 网关、编码套餐走开放平台 —— 见
+    // `update_zcode_plan_mode` 的说明），通用 `update_account` 不认识它。
+    // 与 balanceToken 同一处置：通用 patch 之前先落，两处改动一次保存全生效。
+    let mut plan_changes: Vec<String> = Vec::new();
+    if let Some(value) = patch.get("planMode") {
+        match state.store().update_zcode_plan_mode(&id, value) {
+            Ok(changes) => plan_changes = changes,
+            Err(error) => return store_error(error),
+        }
+    }
     match state.store().update_account(&id, &patch) {
         Ok((account, mut changes)) => {
             changes.extend(balance_changes);
+            changes.extend(plan_changes);
             ok_json(json!({
                 "account": account,
                 "changes": changes,

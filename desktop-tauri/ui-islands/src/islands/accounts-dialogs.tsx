@@ -364,6 +364,12 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
   const [name, setName] = React.useState(account?.name || '')
   const [proxyDraft, setProxyDraft] = React.useState<ProxyDraft>(() => draftOfProxy(account?.proxy))
   const [balanceToken, setBalanceToken] = React.useState('')
+  // ZCode 系的套餐通道（别的家没有这个概念，选择器也不渲染）：后端只认
+  // coding-plan / start-plan 两个枚举，这里直接用归一后的值做受控状态
+  const isZcodeFamily = providerOf(account) === 'zcode' || providerOf(account) === 'zcode-intl'
+  const [planMode, setPlanMode] = React.useState(
+    isZcodeFamily ? (account?.planMode === 'start-plan' ? 'start-plan' : 'coding-plan') : '',
+  )
   const [busy, setBusy] = React.useState(false)
   const [status, setStatus] = React.useState<React.ReactNode>('')
   const [provider, setProvider] = React.useState<{ id: string; name?: string; protocol?: string; baseUrl?: string } | null>(null)
@@ -411,6 +417,7 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
     : undefined
   const used = [...new Set(peers.map(item => Number(item.priority)))].sort((a, b) => a - b)
   const isCatpaw = providerOf(target) === 'catpaw'
+  const isZcode = isZcodeFamily
 
   /** 清除余额凭证（立即落库，不走保存按钮 —— 它是一个独立的撤销动作） */
   async function clearBalanceToken(): Promise<void> {
@@ -469,12 +476,16 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
       // 输入框永远是空的；若把「空」解释成清除，用户每次保存设置都会把配好的凭证删掉）。
       // 清除走上面那个显式按钮。
       const balancePatch = isCatpaw && balanceToken.trim() ? { balanceToken: balanceToken.trim() } : {}
+      // 套餐通道恒随保存提交（后端对未变化的原值零写入）：两档是「这账号的
+      // 额度花哪份」的选择，不依赖其它字段是否变化
+      const planModePatch = isZcode ? { planMode } : {}
       await shared().workbuddyDesktop?.updateAccount?.(id, {
         name: name.trim() || target.name,
         priority: clamped,
         enabled,
         proxy,
         ...balancePatch,
+        ...planModePatch,
       })
       // 提供商那一段排在账号之后（账号是本弹窗的主角，先落库）。它失败时账号已经存下了，
       // 所以留在弹窗里把那句话说清楚 —— 笼统报成「保存失败」会把两件事混成一件
@@ -549,6 +560,20 @@ export function AccountSettingsDialog({ id, onClose }: { id: string; onClose: ()
               <BalanceTokenField configured={account.hasBalanceToken === true} value={balanceToken}
                 onChange={setBalanceToken} clearBusy={busy}
                 onClear={() => void clearBalanceToken()} />
+            ) : null}
+            {isZcode ? (
+              <div className='field-row mt-2.5'>
+                <span className='text-xs text-subtle'>套餐通道</span>
+                <RadioGroup value={planMode} onValueChange={value => setPlanMode(String(value))}
+                  className='flex-row items-center gap-5' aria-label='套餐通道'>
+                  <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+                    <RadioGroupItem value='coding-plan' />编码套餐
+                  </Label>
+                  <Label className='inline-flex cursor-pointer items-center gap-2 font-normal'>
+                    <RadioGroupItem value='start-plan' />体验套餐（start-plan）
+                  </Label>
+                </RadioGroup>
+              </div>
             ) : null}
           </DialogSection>
 

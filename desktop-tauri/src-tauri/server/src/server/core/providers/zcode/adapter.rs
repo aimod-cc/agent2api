@@ -35,12 +35,18 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
 use super::super::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ChatUpstreamProtocol, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
 use super::super::content_block;
 use super::super::ProviderKind;
 use super::models;
 use super::region::Region;
+use crate::server::core::protocol::anthropic_outbound;
+
+/// 账号 `planMode` 字段的两个取值（账号级套餐通道，见 `build_chat_request`）。
+/// 缺省 / 空值 / 认不出 = 编码套餐通道（与历史账号逐字兼容）。
+pub const PLAN_MODE_CODING: &str = "coding-plan";
+pub const PLAN_MODE_START: &str = "start-plan";
 
 /// ZCode 适配器（无状态；地区是唯一的状态，构造期固定）
 pub struct ZcodeAdapter {
@@ -69,6 +75,66 @@ impl ZcodeAdapter {
         self.region
             .env_override("OPENAI_BASE_URL")
             .unwrap_or_else(|| self.region.openai_base_url().to_string())
+    }
+
+    /// 体验套餐（start-plan）通道的请求计划。
+    ///
+    /// ── 凭证为什么是 JWT 而不是 accessToken ───────────────────
+    /// 两个凭证各管一张网（见 `credentials.rs` 的模块头）：`accessToken`（编码
+    /// 套餐 API Key）只被开放平台的 coding 端点认；`zcode.z.ai` 的套餐网关认的
+    /// 是**登录 JWT** —— 就是「领套餐」用的那一份。缺 JWT 时给出可操作的指引
+    /// 而不是含混的 401：粘贴凭证添加的账号可能只填了一半。
+    ///
+    /// ── body 为什么要翻成 Anthropic messages ──────────────────
+    /// 这条网关只说 Anthropic 协议（老 OpenAI 路由已退役，见 region 的说明）。
+    /// 入站的 chat 体在这里出站翻译；回程由编排层把 Anthropic SSE 翻回 chat
+    /// （`ChatRequestPlan::protocol` 位驱动，与 custom 家同一道翻译）。
+    fn build_start_plan_request(
+        &self,
+        session: &Value,
+        body: &Value,
+    ) -> Result<ChatRequestPlan, GatewayError> {
+        let jwt = session
+            .get("jwt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if jwt.is_empty() {
+            return Err(GatewayError::with_status(
+                401,
+                "ZCode 账号缺少登录 JWT，无法走体验套餐（start-plan）通道：\
+                 请在「账号」页对该账号重新登录，或补粘贴完整凭证",
+            ));
+        }
+        let requested = body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        // 出站翻译：chat 体 → Anthropic messages。stream 恒为 true（与
+        // chat 协议同一条策略：上游恒流式，非流式客户端由聚合路径收流 ——
+        // 转换器只如实搬运 chat 体上的 stream，这里统一覆写，不依赖注入约定）。
+        let mut payload = anthropic_outbound::anthropic_request_from_chat(body, &requested)
+            .map_err(|message| GatewayError::with_status(400, format!("{message}")))?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("stream".to_string(), Value::Bool(true));
+        }
+        let mut headers: Vec<(String, String)> = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Accept".to_string(), "*/*".to_string()),
+            ("Authorization".to_string(), format!("Bearer {jwt}")),
+            // Anthropic 网关的版本头（custom 家的 anthropic 上游同一取值）
+            ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ];
+        headers.extend(identity_headers());
+        Ok(ChatRequestPlan {
+            protocol: ChatUpstreamProtocol::Anthropic,
+            url: self.region.start_plan_anthropic_url().to_string(),
+            headers,
+            body: payload,
+        })
     }
 }
 
@@ -106,6 +172,18 @@ impl ProviderAdapter for ZcodeAdapter {
         body: &Value,
         _client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError> {
+        // ── 套餐通道分流（账号级字段 `planMode`，缺省 = 编码套餐）────────
+        // start-plan 的额度不挂在编码套餐 API Key 上（见 `region::
+        // start_plan_anthropic_url` 的说明）：走体验套餐通道时，请求改打
+        // zcode.z.ai 的 Anthropic 网关、鉴权用登录 JWT，body 翻成 Anthropic
+        // messages —— 回程翻译由编排层按 `protocol` 位接线。
+        let plan_mode = account
+            .get("planMode")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if plan_mode.eq_ignore_ascii_case(PLAN_MODE_START) {
+            return self.build_start_plan_request(account, body);
+        }
         let token = account
             .get("auth")
             .and_then(|auth| auth.get("accessToken"))
@@ -126,6 +204,7 @@ impl ProviderAdapter for ZcodeAdapter {
         ];
         headers.extend(identity_headers());
         Ok(ChatRequestPlan {
+            protocol: ChatUpstreamProtocol::OpenAI,
             url: format!("{}/chat/completions", self.openai_base_url()),
             headers,
             body: body.clone(),
@@ -293,5 +372,96 @@ fn os_category() -> &'static str {
         "macos"
     } else {
         "linux"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 一次编码套餐通道的会话（与 `session_from_record` 对 zcode 系产出的
+    /// 形状一致：accessToken 在 auth 下、jwt / planMode 在顶层扩展字段里）
+    fn session(plan_mode: Option<&str>, jwt: &str) -> Value {
+        let mut session = json!({
+            "auth": { "accessToken": "ak-test" },
+            "jwt": if jwt.is_empty() { Value::Null } else { Value::String(jwt.to_string()) },
+        });
+        if let Some(mode) = plan_mode {
+            session["planMode"] = Value::String(mode.to_string());
+        }
+        session
+    }
+
+    fn chat_body() -> Value {
+        json!({
+            "model": "glm-5.3-flash",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }],
+        })
+    }
+
+    /// 缺省（无 planMode 键）= 编码套餐通道：URL / 协议 / 鉴权头与历史行为
+    /// 逐字一致 —— 这条是「老账号零迁移」的钉子。
+    #[test]
+    fn the_default_plan_mode_keeps_the_coding_route() {
+        let plan = ZCODE_ADAPTER.build_chat_request(&session(None, ""), &chat_body(), &HeaderMap::new()).unwrap();
+        assert_eq!(
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+            plan.url
+        );
+        assert_eq!(ChatUpstreamProtocol::OpenAI, plan.protocol);
+        let (_, token) = plan
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .expect("缺 Authorization 头");
+        assert_eq!("Bearer ak-test", token);
+    }
+
+    /// start-plan：改打 zcode.z.ai 的 Anthropic 网关，鉴权换成登录 JWT，
+    /// body 翻成 Anthropic messages（model 原样、stream 恒 true）。
+    #[test]
+    fn start_plan_mode_routes_to_the_plan_gateway() {
+        let plan = ZCODE_ADAPTER
+            .build_chat_request(&session(Some("start-plan"), "jwt-test"), &chat_body(), &HeaderMap::new())
+            .unwrap();
+        assert_eq!("https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages", plan.url);
+        assert_eq!(ChatUpstreamProtocol::Anthropic, plan.protocol);
+        let header = |name: &str| {
+            plan.headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!("Bearer jwt-test", header("Authorization"), "鉴权用登录 JWT");
+        assert_eq!("2023-06-01", header("anthropic-version"), "Anthropic 网关要版本头");
+        assert_eq!("glm-5.3-flash", plan.body["model"].as_str().unwrap_or(""));
+        assert_eq!(true, plan.body["stream"].as_bool().unwrap_or(false));
+        assert!(plan.body["messages"].as_array().is_some_and(|items| !items.is_empty()));
+    }
+
+    /// 认不出的 planMode 一律回落编码套餐通道（store 侧已把非法值 400 挡住，
+    /// 这里钉的是适配器自身的兜底：手工编辑落进来的脏值不打爆转发）。
+    #[test]
+    fn an_unknown_plan_mode_falls_back_to_the_coding_route() {
+        let plan = ZCODE_ADAPTER
+            .build_chat_request(&session(Some("plan-x"), "jwt-test"), &chat_body(), &HeaderMap::new())
+            .unwrap();
+        assert_eq!(ChatUpstreamProtocol::OpenAI, plan.protocol);
+        assert!(plan.url.contains("open.bigmodel.cn"));
+    }
+
+    /// 缺 JWT 是用户可修的配置问题：文案要点名去哪补，而不是含混的 401。
+    #[test]
+    fn start_plan_without_a_jwt_says_what_to_do() {
+        let error = ZCODE_ADAPTER
+            .build_chat_request(&session(Some("start-plan"), ""), &chat_body(), &HeaderMap::new())
+            .err()
+            .expect("缺 JWT 该报错");
+        assert_eq!(401, error.status_code);
+        assert!(error.message.contains("JWT"), "{}", error.message);
+        assert!(error.message.contains("重新登录") || error.message.contains("粘贴"), "{}", error.message);
     }
 }

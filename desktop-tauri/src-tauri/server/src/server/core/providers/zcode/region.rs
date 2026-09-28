@@ -122,6 +122,21 @@ impl Region {
         }
     }
 
+    /// 体验套餐（start-plan）的推理网关：Anthropic messages 端点（两地相同）。
+    ///
+    /// ── 为什么它不在两个开放平台上 ─────────────────────────────
+    /// start-plan 的额度**不挂**在开放平台的编码套餐 API Key 上：拿那把 Key 打
+    /// `/api/coding/paas/v4`，上游按 Coding Plan 判账 —— 套餐过期就回 429
+    /// 「您的GLM Coding Plan套餐已到期」，体验套餐的额度一动不动。它走的是
+    /// ZCode 自己服务端（`zcode.z.ai`）的 Anthropic 网关，鉴权用**登录 JWT**
+    /// —— 与登录/领取同一台平面（见模块头：zcode 平面两地相同）。
+    ///
+    /// 老的 OpenAI 形态路由（`…/zcode-plan/chat/completions`）已于 2026-08-28
+    /// 服务端退役（恒 404，参考实现实测记录），所以这条恒为 Anthropic messages。
+    pub fn start_plan_anthropic_url(self) -> &'static str {
+        "https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages"
+    }
+
     /// 编码套餐业务域（凭证换取用，见 `coding_key.rs`）。
     ///
     /// ── 国内版为什么是 `bigmodel.cn` 而不是 `open.bigmodel.cn` ──

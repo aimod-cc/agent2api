@@ -25,7 +25,7 @@ use crate::server::core::account_store::{AccountStore, CredentialWrite};
 use crate::server::errors::GatewayError;
 use crate::server::core::proxies::ResolvedProxy;
 
-use super::super::adapter::{
+use super::super::adapter::{ ChatUpstreamProtocol,
     ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
 use super::super::content_block;
@@ -100,6 +100,7 @@ impl ProviderAdapter for TraeAdapter {
         // （本家 M3 前不广告模型，也就没有"映射后的上游名"要覆盖）。
         let headers = solo_headers(&identity, true);
         Ok(ChatRequestPlan {
+            protocol: ChatUpstreamProtocol::OpenAI,
             url: format!("{AGENT_BASE_URL}{CHAT_PATH}"),
             headers: headers.into_iter().collect(),
             body: payload::prepare_body(body, credential.variant(), ""),

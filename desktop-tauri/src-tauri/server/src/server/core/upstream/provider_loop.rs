@@ -747,7 +747,7 @@ async fn attempt_queue(
         // ——不存在「一直重发」的路径。
         let started_at = logging::now_ms();
         let mut refreshed = false;
-        let (response, wire_model) = loop {
+        let (response, wire_model, plan_protocol) = loop {
             // 发送体在这一轮发送前取一次（同一家同池同降级状态下复用缓存项）：
             // 借用在本次迭代内有效，`continue`（401 刷新 / 内容拦截补救）时
             // 重新取 —— 于是「换了 body 的那次重试」拿到的一定是新的一份。
@@ -818,6 +818,9 @@ async fn attempt_queue(
                         .unwrap_or_else(|| "?".to_string()),
                 ),
             );
+            // 上游协议在 plan 被搬进 TransportRequest 前取一份：响应消费
+            //（下面两个出口）按它决定要不要插一道回程翻译。
+            let plan_protocol = plan.protocol;
             let transport = TransportRequest {
                 url: plan.url,
                 headers: plan.headers,
@@ -854,7 +857,7 @@ async fn attempt_queue(
                     // 口径，见 `RequestEntry::is_success` 的说明。
                     ctx.telemetry
                         .finish_last_attempt(Some(i64::from(response.status().as_u16())), None);
-                    break (response, wire_model);
+                    break (response, wire_model, plan_protocol);
                 }
                 Err(failure) => {
                     // ── 手动终止优先于一切重试动作 ────────────────────────
@@ -1197,6 +1200,14 @@ async fn attempt_queue(
             capture.attach_response(response.status().as_u16(), response.headers());
         }
 
+        // ── 回程协议翻译（Anthropic 上游专用）─────────────────────
+        // 通用消费层（ForwardStream / 聚合器）只认标准 chat SSE。上游说
+        // Anthropic messages 的家（当前 = ZCode 体验套餐通道，见
+        // `ChatUpstreamProtocol`）在这里先过一道翻译 —— 与 custom 家的
+        // anthropic 上游共用同一份实现（协议知识在 `anthropic_outbound`）。
+        // 槽位 / 连接计数的移交时序两条分支完全一致：翻译不改变「流占着槽」
+        // 的语义，只是把上游字节换成了 chat 帧。
+        let anthropic_upstream = plan_protocol.is_anthropic();
         if ctx.stream {
             let status = response.status().as_u16();
             return Ok(ForwardOutcome::Stream {
@@ -1204,21 +1215,49 @@ async fn attempt_queue(
                 // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者；
                 // 连接计数同样移交（`handoff` 转移所有权，本栈帧的凭证随即失效，
                 // 避免同一账号被两份凭证各算一次）
-                stream: Box::new(super::ForwardStream::new(
-                    response,
-                    slot.take(),
-                    connections.handoff(),
-                    ctx.telemetry.clone(),
-                    model_rewrite_of(adapter, &model),
-                )),
+                stream: Box::new(if anthropic_upstream {
+                    super::ForwardStream::from_translated(
+                        Box::pin(crate::server::core::providers::custom::forward::ProtocolTranslateStream::anthropic(
+                            &wire_model,
+                            response,
+                            ctx.telemetry,
+                        )),
+                        slot.take(),
+                        connections.handoff(),
+                        ctx.telemetry.clone(),
+                        model_rewrite_of(adapter, &model),
+                    )
+                } else {
+                    super::ForwardStream::new(
+                        response,
+                        slot.take(),
+                        connections.handoff(),
+                        ctx.telemetry.clone(),
+                        model_rewrite_of(adapter, &model),
+                    )
+                }),
             });
         }
-        let aggregated = super::aggregate::aggregate_sse_completion(
-            response,
-            ctx.telemetry.clone(),
-            model_rewrite_of(adapter, &model),
-        )
-        .await?;
+        let aggregated = if anthropic_upstream {
+            let translated = crate::server::core::providers::custom::forward::ProtocolTranslateStream::anthropic(
+                &wire_model,
+                response,
+                ctx.telemetry,
+            );
+            super::aggregate::aggregate_frame_stream(
+                Box::pin(translated),
+                ctx.telemetry.clone(),
+                model_rewrite_of(adapter, &model),
+            )
+            .await?
+        } else {
+            super::aggregate::aggregate_sse_completion(
+                response,
+                ctx.telemetry.clone(),
+                model_rewrite_of(adapter, &model),
+            )
+            .await?
+        };
         let choice = aggregated.body.get("choices").and_then(|value| value.get(0));
         let content_chars = choice
             .and_then(|choice| choice.pointer("/message/content"))

@@ -542,7 +542,7 @@ async fn forward_translated(
 /// `ForwardStream` 补「错误帧 + [DONE]」收尾，聚合路径转成 502 —— 与 chat
 /// 协议同一条错误语义。调试采集器在这里采**上游原始字节**（翻译前），
 /// 与 chat 路径「采上游原样吐出的东西」的语义一致。
-struct ProtocolTranslateStream {
+pub(crate) struct ProtocolTranslateStream {
     /// 上游字节流。错误在构造时就描述成文案折进 `io::Error`（与
     /// `ForwardStream::new` 同一手法）：空闲守卫的入参就是这个类型，
     /// 两个消费层（ForwardStream / 聚合器）拿到的也是同一形态。
@@ -578,6 +578,20 @@ impl TranslateMachine {
 }
 
 impl ProtocolTranslateStream {
+    /// Anthropic 上游的翻译管道（内置家共用入口）。
+    ///
+    /// ZCode 的体验套餐通道（`zcode::adapter` 的 start-plan 分支）上游也是
+    /// Anthropic messages —— 通用编排层拿到响应后调这里插一道翻译，与下面
+    /// custom 家自己的两个分支走同一份实现（协议知识全在
+    /// `protocol::anthropic_outbound`，本结构只做字节 → 帧的管道）。
+    pub(crate) fn anthropic(
+        model: &str,
+        response: reqwest::Response,
+        telemetry: &Arc<RequestTelemetry>,
+    ) -> Self {
+        Self::new(OutboundKind::Anthropic, model, response, telemetry)
+    }
+
     fn new(
         kind: OutboundKind,
         model: &str,

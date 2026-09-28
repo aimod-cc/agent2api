@@ -128,6 +128,29 @@ use super::{catalog_cache, ProviderKind};
 /// body 还是 `Value`（不同家的改写规则不同，比如 workbuddy 要注入首条
 /// system 消息），且**不含出网代理** —— 代理是账号级的、与 provider 无关，
 /// 由编排层从账号会话里解析后自己带上。
+/// 内置家转发请求的上游协议（[`ChatRequestPlan::protocol`]）。
+///
+/// 绝大多数家的上游是 OpenAI chat 协议（这也是转发编排层的「通用语」：
+/// 发送体、SSE 消费、usage 提取都按它写）。上游说 Anthropic messages 的家
+/// （ZCode 体验套餐通道，见 `zcode` 的模块头）把这里标成 [`ChatUpstreamProtocol::Anthropic`]，
+/// 编排层就会在响应进入通用消费层（`ForwardStream` / 聚合器）之前插一道
+/// 「Anthropic SSE → chat SSE」的翻译 —— 同一道翻译 custom 家已经在用
+/// （见 `custom::forward` 的 `ProtocolTranslateStream`）；请求侧的出站翻译
+/// 则由适配器自己在 `build_chat_request` 里完成（`anthropic_request_from_chat`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatUpstreamProtocol {
+    /// OpenAI chat completions（SSE / JSON 同形，默认）
+    OpenAI,
+    /// Anthropic messages（恒以 SSE 上行，回程须翻译）
+    Anthropic,
+}
+
+impl ChatUpstreamProtocol {
+    pub fn is_anthropic(self) -> bool {
+        self == Self::Anthropic
+    }
+}
+
 pub struct ChatRequestPlan {
     /// 上游完整 URL（含路径）
     pub url: String,
@@ -135,6 +158,8 @@ pub struct ChatRequestPlan {
     pub headers: Vec<(String, String)>,
     /// 已按 provider 规则改写过的请求体
     pub body: Value,
+    /// 上游响应的协议（默认 OpenAI；Anthropic 时编排层负责回程翻译）
+    pub protocol: ChatUpstreamProtocol,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。

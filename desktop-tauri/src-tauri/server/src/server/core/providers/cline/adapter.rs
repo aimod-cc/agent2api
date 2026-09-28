@@ -73,7 +73,7 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ChatUpstreamProtocol, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::GatewayError;
@@ -180,6 +180,7 @@ impl ProviderAdapter for ClineAdapter {
             ("X-Title".to_string(), "Cline".to_string()),
         ];
         Ok(ChatRequestPlan {
+            protocol: ChatUpstreamProtocol::OpenAI,
             url: format!("{}/chat/completions", credentials::API_BASE_URL),
             headers,
             body: body.clone(),

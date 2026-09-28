@@ -17,6 +17,7 @@
 
 use serde_json::{json, Map, Value};
 
+use crate::server::core::providers::zcode::adapter::{PLAN_MODE_CODING, PLAN_MODE_START};
 use crate::server::core::providers::zcode::credentials::ZcodeCredentials;
 use crate::server::core::providers::zcode::region::Region;
 use crate::server::core::providers::{kind_id, ProviderKind};
@@ -239,6 +240,12 @@ impl AccountStore {
         );
         public.insert("desktop".to_string(), Value::Bool(false));
         public.insert("available".to_string(), Value::Bool(available));
+        // 套餐通道（转发打哪个上游网关，见 `zcode::adapter` 的 planMode 说明）：
+        // 记录里没有该键 = 编码套餐（历史账号的缺省读法），公开形态原样透出
+        public.insert(
+            "planMode".to_string(),
+            record.get("planMode").cloned().unwrap_or(Value::Null),
+        );
         public.insert(
             "maxConcurrent".to_string(),
             Value::from(max_concurrent_public(record.get("maxConcurrent"))),
@@ -246,6 +253,85 @@ impl AccountStore {
         // `chatSupported` 不在这里写：它是跨家统一事实，由 `store.rs::public_account`
         // 按适配器的 `supports_chat()` 注入（与 Qoder 那份同样的处置）
         Value::Object(public)
+    }
+
+    /// 更新 ZCode 账号的**套餐通道**（`planMode`：转发打哪个上游网关）。
+    ///
+    /// ── 为什么这是一个字段而不是两把凭证的开关 ─────────────────
+    /// 两个通道各认一张网：编码套餐走开放平台的 coding 端点（`accessToken`），
+    /// 体验套餐走 `zcode.z.ai` 的 Anthropic 网关（`jwt`）。同一把 key 打不进
+    /// 另一张网（上游按套餐判账），所以「用哪份额度」只能由用户**点名**：
+    /// 编码套餐过期、只有体验套餐的账号切到 `start-plan`；两样都有的账号
+    /// 自己挑要花哪份。字段挂在账号记录上（与 `maxConcurrent` 同一层），
+    /// 缺省 / 空值 / 认不出一律回落编码套餐 —— 历史账号零迁移。
+    ///
+    /// 归属校验与 CatPaw 的 `balanceToken` 同一手法：这个字段只属于 ZCode
+    /// 系（两个地区共用 —— 网关与字段语义两地一致），别家账号设置了就是
+    /// 误操作，明确 400 比静默忽略好。
+    pub fn update_zcode_plan_mode(
+        &self,
+        id: &str,
+        value: &Value,
+    ) -> Result<Vec<String>, AccountStoreError> {
+        let _guard = self.guard();
+        let mut record = self
+            .record_by_id(&_guard, id)
+            .filter(|record| Region::from_provider_id(&record.provider()).is_some())
+            .ok_or_else(|| AccountStoreError::not_found("账号不存在或不属于 ZCode"))?;
+        // 取值只认两个枚举（大小写不敏感地归一）；Null / 空串 = 回落缺省
+        let next: Option<String> = match value {
+            Value::Null => None,
+            other => {
+                // 大小写不敏感地归一到两个枚举值；认不出的一律 400（静默回落
+                // 会让「切到体验套餐」悄悄失效，用户对着 429 排查半天）
+                let normalized = match other
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| text.to_ascii_lowercase())
+                    .as_deref()
+                {
+                    Some(PLAN_MODE_START) => PLAN_MODE_START.to_string(),
+                    Some(PLAN_MODE_CODING) => PLAN_MODE_CODING.to_string(),
+                    _ => {
+                        return Err(AccountStoreError::bad_request(
+                            "套餐通道只认 coding-plan / start-plan",
+                        ))
+                    }
+                };
+                Some(normalized)
+            }
+        };
+        let current = record
+            .get("planMode")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if current == next {
+            return Ok(Vec::new());
+        }
+        let mut changes = Vec::new();
+        match &next {
+            Some(mode) => {
+                record.set("planMode", Value::String(mode.clone()));
+                changes.push(if mode == crate::server::core::providers::zcode::adapter::PLAN_MODE_START {
+                    "套餐通道 → 体验套餐（start-plan）".to_string()
+                } else {
+                    "套餐通道 → 编码套餐".to_string()
+                });
+            }
+            None => {
+                record.remove("planMode");
+                changes.push("套餐通道 → 编码套餐（缺省）".to_string());
+            }
+        }
+        record.set_updated_at(logging::now_ms());
+        let name = record.name();
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))?;
+        logging::log(
+            "[Accounts]",
+            &format!("✏️  ZCode 账号已更新: {name}（{}）", changes.join("，")),
+        );
+        Ok(changes)
     }
 }
 
@@ -269,4 +355,85 @@ fn anonymous_account_id(region: Region) -> Result<String, AccountStoreError> {
     })?;
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     Ok(format!("{}anon-{hex}", region.account_id_prefix()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每条用例一个独立的临时库（与 trae_accounts 的测试同一手法：账号层碰
+    /// 的是真 SQLite，共用一个库会让用例互相看到对方的行）。
+    fn store(label: &str) -> (AccountStore, crate::server::db::test_temp::TempDb) {
+        let (db, guard) = crate::server::db::test_temp::TempDb::open(&format!("zcode-plan-mode-{label}"));
+        (AccountStore::with_db(Some(db)), guard)
+    }
+
+    fn credentials(jwt: &str) -> ZcodeCredentials {
+        ZcodeCredentials {
+            region: Region::Cn,
+            access_token: "ak-test".to_string(),
+            jwt: jwt.to_string(),
+            user_id: "u-1".to_string(),
+            device_mid: "11111111-2222-3333-4444-555555555555".to_string(),
+        }
+    }
+
+    /// 切到 start-plan → 记录与公开形态都带上 planMode；切回 coding-plan →
+    /// 归一回显；Null = 回落缺省（记录里的键被移除）。
+    #[test]
+    fn plan_mode_round_trips_through_the_store() {
+        let (store, _db) = store("roundtrip");
+        let added = store.add_zcode_account(&credentials("jwt-1"), None, "manual").unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+
+        let changes = store
+            .update_zcode_plan_mode(&id, &json!("start-plan"))
+            .expect("切换该成功");
+        assert!(changes[0].contains("体验套餐"), "{}", changes.join("，"));
+        assert_eq!(
+            "start-plan",
+            store.list_accounts().get("accounts").and_then(Value::as_array).and_then(|accounts| {
+                accounts.iter().find(|item| item["id"].as_str() == Some(id.as_str()))
+            })
+            .and_then(|account| account["planMode"].as_str())
+            .unwrap_or(""),
+            "公开形态必须带出 planMode（设置弹窗回显靠它）"
+        );
+
+        // 大小写不敏感地归一
+        store.update_zcode_plan_mode(&id, &json!("START-PLAN")).unwrap();
+        assert_eq!(
+            "start-plan",
+            store.zcode_account_record(&id).unwrap()["planMode"].as_str().unwrap_or("")
+        );
+
+        // 回落缺省：Null 把键整个移除（老账号的形状）
+        store.update_zcode_plan_mode(&id, &Value::Null).unwrap();
+        assert!(store.zcode_account_record(&id).unwrap().get("planMode").is_none());
+    }
+
+    /// 认不出的取值 400：静默回落会让「切到体验套餐」悄悄失效，
+    /// 用户得对着上游的「套餐已到期」429 排查半天才知道没存上。
+    #[test]
+    fn an_unknown_plan_mode_is_rejected_not_silently_dropped() {
+        let (store, _db) = store("invalid");
+        let added = store.add_zcode_account(&credentials("jwt-1"), None, "manual").unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+        let error = store.update_zcode_plan_mode(&id, &json!("weekend")).err().expect("非法值该被拒");
+        assert_eq!(400, error.status_code);
+        assert!(error.message.contains("coding-plan"), "{}", error.message);
+    }
+
+    /// 不存在的 id（含「存在但不是 ZCode」的归属错位）一律 404 —— 与
+    /// balanceToken 的归属校验同一口径。
+    #[test]
+    fn a_missing_or_foreign_account_is_not_found() {
+        let (store, _db) = store("foreign");
+        let error = store
+            .update_zcode_plan_mode("no-such-id", &json!("start-plan"))
+            .err()
+            .expect("不存在的账号该报错");
+        assert_eq!(404, error.status_code);
+        assert!(error.message.contains("ZCode"), "{}", error.message);
+    }
 }

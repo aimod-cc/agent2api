@@ -24,11 +24,26 @@
 //! 体验套餐。因此本家进定时任务框架的是 [`claim`] 而不是签到 —— 调度形状相同
 //! （每天/按窗口跑一次、结果进同一套汇总），协议完全不同。
 //!
+//! ── 两条转发通道（账号级 `planMode` 字段选择）────────────────
+//! 同一账号的两份额度各有一张网，凭据互不通用（上游按套餐判账）：
+//!
+//!   · **编码套餐**（缺省）→ `open.bigmodel.cn/api/coding/paas/v4`（OpenAI
+//!     协议），鉴权用换出来的 `zcode-api-key`（`coding_key.rs`）；
+//!   · **体验套餐 / start-plan** → `zcode.z.ai/api/v1/zcode-plan/anthropic/
+//!     v1/messages`（Anthropic messages），鉴权用**登录 JWT**。start-plan 的
+//!     额度（周末套餐 / 限时赠送）不挂在 API Key 上 —— 拿编码套餐的 Key 打
+//!     coding 端点只会得到「套餐已到期」的 429，赠额度一动不动。
+//!
+//! 分流的承载方式见 `adapter.rs` 的 `build_chat_request` 与
+//! `ChatUpstreamProtocol`：适配器出站翻成 Anthropic，编排层按协议位把回程
+//! SSE 翻回 chat（与 custom 家同一道翻译）。切换入口在账号设置弹窗
+//! （PATCH /api/accounts/{id} 的 `planMode` 字段，store 侧白名单校验）。
+//!
 //! ── 子模块与当前进度 ────────────────────────────────────────
 //!   region.rs       地区（域名 / 身份 / 环境变量 / 账号 id 前缀）—— 已完成
 //!   models.rs       模型清单（静态表，两地共用）—— 已完成
 //!   claim.rs        周末套餐领取（探测 / 领取 / 失败分类 / 调度语义）—— 已完成
-//!   adapter.rs      `ProviderAdapter` 实现（OpenAI 兼容转发）—— 已完成
+//!   adapter.rs      `ProviderAdapter` 实现（双通道转发 + 套餐分流）—— 已完成
 //!   credentials.rs  凭证（访问令牌 + 套餐 JWT + 设备标识）—— 已完成
 //!   oauth.rs        CLI 轮询登录（init / poll / 授权地址中转页）—— 已完成
 //!   coding_key.rs   编码套餐凭证换取（OAuth 令牌 → 能用于推理的 API Key）—— 已完成

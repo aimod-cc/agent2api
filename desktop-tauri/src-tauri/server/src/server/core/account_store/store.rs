@@ -501,7 +501,7 @@ impl AccountStore {
                 record.expires_at().unwrap_or(0.0),
             ),
         };
-        json!({
+        let mut session = json!({
             "endpoint": record.endpoint().unwrap_or_else(|| edition.endpoint.to_string()),
             "prefixPath": record
                 .prefix_path()
@@ -525,7 +525,26 @@ impl AccountStore {
                 "enterpriseId": record.enterprise_id(),
                 "enterpriseName": record.enterprise_name(),
             },
-        })
+        });
+        // ── ZCode 系的扩展字段（两家共用的会话扩展，别家不受影响）──────
+        // 适配器的 `build_chat_request` 拿到的是**会话**而不是账号记录，而
+        // 体验套餐通道需要两样会话默认不带的东西：`jwt`（zcode.z.ai 网关的
+        // 鉴权凭证，与领取同源）与 `planMode`（套餐通道选择，缺省 = 编码
+        // 套餐）。条件注入：其余各家的会话一个键都不多（公开形态那条
+        // 「纯新增字段，旧客户端忽略它」的同一条克制）。
+        if super::is_zcode_family(&record.provider()) {
+            if let Some(object) = session.as_object_mut() {
+                object.insert(
+                    "jwt".to_string(),
+                    record.get("jwt").cloned().unwrap_or(Value::Null),
+                );
+                object.insert(
+                    "planMode".to_string(),
+                    record.get("planMode").cloned().unwrap_or(Value::Null),
+                );
+            }
+        }
+        session
     }
 
     /// 指定账号的凭证（Node 版 getCredentialsById）；无凭证/不存在时 None

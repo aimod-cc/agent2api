@@ -47,7 +47,8 @@ use crate::server::core::models::global_catalog;
 use crate::server::errors::GatewayError;
 
 use super::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
+    ChatRequestPlan, ChatUpstreamProtocol, ModelRefreshOutcome, ProviderAdapter, RetryAdvice,
+    UpstreamErrorClass,
 };
 use super::content_block;
 use super::ProviderKind;
@@ -147,7 +148,12 @@ impl ProviderAdapter for WorkBuddyAdapter {
             &crate::server::core::upstream::request::new_request_id(),
             Some("text/event-stream"),
         );
-        Ok(ChatRequestPlan { url, headers, body: with_system })
+        Ok(ChatRequestPlan {
+            protocol: ChatUpstreamProtocol::OpenAI,
+            url,
+            headers,
+            body: with_system,
+        })
     }
 
     /// 上游错误分类（照抄改造前 `upstream` 的判定与文案）：

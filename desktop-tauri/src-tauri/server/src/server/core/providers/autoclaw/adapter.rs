@@ -85,7 +85,7 @@ use serde_json::Value;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::content_block;
 use crate::server::core::providers::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ChatUpstreamProtocol, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
 };
 use crate::server::core::providers::ProviderKind;
 use crate::server::errors::GatewayError;
@@ -219,6 +219,7 @@ impl ProviderAdapter for AutoClawAdapter {
         // body 不是对象时原样透传（chat.rs 已保证是对象；这里的兜底只为不 panic，
         // 上游会自己报格式错误 —— 比在网关里编一个空对象更能说明问题）
         Ok(ChatRequestPlan {
+            protocol: ChatUpstreamProtocol::OpenAI,
             url: format!(
                 "{}/chat/completions",
                 credentials::upstream_base_url(self.region)
