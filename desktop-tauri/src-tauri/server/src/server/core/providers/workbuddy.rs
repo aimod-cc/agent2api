@@ -39,11 +39,13 @@
 //! `Option` 链与 `unwrap_or`，序列化失败一律转成 GatewayError。
 
 use axum::http::HeaderMap;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::auth::{is_token_expiring, AuthService};
 use crate::server::core::models::global_catalog;
+use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::upstream::request::TransportRequest;
 use crate::server::errors::GatewayError;
 
 use super::adapter::{
@@ -68,6 +70,13 @@ const RATE_LIMIT_CODE: i64 = 11128;
 /// 上游要求首条消息必须是 system prompt，否则返回 400
 /// （first message is not system prompt）。客户端没带 system 消息时注入一条兜底系统消息。
 const DEFAULT_SYSTEM_PROMPT: &str = "你是一个得力助手";
+
+/// WorkBuddy 国际版每日活跃任务使用的免费模型，按可用性优先级尝试。
+///
+/// 这些模型在参考客户端中实测为 x0.00，不会消耗账号积分；列表保持集中，
+/// 便于上游模型调整时只改一处。
+pub(crate) const DAILY_ACTIVITY_FREE_MODELS: &[&str] =
+    &["deepseek-v4.1-flash", "hy3", "hy4-preview", "hy4-preview-f"];
 
 /// 上游限额码 6004（HTTP 429）：账号×模型维度的用量限额，
 /// msg 形如 `您的使用量已超出频率限制，将在 2026-09-11 19:43:46 UTC+8 重置…`
@@ -327,7 +336,10 @@ impl ProviderAdapter for WorkBuddyAdapter {
                             )
                         })
                 }
-                Err(error) => Err(GatewayError::with_status(error.http_status(), error.message)),
+                Err(error) => Err(GatewayError::with_status(
+                    error.http_status(),
+                    error.message,
+                )),
             }
         })
     }
@@ -357,9 +369,7 @@ impl ProviderAdapter for WorkBuddyAdapter {
         store: &'a AccountStore,
         account_id: &'a str,
         _force: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ModelRefreshOutcome> + Send + 'a>> {
         Box::pin(async move {
             let auth = AuthService::for_store(store.clone());
             // `account_id` 非空 = 用户在「获取模型」弹窗里点名的那条账号
@@ -395,7 +405,12 @@ impl ProviderAdapter for WorkBuddyAdapter {
     ///
     /// 返回的 `reason` 不含「第 n/N 次」：那是编排层才知道的读数
     /// （见 `RetryAdvice` 的说明）。
-    fn retry_advice(&self, error_body: &Value, attempt: usize, budget: usize) -> Option<RetryAdvice> {
+    fn retry_advice(
+        &self,
+        error_body: &Value,
+        attempt: usize,
+        budget: usize,
+    ) -> Option<RetryAdvice> {
         let code = error_body.get("code").and_then(Value::as_i64);
         if code != Some(RATE_LIMIT_CODE) {
             return None;
@@ -503,9 +518,8 @@ impl ProviderAdapter for WorkBuddyAdapter {
         &'a self,
         store: &'a AccountStore,
         account_id: &'a str,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let Some(entry) = store.get_session_by_id(account_id) else {
                 return Err(GatewayError::with_status(
@@ -547,7 +561,10 @@ async fn default_session_token(store: &AccountStore) -> Result<String, GatewayEr
             401,
             "当前没有可用登录态：请先在桌面端完成登录",
         )),
-        Err(error) => Err(GatewayError::with_status(error.http_status(), error.message)),
+        Err(error) => Err(GatewayError::with_status(
+            error.http_status(),
+            error.message,
+        )),
     }
 }
 
@@ -581,12 +598,18 @@ fn chat_headers(session: &Value, request_id: &str, accept: Option<&str>) -> Vec<
         // 客户端身份头：服务端按此做客户端识别与白名单校验
         ("X-IDE-Type".to_string(), edition.ua_platform.to_string()),
         ("X-IDE-Name".to_string(), edition.product_name.to_string()),
-        ("X-IDE-Version".to_string(), edition.client_version.to_string()),
+        (
+            "X-IDE-Version".to_string(),
+            edition.client_version.to_string(),
+        ),
         ("X-Product".to_string(), edition.product_name.to_string()),
         ("X-Agent-Intent".to_string(), "craft".to_string()),
         // 会话追踪
         ("X-Request-ID".to_string(), request_id.to_string()),
-        ("X-Conversation-Request-ID".to_string(), request_id.to_string()),
+        (
+            "X-Conversation-Request-ID".to_string(),
+            request_id.to_string(),
+        ),
         ("X-Conversation-ID".to_string(), request_id.to_string()),
         ("X-Session-ID".to_string(), request_id.to_string()),
     ];
@@ -595,6 +618,62 @@ fn chat_headers(session: &Value, request_id: &str, accept: Option<&str>) -> Vec<
         headers.push(("Accept".to_string(), accept.to_string()));
     }
     headers
+}
+
+/// 构造国际版每日活跃保活请求。
+///
+/// 活跃任务必须沿用 WorkBuddy 对话链路的端点、鉴权头和账号代理；这里只固定
+/// 参考客户端使用的最小流式 body。调用方负责通过传输层发送并消费响应体。
+pub(crate) fn build_daily_activity_request(
+    session: &Value,
+    model: &str,
+) -> Result<TransportRequest, String> {
+    let body = json!({
+        "model": model,
+        "stream": true,
+        "max_tokens": 16,
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "hi"},
+        ],
+    });
+    let payload =
+        serde_json::to_string(&body).map_err(|error| format!("活跃请求序列化失败: {error}"))?;
+    let request_id = crate::server::core::upstream::request::new_request_id();
+    let edition = crate::server::core::endpoints::resolve_edition(
+        session.get("edition").and_then(Value::as_str),
+    );
+    let mut headers = chat_headers(session, &request_id, Some("text/event-stream"));
+    // 国际版参考客户端使用 conversation/purpose 头族；保留既有 WorkBuddy
+    // 头集合并补齐这些浏览器/会话字段，国内版请求形态不受影响。
+    if edition.id == "intl" {
+        headers.retain(|(key, _)| key != "X-Agent-Intent");
+        headers.push(("X-Agent-Purpose".to_string(), "conversation".to_string()));
+        headers.push(("X-Conversation-Message-ID".to_string(), request_id.clone()));
+        headers.push(("X-Root-Request-ID".to_string(), request_id.clone()));
+        headers.push(("Origin".to_string(), "https://www.workbuddy.ai".to_string()));
+        headers.push((
+            "Referer".to_string(),
+            "https://www.workbuddy.ai/".to_string(),
+        ));
+        headers.push(("X-Requested-With".to_string(), "XMLHttpRequest".to_string()));
+    }
+    let proxy = match ResolvedProxy::from_json(session.get("proxy").unwrap_or(&Value::Null)) {
+        Ok(proxy) => proxy,
+        Err(reason) => {
+            crate::server::logging::log(
+                "[Upstream]",
+                &format!("⚠️ 账号代理不可用（{reason}），活跃请求回退直连"),
+            );
+            None
+        }
+    };
+    Ok(TransportRequest {
+        url: chat_completions_url(session),
+        headers,
+        payload,
+        proxy,
+    })
 }
 
 /// 对话接口 URL：`{session.endpoint || 默认端点}/v2/chat/completions`。
@@ -650,5 +729,48 @@ fn value_text(value: &Value) -> String {
         Value::Number(number) => number.to_string(),
         Value::Bool(flag) => flag.to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daily_activity_request_matches_reference_minimal_body() {
+        let session = json!({
+            "endpoint": "https://www.workbuddy.ai",
+            "edition": "intl",
+            "auth": { "accessToken": "test-token" },
+            "account": { "uid": "test-user" },
+            "proxy": null,
+        });
+        let plan = build_daily_activity_request(&session, "hy3").expect("request builds");
+        assert_eq!(plan.url, "https://www.workbuddy.ai/v2/chat/completions");
+        let body: Value = serde_json::from_str(&plan.payload).expect("valid JSON body");
+        assert_eq!(body["model"], "hy3");
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["max_tokens"], 16);
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["content"], "hi");
+        assert!(plan
+            .headers
+            .iter()
+            .any(|(key, value)| key == "Authorization" && value == "Bearer test-token"));
+        assert!(plan
+            .headers
+            .iter()
+            .any(|(key, value)| key == "X-Agent-Purpose" && value == "conversation"));
+        assert!(plan
+            .headers
+            .iter()
+            .any(|(key, value)| key == "Origin" && value == "https://www.workbuddy.ai"));
+        assert!(!plan.headers.iter().any(|(key, _)| key == "X-Agent-Intent"));
+    }
+
+    #[test]
+    fn daily_activity_free_models_are_non_empty_and_ordered() {
+        assert_eq!(DAILY_ACTIVITY_FREE_MODELS[0], "deepseek-v4.1-flash");
+        assert!(DAILY_ACTIVITY_FREE_MODELS.contains(&"hy4-preview-f"));
     }
 }

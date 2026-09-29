@@ -86,6 +86,7 @@ type CheckinResult = {
   at?: number | null
   reason?: string | null
   succeeded?: number | null
+  active?: number | null
   total?: number | null
   skipped?: number | null
   failedCount?: number | null
@@ -283,6 +284,7 @@ function checkinStateText(data: CheckinState | null): string {
     const head = `${when ? `${when} ` : ''}上次执行（${result.reason || '定时'}）：` +
       `${Number(result.succeeded) || 0}/${Number(result.total) || 0} 个成功`
     const extras: string[] = []
+    if (Number(result.active)) extras.push(`日活保活 ${Number(result.active)} 个`)
     if (Number(result.skipped)) extras.push(`跳过 ${Number(result.skipped)} 个`)
     if (Number(result.failedCount)) extras.push(`失败 ${Number(result.failedCount)} 个`)
     // 失败明细只列前两条，与账号页的展示密度一致
@@ -627,12 +629,13 @@ function TasksPanel() {
     try {
       const result = await api.runAutoCheckinNow()
       const succeeded = Number(result?.succeeded) || 0
+      const active = Number(result?.active) || 0
       const total = Number(result?.total) || 0
       const failed = Number(result?.failedCount) || 0
       if (failed) {
-        toast(`签到完成：${succeeded}/${total} 成功，${failed} 个失败`, 'err')
+        toast(`签到完成：${succeeded}/${total} 成功${active ? `，日活保活 ${active} 个` : ''}，${failed} 个失败`, 'err')
       } else {
-        toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取`)
+        toast(`✅ 签到完成：${succeeded}/${total} 个账号成功领取${active ? `，日活保活 ${active} 个` : ''}`)
       }
       // run 的响应把 state 合并进来了（见 api::auto_checkin::run_now），不必再跑一趟 GET
       if (result) setCheckin(result)

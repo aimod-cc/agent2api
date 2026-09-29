@@ -2,7 +2,7 @@
 //!
 //! 对照 Node 版 src/workbuddy-auto-checkin.mjs 全量移植。与 /api/accounts/checkin
 //! 用的是同一段签到逻辑（`core::billing::checkin::run_checkin`），
-//! 因此限额跳过、国际版排除、串行防风的规则完全一致，不存在两套行为。
+//! 因此范围过滤、版本分流、串行防风的规则完全一致，不存在两套行为。
 //!
 //! ── 触发方式：轮询 + 当天去重（不是单个定时器）────────────────
 //! Node 版用 `setInterval(tick, 30s)`：单个 setTimeout 在系统休眠、锁屏、时钟被改
@@ -49,7 +49,7 @@ pub const DEFAULT_TIME: &str = "00:01";
 
 /// 可勾选的签到提供商（界面上的复选框）。默认全选。
 ///
-///   - **WorkBuddy**：腾讯的每日签到接口；
+///   - **WorkBuddy**：国内版走腾讯每日签到，国际版走活跃探测与免费模型保活；
 ///   - **小浣熊**：「桌面登录积分」链路（`providers::raccoon` 的每日积分发放）；
 ///   - **AutoClaw 国内版 / 国际版**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin`）。两个地区**都支持** —— 任务接口在
@@ -57,12 +57,11 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     都列进来；地区由 `billing::checkin` 从账号的 provider 反查。
 ///   - **Qoder 中国版**：活动（campaign）领取链路（`providers::qoder::checkin`）。
 ///     只有中国版有每日签到 —— 国际版这个地区没有签到计划（legacy 路径 404、
-///     活动列表里只有促销），由 `billing::checkin::supports_checkin` 按 edition
-///     排除。中国版里 Free 套餐账号也可能没有被下发活动（实测如此），那种情况
-///     实现返回一条中性结果（「当前没有可领取的签到活动」），不算失败。
+///     活动列表里只有促销），由 `billing::checkin::supports_checkin` 按 provider
+///     与 edition 联合判断排除；WorkBuddy 国际版是唯一的活跃任务例外。
 ///
-/// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw 有积分查询但
-/// 没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
+/// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分查询
+/// 但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
 pub const CHECKIN_PROVIDERS: [&str; 5] =
     ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder"];
@@ -76,15 +75,13 @@ pub fn default_providers() -> Vec<String> {
 ///
 /// ── 为什么 WorkBuddy 要带上「国内版」────────────────────────
 /// 这个标签只出现在**签到语境**（提供商复选框、配置错误提示、签到范围变更日志），
-/// 而签到对 WorkBuddy 是**有版本限定**的：只有国内版有签到活动，国际版账号
-/// 一律被 `billing::checkin::supports_checkin` 排除（上游事实：腾讯的每日签到
-/// 接口只有国内站有）。注册表里的 `label` 是这家在**所有语境**下的通用展示名
+/// 而签到对 WorkBuddy 按版本分流：国内版领取签到奖励，国际版完成每日活跃任务。
+/// 注册表里的 `label` 是这家在**所有语境**下的通用展示名
 /// （账号卡片、筛选、模型清单都用它），改成「WorkBuddy 国内版」会让那些地方
 /// 出现一个没头没尾的版本后缀。
 ///
-/// 因此在这里覆盖而不是改注册表：分叉的原因不是「名字不一样」，而是
-/// 「签到这条链路只有国内版能走」—— 标签替用户把这件事讲清楚，
-/// 他勾上它时就知道国际版账号不会参与，而不是签完发现被跳过了才回来查。
+/// 因此在这里覆盖而不是改注册表：标签替用户把国内版领取、国际版活跃的差异
+/// 讲清楚，而不是让国际版账号被静默跳过。
 ///
 /// 另外几家没有这个后缀：小浣熊没有版本区分（`edition` 概念不适用于它），
 /// AutoClaw 两地的签到链路都存在且同形 —— 它的展示名已经带「国内版 / 国际版」
@@ -95,7 +92,7 @@ pub fn default_providers() -> Vec<String> {
 /// 「Qoder 中国版」——用户勾上它时就知道自家国际版账号不会参与。
 fn provider_label(id: &str) -> &str {
     match id {
-        "workbuddy" => "WorkBuddy 国内版",
+        "workbuddy" => "WorkBuddy（含国际版活跃）",
         "qoder" => "Qoder 中国版",
         other => crate::server::core::providers::PROVIDERS
             .iter()
@@ -114,10 +111,7 @@ pub fn normalize_providers(value: Option<&Value>) -> Vec<String> {
     };
     let picked: Vec<String> = CHECKIN_PROVIDERS
         .iter()
-        .filter(|id| {
-            list.iter()
-                .any(|item| item.as_str() == Some(*id))
-        })
+        .filter(|id| list.iter().any(|item| item.as_str() == Some(*id)))
         .map(|id| id.to_string())
         .collect();
     if picked.is_empty() {
@@ -151,7 +145,10 @@ pub const CHECKIN_BUSY_STATUS: i32 = 400;
 
 impl AutoCheckinConfigError {
     fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), status_code: 400 }
+        Self {
+            message: message.into(),
+            status_code: 400,
+        }
     }
 }
 
@@ -206,7 +203,9 @@ pub fn normalize_time(value: Option<&Value>) -> Result<String, AutoCheckinConfig
         })
         .and_then(|(head, tail)| Some((head.parse::<u32>().ok()?, tail.parse::<u32>().ok()?)));
     let Some((hour, minute)) = parsed else {
-        return Err(AutoCheckinConfigError::new("时间格式应为 HH:MM（例如 00:01）"));
+        return Err(AutoCheckinConfigError::new(
+            "时间格式应为 HH:MM（例如 00:01）",
+        ));
     };
     if hour > 23 || minute > 59 {
         return Err(AutoCheckinConfigError::new("时间超出范围（00:00 - 23:59）"));
@@ -297,7 +296,10 @@ fn read_state() -> CheckinState {
         .get("lastFiredDate")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let last_result = raw.get("lastResult").filter(|value| value.is_object()).cloned();
+    let last_result = raw
+        .get("lastResult")
+        .filter(|value| value.is_object())
+        .cloned();
     CheckinState {
         enabled,
         time,
@@ -430,7 +432,9 @@ impl AutoCheckin {
                 return None;
             }
             inner.running = true;
-            RunningGuard { inner: self.inner.clone() }
+            RunningGuard {
+                inner: self.inner.clone(),
+            }
         };
 
         let today = local_date_key(Local::now());
@@ -455,6 +459,7 @@ impl AutoCheckin {
                         "date": today,
                         "reason": reason,
                         "succeeded": 0,
+                        "active": 0,
                         "total": 0,
                         "skipped": 0,
                         "failed": [error.message.clone()],
@@ -471,13 +476,9 @@ impl AutoCheckin {
 
     /// 成功分支：汇总 + 记录 lastResult + 日志（对应 Node fire 里的 try 主体）
     fn record_success(&self, result: &Value, today: &str, reason: &str) -> Value {
-        let number = |key: &str| {
-            result
-                .get(key)
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-        };
+        let number = |key: &str| result.get(key).and_then(Value::as_u64).unwrap_or(0);
         let succeeded = number("succeeded");
+        let active = number("active");
         let total = number("total");
         let skipped = number("skipped");
         // 失败明细：`名字（错误）`，名字缺失时退到 id，再退到「未知账号」
@@ -505,6 +506,7 @@ impl AutoCheckin {
             "date": today,
             "reason": reason,
             "succeeded": succeeded,
+            "active": active,
             "total": total,
             "skipped": skipped,
             // 只留前 5 条：面板展示用，避免 config.json 被长列表撑大（Node 同）
@@ -515,12 +517,21 @@ impl AutoCheckin {
         logging::log(
             "[Checkin]",
             &format!(
-                "定时签到完成: {succeeded}/{total} 个账号成功领取{}{}",
-                if skipped > 0 { format!("，跳过 {skipped} 个") } else { String::new() },
+                "定时签到完成: {succeeded}/{total} 个账号成功领取{}{}{}",
+                if skipped > 0 {
+                    format!("，跳过 {skipped} 个")
+                } else {
+                    String::new()
+                },
                 if failures.is_empty() {
                     String::new()
                 } else {
                     format!("，失败 {} 个", failures.len())
+                },
+                if active > 0 {
+                    format!("，活跃保活 {active} 个")
+                } else {
+                    String::new()
                 },
             ),
         );
@@ -628,10 +639,16 @@ impl AutoCheckin {
         if let Some(value) = payload.get("enabled") {
             // Node: `enabled !== undefined` → `patch.enabled = enabled === true`，
             // 也就是说 null / 字符串 / 0 都会把开关置为 false（不是「忽略」）
-            patch.insert("enabled".to_string(), Value::Bool(value == &Value::Bool(true)));
+            patch.insert(
+                "enabled".to_string(),
+                Value::Bool(value == &Value::Bool(true)),
+            );
         }
         if let Some(value) = payload.get("time") {
-            patch.insert("time".to_string(), Value::String(normalize_time(Some(value))?));
+            patch.insert(
+                "time".to_string(),
+                Value::String(normalize_time(Some(value))?),
+            );
         }
         if let Some(value) = payload.get("providers") {
             // 勾选清单：只认注册过的提供商 id（去重、按注册顺序落盘）；
