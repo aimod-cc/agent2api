@@ -38,6 +38,11 @@ use crate::server::db::Db;
 pub const ACCESS_COOKIE: &str = "agent2api-panel";
 /// 刷新 cookie 名（path 限定在 /api/panel，缩小暴露面 —— 照 OmniProxy 的做法）
 pub const REFRESH_COOKIE: &str = "agent2api-panel-rt";
+/// 会话传输探测 cookie（60 秒寿命）：登录页连打两发 `GET /api/panel/cookie-probe`
+/// 测「这个环境里 cookie 能不能往返」。中转入口（fnOS docker 管理页这类）下发/
+/// 回带都活不成，探测失败时前端才显式要求令牌进响应体（见 api::panel::cookie_probe
+/// 与 panel::issue_response）。它不关联任何会话，服务端只判「有/无」不校验值。
+pub const PROBE_COOKIE: &str = "agent2api-panel-probe";
 
 /// access token 有效期（短效）
 const ACCESS_TTL: Duration = Duration::from_secs(2 * 3600);
@@ -340,10 +345,13 @@ fn persist_refresh_tokens(table: &mut Vec<RefreshRecord>) {
 
 // ── 会话签发 / 校验 / 轮换 / 撤销 ─────────────────────────────
 
-/// 一次登录的产出：两段 Set-Cookie 值交给 handler 下发。
+/// 一次登录的产出：两段 Set-Cookie 值交给 handler 下发；裸令牌同时进响应体
+/// （Cookie 在「反代/嵌入面板」环境会丢，见 `session_valid` 的头回退说明）。
 pub struct IssuedSession {
     pub access_cookie: String,
     pub refresh_cookie: String,
+    pub access_token: String,
+    pub refresh_token: String,
 }
 
 impl IssuedSession {
@@ -390,6 +398,8 @@ impl IssuedSession {
                 "{REFRESH_COOKIE}={refresh_token}; Path=/api/panel; HttpOnly; SameSite=Lax; Max-Age={}",
                 REFRESH_TTL.as_secs()
             ),
+            access_token,
+            refresh_token,
         }
     }
 
@@ -399,9 +409,68 @@ impl IssuedSession {
     }
 }
 
+/// 面板 access 令牌的**请求头**取值：`x-panel-token` 头 → `Authorization: Bearer`。
+///
+/// 存在的理由：面板不总在直连环境里跑 —— 从 fnOS docker 管理页一类宿主进入
+/// 时，请求经宿主侧中转，HttpOnly cookie 的两跳（下发 → 回带）都可能被掐掉。
+/// 前端（web_shim / login.html）把登录响应体里的裸令牌存 localStorage，之后
+/// 每个请求带头；服务端**cookie 优先、头兜底**，直连环境行为不变。
+/// 头里的令牌 JS 可读（localStorage），与 HttpOnly cookie 相比多暴露给面板
+/// 自身的 XSS 面 —— 这是反代环境下的可用性换安全，面板是同源可信代码。
+fn access_token_of(headers: &HeaderMap) -> Option<String> {
+    if let Some(value) = headers.get("x-panel-token") {
+        if let Ok(text) = value.to_str() {
+            let token = text.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    bearer_token_of(headers)
+}
+
+fn bearer_token_of(headers: &HeaderMap) -> Option<String> {
+    let text = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = text.strip_prefix("Bearer ")?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+/// refresh 令牌的取值：cookie → `x-panel-refresh` 头 → `Authorization: Bearer`。
+/// 返回**裸令牌**（cookie 分支已在 `cookie_value` 里剥掉名字）。
+/// 与 `session_valid` 同一口径：**cookie 优先、头只是回退**。头里的令牌来自
+/// localStorage，只有「中转剥过 Cookie 的年代」才会被存下 —— 中转修好、用户
+/// 回到直连 cookie 登录后，它指向的是一条早已不再使用的旧会话链：头优先会让
+/// 续期续在旧链上（而非当前 cookie 会话），旧链作废后还得白登录一回。反过来
+/// cookie 缺席（中转剥 cookie，正是头存在的场景）时头照常兜底，两条通道互不
+/// 挡路。
+/// Bearer 分支原先写在 panel.rs 的 `refresh_cookie_of` 里，但它把 Cookie 头
+/// 原文和裸令牌混在一个返回值里，下游 `cookie_value_from` 解析裸令牌必然
+/// 落空 —— 等于从未生效；这里统一成「入口即剥净」。
+pub fn refresh_token_of(headers: &HeaderMap) -> Option<String> {
+    if let Some(token) = cookie_value(headers, REFRESH_COOKIE) {
+        return Some(token);
+    }
+    if let Some(value) = headers.get("x-panel-refresh") {
+        if let Ok(text) = value.to_str() {
+            let token = text.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    bearer_token_of(headers)
+}
+
 /// 请求是否携带有效 access token。
 pub fn session_valid(headers: &HeaderMap) -> bool {
-    let Some(token) = cookie_value(headers, ACCESS_COOKIE) else {
+    let token = cookie_value(headers, ACCESS_COOKIE).or_else(|| access_token_of(headers));
+    let Some(token) = token else {
         return false;
     };
     let now = Instant::now();
@@ -418,8 +487,8 @@ pub fn session_valid(headers: &HeaderMap) -> bool {
 /// 返回 `None` = 刷新令牌无效 / 过期 / 已被轮换。**重放检测**：拿一条
 /// 已轮换的旧令牌来换，说明它泄露了（活链上新令牌在浏览器手里）——
 /// 整条会话链作废，逼着重新登录。
-pub fn rotate_session(refresh_cookie: Option<&str>) -> Option<IssuedSession> {
-    let presented = cookie_value_from(refresh_cookie, REFRESH_COOKIE)?;
+pub fn rotate_session(presented_refresh: Option<String>) -> Option<IssuedSession> {
+    let presented = presented_refresh?;
     let presented_hash = sha256_hex(&presented);
     let now = now_ms();
     let mut table = match refresh_tokens().lock() {
@@ -447,11 +516,11 @@ pub fn rotate_session(refresh_cookie: Option<&str>) -> Option<IssuedSession> {
     Some(IssuedSession::issue(session))
 }
 
-/// 登出：按 refresh cookie 找到会话链，整链撤销 + 清掉对应 access token。
-pub fn revoke_session(refresh_cookie: Option<&str>, access_headers: &HeaderMap) {
-    let presented_refresh = cookie_value_from(refresh_cookie, REFRESH_COOKIE);
-    let presented_access = cookie_value(access_headers, ACCESS_COOKIE);
+/// 登出：按 refresh 令牌找到会话链，整链撤销 + 清掉对应 access token。
+pub fn revoke_session(presented_refresh: Option<String>, access_headers: &HeaderMap) {
     let presented_hash = presented_refresh.as_deref().map(sha256_hex);
+    let presented_access = cookie_value(access_headers, ACCESS_COOKIE)
+        .or_else(|| access_token_of(access_headers));
     let target_session;
     {
         let mut table = match refresh_tokens().lock() {
@@ -489,13 +558,9 @@ fn revoke_access_of_session(session: &str) {
     table.retain(|_, (session_of, _)| session_of != session);
 }
 
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     cookie_value_from_str(header, name)
-}
-
-fn cookie_value_from(raw: Option<&str>, name: &str) -> Option<String> {
-    cookie_value_from_str(raw?, name)
 }
 
 fn cookie_value_from_str(header: &str, name: &str) -> Option<String> {
@@ -592,3 +657,53 @@ pub fn set_v1_fail_closed(on: bool) {
 // 注意：`panelAdmin` / `panelTokens` 两个 kv 键已登记进
 // `db::schema::RESERVED_KV_KEYS`（配置写侧据它排除）—— 新增键时必须两处
 // 同步，否则用户改一次配置就会把管理员与令牌静默删掉。
+
+#[cfg(test)]
+mod refresh_token_order_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn headers_with(cookie: Option<&str>, panel_refresh: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let Some(cookie) = cookie {
+            headers.insert(
+                axum::http::header::COOKIE,
+                axum::http::HeaderValue::from_str(cookie).unwrap(),
+            );
+        }
+        if let Some(token) = panel_refresh {
+            headers.insert(
+                axum::http::HeaderName::from_static("x-panel-refresh"),
+                axum::http::HeaderValue::from_str(token).unwrap(),
+            );
+        }
+        headers
+    }
+
+    /// 取值顺序必须 cookie 优先（与 `session_valid` 同一口径）：中转修好、
+    /// 用户回到直连 cookie 登录后，localStorage 里存的是早已不再使用的旧
+    /// 会话链 —— 头优先会把续期续到旧链上，而不是当前 cookie 会话。
+    #[test]
+    fn cookie_wins_over_the_local_storage_header() {
+        let headers = headers_with(
+            Some("agent2api-panel-rt=from-cookie; other=x"),
+            Some("from-header"),
+        );
+        assert_eq!(
+            Some("from-cookie".to_string()),
+            refresh_token_of(&headers),
+            "cookie 在场时头里的旧令牌不许抢跑"
+        );
+    }
+
+    /// cookie 缺席（中转剥 cookie，正是头存在的场景）→ 头兜底，两条通道互不挡路。
+    #[test]
+    fn header_fallbacks_when_the_cookie_is_absent() {
+        let headers = headers_with(None, Some("from-header"));
+        assert_eq!(Some("from-header".to_string()), refresh_token_of(&headers));
+
+        // 空头值不算数：回落到 Bearer / cookie 的老顺序不受影响
+        let empty_header = headers_with(None, Some("   "));
+        assert_eq!(None, refresh_token_of(&empty_header));
+    }
+}
