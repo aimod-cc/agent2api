@@ -68,6 +68,41 @@ pub async fn captcha_challenge() -> Response {
 /// 来源/环境猜测：标记由前端在传输探测（`cookie_probe`）失败后显式给出。
 const TOKEN_BODY_MODE: &str = "x-panel-auth-mode";
 
+/// 最近一次发出的探针（值 + 时刻）——服务器端自持的判据。
+///
+/// ── 为什么前端配合还不够 ────────────────────────────────────
+/// 实测（2026-09-29 两轮）：这个中转对 Set-Cookie / 自定义请求头 / URL
+/// 参数的态度无法从服务器侧观测，且浏览器里长期留着早前轮次写下的 90 天
+/// 旧探针 —— 页面版本旧、标记被剥、query 被剥，任何一种都会让「前端说了
+/// 算」的判定失真。把判据收回服务器：登录 / 刷新时收到的探针 cookie 必须
+/// **等于最近发出的那个值且足够新**，才证明「这条通道此刻真的能往返」；
+/// 其余一切情况（缺席、旧值、对不上）一律令牌进响应体 —— 宁可多给，不可
+/// 错判。直连环境的时序（登录页加载 → 几秒内登录）天然命中；探针超过
+/// 窗口后令牌也会进响应体，功能无损（客户端两边都认）。
+static LAST_ISSUED_PROBE: std::sync::OnceLock<std::sync::Mutex<Option<(String, std::time::Instant)>>> =
+    std::sync::OnceLock::new();
+const PROBE_FRESH_WINDOW: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+fn remember_issued_probe(value: &str) {
+    let Ok(mut slot) = LAST_ISSUED_PROBE.get_or_init(|| std::sync::Mutex::new(None)).lock() else {
+        return;
+    };
+    *slot = Some((value.to_string(), std::time::Instant::now()));
+}
+
+/// 收到的探针 cookie 是否「当前有效」：存在、等于最近发出的值、且在窗口内。
+fn probe_is_currently_valid(received: Option<&str>) -> bool {
+    let Ok(slot) = LAST_ISSUED_PROBE.get_or_init(|| std::sync::Mutex::new(None)).lock() else {
+        return false;
+    };
+    match (&*slot, received) {
+        (Some((value, at)), Some(received)) => {
+            received == value && at.elapsed() < PROBE_FRESH_WINDOW
+        }
+        _ => false,
+    }
+}
+
 fn tokens_in_body(
     headers: &HeaderMap,
     query: &std::collections::HashMap<String, String>,
@@ -86,12 +121,13 @@ fn tokens_in_body(
     if header_marked || query_marked {
         return true;
     }
-    // 探针 cookie 不在场 = 这个环境的 cookie 传输已被掐掉（宿主中转剥
-    // Set-Cookie / Cookie 任一侧都会走到这里）。前端标记要穿过中转才能到
-    // 服务器 —— 中转连自定义请求头一起剥时，标记就哑了；探针 cookie 的
-    // 缺席是**服务器自己能看见**的同一事实，不依赖任何请求头穿过中转。
-    // 直连环境探针 cookie 长效（90 天）恒在场，响应体保持与旧版逐字一致。
-    access::cookie_value(headers, access::PROBE_COOKIE).is_none()
+    // 探针 cookie 必须是「本服务刚发的那个值」（见 `probe_is_currently_valid`
+    // 的说明）才算 cookie 通道可用 —— 缺席、旧值（早前轮次 / 同宿主其它端口
+    // 写下的）、对不上，一律令牌进响应体。这是服务器端自持的判据，不依赖
+    // 任何前端标记穿过中转，也不被同宿主旧探针骗过。
+    !probe_is_currently_valid(
+        access::cookie_value(headers, access::PROBE_COOKIE).as_deref(),
+    )
 }
 
 /// 判定依据的可读形态（登录日志用）：标记走了哪条通道。
@@ -157,6 +193,7 @@ pub async fn cookie_probe(
         access::PROBE_COOKIE,
         90 * 24 * 3600
     );
+    remember_issued_probe(&token);
     let mut response = ok_json(serde_json::json!({ "roundtrip": false, "token": token }));
     if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
         response.headers_mut().append(SET_COOKIE, value);
@@ -349,14 +386,21 @@ mod tokens_in_body_tests {
             .collect()
     }
 
-    /// 直连环境（探针 cookie 在场、无标记）：响应体与旧版逐字一致，
-    /// 令牌只存在于 HttpOnly cookie，JS 读不到。
+    /// 直连环境的两条命（共用一个全局槽位，必须在同一条测试里顺序跑，
+    /// 并行测试会互踩槽位）：
+    ///   · 探针 cookie = **刚发的那个值** → cookie 通道真的通了，响应体与
+    ///     旧版逐字一致（令牌只在 HttpOnly cookie，JS 读不到）；
+    ///   · 探针 cookie 是**同宿主其它来源写下的旧值**（cookie 不分端口，
+    ///     fnOS :5666 中转与 :3065 直连共用一份罐）→ 如实判不通，令牌进
+    ///     响应体 —— 这是 2026-09-29 实测弹回的根因。
     #[test]
-    fn a_direct_environment_keeps_tokens_out_of_the_body() {
-        let headers = headers_with(&[
-            ("cookie", "agent2api-panel-probe=abc; other=x"),
-        ]);
-        assert!(!tokens_in_body(&headers, &HashMap::new()));
+    fn the_probe_cookie_must_match_the_recently_issued_value() {
+        remember_issued_probe("fresh-value");
+        let fresh = headers_with(&[("cookie", "agent2api-panel-probe=fresh-value")]);
+        assert!(!tokens_in_body(&fresh, &HashMap::new()));
+
+        let stale = headers_with(&[("cookie", "agent2api-panel-probe=stale-value")]);
+        assert!(tokens_in_body(&stale, &HashMap::new()));
     }
 
     /// 中转剥了 cookie（探针不在场）→ 令牌进响应体，**哪怕前端标记没穿过
@@ -383,8 +427,9 @@ mod tokens_in_body_tests {
             &headers,
             &query_with(&[("auth-mode", "body")])
         ));
-        // 认不出的标记值不算数
-        assert!(!tokens_in_body(
+        // 认不出的标记值不算数：落到探针有效性判据上 —— 这里的探针值
+        // （abc）不是本服务刚发的，安全默认 = 令牌进响应体
+        assert!(tokens_in_body(
             &headers,
             &query_with(&[("auth-mode", "cookie")])
         ));
