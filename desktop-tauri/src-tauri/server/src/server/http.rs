@@ -91,6 +91,12 @@ pub fn panel_router(state: ServerState) -> Router {
         // ALTCHA 领题：与 status / setup 同为「认证边界」端点 —— 领题时
         // 用户还没有任何凭证（开关关闭时回 400，前端跳过校验）
         .route("/api/panel/captcha", get(api::panel::captcha_challenge))
+        // 会话传输探测（登录页连打两发）：同为 public —— 探测在登录之前，
+        // 只种/读一枚 60 秒寿命的探针 cookie，不建立会话、不校验值
+        // （见 api::panel::cookie_probe）
+        // any 而不是 get：探针要与登录**同动词**（POST）—— 有的中转按方法
+        // 区别对待 Set-Cookie，只测 GET 会误报「cookie 通道完好」
+        .route("/api/panel/cookie-probe", any(api::panel::cookie_probe))
         // CatPaw 网页登录的 loopback 回调：**上游浏览器直接 POST 到这里**
         // （redirect 指向本网关自己的 loopback 端口，见 core::login::catpaw），
         // 所以它必须免鉴权 —— 调用方是美团 passport 页面，它没有我们的 API Key。
@@ -638,6 +644,37 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
             // Key 也能操作管理接口（桌面壳 / 脚本自动化的通道）
             return next.run(request).await;
         }
+        // 诊断：面板认证分支的 401 此前是静默的 —— 「登录成功却被弹回登录
+        // 页」时这一行是唯一现场：两路凭证（cookie / 请求头）各自看到了什么，
+        // 一眼定位是令牌没送到还是没存上。登录页每次加载的 /api/session 探测
+        // 也会命中这一行（预期内的 401），属正常噪声。
+        // 除了「本家那把在不在」，还要看**这一趟到底带回来了哪几把 cookie**：
+        // 中转把多条 Set-Cookie 合并/丢一条时，浏览器回带的常常是探针或上一轮的
+        // 会话 —— "cookie=有"这三种情况在旧文案里长得一模一样，分不出"没送到"
+        // 与"送到但不是这把"。只列名字，值不写（见 `access::cookie_names`）。
+        let names = crate::server::access::cookie_names(request.headers());
+        let seen_headers: Vec<&str> = ["x-panel-token", "x-panel-refresh", "authorization"]
+            .into_iter()
+            .filter(|name| request.headers().contains_key(*name))
+            .collect();
+        // 指纹按**候选顺序**逐个列（最多两把）：同名 cookie 重复上行 + 头里还躺着
+        // 旧令牌时，"哪一把被试过"就是这一行要回答的问题 —— 只打第一把会把
+        // 「cookie 短路」这种故障伪装成「什么都没带」。
+        let fingerprints = crate::server::access::access_fingerprints(request.headers());
+        logging::log(
+            "[Security]",
+            &format!(
+                "❌ 面板会话无效: {} {path}（试过的凭证指纹={} 带回来的 cookie={} 凭证头={}）",
+                request.method(),
+                if fingerprints.is_empty() {
+                    "无".to_string()
+                } else {
+                    fingerprints.join(",")
+                },
+                if names.is_empty() { "无".to_string() } else { names.join("|") },
+                if seen_headers.is_empty() { "无".to_string() } else { seen_headers.join("+") },
+            ),
+        );
         return errors::panel_login_required_response();
     }
     // ── 未注册闸门（headless 专属，桌面壳不开启）────────────────
