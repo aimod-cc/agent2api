@@ -258,7 +258,8 @@ pub fn shim_js() -> &'static str {
         headers['x-panel-refresh'] = refreshToken;
         headers['x-panel-auth-mode'] = 'body';
       }
-      var resp = await fetch('/api/panel/refresh', { method: 'POST', headers: headers });
+      // 标记走两条通道（头 + query）：中转剥自定义请求头时 query 照常生效
+      var resp = await fetch('/api/panel/refresh?auth-mode=body', { method: 'POST', headers: headers });
       if (!resp.ok) return false;
       var payload = await resp.json();
       var data = payload && payload.data;

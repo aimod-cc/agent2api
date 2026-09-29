@@ -644,6 +644,26 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
             // Key 也能操作管理接口（桌面壳 / 脚本自动化的通道）
             return next.run(request).await;
         }
+        // 诊断：面板认证分支的 401 此前是静默的 —— 「登录成功却被弹回登录
+        // 页」时这一行是唯一现场：两路凭证（cookie / 请求头）各自看到了什么，
+        // 一眼定位是令牌没送到还是没存上。登录页每次加载的 /api/session 探测
+        // 也会命中这一行（预期内的 401），属正常噪声。
+        let seen_cookie = crate::server::access::cookie_value(
+            request.headers(),
+            crate::server::access::ACCESS_COOKIE,
+        )
+        .is_some();
+        let seen_header = request.headers().contains_key("x-panel-token")
+            || request.headers().contains_key(axum::http::header::AUTHORIZATION);
+        logging::log(
+            "[Security]",
+            &format!(
+                "❌ 面板会话无效: {} {path}（cookie={} 凭证头={}）",
+                request.method(),
+                if seen_cookie { "有" } else { "无" },
+                if seen_header { "有" } else { "无" },
+            ),
+        );
         return errors::panel_login_required_response();
     }
     // ── 未注册闸门（headless 专属，桌面壳不开启）────────────────
