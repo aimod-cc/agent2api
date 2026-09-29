@@ -25,10 +25,10 @@
 //! `GET /api/session/login/wait?state=` 直到 done（与桌面壳的等待语义一致，
 //! 返回最终 session；取消/错误原样上抛）。适用面（对齐各上游回调机制）：
 //!   · WorkBuddy / Qoder / Cline：设备授权轮询，网页端完全可用；
-//!   · AutoClaw（OAuth）/ CatPaw：回调打**本机网关 loopback 端口** ——
-//!     浏览器与网关同机（compose 本地映射）时可用，远程面板不可用；
-//!   · 小浣熊：自定义协议回调（office-raccoon://），浏览器无法转交，
-//!     网页端用「填写凭证」。
+//!   · AutoClaw（OAuth）：优先接收 loopback 回调，远程面板由网页端粘贴
+//!     最终回调地址兜底；CatPaw 由服务端 poll-token 兜底；
+//!   · 小浣熊：网页端把授权页切换到官方 `redirect` 分支，直接回到网关的
+//!     HTTP 回调；Trae / Accio / CodeArts：网页端自动提供“粘贴回调地址”兜底。
 //!
 //! ── 壳特有命令的降级 ────────────────────────────────────────
 //! 窗口主题、托盘、改端口、软件更新安装、桌面设置、文件对话框导入导出
@@ -55,6 +55,33 @@ pub fn shim_js() -> &'static str {
       if (value) localStorage.setItem(KEY_STORAGE, value);
       else localStorage.removeItem(KEY_STORAGE);
     } catch (e) { /* 隐私模式等：留在内存即可 */ }
+  }
+
+  // ── 面板双令牌的本地保管（PANEL_AUTH）──────────────────────
+  // HttpOnly cookie 在「宿主中转」入口（fnOS docker 管理页这类面板跳板）
+  // 下发/回带都会被掐掉：登录 POST 能到、Set-Cookie 回不来，主页第一个
+  // 请求就 401 被踢回登录页。因此登录/刷新接口把裸令牌同时放进响应体
+  // （见 panel.rs issue_response），前端存这里，后续请求带
+  // `x-panel-token` / `x-panel-refresh` 头。直连环境下 cookie 照常下发
+  // 且服务端优先认它，这套头是纯增量，互不干扰。
+  var PANEL_AUTH = 'agent2api.panelAuth';
+  function readPanelAuth() {
+    try { return JSON.parse(localStorage.getItem(PANEL_AUTH) || 'null'); }
+    catch (e) { return null; }
+  }
+  function storedPanelToken(kind) {
+    var auth = readPanelAuth();
+    var value = auth && auth[kind];
+    if (typeof value === 'string' && value) return value;
+    return '';
+  }
+  function storePanelAuth(access, refresh) {
+    try {
+      localStorage.setItem(PANEL_AUTH, JSON.stringify({ access: access, refresh: refresh }));
+    } catch (e) { /* 隐私模式等：留在本次调用链即可 */ }
+  }
+  function clearPanelAuth() {
+    try { localStorage.removeItem(PANEL_AUTH); } catch (e) { /* 无害 */ }
   }
 
   // ── 覆盖层（Key 输入 / 链接兜底）：原生 DOM，界面样式不依赖 ──
@@ -128,6 +155,92 @@ pub fn shim_js() -> &'static str {
     );
   }
 
+  function closeWebOverlay() {
+    var overlay = document.getElementById('a2a-web-overlay');
+    if (overlay) overlay.remove();
+  }
+
+  // 这些提供商的授权页会把浏览器导航到 loopback 地址。
+  // Docker 远程面板里该地址属于浏览器所在电脑，不能自动回到容器，
+  // 因此让用户把地址栏的最终 URL 粘回受保护接口。小浣熊单独改用
+  // 官方授权页支持的 redirect 分支，直接把 authorization_code 导回网关。
+  function needsManualCallback(provider) {
+    return provider === 'trae'
+      || provider === 'accio' || provider === 'accio-cn'
+      || provider === 'codearts' || provider === 'autoclaw-intl';
+  }
+
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  // 官方小浣熊授权页在 login_source=desktop 时固定跳 office-raccoon://，
+  // 浏览器地址栏不会暴露授权码。该页面还支持 redirect 分支：去掉 desktop
+  // 标记后，它会把 authorization_code 追加到 redirect URL 并导航过去。
+  // 这里把回调地址放在当前面板 Origin，浏览器因此能直接访问 Docker 网关。
+  function buildRaccoonWebAuthUrl(provider, state, authUrl) {
+    if (provider !== 'raccoon') return authUrl;
+    var authorizeUrl;
+    try {
+      authorizeUrl = new URL(authUrl, window.location.href);
+    } catch (error) {
+      throw new Error('小浣熊授权地址无效，无法建立远程回调');
+    }
+    var callbackUrl = new URL('/api/session/login/raccoon-callback', window.location.origin);
+    callbackUrl.searchParams.set('state', state);
+    authorizeUrl.searchParams.set('login_source', 'web');
+    authorizeUrl.searchParams.set('redirect', callbackUrl.toString());
+    return authorizeUrl.toString();
+  }
+
+  async function waitForManualCallback(provider, state, authUrl) {
+    var label = provider === 'raccoon' ? '小浣熊'
+      : provider === 'trae' ? 'Trae'
+      : provider.indexOf('accio') === 0 ? 'Accio'
+      : provider === 'codearts' ? 'CodeArts' : 'AutoClaw';
+    var callbackInstruction = '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
+        + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。';
+    while (true) {
+      var callbackUrl = await ensureOverlay(
+        label + '需要粘贴回调地址',
+        '<div style="margin-bottom:10px;">' + callbackInstruction + '</div>'
+        + '<div style="margin-bottom:10px;">如果授权页没有打开，请先点击：<a href="'
+        + escapeHtml(authUrl) + '" target="_blank" rel="noopener" style="color:#7fa7ff;word-break:break-all;">'
+        + escapeHtml(authUrl) + '</a></div>'
+        + '<input type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:…/callback?..." '
+        + 'style="width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #3a3b3f;'
+        + 'border-radius:6px;background:#26272b;color:#e8e8e8;">',
+        '提交回调地址'
+      );
+      callbackUrl = String(callbackUrl || '').trim();
+      if (!callbackUrl) continue;
+      try {
+        var submitted = await call('POST', '/api/session/login/callback', {
+          state: state,
+          callbackUrl: callbackUrl,
+        });
+        if (submitted && submitted.nextUrl) {
+          // CodeArts 第一跳只有 secret，需要先打开 portal 的下一跳；下一轮
+          // 再粘贴浏览器最终回调地址即可完成换码。
+          authUrl = String(submitted.nextUrl);
+          continue;
+        }
+        // Trae 是把 query 注入现有 listener 后异步换证；其它几家也统一
+        // 以 /wait 的最终状态为准，避免把“已收到回调”误报成“已登录”。
+        return await pollWait(state);
+      } catch (error) {
+        await ensureOverlay(
+          '回调提交失败',
+          '<div style="margin-bottom:4px;">' + escapeHtml(error && error.message ? error.message : error)
+          + '</div><div>请确认复制的是授权完成后的完整地址，再重新提交。</div>',
+          '重新填写'
+        );
+      }
+    }
+  }
+
   // ── 错误归一（与桌面 bridge 的 asError 同语义）─────────────
   function asError(failure) {
     if (failure instanceof Error) return failure;
@@ -146,6 +259,19 @@ pub fn shim_js() -> &'static str {
   async function httpCall(method, path, body, retried) {
     var headers = { 'Accept': 'application/json' };
     if (apiKey) headers['x-api-key'] = apiKey;
+    // 面板会话的头部回退（见 PANEL_AUTH 段）：有存令牌就带上；
+    // refresh/logout 只在 /api/panel/ 路径发 refresh，对齐
+    // refresh cookie 的 Path=/api/panel 语义。
+    var panelAccess = storedPanelToken('access');
+    if (panelAccess) {
+      headers['x-panel-token'] = panelAccess;
+      // Authorization 是标准头：连自定义请求头都剥的中转也会放它过去
+      headers['Authorization'] = 'Bearer ' + panelAccess;
+    }
+    if (path.indexOf('/api/panel/') === 0) {
+      var panelRefresh = storedPanelToken('refresh');
+      if (panelRefresh) headers['x-panel-refresh'] = panelRefresh;
+    }
     var init = { method: method, headers: headers };
     var wantsBody = method === 'POST' || method === 'PUT' || method === 'PATCH'
       || !(body === null || body === undefined);
@@ -170,6 +296,9 @@ pub fn shim_js() -> &'static str {
       if (errorType === 'panel_login_required') {
         var refreshed = await tryRefresh();
         if (refreshed) return httpCall(method, path, body, true);
+        // 续期失败 = 会话链真的没了：清掉本地令牌再跳登录页，
+        // 否则下次进来还带着死 token，永远是同一轮失败。
+        clearPanelAuth();
         window.location.href = '/login';
         // 页面即将整页跳转，返回一个挂起的承诺占位
         return new Promise(function () {});
@@ -200,12 +329,31 @@ pub fn shim_js() -> &'static str {
     return httpCall(method, path, body === undefined ? null : body);
   }
 
-  // access 短效令牌过期后的静默续期：refresh cookie（path 限 /api/panel）
-  // 会由浏览器自动带上；成功 = 新双令牌已落 cookie，原请求可重试。
+  // access 短效令牌过期后的静默续期。中转环境里 refresh cookie 到不了
+  // 服务端，改为带 `x-panel-refresh` 头，并显式带 `x-panel-auth-mode: body`
+  // 要求新令牌进响应体（服务端只认这个标记，直连环境响应体与旧行为
+  // 逐字节一致）；响应体里的新令牌回写 PANEL_AUTH（轮换后旧 refresh 已
+  // 作废，不回存下次必失败）。cookie 模式（本地没存过令牌，即不带
+  // x-panel-refresh）下轮换随 Set-Cookie 完成，body 里没有令牌 ——
+  // resp.ok 即续期成功，不能按失败处理。
   async function tryRefresh() {
     try {
-      var resp = await fetch('/api/panel/refresh', { method: 'POST' });
-      return resp.ok;
+      var headers = { 'Accept': 'application/json' };
+      var refreshToken = storedPanelToken('refresh');
+      if (refreshToken) {
+        headers['x-panel-refresh'] = refreshToken;
+        headers['x-panel-auth-mode'] = 'body';
+      }
+      // 标记走两条通道（头 + query）：中转剥自定义请求头时 query 照常生效
+      var resp = await fetch('/api/panel/refresh?auth-mode=body', { method: 'POST', headers: headers });
+      if (!resp.ok) return false;
+      var payload = await resp.json();
+      var data = payload && payload.data;
+      if (data && typeof data.accessToken === 'string' && data.accessToken
+        && typeof data.refreshToken === 'string' && data.refreshToken) {
+        storePanelAuth(data.accessToken, data.refreshToken);
+      }
+      return true;
     } catch (e) {
       return false;
     }
@@ -260,6 +408,7 @@ pub fn shim_js() -> &'static str {
       var started = await startRequest;
       var authUrl = started && started.authUrl;
       if (!authUrl) throw new Error('网关未返回授权地址');
+      authUrl = buildRaccoonWebAuthUrl(provider, started.state, authUrl);
       if (popup && !popup.closed) {
         popup.location.href = authUrl;
       } else {
@@ -267,9 +416,18 @@ pub fn shim_js() -> &'static str {
         try { second = window.open(authUrl, '_blank'); } catch (e) { /* 落到链接兜底 */ }
         if (!second) showLinkFallback(authUrl);
       }
+      if (needsManualCallback(provider)) {
+        // 同时保留自动轮询：同机部署仍会自动完成，远程 Docker 则由用户
+        // 粘贴地址；先完成的一方结束流程，finally 会关闭残留覆盖层。
+        return await Promise.race([
+          pollWait(started.state),
+          waitForManualCallback(provider, started.state, authUrl),
+        ]);
+      }
       return await pollWait(started.state);
     } finally {
       if (popup && !popup.closed) { try { popup.close(); } catch (e) { /* 无害 */ } }
+      closeWebOverlay();
       loginActive = false;
       loginProvider = '';
       emitLogin();
@@ -317,6 +475,11 @@ pub fn shim_js() -> &'static str {
   async function downloadFile(method, path, filename) {
     var headers = { 'Accept': '*/*' };
     if (apiKey) headers['x-api-key'] = apiKey;
+    var panelAccess = storedPanelToken('access');
+    if (panelAccess) {
+      headers['x-panel-token'] = panelAccess;
+      headers['Authorization'] = 'Bearer ' + panelAccess;
+    }
     var response = await fetch(path, { method: method, headers: headers });
     if (!response.ok) throw new Error('导出失败（HTTP ' + response.status + '）');
     var blob = await response.blob();
@@ -413,6 +576,12 @@ pub fn shim_js() -> &'static str {
         provider: target,
       }));
     },
+    submitLoginCallback: function (state, callbackUrl) {
+      return call('POST', '/api/session/login/callback', {
+        state: String(state || ''),
+        callbackUrl: String(callbackUrl || ''),
+      });
+    },
     getLoginState: function () {
       return Promise.resolve({ active: loginActive, provider: loginProvider });
     },
@@ -427,7 +596,10 @@ pub fn shim_js() -> &'static str {
     },
     startAutoclawOauthLogin: function (state, authUrl, mode) {
       if (!state || !authUrl) return Promise.reject(new Error('缺少授权参数（state / authUrl）'));
-      return runLoginFlow('autoclaw-intl', Promise.resolve({ state: state, authUrl: authUrl }));
+      // AutoClaw OAuth 控制器与桌面 bridge 共用 `{ok, session}` 契约。
+      // 网页端轮询拿到的是原始 session，直接返回会被前端误判为取消。
+      return runLoginFlow('autoclaw-intl', Promise.resolve({ state: state, authUrl: authUrl }))
+        .then(function (session) { return { ok: true, session: session }; });
     },
     getAutoclawOauthCaptchaConfig: function (provider) {
       return call('POST', '/api/session/login/oauth/captcha-config',
@@ -681,7 +853,11 @@ pub fn shim_js() -> &'static str {
     saveRetention: function (patch) { return call('PUT', '/api/retention', patch); },
 
     // ── 面板登录（headless 托管面板才有「登录面板」的概念）──
-    panelLogout: function () { return call('POST', '/api/panel/logout', {}); },
+    panelLogout: async function () {
+      await call('POST', '/api/panel/logout', {});
+      // 服务端已撤销会话链；本地保管的双令牌一并清掉。
+      clearPanelAuth();
+    },
 
     // ── 机器人校验开关（登录 / 注册的 ALTCHA proof-of-work）──
     getCaptchaSetting: function () { return call('GET', '/api/captcha'); },

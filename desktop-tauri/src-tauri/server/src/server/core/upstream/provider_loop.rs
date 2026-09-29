@@ -588,10 +588,48 @@ async fn attempt_queue(
                         );
                         return Err(cancellation::cancelled_error());
                     }
-                    if let Some(account_id) = stateful_account_id {
+                    if let Some(account_id) = stateful_account_id.clone() {
                         if !tried_ids.contains(&account_id) {
                             tried_ids.push(account_id);
                         }
+                    }
+                    // ── 会话式路径的限额记账（与无状态「动作 1」同一语义）──
+                    // 分类由适配器供给（默认 Fatal，既有家逐字不变）；取到的
+                    // QuotaLimited 只用它的**记账**语义 —— 标冷却后仍走下面的
+                    // 队列顺延，不套用无状态的重试/刷新动作。冷却键从
+                    // `cooldown_keys` 解析（与判定侧同源）；会话式分支发生在
+                    // 发送体构建之前，拿不到 `SendBody::wire_model`。
+                    if let (UpstreamErrorClass::QuotaLimited { status, upstream_code, .. },
+                            Some(account_id)) =
+                        (adapter.classify_conversation_error(&error), &stateful_account_id)
+                    {
+                        let wire = cooldown_keys.for_provider(provider_id);
+                        let group = adapter.quota_cooldown_models(account_id, &wire);
+                        for name in &group {
+                            rotate::mark_account_limited(
+                                service,
+                                account_id,
+                                name,
+                                i32::from(status),
+                                upstream_code,
+                                None,
+                                &error.message,
+                            );
+                        }
+                        let label = if group.len() > 1 {
+                            format!("{} 等 {} 个模型（福利池按账号记账）",
+                                    group.first().cloned().unwrap_or_else(|| wire.clone()),
+                                    group.len())
+                        } else {
+                            wire.clone()
+                        };
+                        logging::console_line(
+                            "[Upstream]",
+                            &format!(
+                                "⚠️ 会话式账号 {} 对模型 {} 已限额，标记冷却后按队列顺延",
+                                account_id, label,
+                            ),
+                        );
                     }
                     match rotate::pick_next_account(
                         service,

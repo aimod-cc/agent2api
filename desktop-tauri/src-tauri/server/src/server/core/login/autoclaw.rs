@@ -127,6 +127,13 @@ impl LoginService {
         gateway_base: &str,
         local_browser: bool,
     ) -> Result<(LoginTaskHandle, Option<String>), String> {
+        if vendor == Vendor::Zai && !local_browser {
+            return Err(
+                "当前部署形态下网关不在浏览器所在的机器上，Zai 登录无法完成 —— \
+                 请改用 Google 登录，或用「填写凭证」/「导入桌面端登录态」"
+                    .to_string(),
+            );
+        }
         let state = random_hex()?;
         let device_id = oauth::new_oauth_device_id();
         let endpoint = self.callback_endpoint(gateway_base, vendor, local_browser).await;
@@ -188,9 +195,9 @@ impl LoginService {
     ///      直接拒），回调靠壳侧内嵌窗口截回网关（见 `src/login.rs` 的
     ///      `autoclaw_callback_forward`）—— 同时给一句提示，因为「系统浏览器」
     ///      方式没有窗口可截，那条路得先退出官方客户端；
-    /// 3. 浏览器不在本机（容器 / 远程面板）：不占端口，沿用网关自己的地址 ——
+    /// 3. 浏览器不在本机（容器 / 远程面板）：Google 不占端口，沿用网关自己的地址 ——
     ///    浏览器解析到的 `localhost` 是它自己那台机器，占了也没用。Zai 在这种
-    ///    形态下本来就走不通（白名单），提示里说清替代入口。
+    ///    形态下会在发起请求前被拒绝（白名单只接受官方 loopback 端口）。
     async fn callback_endpoint(
         &self,
         gateway_base: &str,
@@ -198,15 +205,10 @@ impl LoginService {
         local_browser: bool,
     ) -> CallbackEndpoint {
         if !local_browser {
-            let notice = (vendor == Vendor::Zai).then(|| {
-                "当前部署形态下网关不在浏览器所在的机器上，Zai 登录无法完成 —— \
-                 请改用 Google 登录，或用「填写凭证」/「导入桌面端登录态」"
-                    .to_string()
-            });
             return CallbackEndpoint {
                 base: gateway_base.trim_end_matches('/').to_string(),
                 listener: None,
-                notice,
+                notice: None,
             };
         }
         match CallbackListener::bind(gateway_base).await {
@@ -262,7 +264,7 @@ impl LoginService {
     /// 锁序：先在待办表的锁内收集候选（state + 发起时间），**释放后再**查任务
     /// 表 —— 两张表各是独立锁，不在一张锁的临界区里去碰另一张，避免与
     /// `start`（先任务后待办）形成反向嵌套。
-    fn find_pending_for_vendor(&self, vendor: Vendor) -> Option<(String, LoginTaskHandle)> {
+    pub(crate) fn find_autoclaw_pending_for_vendor(&self, vendor: Vendor) -> Option<(String, LoginTaskHandle)> {
         let mut candidates: Vec<(String, i64)> = {
             let table = self.autoclaw_oauth.lock().unwrap_or_else(|error| error.into_inner());
             table
@@ -336,7 +338,7 @@ impl LoginService {
         if code.is_empty() {
             return Err(GatewayError::with_status(400, "回调没有携带授权码"));
         }
-        let Some((state, handle)) = self.find_pending_for_vendor(vendor) else {
+        let Some((state, handle)) = self.find_autoclaw_pending_for_vendor(vendor) else {
             return Err(GatewayError::with_status(
                 404,
                 "这次登录已取消或已过期，请重新发起",

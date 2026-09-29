@@ -9,7 +9,7 @@
 //!
 //! ── 上游协议 ────────────────────────────────────────────────
 //! 推理走 **OpenAI 兼容**端点：`POST {openai_base}/chat/completions`，
-//! `Authorization: Bearer {token}`，body 原样透传（与 raccoon 同构）。
+//! `Authorization: Bearer {token}`，发送前统一归一思考等级。
 //! 因此 `is_stateful()` 保持默认 false（一次发送由通用编排层完成），
 //! 与 CatPaw / Qoder / Accio 那三家「适配器自己发」的情形不同。
 //!
@@ -35,7 +35,7 @@ use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
 use super::super::adapter::{
-    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, UpstreamErrorClass,
+    ChatRequestPlan, ModelRefreshOutcome, ProviderAdapter, ReasoningPatch, UpstreamErrorClass,
 };
 use super::super::content_block;
 use super::super::ProviderKind;
@@ -53,6 +53,9 @@ pub static ZCODE_ADAPTER: ZcodeAdapter = ZcodeAdapter { region: Region::Cn };
 
 /// 国际版实例
 pub static ZCODE_INTL_ADAPTER: ZcodeAdapter = ZcodeAdapter { region: Region::Intl };
+
+/// ZCode 两个地区共用的思考等级字段。
+const REASONING_FIELD: &str = "reasoning_effort";
 
 impl ZcodeAdapter {
     /// 本实例的地区（供 `adapter_for` 之外的调用点自查，例如领取任务的选路）
@@ -82,13 +85,38 @@ impl ProviderAdapter for ZcodeAdapter {
         models::list(self.region)
     }
 
+    /// 两地共用的默认等级绑定；客户端显式字段优先，能力按上游模型判定。
+    fn reasoning_patch(&self, level: &str, model: &str, body: &Value) -> ReasoningPatch {
+        if body.get(REASONING_FIELD).is_some()
+            || body.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled")
+        {
+            return ReasoningPatch::Skip {
+                reason: "客户端已指定思考参数，绑定不覆盖",
+            };
+        }
+        let Some(effort) = normalize_effort(model, level) else {
+            return ReasoningPatch::Skip {
+                reason: "模型或绑定等级没有已确认的 ZCode 思考等级映射",
+            };
+        };
+        ReasoningPatch::Set {
+            field: REASONING_FIELD,
+            value: Value::String(effort.to_string()),
+        }
+    }
+
+    /// 日志与发送体使用同一归一规则。
+    fn outbound_reasoning(&self, body: &Value) -> Option<String> {
+        let level = body.get(REASONING_FIELD)?.as_str()?;
+        let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+        Some(normalize_effort(model, level).unwrap_or(level).to_string())
+    }
+
     /// 构造上游请求：按账号的「使用套餐」（`zcodePlan`）**二选一**。
     ///
     ///   - `coding-plan`（默认）：`POST {openai_base}/chat/completions`，
-    ///     `Authorization: Bearer {accessToken}`，body 原样透传 —— 上游就是
-    ///     OpenAI 协议，本家没有任何要改写的字段（不做模型改名、不注入思考
-    ///     等级：后者靠 `reasoning_patch` 的默认 `Skip`，那是「没证据就不注入」
-    ///     的正确默认）；
+    ///     `Authorization: Bearer {accessToken}`，body 使用 OpenAI 协议，发送前
+    ///     按该通道的模型能力归一 `reasoning_effort`；
     ///   - `start-plan`：`POST {zcode}/api/v1/zcode-plan/anthropic/v1/messages`，
     ///     `Authorization: Bearer {jwt}`，OpenAI 体翻成 Anthropic 并装配官方
     ///     系统提示词块 —— 细节全在 [`super::plan`]，本函数只做分派。
@@ -144,7 +172,7 @@ impl ProviderAdapter for ZcodeAdapter {
         Ok(ChatRequestPlan::chat(
             format!("{}/chat/completions", self.openai_base_url()),
             headers,
-            body.clone(),
+            prepare_reasoning(body),
         ))
     }
 
@@ -371,3 +399,42 @@ fn os_category() -> &'static str {
         "linux"
     }
 }
+
+/// 已确认的 Chat Completions 能力，不把 Anthropic 上游的预算契约混进来。
+/// https://docs.z.ai/api-reference/llm/chat-completion
+/// 5.2 的 minimal 会关闭思考，必须保留；5.3 系列仅接受 low/high/max。
+/// 未知模型不猜能力：绑定跳过，客户端原值仍由上游校验。
+fn normalize_effort(model: &str, level: &str) -> Option<&'static str> {
+    let rank = crate::server::core::model_rules::reasoning_rank(level)?;
+    match model.trim().to_ascii_lowercase().as_str() {
+        "glm-5.2" => match rank {
+            0 => Some("minimal"),
+            1..=3 => Some("high"),
+            4..=5 => Some("max"),
+            _ => None,
+        },
+        "glm-5.3" | "glm-5.3-flash" => match rank {
+            0..=1 => Some("low"),
+            2..=3 => Some("high"),
+            4..=5 => Some("max"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn prepare_reasoning(body: &Value) -> Value {
+    let mut result = body.clone();
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    if let Some(effort) = body
+        .get(REASONING_FIELD)
+        .and_then(Value::as_str)
+        .and_then(|level| normalize_effort(model, level))
+    {
+        result[REASONING_FIELD] = Value::String(effort.to_string());
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests;

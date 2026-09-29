@@ -71,6 +71,11 @@ impl Session {
         self.listener.close();
     }
 
+    /// 把远程浏览器粘贴的回调 query 投递给正在等待的登录流程。
+    pub fn submit_callback(&self, query: &str) -> Result<(), String> {
+        self.listener.submit_callback(query)
+    }
+
     /// 等回调并把它换成凭据（**不**含落盘，落盘由调用方做）。
     ///
     /// 回调一次只认一个：监听器已经把"认不出材料的噪音"（favicon /

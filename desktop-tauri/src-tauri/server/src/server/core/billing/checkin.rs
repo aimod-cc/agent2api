@@ -5,7 +5,7 @@
 //! 定时签到（core::auto_checkin，对照 workbuddy-auto-checkin.mjs）与
 //! `POST /api/accounts/checkin` 必须是**同一段逻辑**。Node 版靠依赖注入做到这点：
 //! `createAutoCheckin({ runCheckin: id => accountRoutes.runCheckin(id) })` ——
-//! 调度器拿到的就是账号路由里那个函数，所以「限额跳过、国际版排除、串行防风」
+//! 调度器拿到的就是账号路由里那个函数，所以「范围过滤、版本分流、串行防风」
 //! 的规则只维护一份，不存在两套行为。
 //!
 //! Rust 侧的 core 不能依赖 api（core 不认识 axum，见 core/mod.rs 的约定），
@@ -27,12 +27,12 @@
 //! 同一个池子，用户对禁用账号点「签到」本身就是明确意图，替他拦下来反而多余。
 //!
 //! 仍然要看的只剩两处，两条路径各自一致：`available`（批量路径过滤，单账号不看 ——
-//! Node 版既定语义：账号暂时不可用不影响手动操作）与 `supports_checkin`
-//! （国际版没有签到活动，两条路径都排除）。
+//! Node 版既定语义：账号暂时不可用不影响手动操作）与 `supports_checkin`。
 //!
 //! ── `skipped` 的分母 ────────────────────────────────────────
-//! 「可用账号总数 − 可签到数」，只可能由**国际版**与**范围外的提供商**两类构成
-//! （`enabled` 不再参与），与 /api/accounts/usage 的「只算被禁用的」口径不同 ——
+//! 「可用账号总数 − 可签到数」，只可能由**不支持签到/活跃任务的版本**与**范围外
+//! 提供商**两类构成（`enabled` 不再参与），与 /api/accounts/usage 的「只算被禁用的」
+//! 口径不同 ——
 //! 两个动作的「不适用」集合本来就不一样。
 
 use serde_json::{json, Value};
@@ -51,7 +51,10 @@ pub struct CheckinError {
 
 impl CheckinError {
     fn new(message: impl Into<String>, status_code: i32) -> Self {
-        Self { message: message.into(), status_code }
+        Self {
+            message: message.into(),
+            status_code,
+        }
     }
 }
 
@@ -61,13 +64,11 @@ impl std::fmt::Display for CheckinError {
     }
 }
 
-/// 国际版没有签到活动，签到相关操作一律排除该版本账号
-/// （Node: `account.edition !== 'intl'`）。
+/// 计算账号是否进入自动/手动签到目标集合。
 ///
-/// **Qoder 也吃这条判据**：它的公开账号形态带 `edition`（`account_store` 把
-/// `Region::edition()` 写进公开字段，global → `intl`），而签到活动只有中国版有
-/// （国际版的 legacy 签到路径 404、活动列表里只有促销），于是「非 intl」这一条
-/// 刚好把国际版 Qoder 排除、放行中国版 —— 不需要为它再加一条 provider 特判。
+/// WorkBuddy 国际版虽然没有国内版的常规签到面板，但参考客户端把它接到同一
+/// `DailyCheckin` 调度器，执行「活动探测 + 条件领取 + 免费对话保活」，因此按
+/// provider + edition 联合判断放行。其它 provider 继续沿用各自的地区能力判据。
 ///
 /// Accio 系（两个地区）**整家**也没有签到活动：上游客户端全包检索不到
 /// 「签到 / checkin / 每日任务」的任何痕迹（见 `providers::accio` 的模块头）。
@@ -77,13 +78,21 @@ impl std::fmt::Display for CheckinError {
 /// 这一步是**必需的**：不在范围的家会落到 `checkin_for` 的分派里，拿另一家的
 /// 令牌去打错的签到接口只会稳定报错（见那里的最后两条分支）。
 pub fn supports_checkin(account: &Value) -> bool {
-    if account.get("edition").and_then(Value::as_str) == Some("intl") {
-        return false;
-    }
     let provider = account
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
+    // WorkBuddy 国内版走计费签到，国际版走每日活跃任务；两者都复用本入口。
+    if provider == crate::server::core::providers::DEFAULT_PROVIDER_ID {
+        return true;
+    }
+    // AutoClaw 国际版也有独立的 daily_signin 任务链路，不能被通用 intl 判据挡掉。
+    if provider == crate::server::core::account_store::AUTOCLAW_INTL_PROVIDER_ID {
+        return true;
+    }
+    if account.get("edition").and_then(Value::as_str) == Some("intl") {
+        return false;
+    }
     // CodeArts 与 Trae 两家都没有「签到」链路，必须先排除：
     // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而这两家
     // 的按钮在界面上由能力位 `checkin: false` 收起 —— 这一层是批量路径
@@ -135,18 +144,18 @@ fn accounts_of(store: &AccountStore) -> Vec<Value> {
 
 /// 签到目标集合。
 ///
-/// 批量（`id` 为空）：可用账号 ∩ **提供商在 `providers` 范围内** ∩ 非国际版，
-/// `skipped` = 可用总数 − 可签到数。范围由配置给出（WorkBuddy / 小浣熊 / AutoClaw
+/// 批量（`id` 为空）：可用账号 ∩ **提供商在 `providers` 范围内** ∩ 支持签到/活跃任务，
+/// `skipped` = 可用总数 − 可执行数。范围由配置给出（WorkBuddy / 小浣熊 / AutoClaw
 /// 可勾选），定时签到与账号页批量签到共用同一份口径。**禁用账号照常参与** ——
 /// 签到与转发是两件事（见模块头「签到不看 enabled」）。
 ///
 /// 指定 id：命中即用（**不过滤 available，也不过滤 provider**），
-/// 国际版直接报 400 —— 用户点的是谁就签谁，与「显式指定就执行」的既有语义一致；
+/// 不支持签到/活跃任务的账号直接报 400 —— 用户点的是谁就执行谁，与「显式指定就执行」的既有语义一致；
 /// 批量路径必须过滤 available 与 provider，否则会把范围外的账号也签一遍。
 ///
 /// ── 两条路径的「不满足条件」为什么语义不同（有意如此）──────────
 ///   批量路径 → **静默跳过**（计入 `skipped`）：定时任务会一次扫过几十个账号，
-///     用户没在看着，为一个「国际版没有签到活动」把整轮任务报错没有意义。
+///     用户没在看着，为一个「不支持签到/活跃任务」把整轮任务报错没有意义。
 ///   单账号路径 → **明确 400 + 原因**：用户显式点了某个账号的按钮，
 ///     他需要知道为什么不行。静默成功或静默跳过都会让他以为签到了。
 /// 所以 `supports_checkin` 在单账号路径报错、在批量路径过滤掉 ——
@@ -165,12 +174,10 @@ pub fn resolve_checkin_targets(
         if found.is_empty() {
             return Err(CheckinError::new("账号不存在", 404));
         }
-        // 唯一的拒绝理由：上游这一站根本没有签到活动（国际版）。
-        // 文案与账号页明细面板里那句「国际版暂无签到活动」同源同义
-        // （见 ui/accounts-model.js 的 checkinPanelHtml）—— 两处说法不一致
-        // 会让用户以为遇到的是两个不同的问题。
+        // 账号页明细面板与这里共用「不支持签到」语义；WorkBuddy 国际版已经
+        // 由活跃任务分支放行，Qoder 等其它不支持的版本仍在这里给出明确 400。
         if !supports_checkin(&found[0]) {
-            return Err(CheckinError::new("国际版账号暂不支持签到", 400));
+            return Err(CheckinError::new("该账号暂不支持签到或每日活跃任务", 400));
         }
         return Ok((found, 0));
     }
@@ -189,7 +196,9 @@ pub fn resolve_checkin_targets(
 /// 前端把「今天已签到」显示成一条 warn 提示。
 ///
 /// ── 按提供商分派（四家的接口互不相通）────────────────────────
-///   - **WorkBuddy**：计费服务的每日签到（`billing.claim_daily_checkin`）；
+///   - **WorkBuddy 国内版**：计费服务的每日签到（`billing.claim_daily_checkin`）；
+///   - **WorkBuddy 国际版**：活跃探测、条件领取与免费模型保活
+///     （`billing.workbuddy_daily_activity`）；
 ///   - **小浣熊**：桌面登录积分链路（`providers::raccoon::balance::claim_daily_grant`）；
 ///   - **AutoClaw**：通用任务接口的 `daily_signin` 任务
 ///     （`providers::autoclaw::checkin::claim_daily_signin`）；
@@ -200,12 +209,12 @@ pub fn resolve_checkin_targets(
 /// 优化。各分支的收尾（claim → 结果行 + 日志）完全一致，共用 [`claim_result`]；
 /// 各家的 claim 都由各自的实现对齐成 `{success, msg}` 形状。最后的兜底**只认**
 /// 默认那家（WorkBuddy），未知家明确报「未接入」——见那里的说明。
-pub async fn checkin_for(
-    store: &AccountStore,
-    billing: &BillingService,
-    account: &Value,
-) -> Value {
-    let id = account.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+pub async fn checkin_for(store: &AccountStore, billing: &BillingService, account: &Value) -> Value {
+    let id = account
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let name = account.get("name").cloned().unwrap_or(Value::Null);
     let display = name.as_str().unwrap_or(&id).to_string();
     // 分派的键就是账号的 provider id（`provider_of` 已归一）；AutoClaw 两个
@@ -221,10 +230,9 @@ pub async fn checkin_for(
             claim_result(id, name, &display, true, claim)
         }
         "autoclaw" | "autoclaw-intl" => {
-            let region = crate::server::core::providers::autoclaw::Region::from_provider_id(
-                provider_id,
-            )
-            .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
+            let region =
+                crate::server::core::providers::autoclaw::Region::from_provider_id(provider_id)
+                    .unwrap_or(crate::server::core::providers::autoclaw::Region::Cn);
             let claim = crate::server::core::providers::autoclaw::checkin::claim_daily_signin(
                 region, store, &id,
             )
@@ -233,19 +241,15 @@ pub async fn checkin_for(
             claim_result(id, name, &display, true, claim)
         }
         "qoder" => {
-            // 中国版的每日权益以活动（campaign）形式下发；国际版没有签到计划，
-            // 它由 `supports_checkin` 挡在入口（Qoder 公开形态带 edition），
-            // 实现里的国际版文案只是兜底。
+            // 中国版的每日权益以活动（campaign）形式下发；国际版由
+            // `supports_checkin` 挡在普通签到分支，保持其它提供商的地区判据。
             let claim =
                 crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
-        // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
-        // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
-        // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
-        // 现在落到这里的未知家明确报「未接入」，新增一家时忘了加分支会立刻暴露。
+        // WorkBuddy 国内版与国际版共用 provider id，按 edition 选择任务形态。
         _ if provider_id == crate::server::core::providers::DEFAULT_PROVIDER_ID => {
             let Some(entry) = store.get_session_by_id(&id) else {
                 return json!({
@@ -255,6 +259,32 @@ pub async fn checkin_for(
                     "error": "没有可用凭证",
                 });
             };
+            if account.get("edition").and_then(Value::as_str) == Some("intl") {
+                let activity = billing.workbuddy_daily_activity(&entry.session).await;
+                let claim = activity.get("claim").cloned().unwrap_or_else(
+                    || json!({ "success": false, "code": -1, "msg": "活跃保活失败" }),
+                );
+                let claim_success = claim
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let message = claim.get("msg").and_then(Value::as_str).unwrap_or("");
+                if claim_success {
+                    logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
+                } else {
+                    logging::log(
+                        "[Accounts]",
+                        &format!("账号 {display}: WorkBuddy 国际版 {message}"),
+                    );
+                }
+                return json!({
+                    "id": id,
+                    "name": name,
+                    "claim": claim,
+                    "activity": activity.get("activity").cloned().unwrap_or(Value::Null),
+                    "error": Value::Null,
+                });
+            }
             let claim = billing
                 .claim_daily_checkin(Some(&entry.session))
                 .await
@@ -286,7 +316,10 @@ fn claim_result(
 ) -> Value {
     match result {
         Ok(claim) => {
-            let success = claim.get("success").and_then(Value::as_bool).unwrap_or(false);
+            let success = claim
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let msg = claim.get("msg").and_then(Value::as_str).unwrap_or("");
             if success {
                 if log_success_msg && !msg.is_empty() {
@@ -295,7 +328,10 @@ fn claim_result(
                     logging::log("[Accounts]", &format!("账号 {display}: 签到成功"));
                 }
             } else {
-                logging::log("[Accounts]", &format!("账号 {display}: 签到未领取（{msg}）"));
+                logging::log(
+                    "[Accounts]",
+                    &format!("账号 {display}: 签到未领取（{msg}）"),
+                );
             }
             json!({ "id": id, "name": name, "claim": claim, "error": Value::Null })
         }
@@ -372,11 +408,21 @@ pub async fn run_checkin(
         }
         results.push(row);
     }
+    // 「真实领取」与「今日已领取」都表示本日签到已完成；只有活跃保活不计入
+    // succeeded，避免把普通签到时间与活跃任务混为一谈。
     let succeeded = results
         .iter()
         .filter(|item| {
             item.get("claim")
-                .and_then(|claim| claim.get("success"))
+                .map(checkin_completed_today)
+                .unwrap_or(false)
+        })
+        .count();
+    let active = results
+        .iter()
+        .filter(|item| {
+            item.get("activity")
+                .and_then(|activity| activity.get("pokeSucceeded"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         })
@@ -384,17 +430,68 @@ pub async fn run_checkin(
     if skipped > 0 {
         logging::log(
             "[Accounts]",
-            &format!("已跳过 {skipped} 个账号（国际版无签到活动或不在签到范围内）"),
+            &format!("已跳过 {skipped} 个账号（不支持签到/活跃任务或不在签到范围内）"),
         );
     }
     logging::log(
         "[Accounts]",
-        &format!("签到完成: {succeeded}/{} 个账号成功领取", results.len()),
+        &format!(
+            "签到完成: {succeeded}/{} 个账号成功领取，{active} 个账号完成活跃保活",
+            results.len()
+        ),
     );
     Ok(json!({
         "results": results,
         "succeeded": succeeded,
+        "active": active,
         "total": results.len(),
         "skipped": skipped,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workbuddy_international_is_included_in_checkin_targets() {
+        assert!(supports_checkin(&json!({
+            "provider": "workbuddy",
+            "edition": "intl",
+        })));
+        assert!(supports_checkin(&json!({
+            "provider": "workbuddy",
+            "edition": "cn",
+        })));
+    }
+
+    #[test]
+    fn unrelated_international_providers_remain_excluded() {
+        assert!(!supports_checkin(&json!({
+            "provider": "qoder",
+            "edition": "intl",
+        })));
+        assert!(!supports_checkin(&json!({
+            "provider": "accio",
+            "edition": "intl",
+        })));
+        assert!(supports_checkin(&json!({
+            "provider": "autoclaw-intl",
+            "edition": "intl",
+        })));
+    }
+
+    #[test]
+    fn activity_keepalive_does_not_mark_regular_checkin() {
+        assert!(!checkin_completed_today(&json!({
+            "success": false,
+            "msg": "活跃保活完成",
+        })));
+        assert!(checkin_completed_today(&json!({
+            "success": false,
+            "alreadyCompleted": true,
+            "msg": "今日已领取",
+        })));
+        assert!(checkin_completed_today(&json!({ "success": true })));
+    }
 }

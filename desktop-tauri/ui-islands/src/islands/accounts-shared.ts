@@ -123,6 +123,7 @@ export type AccountsBridge = {
   checkinAllAccounts(id?: string | null): Promise<{
     results?: Array<Record<string, unknown>>
     succeeded?: number
+    active?: number
     total?: number
     skipped?: number
   } | null | undefined>

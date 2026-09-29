@@ -39,7 +39,8 @@ import {
 import { formatTime, poolItemLabel, POOL_VALUE_PREFIX, shared, type AccountRecord, type UsageEntry } from './accounts-shared'
 import {
   accountTags, activeLimits, checkedInToday, checkinDoneTitle, claimDoneTitle, claimedToday,
-  displayNameOf, editionSuffix, formatResetText, identifierOf, isDesktopAccount, isEnabled,
+  isWorkBuddyInternational,
+  displayNameOf, editionSuffix, expiryMillis, formatResetText, identifierOf, isDesktopAccount, isEnabled,
   providerFeatures, providerOf, RESET_UNKNOWN, supportsCheckin, supportsClaim, supportsUsage,
   supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
 } from './accounts-domain'
@@ -206,10 +207,16 @@ export function LimitsCell({ account, open }: { account: AccountRecord; open: bo
  * 有效期：按「这家有没有版本概念」选字段（workbuddy 是 expiresAt，其余是
  * tokenExpiresAt），与域层的 tokenExpiryOf 同口径。文案收短成「30 天后」，
  * 完整句留在 title —— 列宽有限。
+ *
+ * 读数经域层 `expiryMillis` **先归一到毫秒**再判：落盘的到期值在秒与毫秒之间漂过
+ * （Trae 的凭据是从 CPA 的 auth 文件与手工粘贴进来的，那里是 10 位秒；别家与上游
+ * 刷新响应都是 13 位毫秒），不归一时 `1791009732` 当毫秒读就是 1970-01-21，账号一进
+ * 面板就红着显示「已过期」。归一规则与理由写在 accounts-domain.ts 那一处，
+ * 后端 `providers::trae::Credential::expires_at_ms` 是同一个口径。
  */
 export function ExpiryCell({ account }: { account: AccountRecord }) {
   const features = providerFeatures(providerOf(account))
-  const expiresAt = Number(features.edition ? account.expiresAt : account[features.expiry]) || 0
+  const expiresAt = expiryMillis(features.edition ? account.expiresAt : account[features.expiry])
   if (!expiresAt) return <span className='muted' title='记录里没有过期时间'>—</span>
   const left = expiresAt - Date.now()
   if (left <= 0) return <Badge variant='destructive' shape='tag' title='凭证已过期，转发时会先刷新'>已过期</Badge>
@@ -603,6 +610,7 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
   const [usageBusy, setUsageBusy] = React.useState(false)
   const checkedIn = checkedInToday(account)
   const canCheckin = supportsCheckin(account)
+  const activeOnly = isWorkBuddyInternational(account)
   const canUsage = supportsUsage(account)
   const canClaim = supportsClaim(account)
   const canWelfare = supportsWelfare(account)
@@ -639,9 +647,11 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
           // 上一次失败的原因挂在这颗按钮的 title 上（toast 几秒就没了，
           // 而「为什么没签上」要能复看）—— 签到没有明细面板，见 accounts-data.ts
           <Button variant='outline' size='xs'
-            title={checkinFailed ? `上次签到失败：${checkinFailed}（点此重试）` : '为该账号签到'}
+            title={checkinFailed
+              ? `上次${activeOnly ? '日活任务' : '签到'}失败：${checkinFailed}（点此重试）`
+              : activeOnly ? '手动执行活跃保活，并尝试领取每日活跃奖励' : '为该账号签到'}
             onClick={() => void runCheckin(account.id)}>
-            签到
+            {activeOnly ? '领日活' : '签到'}
           </Button>
         )
       ) : null}
