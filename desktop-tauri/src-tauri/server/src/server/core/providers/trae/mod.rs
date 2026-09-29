@@ -30,6 +30,7 @@
 
 pub mod adapter;
 pub mod callback_server;
+pub mod checkin;
 pub mod credentials;
 pub mod device;
 pub mod errors;

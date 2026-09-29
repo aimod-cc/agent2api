@@ -60,12 +60,23 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     活动列表里只有促销），由 `billing::checkin::supports_checkin` 按 edition
 ///     排除。中国版里 Free 套餐账号也可能没有被下发活动（实测如此），那种情况
 ///     实现返回一条中性结果（「当前没有可领取的签到活动」），不算失败。
+///   - **Trae**（2026-09-29 加）：SOLO 的 `checkin_credits` 领取
+///     （`providers::trae::checkin`）。加它不是因为"别家有"，而是这条链
+///     **有钱**：参考实现 v0.12.30 起 SOLO 转积分制，模型调用花的正是签到
+///     那份钱包（`plugins/trae/panel.html:304`），不签就是每天白丢一笔额度。
+///     它的风险不在"该不该签"而在"怎么签"：设备号必须每轮全新（复用是风控
+///     可疑项）、`req_source` 必须与令牌谱系一致（错配即 9074）、claim 的
+///     `code:0` 要用同设备号回查确认（幂等假成功）。三条都在那个模块里钉着。
+///     ⚠️ 本清单同时是**缺省全选**的来源：老配置的 `autoCheckin` 里没有
+///     `providers` 字段时，读出来就是"包括 trae"——上线后第二天零点就会多发
+///     一轮签到请求。不想要就在设置页「定时任务」里取消勾选，别改这份常量
+///     （那会让新装的用户永远拿不到这一档）。
 ///
 /// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw 有积分查询但
 /// 没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 5] =
-    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder"];
+pub const CHECKIN_PROVIDERS: [&str; 6] =
+    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder", "trae"];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {

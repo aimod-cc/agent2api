@@ -129,10 +129,17 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 而不是一个地区的两种拼法，国际版将来接入时另立 provider id，不把它做成账号字段。
   // `usage: true` 对应 providers::trae::usage（上游两份账：ide_user_ent_usage 的权益包/
   // 积分池 + ide_user_pay_status 的快请求与 SOLO 并发）。
-  // `checkin: false` 同样不是省事：签到那条链在参考实现里有把出口 IP 打进封禁的前科，
-  // 且它记的「签到钱包」与模型调用真正扣的积分池是两笔钱 —— 不给按钮，免得给一个
-  // 点了必然报错（或报出一个对不上官方数字的余额）的入口。
-  trae: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // `checkin: true`（2026-09-29 起）对应 providers::trae::checkin。这里以前写的是
+  // false，理由有两半：「签到链有把出口 IP 打进封禁的前科」与「签到钱包与模型积分池
+  // 是两笔钱」。后一半只说对了"两份账要分开显示"（参考实现 v0.12.34 正是为此而改），
+  // 但 SOLO 转积分制之后模型调用花的**就是**签到那份钱（plugins/trae/panel.html:304），
+  // 不给按钮等于每天白丢一笔额度；前一半的真因也不是"签到危险"，而是**签到姿势**：
+  // 设备号复用、`req_source` 与令牌谱系错配、同账号混用多套客户端画像（见那个模块的
+  // 模块头）。这三条现在都由后端钉住，界面这边该给入口。
+  // ⚠️ 两类"今天点不动"是本家特有的，后端都回的是**未领取而不是错误**，所以界面
+  // 会显示失败原因而不是红色报错：上游没对该账号开活动、以及凭据没有 deviceId
+  // （手工粘贴的那类没有设备绑定，打过去正好落在官方风控画像上）。
+  trae: { usage: true, checkin: true, edition: false, identifier: 'uid', expiry: 'expiresAt' },
 }
 
 /**
@@ -661,9 +668,15 @@ export function accountTags(account: AccountRecord): AccountTag[] {
  * 「下次什么时候能再签」的说明（已签到按钮的悬停说明与明细面板共用一句）。
  *
  * 两家口径不同：
- *   - WorkBuddy / 小浣熊 / AutoClaw：按**自然日**重置，明天 0 点后可再签；
+ *   - WorkBuddy / 小浣熊 / AutoClaw / Trae：按**自然日**重置，明天 0 点后可再签
+ *     （Trae 与官方客户端同频 —— 参考实现的每日主循环就定在 0 点，见
+ *     `providers/trae/scheduler.go`）；
  *   - Qoder：每日权益是一个**活动窗口**（当天 10:00 → 次日 10:00），
  *     所以 0 点后不一定能签 —— 说「0 点后可再签」会让人白点一次。
+ *
+ * Trae 走默认那条分支，但它的"点不动"还有一种不是"已签过"：上游把活动对**这个
+ * 账号**关掉（`enable:false`）或凭据没有 deviceId。那种情况后端回的是未领取 +
+ * 具体原因，会直接显示在失败原因里，不靠这句悬停说明解释。
  */
 export function checkinResetHint(account: AccountRecord | null | undefined): string {
   return providerOf(account) === 'qoder'
