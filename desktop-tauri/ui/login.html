@@ -99,13 +99,19 @@
       // 令牌才进响应体，存 localStorage 走头部回退。探测测的是本环境的
       // 真实传输，不猜代理行为 —— 哪天中转把 cookie 修好了会自动回归。
       var headerMode = false;
-      // 两发都用 POST：探针要与登录**同动词** —— 有的中转按方法区别对待
-      // Set-Cookie，只测 GET 会误报「cookie 通道完好」
+      // 探针改**值比对**：cookie 按主机算、不分端口 —— 从 fnOS（:5666）中转
+      // 进来时，浏览器会把直连 :3065 时存下的**旧探针**一起带上；只判「有没
+      // 有」会被它骗成「通道完好」（实测弹回登录页）。所以第一发记住服务端
+      // 刚发的值，第二发用 ?expect= 让服务端比对 —— 旧探针的值对不上才算
+      // 不通。两发都用 POST：与登录同动词，防中转按方法区别对待 Set-Cookie。
       var probeDone = fetch('/api/panel/cookie-probe?step=1', { method: 'POST', cache: 'no-store' })
-        .then(function () {
-          return fetch('/api/panel/cookie-probe?step=2', { method: 'POST', cache: 'no-store' });
-        })
         .then(function (resp) { return resp.json(); })
+        .then(function (payload) {
+          var issued = payload && payload.data && payload.data.token;
+          if (!issued) return { roundtrip: false };
+          return fetch('/api/panel/cookie-probe?step=2&expect=' + encodeURIComponent(issued),
+            { method: 'POST', cache: 'no-store' }).then(function (resp) { return resp.json(); });
+        })
         .then(function (payload) {
           var data = payload && payload.data;
           headerMode = !!(data && !data.roundtrip);
@@ -175,8 +181,11 @@
         var body = { username: username, password: password };
         if (captchaPayload) body.captcha = captchaPayload;
         var headers = { 'Content-Type': 'application/json' };
+        // 标记走两条通道：自定义头 + URL 参数 —— 有的中转剥自定义请求头，
+        // query 剥不掉（登录请求能到服务器，query 就完整）
+        var markerUrl = headerMode ? '?auth-mode=body' : '';
         if (headerMode) headers['x-panel-auth-mode'] = 'body';
-        fetch(isSetup ? '/api/panel/setup' : '/api/panel/login', {
+        fetch((isSetup ? '/api/panel/setup' : '/api/panel/login') + markerUrl, {
           method: 'POST',
           headers: headers,
           body: JSON.stringify(body),
