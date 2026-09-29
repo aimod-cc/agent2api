@@ -460,6 +460,46 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::request::read_upstream_error`），因为「怎么读一个 HTTP 错误体」
     /// 是协议层的事、与哪一家无关。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass;
+
+    /// 会话式转发（`attempt_stateful`）失败后的分类。
+    ///
+    /// ── 为什么这个钩子必须存在 ─────────────────────────────────
+    /// 会话式路径的错误编排历来是「一律透传（Fatal 语义）：不换账号、不冷却、
+    /// 不重试」（见 `provider_loop::attempt_stateful`）。但「透传」只该是
+    /// **编排**的默认，不该堵死分类：CodeArts 因会话准入走有状态路径，它的
+    /// 流内额度信封（HTTP 200 SSE → 首包门 403）在这条路径上永远到不了
+    /// [`Self::classify_error`]，结果福利池耗尽后每个请求都从头撞一遍全部
+    /// 账号、一个冷却标记都不落。分类本身是 provider 专属知识（403 是额度
+    /// 还是封禁，只有适配器知道），所以由适配器供给。
+    ///
+    /// ── 为什么默认是 Fatal ─────────────────────────────────────
+    /// 既有会话式家（CatPaw）的行为就是透传，默认值让它们逐字不变；
+    /// 只有明确声明「我的会话式错误里有可记账的限额」的家才覆写。
+    /// 注意编排层只取这里 QuotaLimited 的**记账**语义（标记冷却后仍按队列
+    /// 顺延）—— 不会对同一条错误再套用无状态路径的重试/刷新动作。
+    fn classify_conversation_error(&self, error: &GatewayError) -> UpstreamErrorClass {
+        UpstreamErrorClass::Fatal {
+            status: u16::try_from(error.status_code).unwrap_or(500),
+            message: error.message.clone(),
+            upstream_code: error.upstream_code,
+        }
+    }
+
+    /// 一次限额要给哪些**模型冷却键**记账。
+    ///
+    /// 默认只有本次的上游真名一条。 CodeArts 的福利池是**账号级**日额度：
+    /// 池子耗尽时该账号的全部福利模型（下一轮哪怕请求的是另一个名字）都会
+    /// 撞同样的 `insufficient quota`，只记一个键挡不住下一次顺延白撞 ——
+    /// 所以这类家返回整组真名。返回值必须是**上游真名**（与
+    /// `routing::CooldownKeys` 写读两侧同一口径），传入的 `wire_model` 就是
+    /// 本次发出去的真名。
+    ///
+    /// `account_id` 供按账号取目录的家使用（当前 CodeArts 的目录是全 provider
+    /// 共享缓存，不用它；留在签名里避免下一个这类家改签名）。
+    fn quota_cooldown_models(&self, _account_id: &str, wire_model: &str) -> Vec<String> {
+        vec![wire_model.to_string()]
+    }
+
     /// 取可用 access token（含临期主动刷新；刷新结果回写 store）。
     ///
     /// `account_id` 为空串表示「没有指定账号」：用默认登录态

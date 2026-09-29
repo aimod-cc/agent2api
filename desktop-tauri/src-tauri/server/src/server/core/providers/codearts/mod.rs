@@ -54,6 +54,29 @@ impl CodeArtsAdapter {
     }
 }
 
+/// 纯函数：给定目录与本次真名，返回整组冷却名单。福利判定**大小写无关**
+/// （客户端的大小写变体也算福利）；命中 → 全部福利模型 id，并把**本次发送名
+/// 原文**也补进名单 —— 它与目录 id 只是大小写不同时，判定侧对这类「映射没
+/// 解析出来」的请求读的是请求原文键（`routing::CooldownKeys` 的 ④ 兜底），
+/// 不补就会对同一形态的下一个请求漏命中。非福利/未知 → 只记本次名，
+/// 与 trait 默认行为一致。
+fn benefit_cooldown_group(catalog: &models::Catalog, wire_model: &str) -> Vec<String> {
+    let is_benefit = catalog.models.iter().any(|model| {
+        model.id.eq_ignore_ascii_case(wire_model) && model.source == models::ModelSource::Benefit
+    });
+    if !is_benefit {
+        return vec![wire_model.to_string()];
+    }
+    let mut names: Vec<String> = catalog.models.iter()
+        .filter(|model| model.source == models::ModelSource::Benefit)
+        .map(|model| model.id.clone())
+        .collect();
+    if !names.iter().any(|name| name == wire_model) {
+        names.push(wire_model.to_string());
+    }
+    names
+}
+
 impl ProviderAdapter for CodeArtsAdapter {
     fn kind(&self) -> ProviderKind {
         ProviderKind::CodeArts
@@ -287,6 +310,55 @@ impl ProviderAdapter for CodeArtsAdapter {
                 message,
                 upstream_code: None,
             },
+        }
+    }
+
+    /// 会话式路径的分类：429 无歧义（限流）→ 记账；403 只有在**认得出额度**
+    /// 时才记账 —— 流内额度信封由首包门按 `insufficient quota` 折成 403，
+    /// 消息必带这串原文，HTTP 403 的诊断体带了也算数。认不出的 403（内容
+    /// 闸门 / 权限 / 签名这类）一律 Fatal 透传顺延、不罚账号：403 在本家是
+    /// 个粗状态码（`stream_fault` 给客户端补 `code` 正是为这个歧义），而福利
+    /// 池按整组记账，误罚的爆炸半径是全部福利模型 —— 宁缺勿滥。
+    ///
+    /// 首包门把流内 `insufficient quota` 信封折成 403 后落在这里 —— 之前它走
+    /// 「一律透传」，福利池耗尽后每个请求都白撞一遍全部账号、一个冷却都不落
+    /// （实测三条 codearts 账号每请求约 1.2s 的顺延噪声，见 2026-09-28 取证）。
+    ///
+    /// 401 故意**不**交 TokenExpired：会话式路径没有「刷凭证后同账号重试」
+    /// 的编排，透传让调用方顺延下一个账号（跟现状一致）。
+    fn classify_conversation_error(&self, error: &GatewayError) -> UpstreamErrorClass {
+        let quota_403 = error.status_code == 403
+            && error.message.to_lowercase().contains("insufficient quota");
+        match error.status_code {
+            429 => UpstreamErrorClass::QuotaLimited {
+                reset_at: None,
+                message: error.message.clone(),
+                upstream_code: error.upstream_code,
+                status: u16::try_from(error.status_code).unwrap_or(429),
+            },
+            403 if quota_403 => UpstreamErrorClass::QuotaLimited {
+                reset_at: None,
+                message: error.message.clone(),
+                upstream_code: error.upstream_code,
+                status: 403,
+            },
+            _ => UpstreamErrorClass::Fatal {
+                status: u16::try_from(error.status_code).unwrap_or(500),
+                message: error.message.clone(),
+                upstream_code: error.upstream_code,
+            },
+        }
+    }
+
+    /// 福利池是**账号级**日额度：本次失败的模型是福利源时，整组福利模型一起
+    /// 记冷却 —— 不然池子已经空了，换一个福利模型名照样从头撞一遍。
+    /// 真名以目录缓存的 `id` 为准（转发的发送名就是它）；模型不在缓存里
+    /// （目录还没拉过 / 已下架）或不是福利源时，只记本次的真名，与默认行为
+    /// 一致。纯逻辑在模块级 [`benefit_cooldown_group`]（吃目录参数，可测）。
+    fn quota_cooldown_models(&self, _account_id: &str, wire_model: &str) -> Vec<String> {
+        match models::cached_catalog() {
+            Some(catalog) => benefit_cooldown_group(&catalog, wire_model),
+            None => vec![wire_model.to_string()],
         }
     }
 
@@ -543,7 +615,8 @@ mod store_hooks {
     use crate::server::core::providers::codearts::credentials::{OAuthContext, PkcePair, Credential};
     use crate::server::db::Db;
 
-    use super::{CODEARTS_ADAPTER, ProviderAdapter};
+    use super::{benefit_cooldown_group, models};
+    use super::{CODEARTS_ADAPTER, CodeArtsAdapter, ProviderAdapter};
 
     static SEQ: AtomicUsize = AtomicUsize::new(0);
 
@@ -622,5 +695,122 @@ mod store_hooks {
         };
         assert_eq!(400, error.status_code, "缺续期链是用户可修的本地错误，不是上游错误");
         assert!(error.message.contains("refresh token"), "文案要点名缺什么：{}", error.message);
+    }
+
+    /// 会话式分类：429 与「认得出额度」的 403 交回 QuotaLimited（都要落冷却）；
+    /// 认不出额度的 403（内容闸门/权限/签名）与 401/502 一律 Fatal —— 特别是
+    /// 401：会话式路径没有「刷凭证后同账号重试」的编排，交 TokenExpired 会把
+    /// 错误吞进一条根本不存在的重试链里。
+    #[test]
+    fn conversation_classification_marks_quota_only_for_403_and_429() {
+        use crate::server::errors::GatewayError;
+        use super::UpstreamErrorClass;
+        let class = |status: i32, message: &str| {
+            CODEARTS_ADAPTER
+                .classify_conversation_error(&GatewayError::with_status(status, message))
+        };
+        // 流内折叠的额度信封：首包门按 insufficient quota 折的 403，消息必带原文
+        assert!(matches!(
+            class(403, "上游报告 InferHub.4291.200：insufficient quota"),
+            UpstreamErrorClass::QuotaLimited { status: 403, .. }
+        ));
+        // HTTP 403、诊断体里带额度原文 → 也认
+        assert!(matches!(
+            class(403, "CodeArts 上游返回 HTTP 403：{error_msg: insufficient quota}"),
+            UpstreamErrorClass::QuotaLimited { .. }
+        ));
+        // 认不出额度的 403 → 透传，不罚账号
+        assert!(matches!(
+            class(403, "CodeArts 上游返回 HTTP 403：permission denied"),
+            UpstreamErrorClass::Fatal { status: 403, .. }
+        ));
+        // 429 无歧义（限流）→ 记账
+        assert!(matches!(
+            class(429, "too many requests"),
+            UpstreamErrorClass::QuotaLimited { status: 429, .. }
+        ));
+        assert!(matches!(class(401, "x"), UpstreamErrorClass::Fatal { status: 401, .. }));
+        assert!(matches!(class(502, "x"), UpstreamErrorClass::Fatal { status: 502, .. }));
+        // 其它家的默认实现必须还是 Fatal（CatPaw 的行为逐字不变）
+        use crate::server::core::providers::catpaw::adapter::CATPAW_ADAPTER;
+        assert!(matches!(
+            CATPAW_ADAPTER.classify_conversation_error(&GatewayError::with_status(403, "x")),
+            UpstreamErrorClass::Fatal { status: 403, .. }
+        ));
+    }
+
+    /// 本地合成目录（不碰全局缓存）：三份真实 fixture 走与生产同一合并链，
+    /// 得到 4 个福利模型的目录。
+    fn local_catalog() -> models::Catalog {
+        const AGENT_DETAIL: &str = include_str!("catalog_fixtures/agent-detail.json");
+        const BUILTIN: &str = include_str!("catalog_fixtures/builtin.json");
+        const BENEFIT_CONFIG: &str = include_str!("catalog_fixtures/benefit-gateway-config.json");
+        let agent = models::parse_agent_detail(AGENT_DETAIL, "en-us").unwrap();
+        let builtin = models::parse_builtin(BUILTIN).unwrap();
+        let merged = models::merge_agent_and_builtin(agent, builtin);
+        models::Catalog {
+            models: models::merge_benefit(merged, models::parse_benefit(BENEFIT_CONFIG).unwrap()),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// 福利池是账号级日额度：本次失败的模型是福利源时，整组福利模型一起进
+    /// 冷却名单；非福利模型（或不认识的名字）只记自己。吃**本地合成**目录
+    /// —— models.rs 的测试会并发改写全局目录缓存（实测全量跑必红、单跑绿），
+    /// 所以纯逻辑测试不读缓存；生产读取路径（`quota_cooldown_models` 的
+    /// `cached_catalog` 分支）只做一层委托，本文件不重复测它。
+    #[test]
+    fn benefit_quota_marks_the_whole_benefit_group() {
+        let catalog = local_catalog();
+        let group = benefit_cooldown_group(&catalog, "glm-5.3-flash");
+        assert_eq!(4, group.len(), "整组福利模型：{group:?}");
+        for expected in ["deepseek-v4-flash-0731", "glm-5.3-flash", "deepseek-v4-pro-0813", "deepseek-v4.1-flash"] {
+            assert!(group.iter().any(|name| name == expected), "缺 {expected}：{group:?}");
+        }
+        // 大小写变体也算福利：整组照记，并补上本次发送名原文的键（判定侧对
+        // 解析不出映射的请求读的是请求原文键，见 benefit_cooldown_group 注释）
+        let variant = benefit_cooldown_group(&catalog, "GLM-5.3-Flash");
+        assert_eq!(5, variant.len(), "整组 4 条 + 变体原文 1 条：{variant:?}");
+        assert!(variant.iter().any(|name| name == "GLM-5.3-Flash"), "缺变体原文键：{variant:?}");
+        // 非福利源（agent/builtin）与不在目录里的名字只记自己 —— 不波及别人
+        assert_eq!(vec!["GLM-5.2".to_string()], benefit_cooldown_group(&catalog, "GLM-5.2"));
+        assert_eq!(vec!["ghost".to_string()], benefit_cooldown_group(&catalog, "ghost"));
+    }
+
+    /// 端到端语义（不联网、不发请求）：福利模型撞限额后按**整组**落冷却，
+    /// 之后换**另一个福利模型名**来请求也能命中冷却记录。改造前只记单模型
+    /// 键，这正是「福利池空了还把请求打过去」的缺口。
+    ///
+    /// 刻意**不**走 `CooldownKeys`/全局 manifest 解析：models.rs 的测试会并发
+    /// 改写 codearts 目录缓存，读侧解析在并发下不确定（实测全量跑必红、单跑
+    /// 绿）。生产里键的同源性由 `routing::CooldownKeys` 的既有机制与默认启用
+    /// 的模型保证；这里钉的是本次改动的语义 —— **写入侧的键集合**。
+    #[test]
+    fn whole_group_cooldown_blocks_a_different_benefit_model() {
+        let catalog = local_catalog();
+
+        let store = store();
+        store.add_codearts_account(&credential("AK_BARE", "bare", 120, false), None, "manual").unwrap();
+        let id = store.codearts_account_record("").expect("账号应当可读")["id"].as_str().unwrap().to_string();
+
+        // 与 provider_loop 会话式分支同一动作：按整组名单逐个记账
+        // （reset_at = None → store 落 10 分钟兜底冷却，与无状态路径同一兜底）。
+        let group = benefit_cooldown_group(&catalog, "glm-5.3-flash");
+        for name in &group {
+            store.mark_rate_limited(&id, name, 403, None, None, "上游报告 InferHub.4291.200：insufficient quota");
+        }
+
+        let now = crate::server::logging::now_ms();
+        let limits = store.codearts_account_record("").unwrap()["rateLimits"].clone();
+        let limits = limits.as_object().expect("rateLimits 应当是对象");
+        // 别的福利模型名（本次没撞的那个）也必须有自己的冷却记录
+        for expected in ["deepseek-v4-flash-0731", "glm-5.3-flash", "deepseek-v4-pro-0813", "deepseek-v4.1-flash"] {
+            let entry = limits.get(expected).unwrap_or_else(|| panic!("缺整组键 {expected}：{:?}", limits.keys().collect::<Vec<_>>()));
+            let reset = entry["resetAt"].as_f64().unwrap_or(0.0);
+            assert!(reset > now as f64 && reset - now as f64 <= 11.0 * 60.0 * 1000.0,
+                    "{expected} 的 resetAt 应是 10 分钟兜底，实际 {reset}");
+        }
+        // 对照组：非福利模型键没有被整组波及 —— 冷却只盖福利池，不把整号打死
+        assert!(!limits.contains_key("GLM-5.2"), "非福利模型不该被整组标记");
     }
 }
