@@ -475,7 +475,7 @@ export async function checkinAll(): Promise<void> {
   if (getStore().checkinBusy) return
   const targets = checkinableAccounts(allAccounts())
   if (!targets.length) {
-    toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版 / 小浣熊 / AutoClaw / Qoder 中国版）', 'err')
+    toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版 / 小浣熊 / AutoClaw / Qoder 中国版 / Trae）', 'err')
     return
   }
   if (!(await shared().wbConfirm?.ask?.({
