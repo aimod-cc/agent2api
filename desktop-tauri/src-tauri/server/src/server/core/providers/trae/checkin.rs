@@ -185,9 +185,9 @@ impl Status {
         self.checked_in || self.did_checked_in
     }
 
-    /// 今日奖励合计（会员加成为独立字段，官方口径是两者相加）。
-    pub fn award(&self) -> i64 {
-        self.credits + self.extra_credits
+    /// 今日奖励的两个分量（合计口径见 `Award::total`）。
+    pub fn award(&self) -> Award {
+        Award { credits: self.credits, extra_credits: self.extra_credits }
     }
 }
 
@@ -245,9 +245,9 @@ pub enum Outcome {
     /// 上游没给这个账号开签到活动（中性，不算失败也不算成功）
     NotEnabled,
     /// 今天已经签过了（`already` 带的是当日奖励数额，可能为 0）
-    AlreadyCheckedIn(i64),
+    AlreadyCheckedIn(Award),
     /// 本次真领到了（回查已确认），参数为奖励数额
-    Claimed(i64),
+    Claimed(Award),
     /// 领取被拒（`code` 是上游业务码，9074 时文案要说明"多半是谱系/风控"）
     Rejected(i64, String),
     /// claim 回了 code:0 但同设备号回查没翻转 —— 服务端静默拒签，**不算成功**
@@ -339,11 +339,33 @@ async fn run(
     Ok(complete(decide(&before, claimed, after.as_ref()), &device_id))
 }
 
+/// 今日奖励的**两部分**（基础 + 加成）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Award {
+    pub credits: i64,
+    pub extra_credits: i64,
+}
+
+impl Award {
+    /// 参考实现给界面看的合计数（`scheduler.go:181-184` 就是两者相加）。
+    pub fn total(&self) -> i64 {
+        self.credits + self.extra_credits
+    }
+}
+
 /// 判定 → 界面与日志消费的 `{success, msg, ...}`。
 ///
 /// 设备号一并带回（`checkinDeviceId`）：这一轮用的哪个号，是唯一能把
 /// 「上游回了 9074」与「官方客户端同日替用户签了」这两件事在后端日志里
 /// 分开的线索（参考实现的面板结果里也有这一项）。
+///
+/// ⚠️ 数字口径：`credits`/`extra_credits` 是上游**报出的当日奖励数额**，
+/// 不是到账余额 —— 参考实现为此改过两版（`management.go:931`「仅作展示与
+/// '已签'判定」，`panel.html:808` 把"code:0 但余额未增长"单列成一种结果）。
+/// 2026-09-30 生产实测也是这个形状：一个 Free 的 SOLO 账号报 200（100+100），
+/// 积分池只长了 100（`total_amount` 1850→1950）。所以这里把两个分量原样透出，
+/// 文案说"官方报出的当日奖励"，把"实际到账看余额列"这件事留在界面上已经
+/// 存在的余额列里，不用一句会撒谎的成功文案替它背书。
 fn complete(outcome: Outcome, device_id: &str) -> Value {
     let mut row = serde_json::Map::new();
     let awarded = match outcome {
@@ -363,8 +385,8 @@ fn complete(outcome: Outcome, device_id: &str) -> Value {
             row.insert("alreadyCompleted".into(), json!(true));
             row.insert(
                 "msg".into(),
-                json!(if award > 0 {
-                    format!("今日已签到（当日奖励 {award} 积分）")
+                json!(if award.total() > 0 {
+                    format!("今日已签到（官方报出当日奖励 {} 积分）", award.total())
                 } else {
                     "今日已签到".to_string()
                 }),
@@ -375,8 +397,11 @@ fn complete(outcome: Outcome, device_id: &str) -> Value {
             row.insert("success".into(), json!(true));
             row.insert(
                 "msg".into(),
-                json!(if award > 0 {
-                    format!("签到成功，获得 {award} 积分")
+                json!(if award.total() > 0 {
+                    format!(
+                        "签到成功（官方报出当日奖励 {} 积分；到账看余额列）",
+                        award.total()
+                    )
                 } else {
                     // 回查确认了"今天签过"，但上游没给数额 —— 不编一个数字出来
                     "签到成功（上游未给出奖励数额）".to_string()
@@ -416,7 +441,9 @@ fn complete(outcome: Outcome, device_id: &str) -> Value {
         }
     };
     if let Some(award) = awarded {
-        row.insert("awarded".into(), json!(award));
+        row.insert("awarded".into(), json!(award.total()));
+        row.insert("checkinCredits".into(), json!(award.credits));
+        row.insert("checkinExtraCredits".into(), json!(award.extra_credits));
     }
     row.insert("checkinDeviceId".into(), json!(device_id));
     Value::Object(row)
@@ -594,7 +621,9 @@ mod tests {
         }));
         assert!(parsed.done_today());
         assert!(!parsed.did_checked_in);
-        assert_eq!(250, parsed.award(), "奖励 = 基础 + 会员加成");
+        assert_eq!(200, parsed.award().credits);
+        assert_eq!(50, parsed.award().extra_credits);
+        assert_eq!(250, parsed.award().total(), "合计 = 基础 + 会员加成（参考实现的同一算式）");
         assert_eq!("ok", parsed.message);
     }
 
@@ -603,7 +632,10 @@ mod tests {
         // 这个字段的意义就是"这个设备号今天签过了"——回查确认走的就是它。
         let status = status_of(&json!({"enable": true, "did_checked_in": true, "credits": 100}));
         assert!(status.done_today());
-        assert_eq!(Outcome::AlreadyCheckedIn(100), decide(&status, CODE_OK, None));
+        assert_eq!(
+            Outcome::AlreadyCheckedIn(Award { credits: 100, extra_credits: 0 }),
+            decide(&status, CODE_OK, None)
+        );
     }
 
     #[test]
@@ -638,8 +670,8 @@ mod tests {
     fn a_confirmed_claim_reports_the_award_and_marks_success() {
         let open = status_of(&json!({"enable": true}));
         let after = status_of(&json!({"enable": true, "checked_in": true, "credits": 300, "extra_credits": 100}));
-        assert_eq!(Outcome::Claimed(400), decide(&open, CODE_OK, Some(&after)));
-        let row = complete(Outcome::Claimed(400), "1111111111111111");
+        assert_eq!(Outcome::Claimed(Award { credits: 300, extra_credits: 100 }), decide(&open, CODE_OK, Some(&after)));
+        let row = complete(Outcome::Claimed(Award { credits: 300, extra_credits: 100 }), "1111111111111111");
         assert_eq!(Some(true), row["success"].as_bool());
         assert!(row["msg"].as_str().unwrap_or_default().contains("400"), "收益数字要进日志");
         assert_eq!(
@@ -652,7 +684,7 @@ mod tests {
     #[test]
     fn a_zero_award_claim_does_not_invent_a_number() {
         // 上游回查确认了签过、却没给数额时，宁可只说"成功"。
-        let row = complete(Outcome::Claimed(0), "2222222222222222");
+        let row = complete(Outcome::Claimed(Award { credits: 0, extra_credits: 0 }), "2222222222222222");
         assert_eq!(Some(true), row["success"].as_bool());
         let msg = row["msg"].as_str().unwrap_or_default();
         assert!(!msg.contains('0'), "文案里不该出现一个凭空的 0 积分：{msg}");
@@ -673,9 +705,37 @@ mod tests {
         // `billing::checkin::checkin_completed_today` 认 `alreadyCompleted` 或
         // msg 里的「已签到/已领取」——本家的文案必须满足其中一条，否则当日台账
         // 不落库，定时链第二天也会当成"没签过"再打一轮。
-        let row = complete(Outcome::AlreadyCheckedIn(120), "4444444444444444");
+        let row = complete(Outcome::AlreadyCheckedIn(Award { credits: 120, extra_credits: 0 }), "4444444444444444");
         assert_eq!(Some(true), row["alreadyCompleted"].as_bool());
         assert!(row["msg"].as_str().unwrap_or_default().contains("已签到"));
+    }
+
+    #[test]
+    fn the_success_wording_reports_the_official_figure_without_promising_a_balance() {
+        // 生产实测（2026-09-30，nas-2.9.0-10）：上游对一个 Free 的 SOLO 账号报
+        // 当日奖励 200（credits 100 + extra 100），而积分池只长了 100
+        // （`total_amount` 1850→1950、available 527→627）。参考实现自己就把这个
+        // 数当"仅作展示与已签判定"（`management.go:931`），并把"code:0 但余额
+        // 未增长"单列成一种结果（`panel.html:808`）。所以文案不许说"获得了 200
+        // 积分" —— 那是替上游的一个名义数做到账背书。
+        let row = complete(
+            Outcome::Claimed(Award { credits: 100, extra_credits: 100 }),
+            "5555555555555555",
+        );
+        let msg = row["msg"].as_str().unwrap_or_default();
+        assert!(msg.contains("官方报出"), "要标明这个数的出处：{msg}");
+        assert!(!msg.contains("获得"), "不许写成到账断言：{msg}");
+        assert_eq!(Some(100), row["checkinCredits"].as_i64(), "两个分量要各自可查");
+        assert_eq!(Some(100), row["checkinExtraCredits"].as_i64());
+        assert_eq!(Some(200), row["awarded"].as_i64(), "合计仍是别家用的那个口径");
+
+        // 已签那一格同一口径
+        let already = complete(
+            Outcome::AlreadyCheckedIn(Award { credits: 100, extra_credits: 100 }),
+            "6666666666666666",
+        );
+        let text = already["msg"].as_str().unwrap_or_default();
+        assert!(text.contains("官方报出") && !text.contains("获得"), "{text}");
     }
 
     #[test]
