@@ -37,7 +37,7 @@ import {
 } from '@ui'
 import { formatTime, shared, type AccountRecord, type UsageEntry } from './accounts-shared'
 import {
-  accountTags, activeLimits, checkedInToday, checkinDoneTitle,
+  accountTags, activeLimits, checkedInToday, checkinDoneTitle, isWorkBuddyInternational,
   displayNameOf, editionSuffix, formatResetText, identifierOf, isDesktopAccount, isEnabled,
   providerFeatures, providerOf, RESET_UNKNOWN, supportsCheckin, supportsClaim, supportsUsage,
   supportsWelfare, welfareDoneTitle, welfareStateOf, welfareTodoTitle,
@@ -508,6 +508,7 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
   const [usageBusy, setUsageBusy] = React.useState(false)
   const checkedIn = checkedInToday(account)
   const canCheckin = supportsCheckin(account)
+  const activeOnly = isWorkBuddyInternational(account)
   const canUsage = supportsUsage(account)
   const canClaim = supportsClaim(account)
   const canWelfare = supportsWelfare(account)
@@ -544,9 +545,11 @@ export function ActionsCell({ account, atFront }: { account: AccountRecord; atFr
           // 上一次失败的原因挂在这颗按钮的 title 上（toast 几秒就没了，
           // 而「为什么没签上」要能复看）—— 签到没有明细面板，见 accounts-data.ts
           <Button variant='outline' size='xs'
-            title={checkinFailed ? `上次签到失败：${checkinFailed}（点此重试）` : '为该账号签到'}
+            title={checkinFailed
+              ? `上次${activeOnly ? '日活任务' : '签到'}失败：${checkinFailed}（点此重试）`
+              : activeOnly ? '手动执行活跃保活，并尝试领取每日活跃奖励' : '为该账号签到'}
             onClick={() => void runCheckin(account.id)}>
-            签到
+            {activeOnly ? '领日活' : '签到'}
           </Button>
         )
       ) : null}

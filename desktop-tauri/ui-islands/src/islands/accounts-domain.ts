@@ -71,6 +71,7 @@ type ProviderFeatures = {
  * 用户才有「去配置」的入口。
  */
 const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
+  // 国内版领取签到奖励，国际版通过同一入口完成活跃保活并尝试领取日活奖励。
   workbuddy: { usage: true, checkin: true, edition: true, identifier: 'uid', expiry: 'expiresAt' },
   raccoon: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'tokenExpiresAt' },
   catpaw: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'tokenExpiresAt' },
@@ -246,19 +247,25 @@ export function accountEdition(account: AccountRecord | null | undefined): 'cn' 
 }
 
 /**
- * 该账号是否参与签到：所属家**有签到活动**，且不是国际版。
+ * 该账号是否参与签到目标集合。
  *
- * 版本限定对 WorkBuddy 与 Qoder 两家实际生效 —— 它们的签到活动只在国内站
- * （Qoder 国际版这个地区根本没有签到计划）。判断按「非 intl」写而不是逐个
- * provider 特判：另几家没有 edition 字段，accountEdition 会把缺省值归一成 cn，
- * 因此这个条件对它们是恒真的。
+ * WorkBuddy 国际版没有国内版的普通签到按钮，但参考客户端把它接到同一个
+ * 调度入口：探测/领取日活奖励后，再用免费模型完成一次活跃保活。因此它也要
+ * 进入目标集合；Qoder 国际版仍按「非 intl」排除。
  *
  * 与后端同源同口径：`billing::checkin::supports_checkin` 也是这条判据，
  * 两处任一改动都要同时改（批量签到的目标集合由后端算，前端这处只决定按钮）。
  */
 export function supportsCheckin(account: AccountRecord | null | undefined): boolean {
-  if (!providerFeatures(providerOf(account)).checkin) return false
+  const provider = providerOf(account)
+  if (!providerFeatures(provider).checkin) return false
+  if (provider === DEFAULT_PROVIDER_ID) return true
   return accountEdition(account) !== 'intl'
+}
+
+/** WorkBuddy 国际版执行的是日活保活任务，仍复用签到请求入口。 */
+export function isWorkBuddyInternational(account: AccountRecord | null | undefined): boolean {
+  return providerOf(account) === DEFAULT_PROVIDER_ID && accountEdition(account) === 'intl'
 }
 
 /**
@@ -378,7 +385,8 @@ export function checkedInToday(account: AccountRecord | null | undefined): boole
 }
 
 /**
- * 可参与签到的账号（一键签到只用这批：所属家有签到活动 + 非国际版）。
+ * 可参与签到/日活任务的账号（一键操作只用这批：所属家有签到活动，或是
+ * WorkBuddy 国际版的活跃保活任务）。
  *
  * **不看 `enabled`**：禁用只表示「别用它转发」，签到是另一件事 —— 一个被禁用的账号
  * 依然可以每天签到攒积分。此处与后端 `core::billing::checkin` 的批量路径过滤链

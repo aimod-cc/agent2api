@@ -883,7 +883,8 @@ pub async fn refresh_expiring_accounts(state: &ServerState) -> Response {
 ///
 /// 串行签到：避免多账号同时打上游触发 11128 风控。
 /// id 为空时签全部符合条件的账号，给了 id 则只签该账号；
-/// 返回 `{results, succeeded, total, skipped}`。
+/// 返回 `{results, succeeded, active, total, skipped}`；`active` 是 WorkBuddy 国际版
+/// 完成免费模型保活的数量，不等同于普通签到领取成功数。
 ///
 /// 执行体是 `core::billing::checkin::run_checkin` —— 与定时签到共用同一段逻辑
 /// （Node 版也是 `createAutoCheckin({ runCheckin: accountRoutes.runCheckin })`）。

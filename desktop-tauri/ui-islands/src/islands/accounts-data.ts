@@ -60,15 +60,15 @@ const usageMap = new Map<string, UsageEntry>()
 export const usageEntries = (): ReadonlyMap<string, UsageEntry> => usageMap
 
 /**
- * 上一次签到的**失败原因**（按账号 id）。
+ * 上一次签到/日活任务的**失败原因**（按账号 id）。
  *
  * 签到没有明细面板，结果只落在两处：成功/已领取由行上那颗按钮自己的状态表达
  * （`checkedInToday` → 「已签到」）＋ 一条 toast；失败则要留下可复看的原因 ——
  * toast 几秒后就没了，而「为什么没签上」正是需要复看的信息，所以记在这里，
  * 由按钮的 title 读出来（见 `checkinErrorOf`）。
  *
- * 成功与「今天已领取」都不进这张表：前者按钮会变「已签到」，后者是上游的正常状态，
- * 不该在按钮上挂一个「失败」提示。
+ * 成功、「今天已领取」和「活跃保活完成」都不进这张表：普通签到按钮会变「已签到」，
+ * 日活任务则由 toast 告知结果，不把活跃成功误报成失败。
  */
 const checkinErrors = new Map<string, string>()
 
@@ -377,8 +377,8 @@ export async function queryAllUsage(): Promise<void> {
 }
 
 /**
- * 签到。`id` 缺省 = 全部可签到账号串行签到；指定 id = 单账号签到。
- * 目标集合只用「有签到概念 + 国内版」的账号（后端同样只把国际版排除在外，
+ * 签到/日活任务。`id` 缺省 = 全部目标账号串行执行；指定 id = 单账号执行。
+ * 目标集合包含有签到活动的账号，以及 WorkBuddy 国际版的日活保活任务（后端同口径，
  * **不看启用状态**）。
  *
  * 只发请求、不动任何界面缓存：结果的呈现由调用方决定（行上按钮的状态 + toast，
@@ -388,6 +388,7 @@ export async function queryAllUsage(): Promise<void> {
 export async function checkinFor(id?: string | null): Promise<{
   results?: Array<Record<string, unknown>>
   succeeded?: number
+  active?: number
   total?: number
   skipped?: number
 } | null | undefined> {
@@ -395,14 +396,15 @@ export async function checkinFor(id?: string | null): Promise<{
 }
 
 /**
- * 一行签到结果的分类。三种结局互斥，判据只看 claim 的两个布尔：
+ * 一行签到结果的分类。四种结局互斥，普通签到看 claim，WorkBuddy 国际版还看 activity：
  *   - `ok`：本次真的领到了（`claim.success === true`）；
  *   - `already`：上游说今天已经领过了（`claim.alreadyCompleted === true`）——
  *     **不是失败**：一天里大部分时候点签到都是这个结果，报红会把正常状态说成故障；
+ *   - `active`：活跃保活成功（不伪造普通签到成功，也不落 `checkinAt`）；
  *   - `failed`：其余（`row.error` 后端分派层报的错、`claim.success === false` 且
- *     不是已领取、完全没返回结果），原因取 msg。
+ *     不是已领取、活跃保活也未成功、完全没返回结果），原因取 msg。
  */
-type CheckinOutcome = { kind: 'ok' | 'already' | 'failed'; reason: string }
+type CheckinOutcome = { kind: 'ok' | 'already' | 'active' | 'failed'; reason: string }
 
 function checkinOutcomeOf(row: Record<string, unknown> | undefined): CheckinOutcome {
   if (!row) return { kind: 'failed', reason: '未返回签到结果' }
@@ -411,6 +413,8 @@ function checkinOutcomeOf(row: Record<string, unknown> | undefined): CheckinOutc
   if (!claim) return { kind: 'failed', reason: '签到响应为空' }
   if (claim.success === true) return { kind: 'ok', reason: '' }
   if (claim.alreadyCompleted === true) return { kind: 'already', reason: '' }
+  const activity = row.activity as Record<string, unknown> | null | undefined
+  if (activity?.pokeSucceeded === true) return { kind: 'active', reason: '' }
   return { kind: 'failed', reason: String(claim.msg || '未领取') }
 }
 
@@ -422,7 +426,7 @@ export async function checkinAll(): Promise<void> {
   if (getStore().checkinBusy) return
   const targets = checkinableAccounts(allAccounts())
   if (!targets.length) {
-    toast('暂无可签到的账号（签到仅限 WorkBuddy 国内版 / 小浣熊 / AutoClaw / Qoder 中国版）', 'err')
+    toast('暂无可执行签到/日活任务的账号', 'err')
     return
   }
   if (!(await shared().wbConfirm?.ask?.({
@@ -438,6 +442,7 @@ export async function checkinAll(): Promise<void> {
     const byId = new Map(rows.map(row => [String(row?.id || ''), row]))
     let ok = 0
     let already = 0
+    let active = 0
     const failed: string[] = []
     for (const account of targets) {
       const outcome = checkinOutcomeOf(byId.get(account.id))
@@ -446,6 +451,9 @@ export async function checkinAll(): Promise<void> {
         checkinErrors.delete(account.id)
       } else if (outcome.kind === 'already') {
         already += 1
+        checkinErrors.delete(account.id)
+      } else if (outcome.kind === 'active') {
+        active += 1
         checkinErrors.delete(account.id)
       } else {
         failed.push(`${displayNameOf(account) || account.id}：${outcome.reason}`)
@@ -456,10 +464,11 @@ export async function checkinAll(): Promise<void> {
     // 失败详情：个数 + 第一条原因（各账号自己的原因记进按钮 title，可逐个悬停复看）
     const parts = [`成功领取 ${ok} 个`]
     if (already) parts.push(`今日已领取 ${already} 个`)
+    if (active) parts.push(`完成日活保活 ${active} 个`)
     if (failed.length) parts.push(`未领取 ${failed.length} 个（首个：${failed[0]}）`)
     const skipped = Number(data?.skipped) || 0
     toast(`签到完成：${parts.join('，')}`
-      + (skipped ? `；跳过 ${skipped} 个国际版 / 所属家无签到的账号` : ''), failed.length ? 'err' : 'ok')
+      + (skipped ? `；跳过 ${skipped} 个不支持签到/日活或不在范围内的账号` : ''), failed.length ? 'err' : 'ok')
     // 签到会改变余额读数（签到发的就是积分 / 权益）：静默再查一遍，余额列直接落到
     // 新读数（不 await、不播报，理由见 refreshUsageAfterCheckin）
     void refreshUsageAfterCheckin()
@@ -477,14 +486,16 @@ export async function checkinAll(): Promise<void> {
 }
 
 /**
- * 单个账号签到：请求 → toast 结果 → 重拉账号状态（`checkinAt` 由后端落盘）。
+ * 单个账号签到/日活任务：请求 → toast 结果 → 重拉账号状态（普通签到的 `checkinAt`
+ * 由后端落盘，活跃保活不会伪造该字段）。
  *
- * 三种结局各自的落点（见 `checkinOutcomeOf`）：
+ * 四种结局各自的落点（见 `checkinOutcomeOf`）：
  *   - 成功 → toast ✅，按钮随即变成「已签到」；
  *   - 今日已领取 → 中性 toast（正常状态，不是故障），按钮同样变「已签到」；
- *   - 未领取 → toast 原因 + 把它记进按钮 title（toast 会消失，原因要能复看）。
+ *   - 活跃保活完成 → toast ✅，但不把账号标成普通「已签到」；
+ *   - 未领取/未保活 → toast 原因 + 把它记进按钮 title（toast 会消失，原因要能复看）。
  *
- * 请求正常返回（三种结局都算）后顺带**静默查一次该账号的余额** —— 签到会改变余额
+ * 请求正常返回（四种结局都算）后顺带**静默查一次该账号的余额** —— 签到会改变余额
  * 读数，见 `refreshUsageAfterCheckin`。请求本身抛错时不查：那时后端多半不可达。
  */
 export async function runCheckin(id: string): Promise<void> {
@@ -499,7 +510,9 @@ export async function runCheckin(id: string): Promise<void> {
       toast(`签到失败：${label}：${outcome.reason}`, 'err')
     } else {
       checkinErrors.delete(id)
-      toast(outcome.kind === 'already' ? `${label}：今日已领取` : `✅ ${label} 签到成功`, 'ok')
+      toast(outcome.kind === 'already'
+        ? `${label}：今日已领取`
+        : outcome.kind === 'active' ? `✅ ${label} 日活保活完成` : `✅ ${label} 签到成功`, 'ok')
     }
     bump()
     // 签到会改变余额读数：此刻刷新余额（静默，见 refreshUsageAfterCheckin）。

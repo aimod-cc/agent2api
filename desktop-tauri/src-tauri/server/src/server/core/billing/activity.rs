@@ -38,7 +38,11 @@ impl BillingService {
         let result = match self
             .call_billing(
                 ACTIVITY_BANNER,
-                CallOptions { session: active.as_ref(), expect_code_ok: false, ..Default::default() },
+                CallOptions {
+                    session: active.as_ref(),
+                    expect_code_ok: false,
+                    ..Default::default()
+                },
             )
             .await
         {
@@ -89,7 +93,9 @@ impl BillingService {
         banner.insert(
             "active".to_string(),
             Value::Bool(
-                raw.get("activity_online_status").map(js_truthy).unwrap_or(false)
+                raw.get("activity_online_status")
+                    .map(js_truthy)
+                    .unwrap_or(false)
                     && raw.get("status").and_then(Value::as_str) == Some("None"),
             ),
         );
@@ -140,7 +146,11 @@ impl BillingService {
         let result = match self
             .call_billing(
                 ACTIVITY_AMBASSADOR,
-                CallOptions { session: active.as_ref(), expect_code_ok: false, ..Default::default() },
+                CallOptions {
+                    session: active.as_ref(),
+                    expect_code_ok: false,
+                    ..Default::default()
+                },
             )
             .await
         {
@@ -188,6 +198,26 @@ impl BillingService {
             Some(session) => session.clone(),
             None => self.require_session().await?,
         };
+
+        // WorkBuddy 国际版没有国内版的普通签到接口；组合入口沿用同一条活跃任务
+        // 链路，并把探测/领取/保活结果一起返回，避免重复打上游。
+        if crate::server::core::endpoints::resolve_edition(
+            active.get("edition").and_then(Value::as_str),
+        )
+        .id == "intl"
+        {
+            let activity = self.workbuddy_daily_activity(&active).await;
+            let usage = match self.query_credits_summary(Some(&active), locale).await {
+                Ok(value) => value,
+                Err(error) => json!({ "error": error.message }),
+            };
+            return Ok(json!({
+                "checkinStatus": activity.get("status").cloned().unwrap_or(Value::Null),
+                "claim": activity.get("claim").cloned().unwrap_or(Value::Null),
+                "activity": activity.get("activity").cloned().unwrap_or(Value::Null),
+                "usage": usage,
+            }));
+        }
         assert_checkin_supported(&active)?;
 
         // 查状态与领取：Node 并发，这里顺序（理由见上）。
@@ -199,7 +229,11 @@ impl BillingService {
             Err(error) => json!({ "success": false, "code": -1, "msg": error.message }),
         };
         // 额度可能因签到变化，稍等一下再查（对照 Node 的 sleep(500)）
-        if claim.get("success").and_then(Value::as_bool).unwrap_or(false) {
+        if claim
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         let usage = match self.query_credits_summary(Some(&active), locale).await {

@@ -91,6 +91,17 @@ pub(super) const BILLING_CHECKIN_STATUS: BillingSpec = BillingSpec {
     whitelist_headers: false,
 };
 
+/// WorkBuddy 国际版每日活跃探测端点。
+///
+/// 国际版客户端与国内版的路径不同：参考客户端调用的是不带 `/v2` 的
+/// `/billing/meter/checkin-activity-status`，领取端点仍沿用 `/v2` 路径。
+pub(super) const BILLING_ACTIVITY_CHECKIN_STATUS: BillingSpec = BillingSpec {
+    method: "POST",
+    path: "/billing/meter/checkin-activity-status",
+    body: empty_body,
+    whitelist_headers: false,
+};
+
 pub(super) const BILLING_DAILY_CHECKIN: BillingSpec = BillingSpec {
     method: "POST",
     path: "/v2/billing/meter/daily-checkin",
@@ -157,10 +168,17 @@ pub(super) fn build_headers(session: &Value, extra: &[(String, String)]) -> Vec<
     let mut headers: Vec<(String, String)> = vec![
         ("Accept".to_string(), "application/json".to_string()),
         ("Content-Type".to_string(), "application/json".to_string()),
-        ("Authorization".to_string(), format!("Bearer {access_token}")),
+        (
+            "Authorization".to_string(),
+            format!("Bearer {access_token}"),
+        ),
         (
             "X-User-Id".to_string(),
-            account.get("uid").and_then(Value::as_str).unwrap_or("").to_string(),
+            account
+                .get("uid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         ),
     ];
     // extra 在 Node 里是 `...extra` 插在 X-User-Id 之后的展开，
@@ -400,12 +418,23 @@ pub(super) fn normalize_checkin(data: &Value) -> Value {
     // 累计签到天数
     result.insert(
         "totalDays".to_string(),
-        int_of(&["total_days", "totalDays", "total_checkin_days", "accumulate_days"]),
+        int_of(&[
+            "total_days",
+            "totalDays",
+            "total_checkin_days",
+            "accumulate_days",
+        ]),
     );
     // 本次/今日可领积分
     result.insert(
         "points".to_string(),
-        int_of(&["points", "credit", "reward_points", "rewardPoints", "daily_points"]),
+        int_of(&[
+            "points",
+            "credit",
+            "reward_points",
+            "rewardPoints",
+            "daily_points",
+        ]),
     );
     // 活动周期 / 活动是否在线：同 checkedIn，取不到就不出键
     if let Some(value) = pick(&["start_time", "startTime"]) {
@@ -419,4 +448,22 @@ pub(super) fn normalize_checkin(data: &Value) -> Value {
     }
     result.insert("raw".to_string(), data.clone());
     Value::Object(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn international_activity_probe_uses_reference_path() {
+        assert_eq!(BILLING_ACTIVITY_CHECKIN_STATUS.method, "POST");
+        assert_eq!(
+            BILLING_ACTIVITY_CHECKIN_STATUS.path,
+            "/billing/meter/checkin-activity-status"
+        );
+        assert_eq!(
+            BILLING_DAILY_CHECKIN.path,
+            "/v2/billing/meter/daily-checkin"
+        );
+    }
 }
