@@ -318,17 +318,22 @@ pub async fn panel_login(
     // 「登录成功却被弹回登录页」的第一个分叉点 —— 标记头有没有穿过来、
     // 探针 cookie 在不在场，一眼定位是中转剥头还是剥 cookie。
     let probe_present = access::cookie_value(&headers, access::PROBE_COOKIE).is_some();
+    let session = access::IssuedSession::new_session();
+    // 指纹是这条日志的全部意义：下一个请求的「面板会话无效」行会打印它**收到的**
+    // access cookie 指纹，两行一比对就知道是"新 cookie 没存上"还是"存上了但
+    // 服务端不认"——只看 cookie 名单分不出这两种（它们都显示"带 access cookie"）。
     logging::log(
         "[Security]",
         &format!(
-            "✅ 面板登录成功（{}）令牌进响应体={} 标记={} 探针cookie={}",
+            "✅ 面板登录成功（{}）令牌进响应体={} 标记={} 探针cookie={} 本次会话指纹={}",
             addr.ip(),
             tokens_in_body(&headers, &query),
             marker_source(&headers, &query),
             if probe_present { "有" } else { "无" },
+            access::access_fingerprint(&session),
         ),
     );
-    issue_response(access::IssuedSession::new_session(), tokens_in_body(&headers, &query))
+    issue_response(session, tokens_in_body(&headers, &query))
 }
 
 /// `POST /api/panel/refresh` —— 用长效 refresh 轮换出新的双令牌。

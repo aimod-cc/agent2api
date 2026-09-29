@@ -563,6 +563,44 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     cookie_value_from_str(header, name)
 }
 
+/// `Cookie` 头里出现过的**名字**（排序去重，**只给名字、不取值**）。
+///
+/// 为什么要这份名单：面板「登录成功却被弹回」这类现场，只看得到「cookie 有 / 无」
+/// 是不够的 —— 中转入口（fnOS docker 管理页这类）常见的毛病是把多条 `Set-Cookie`
+/// 合并或只透传一条，于是浏览器带回来的往往是**探针** cookie 或**上一轮**的会话
+/// cookie：同样是"cookie=有"，但对不上这一把会话。名字列表能一次把三种情况分开
+/// （没送到 / 送到但不是这把 / 两条都在却各自过期），值本身是凭据，进日志等于把
+/// 令牌抄到磁盘上，所以这里刻意只出名字。
+pub fn cookie_names(headers: &HeaderMap) -> Vec<String> {
+    let Some(header) = headers.get(axum::http::header::COOKIE).and_then(|v| v.to_str().ok()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = header
+        .split(';')
+        .filter_map(|part| part.split('=').next().map(str::trim))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// 令牌的**短指纹**（sha256 前 8 位十六进制）—— 只为把两行日志对上，不还原令牌。
+///
+/// 日志里绝不能出现令牌本身（那等于把凭据抄进 SQLite 与备份文件）。但排查
+/// 「登录明明成功、下一个请求却仍被判无效」时必须能回答一个问题：带回的那把
+/// access cookie 是**这次发的**还是**上一轮残留的** —— 两者在"cookie=有"里
+/// 长得一模一样。8 位十六进制（4×10⁸ 空间）足以区分同机先后两把，又不足以反推。
+pub fn token_fingerprint(value: &str) -> String {
+    sha256_hex(value).chars().take(8).collect()
+}
+
+/// 本次登录下发的 access 令牌指纹（登录日志与后续请求日志对得上用）。
+pub fn access_fingerprint(session: &IssuedSession) -> String {
+    token_fingerprint(&session.access_token)
+}
+
 fn cookie_value_from_str(header: &str, name: &str) -> Option<String> {
     header.split(';').find_map(|part| {
         let part = part.trim();

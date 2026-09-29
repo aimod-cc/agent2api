@@ -648,20 +648,32 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
         // 页」时这一行是唯一现场：两路凭证（cookie / 请求头）各自看到了什么，
         // 一眼定位是令牌没送到还是没存上。登录页每次加载的 /api/session 探测
         // 也会命中这一行（预期内的 401），属正常噪声。
-        let seen_cookie = crate::server::access::cookie_value(
-            request.headers(),
-            crate::server::access::ACCESS_COOKIE,
-        )
-        .is_some();
-        let seen_header = request.headers().contains_key("x-panel-token")
-            || request.headers().contains_key(axum::http::header::AUTHORIZATION);
+        // 除了「本家那把在不在」，还要看**这一趟到底带回来了哪几把 cookie**：
+        // 中转把多条 Set-Cookie 合并/丢一条时，浏览器回带的常常是探针或上一轮的
+        // 会话 —— "cookie=有"这三种情况在旧文案里长得一模一样，分不出"没送到"
+        // 与"送到但不是这把"。只列名字，值不写（见 `access::cookie_names`）。
+        let names = crate::server::access::cookie_names(request.headers());
+        let seen_headers: Vec<&str> = ["x-panel-token", "x-panel-refresh", "authorization"]
+            .into_iter()
+            .filter(|name| request.headers().contains_key(*name))
+            .collect();
         logging::log(
             "[Security]",
             &format!(
-                "❌ 面板会话无效: {} {path}（cookie={} 凭证头={}）",
+                "❌ 面板会话无效: {} {path}（{} 带回来的 cookie={} 凭证头={}）",
                 request.method(),
-                if seen_cookie { "有" } else { "无" },
-                if seen_header { "有" } else { "无" },
+                match crate::server::access::cookie_value(
+                    request.headers(),
+                    crate::server::access::ACCESS_COOKIE,
+                ) {
+                    Some(value) => format!(
+                        "带 access cookie 指纹={}",
+                        crate::server::access::token_fingerprint(&value)
+                    ),
+                    None => "无 access cookie".to_string(),
+                },
+                if names.is_empty() { "无".to_string() } else { names.join("|") },
+                if seen_headers.is_empty() { "无".to_string() } else { seen_headers.join("+") },
             ),
         );
         return errors::panel_login_required_response();
