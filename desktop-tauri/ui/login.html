@@ -92,24 +92,35 @@
 
       // ── 会话传输探测：cookie 在本环境能不能往返 ─────────────────
       // fnOS docker 管理页这类宿主中转入口会把 Set-Cookie/Cookie 掐掉。
-      // 服务端种一枚 60 秒探针 cookie（GET /api/panel/cookie-probe 连打
-      // 两发，第二发能读到它 = roundtrip:true）。探测通过 → 纯 cookie
+      // 服务端种**两枚**探针 cookie（`/api/panel/cookie-probe` 连打
+      // 两发，第二发两枚都读得回 = roundtrip:true）。探测通过 → 纯 cookie
       // 会话：登录请求不带任何标记，响应体没有令牌（与直连旧行为一致，
       // JS 读不到任何令牌）；失败 → 登录请求带 x-panel-auth-mode: body，
       // 令牌才进响应体，存 localStorage 走头部回退。探测测的是本环境的
       // 真实传输，不猜代理行为 —— 哪天中转把 cookie 修好了会自动回归。
+      // 为什么必须是**两枚**：登录响应下发两条 Set-Cookie（access + refresh），
+      // 探针要和它同形才预测得了。单枚探针在那台中转上是**通过**的（值比对
+      // 对得上），登录却弹回 —— 它把两条拼成一条逗号分隔的，`Path=/` 因此
+      // 降级成一个名叫 `path` 的 cookie（回带名单里 path|domain|max-age|
+      // expires|session|version 那几项就是碎片），新会话没按 `/` 存进罐子。
       var headerMode = false;
       // 探针改**值比对**：cookie 按主机算、不分端口 —— 从 fnOS（:5666）中转
       // 进来时，浏览器会把直连 :3065 时存下的**旧探针**一起带上；只判「有没
       // 有」会被它骗成「通道完好」（实测弹回登录页）。所以第一发记住服务端
-      // 刚发的值，第二发用 ?expect= 让服务端比对 —— 旧探针的值对不上才算
-      // 不通。两发都用 POST：与登录同动词，防中转按方法区别对待 Set-Cookie。
+      // 刚发的值，第二发用 ?expect= / ?expect-b= 让服务端比对 —— 旧探针的值
+      // 对不上才算不通。两发都用 POST：与登录同动词，防中转按方法区别对待 Set-Cookie。
       var probeDone = fetch('/api/panel/cookie-probe?step=1', { method: 'POST', cache: 'no-store' })
         .then(function (resp) { return resp.json(); })
         .then(function (payload) {
-          var issued = payload && payload.data && payload.data.token;
-          if (!issued) return { roundtrip: false };
-          return fetch('/api/panel/cookie-probe?step=2&expect=' + encodeURIComponent(issued),
+          var data = payload && payload.data;
+          var issued = data && data.token;
+          var issuedB = data && data.tokenB;
+          // 少一枚就按不通处理：服务端只发两枚，缺一枚说明响应被动过（或页面
+          // 是旧版缓存），这种环境下不敢把会话全押在 cookie 上
+          if (!issued || !issuedB) return { roundtrip: false };
+          return fetch('/api/panel/cookie-probe?step=2'
+            + '&expect=' + encodeURIComponent(issued)
+            + '&expect-b=' + encodeURIComponent(issuedB),
             { method: 'POST', cache: 'no-store' }).then(function (resp) { return resp.json(); });
         })
         .then(function (payload) {

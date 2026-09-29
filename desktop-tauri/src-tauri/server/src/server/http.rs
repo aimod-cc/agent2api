@@ -657,20 +657,19 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
             .into_iter()
             .filter(|name| request.headers().contains_key(*name))
             .collect();
+        // 指纹按**候选顺序**逐个列（最多两把）：同名 cookie 重复上行 + 头里还躺着
+        // 旧令牌时，"哪一把被试过"就是这一行要回答的问题 —— 只打第一把会把
+        // 「cookie 短路」这种故障伪装成「什么都没带」。
+        let fingerprints = crate::server::access::access_fingerprints(request.headers());
         logging::log(
             "[Security]",
             &format!(
-                "❌ 面板会话无效: {} {path}（{} 带回来的 cookie={} 凭证头={}）",
+                "❌ 面板会话无效: {} {path}（试过的凭证指纹={} 带回来的 cookie={} 凭证头={}）",
                 request.method(),
-                match crate::server::access::cookie_value(
-                    request.headers(),
-                    crate::server::access::ACCESS_COOKIE,
-                ) {
-                    Some(value) => format!(
-                        "带 access cookie 指纹={}",
-                        crate::server::access::token_fingerprint(&value)
-                    ),
-                    None => "无 access cookie".to_string(),
+                if fingerprints.is_empty() {
+                    "无".to_string()
+                } else {
+                    fingerprints.join(",")
                 },
                 if names.is_empty() { "无".to_string() } else { names.join("|") },
                 if seen_headers.is_empty() { "无".to_string() } else { seen_headers.join("+") },
