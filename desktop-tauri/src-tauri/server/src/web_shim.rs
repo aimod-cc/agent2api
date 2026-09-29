@@ -27,8 +27,8 @@
 //!   · WorkBuddy / Qoder / Cline：设备授权轮询，网页端完全可用；
 //!   · AutoClaw（OAuth）：优先接收 loopback 回调，远程面板由网页端粘贴
 //!     最终回调地址兜底；CatPaw 由服务端 poll-token 兜底；
-//!   · 小浣熊 / Trae / Accio / CodeArts：回调地址可能落到浏览器自己的
-//!     loopback 或自定义协议，网页端自动提供“粘贴回调地址”兜底。
+//!   · 小浣熊：网页端把授权页切换到官方 `redirect` 分支，直接回到网关的
+//!     HTTP 回调；Trae / Accio / CodeArts：网页端自动提供“粘贴回调地址”兜底。
 //!
 //! ── 壳特有命令的降级 ────────────────────────────────────────
 //! 窗口主题、托盘、改端口、软件更新安装、桌面设置、文件对话框导入导出
@@ -160,11 +160,12 @@ pub fn shim_js() -> &'static str {
     if (overlay) overlay.remove();
   }
 
-  // 这些提供商的授权页会把浏览器导航到 loopback / 自定义协议地址。
+  // 这些提供商的授权页会把浏览器导航到 loopback 地址。
   // Docker 远程面板里该地址属于浏览器所在电脑，不能自动回到容器，
-  // 因此让用户把地址栏的最终 URL 粘回受保护接口。
+  // 因此让用户把地址栏的最终 URL 粘回受保护接口。小浣熊单独改用
+  // 官方授权页支持的 redirect 分支，直接把 authorization_code 导回网关。
   function needsManualCallback(provider) {
-    return provider === 'raccoon' || provider === 'trae'
+    return provider === 'trae'
       || provider === 'accio' || provider === 'accio-cn'
       || provider === 'codearts' || provider === 'autoclaw-intl';
   }
@@ -175,16 +176,36 @@ pub fn shim_js() -> &'static str {
       .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
+  // 官方小浣熊授权页在 login_source=desktop 时固定跳 office-raccoon://，
+  // 浏览器地址栏不会暴露授权码。该页面还支持 redirect 分支：去掉 desktop
+  // 标记后，它会把 authorization_code 追加到 redirect URL 并导航过去。
+  // 这里把回调地址放在当前面板 Origin，浏览器因此能直接访问 Docker 网关。
+  function buildRaccoonWebAuthUrl(provider, state, authUrl) {
+    if (provider !== 'raccoon') return authUrl;
+    var authorizeUrl;
+    try {
+      authorizeUrl = new URL(authUrl, window.location.href);
+    } catch (error) {
+      throw new Error('小浣熊授权地址无效，无法建立远程回调');
+    }
+    var callbackUrl = new URL('/api/session/login/raccoon-callback', window.location.origin);
+    callbackUrl.searchParams.set('state', state);
+    authorizeUrl.searchParams.set('login_source', 'web');
+    authorizeUrl.searchParams.set('redirect', callbackUrl.toString());
+    return authorizeUrl.toString();
+  }
+
   async function waitForManualCallback(provider, state, authUrl) {
     var label = provider === 'raccoon' ? '小浣熊'
       : provider === 'trae' ? 'Trae'
       : provider.indexOf('accio') === 0 ? 'Accio'
       : provider === 'codearts' ? 'CodeArts' : 'AutoClaw';
+    var callbackInstruction = '授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
+        + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。';
     while (true) {
       var callbackUrl = await ensureOverlay(
         label + '需要粘贴回调地址',
-        '<div style="margin-bottom:10px;">授权完成后，复制授权页浏览器地址栏中的<strong>完整地址</strong>，'
-        + '粘贴到下面提交。不要复制授权页原始地址，也不要改动参数。</div>'
+        '<div style="margin-bottom:10px;">' + callbackInstruction + '</div>'
         + '<div style="margin-bottom:10px;">如果授权页没有打开，请先点击：<a href="'
         + escapeHtml(authUrl) + '" target="_blank" rel="noopener" style="color:#7fa7ff;word-break:break-all;">'
         + escapeHtml(authUrl) + '</a></div>'
@@ -387,6 +408,7 @@ pub fn shim_js() -> &'static str {
       var started = await startRequest;
       var authUrl = started && started.authUrl;
       if (!authUrl) throw new Error('网关未返回授权地址');
+      authUrl = buildRaccoonWebAuthUrl(provider, started.state, authUrl);
       if (popup && !popup.closed) {
         popup.location.href = authUrl;
       } else {
@@ -574,7 +596,10 @@ pub fn shim_js() -> &'static str {
     },
     startAutoclawOauthLogin: function (state, authUrl, mode) {
       if (!state || !authUrl) return Promise.reject(new Error('缺少授权参数（state / authUrl）'));
-      return runLoginFlow('autoclaw-intl', Promise.resolve({ state: state, authUrl: authUrl }));
+      // AutoClaw OAuth 控制器与桌面 bridge 共用 `{ok, session}` 契约。
+      // 网页端轮询拿到的是原始 session，直接返回会被前端误判为取消。
+      return runLoginFlow('autoclaw-intl', Promise.resolve({ state: state, authUrl: authUrl }))
+        .then(function (session) { return { ok: true, session: session }; });
     },
     getAutoclawOauthCaptchaConfig: function (provider) {
       return call('POST', '/api/session/login/oauth/captcha-config',

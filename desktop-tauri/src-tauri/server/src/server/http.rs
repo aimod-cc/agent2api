@@ -107,6 +107,13 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/session/login/catpaw-callback",
             post(api::session::login_catpaw_callback),
         )
+        // 小浣熊远程网页登录回调：网页 shim 使用官方授权页的 redirect 分支，
+        // 浏览器把 authorization_code 以 GET 查询串带回当前面板。调用方是
+        // 上游授权页，不能携带管理 API Key，因此由一次性任务 state 保护。
+        .route(
+            "/api/session/login/raccoon-callback",
+            get(api::session::login_raccoon_callback),
+        )
         // AutoClaw OAuth（国际版）的 loopback 回调：**浏览器 302 到这里**
         // （授权页完成后顶层导航到我们交给上游的 navigate_uri，见
         // `providers::autoclaw::oauth`），所以同样必须免鉴权 —— 调用方是用户的

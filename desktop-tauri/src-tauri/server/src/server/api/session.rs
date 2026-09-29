@@ -5,6 +5,7 @@
 //!   GET    /api/session/login/wait      轮询登录结果 ?state=
 //!   POST   /api/session/login/cancel    取消登录（关弹窗/用户放弃）
 //!   POST   /api/session/login/callback  提交网页登录回调（壳侧捕获或远程面板粘贴）
+//!   GET    /api/session/login/raccoon-callback  小浣熊远程 redirect 回调
 //!   POST   /api/session/refresh         刷新当前账号 token
 //!   POST   /api/session/logout          清除登录态（删掉当前账号）
 //!   POST   /auth/login                  同步登录（等完成才响应）
@@ -464,6 +465,65 @@ pub async fn login_callback(State(state): State<ServerState>, body: Bytes) -> Re
         }
         Err(error) => management_error(error.status_code, error.message),
     }
+}
+
+// ─── GET /api/session/login/raccoon-callback ───────────────
+
+/// 小浣熊远程网页登录回调。
+///
+/// 官方 `/code/authorize` 页面在 `login_source=desktop` 时会把授权码交给
+/// `office-raccoon://` 自定义协议，Docker 浏览器无法把这个协议交回容器。
+/// 网页 shim 改用官方页面的 `redirect` 分支后，授权页会把
+/// `authorization_code` 追加到这个 HTTP 地址并导航回来。这里把它还原成
+/// 后端已有的标准 `office-raccoon://auth/callback` 形态，继续复用 state 校验、
+/// 一次性换码和账号落盘逻辑。
+///
+/// 该路由必须免鉴权：调用方是授权页，不会携带面板 API Key；安全性由本次
+/// 登录任务生成的不可预测 state 承担。
+pub async fn login_raccoon_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    let code = params
+        .get("authorization_code")
+        .or_else(|| params.get("code"))
+        .cloned()
+        .unwrap_or_default();
+    drop(params);
+    if task_state.trim().is_empty() || code.trim().is_empty() {
+        return oauth_callback_page(
+            400,
+            "登录失败：回调缺少 state 或授权码，请重新发起网页登录。",
+        );
+    }
+
+    let callback_url = raccoon_callback_url(&code, &task_state);
+    match state
+        .login()
+        .submit_login_callback(&task_state, &callback_url)
+        .await
+    {
+        Ok(crate::server::core::login::LoginCallbackSubmission::Completed(_)) => {
+            oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。")
+        }
+        Ok(crate::server::core::login::LoginCallbackSubmission::ContinueTo(_)) => {
+            oauth_callback_page(400, "登录回调仍需继续，请重新发起网页登录。")
+        }
+        Err(error) => {
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
+}
+
+fn raccoon_callback_url(code: &str, state: &str) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("code", code);
+    query.append_pair("state", state);
+    format!("office-raccoon://auth/callback?{}", query.finish())
 }
 
 // ─── POST /api/session/login/catpaw-callback ────────────────
