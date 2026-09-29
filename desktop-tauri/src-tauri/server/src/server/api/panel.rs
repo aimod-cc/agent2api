@@ -642,4 +642,74 @@ mod tokens_in_body_tests {
             .expect("探针响应体可读");
         serde_json::from_slice(&bytes).unwrap()
     }
+
+    /// 直连环境的**静默续期**不许把裸令牌吐进响应体（2026-09-29 复核时发现的
+    /// 一条既有缺陷）：`web_shim` 早先把 `?auth-mode=body` 写成无条件发送，于是
+    /// 每两小时一次续期都会让令牌变成 JS 可读、并被落进 localStorage ——
+    /// 「直连环境令牌只在 HttpOnly cookie 里」这条性质在一次续期之后就失效了。
+    /// 客户端改成只在本地存过令牌时才发标记；这一条钉住服务端那一半：
+    /// **没有标记 + 两枚探针都对得上 = cookie 模式 = 响应体里没有令牌**，
+    /// 而新令牌仍随两条 `Set-Cookie` 下发（会话照续）。
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_direct_session_refreshes_without_putting_tokens_in_the_body() {
+        let _serial = hold_probe_slot();
+        remember_issued_probe("direct-a", "direct-b");
+        let session = access::IssuedSession::new_session();
+        let cookie = format!(
+            "{PROBE}=direct-a; {SECOND}=direct-b; {}={}",
+            access::REFRESH_COOKIE,
+            session.refresh_token
+        );
+
+        let response = panel_refresh(
+            headers_with(&[("cookie", cookie.as_str())]),
+            Query(HashMap::new()),
+        )
+        .await;
+        assert!(response.status().is_success(), "cookie 模式的续期应成功");
+        let set_cookies: Vec<String> = response
+            .headers()
+            .get_all(SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_string))
+            .collect();
+        let payload = payload_of(response).await;
+        assert!(
+            payload["data"]["accessToken"].is_null(),
+            "直连续期的响应体不许带访问令牌，实得 {:?}",
+            payload["data"]
+        );
+        assert!(payload["data"]["refreshToken"].is_null());
+        assert_eq!(2, set_cookies.len(), "新令牌应改为随两条 Set-Cookie 下发");
+
+        // 对照：同一个（已轮换过的）链，客户端**带标记**时令牌必须进响应体 ——
+        // 少了这一格，上面的"没有令牌"就可能是「续期根本没发新令牌」
+        let rotated_refresh = set_cookies
+            .iter()
+            .filter_map(|value| value.split(';').next())
+            .find_map(|pair| pair.strip_prefix(&format!("{}=", access::REFRESH_COOKIE)))
+            .map(str::to_string)
+            .expect("Set-Cookie 里应有新的 refresh");
+        let marked = format!(
+            "{PROBE}=direct-a; {SECOND}=direct-b; {}={rotated_refresh}",
+            access::REFRESH_COOKIE
+        );
+        let response = panel_refresh(
+            headers_with(&[
+                ("cookie", marked.as_str()),
+                ("x-panel-auth-mode", "body"),
+            ]),
+            Query(HashMap::new()),
+        )
+        .await;
+        assert!(response.status().is_success());
+        let payload = payload_of(response).await;
+        assert!(
+            payload["data"]["accessToken"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "显式标记必须让令牌进响应体（中转环境的唯一通路）"
+        );
+    }
 }

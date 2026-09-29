@@ -245,21 +245,30 @@ pub fn shim_js() -> &'static str {
 
   // access 短效令牌过期后的静默续期。中转环境里 refresh cookie 到不了
   // 服务端，改为带 `x-panel-refresh` 头，并显式带 `x-panel-auth-mode: body`
-  // 要求新令牌进响应体（服务端只认这个标记，直连环境响应体与旧行为
-  // 逐字节一致）；响应体里的新令牌回写 PANEL_AUTH（轮换后旧 refresh 已
+  // 要求新令牌进响应体；响应体里的新令牌回写 PANEL_AUTH（轮换后旧 refresh 已
   // 作废，不回存下次必失败）。cookie 模式（本地没存过令牌，即不带
   // x-panel-refresh）下轮换随 Set-Cookie 完成，body 里没有令牌 ——
   // resp.ok 即续期成功，不能按失败处理。
+  //
+  // ⚠️ 标记**只在本地存过令牌时才发**（头与 query 两条通道一起，同一个条件）：
+  // 早先这里把 `?auth-mode=body` 写成了无条件，于是直连环境每两小时一次的静默
+  // 续期都会把裸令牌吐进响应体、并被 `storePanelAuth` 落进 localStorage ——
+  // 「直连环境令牌不 JS 可读」这条性质在一次续期之后就没了。服务端把标记当
+  // **显式覆盖**（见 `api::panel::tokens_in_body`），所以不发标记时它会自己按
+  // 探针 cookie 判：直连 → 仍走 cookie（响应体无令牌）；中转 → 探针判不通，
+  // 令牌照样进响应体。两侧行为都不比原来差，只有直连侧少暴露一份凭据。
   async function tryRefresh() {
     try {
       var headers = { 'Accept': 'application/json' };
       var refreshToken = storedPanelToken('refresh');
+      var url = '/api/panel/refresh';
       if (refreshToken) {
         headers['x-panel-refresh'] = refreshToken;
         headers['x-panel-auth-mode'] = 'body';
+        // 标记走两条通道（头 + query）：中转剥自定义请求头时 query 照常生效
+        url += '?auth-mode=body';
       }
-      // 标记走两条通道（头 + query）：中转剥自定义请求头时 query 照常生效
-      var resp = await fetch('/api/panel/refresh?auth-mode=body', { method: 'POST', headers: headers });
+      var resp = await fetch(url, { method: 'POST', headers: headers });
       if (!resp.ok) return false;
       var payload = await resp.json();
       var data = payload && payload.data;

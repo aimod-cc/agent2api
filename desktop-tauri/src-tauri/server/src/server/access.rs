@@ -647,15 +647,15 @@ fn revoke_access_of_session(session: &str) {
     table.retain(|_, (session_of, _)| session_of != session);
 }
 
-pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    cookie_values(headers, name).into_iter().next()
-}
-
 /// `Cookie` 头里某个名字的**全部**取值（按上行顺序）。
+///
+/// 这里**不提供**「只取第一条」的那个体态：本次事故（见 `access_candidates`）的
+/// 成因正是「同名 cookie 有两条上行时只看第一条」。留一个 `Option<String>` 版本
+/// 等于给下一个人留同一条错路 —— 要判存在性用 `.first()`，要判凭据就把全部
+/// 候选交给 `session_valid` / `rotate_session` 那一层。
 ///
 /// 同名两条是**实测会出现**的形态，不是理论：中转拼头、或同一主机不同端口/路径
 /// 各存了一份（cookie 按主机算不分端口，fnOS :5666 中转与 :3065 直连共用一份罐）。
-/// 只取第一条 = 判定结果取决于浏览器哪天先带哪条上行，"登录成功却被弹回"就是这么来的。
 pub fn cookie_values(headers: &HeaderMap, name: &str) -> Vec<String> {
     let Some(header) = headers.get(axum::http::header::COOKIE).and_then(|v| v.to_str().ok()) else {
         return Vec::new();
