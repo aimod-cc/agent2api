@@ -189,7 +189,13 @@ impl Credential {
         let mut fields = vec![
             ("accessToken", json_or_empty(&self.access_token)),
             ("refreshToken", json_or_empty(&self.refresh_token)),
-            ("expiresAt", Value::from(self.expires_at)),
+            // 落盘**统一成毫秒**。本家收到的值在秒与毫秒之间漂过：CPA 的 auth
+            // 文件与手工粘贴是秒（`expiresAt: 1791009732`），上游刷新响应是毫秒。
+            // 存进去是什么单位，决定了面板怎么读它 —— 有效期那一列与别家共用
+            // 同一套按毫秒的读法，存秒的结果是"1970 年到期"，账号一进面板就红着
+            // 显示「已过期」。读取侧本来就有 `expires_at_ms()` 归一（两种都认），
+            // 所以这里写毫秒不会把单位读反，只是让**落盘形状与别家一致**。
+            ("expiresAt", Value::from(self.expires_at_ms())),
             ("domain", json_or_empty(&self.domain)),
             ("apiHost", json_or_empty(&self.api_host)),
             ("machineId", json_or_empty(&self.machine_id)),
@@ -347,5 +353,27 @@ mod tests {
             Some(&Value::String("-----BEGIN PRIVATE KEY-----".into())),
             fields.iter().find(|(key, _)| *key == "devicePrivateKey").map(|(_, value)| value),
         );
+    }
+
+    /// 落盘的 `expiresAt` 必须是**毫秒**，不管进来的是秒还是毫秒。
+    ///
+    /// 这条锁的是面板那一列的读数：`1791009732`（秒）当毫秒读就是 1970-01-21，
+    /// 账号一进列表就红着显示「已过期」，而它的令牌其实还有几天。
+    #[test]
+    fn the_patch_writes_the_expiry_in_milliseconds_whatever_comes_in() {
+        let field = |credential: &Credential, want| {
+            credential
+                .patch_fields()
+                .into_iter()
+                .find(|(key, _)| *key == want)
+                .map(|(_, value)| value)
+                .unwrap()
+        };
+        let seconds = Credential { access_token: "a".into(), expires_at: 1_791_009_732, ..Default::default() };
+        let millis = Credential { access_token: "a".into(), expires_at: 1_791_009_732_000, ..Default::default() };
+        assert_eq!(Value::from(1_791_009_732_000i64), field(&seconds, "expiresAt"), "进来是秒也要写成毫秒");
+        assert_eq!(Value::from(1_791_009_732_000i64), field(&millis, "expiresAt"), "进来已经是毫秒就别动它");
+        // 没给到期时刻仍是 0（"未知"），不能被归一化捏成一个 1970 年的时间戳
+        assert_eq!(Value::from(0i64), field(&Credential::default(), "expiresAt"));
     }
 }
