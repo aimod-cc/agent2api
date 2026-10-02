@@ -242,6 +242,12 @@ impl AccountStore {
             // 所以这里没有 `is_trae_family` —— 将来接国际版时另立 kind、
             // 另开一个分支，不要往本家的记录上挂 `region` 字段。
             self.to_trae_public_account(record)
+        } else if record.provider() == super::orcarouter_accounts::ORCAROUTER_PROVIDER_ID {
+            // OrcaRouter 只有一家（不像 AutoClaw / Accio / ZCode 那样按地区拆）。
+            // 它的公开形态要如实透出「凭据来自哪条入口」（`source`）与
+            // 「这条凭据是不是已被上游拒绝」（`needsReauth`）—— 后者是用户
+            // 决定「去重连还是去查网络」的唯一判据。
+            self.to_orcarouter_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)
@@ -388,6 +394,88 @@ impl AccountStore {
         public.insert(
             "maxConcurrent".to_string(),
             Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
+        );
+        Value::Object(public)
+    }
+
+    /// OrcaRouter 账号的公开形态。
+    ///
+    /// ── 为什么不是自定义账号那一份形状 ────────────────────────────
+    /// 两者都有 `apiKey`，但语义不同：自定义账号的 `apiKey` 是用户填给**任意
+    /// 第三方上游**的，而这里的 Key 是 OrcaRouter 账号的凭据 —— 它隶属一个
+    /// 账号（`userId`）、有一个**实际授予的 scope**、还有一个「已被上游拒绝」
+    /// 的状态位。把这些塞进自定义形状会让界面分不清两家。
+    ///
+    /// ── 两条认证入口在界面上的可见表达 ────────────────────────────
+    ///   · `source`：`manual`（粘贴 Key）/ `oauth`（Connect with OrcaRouter）——
+    ///     账号卡片据此显示「凭据来源」，用户能看出这条记录是怎么来的；
+    ///   · `userId` / `scope`：PKCE 换回来的 Key 才带（手填路径为空），
+    ///     它们让用户确认「登的是哪个账号、授到哪一档范围」；
+    ///   · `needsReauth`：上游 401 后置位（见
+    ///     `account_store::orcarouter_accounts` 的模块头），界面据此把卡片
+    ///     标成「需要重新连接」而不是继续拿死凭据打上游；
+    ///   · `keyManagementUrl` / `authorizedAppsUrl`：控制台的密钥管理页与
+    ///     「已授权应用」页（一键吊销本应用签发的**全部** Key）。
+    ///
+    /// **绝不透出 `apiKey`**：公开形态里只有 `tokenTail`（尾号）。
+    /// `hasCredentials` / `chatSupported` / `checkinAt` 由 [`Self::public_account`]
+    /// 统一注入（跨家事实）。
+    pub(crate) fn to_orcarouter_public_account(&self, record: &StoredAccount) -> Value {
+        let fields = record.fields();
+        let mut public = Map::new();
+        public.insert("id".to_string(), Value::String(record.id().to_string()));
+        public.insert("provider".to_string(), Value::String(record.provider()));
+        public.insert("name".to_string(), Value::String(record.name()));
+        // Key 的尾号（与各家的 tokenTail 同一展示语义）
+        public.insert(
+            "tokenTail".to_string(),
+            value_or(fields.get("tokenTail"), Value::String(String::new())),
+        );
+        public.insert("userId".to_string(), Value::String(record.user_id()));
+        public.insert(
+            "scope".to_string(),
+            value_or(fields.get("scope"), Value::String(String::new())),
+        );
+        // 凭据来源：缺键时回落到 `manual`（历史上只有手填那一条入口）
+        public.insert(
+            "source".to_string(),
+            Value::String(if record.source().is_empty() {
+                crate::server::core::providers::orcarouter::SOURCE_MANUAL.to_string()
+            } else {
+                record.source()
+            }),
+        );
+        public.insert(
+            "needsReauth".to_string(),
+            Value::Bool(record.needs_reauth()),
+        );
+        public.insert("priority".to_string(), Value::from(record.priority()));
+        public.insert("enabled".to_string(), Value::Bool(record.enabled()));
+        public.insert("addedAt".to_string(), Value::from(record.added_at()));
+        public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
+        public.insert("proxy".to_string(), describe_account_proxy(Some(&record.proxy())));
+        public.insert("available".to_string(), Value::Bool(true));
+        public.insert(
+            "maxConcurrent".to_string(),
+            Value::from(max_concurrent_public(fields.get("maxConcurrent"))),
+        );
+        // 推理基址与两个控制台入口：界面把它们显示成只读信息（换 origin 自建时
+        // 尤其重要 —— 用户要能看出请求到底发给谁），以及「去哪吊销」。
+        public.insert(
+            "apiBase".to_string(),
+            Value::String(crate::server::core::providers::orcarouter::api_base_label()),
+        );
+        public.insert(
+            "keyManagementUrl".to_string(),
+            Value::String(
+                crate::server::core::providers::orcarouter::KEY_MANAGEMENT_URL.to_string(),
+            ),
+        );
+        public.insert(
+            "authorizedAppsUrl".to_string(),
+            Value::String(
+                crate::server::core::providers::orcarouter::AUTHORIZED_APPS_URL.to_string(),
+            ),
         );
         Value::Object(public)
     }

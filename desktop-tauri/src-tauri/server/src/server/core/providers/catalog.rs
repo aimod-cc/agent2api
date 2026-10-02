@@ -119,6 +119,16 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::trae::models::remote_refreshed(),
             super::trae::models::last_refreshed_at(),
         ),
+        // OrcaRouter 的清单是 `GET {api}/models`（账号级：不同 Key 可见范围不同）。
+        // 「有远程来源」= 当前快照是 live 拉到的（`Source::Live`）；fallback
+        // （种子）如实报 false —— 界面的「来源」列显示成内置清单，与事实相符。
+        ProviderKind::OrcaRouter => {
+            let snapshot = super::orcarouter::catalog::snapshot();
+            (
+                snapshot.source == super::orcarouter::catalog::Source::Live,
+                snapshot.fetched_at,
+            )
+        }
     }
 }
 

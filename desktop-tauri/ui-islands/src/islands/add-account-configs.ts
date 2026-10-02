@@ -31,6 +31,15 @@ export type FieldSpec = {
    * 让后端再多一种形状 = 给所有家共用的路径加一个只有一家走到的分支。
    */
   jsonExpand?: boolean
+  /**
+   * 敏感字段：渲染成 `type="password"`（**只影响显示**，值照常提交）。
+   *
+   * 为什么要有这个开关而不是让各家自己传 `type`：字段的 DOM 属性在这里统一
+   * 生成（见 `ManualSection`），否则「哪一家哪个字段是密码」这件事会散到视图里；
+   * 而它同时是一条**可核验的界面事实** —— 自动化证据据此断言「密钥是被遮住的」，
+   * 而不是靠肉眼认。当前只有 OrcaRouter 的 `apiKey` 用它。
+   */
+  secret?: boolean
 }
 
 export type RegionOption = { value: string; label: string }
@@ -491,6 +500,54 @@ const TRAE: ProviderConfig = {
   ],
 }
 
+/**
+ * OrcaRouter（`orcarouter`）—— 一个 OpenAI 兼容的聚合网关：一个端点后面路由
+ * 多家提供方（模型 id 是 `vendor/model` 形态，原样转发）。
+ *
+ * ── 这一家在界面上是**唯一一家两种认证入口并列**的 provider ─────────
+ * 「手填 API Key」与「Connect with OrcaRouter（OAuth 2.0 + PKCE）」两条路
+ * 都在这里，且都指向同一个后端落账号入口（`add_orcarouter_account`）。
+ * 因此这里的 `fields` 与 `webLogin` 是**并列的两件事**，不是「二选一」——
+ * 用户有 Key 就粘，没有就点 Connect（规范要求两条入口都能独立使用）。
+ *
+ * 两条路最终换回的是同一件东西（一把属于用户账号的长期 API Key），
+ * 所以界面上的差别只有 `source` 字段（manual / oauth）与 PKCE 才带的
+ * userId / scope。前端的 `secret_masked` 判据就是下面 apiKey 那个
+ * `type: 'password'`（新加的 `secret` 字段）—— 密钥永不进草稿、也不进日志。
+ */
+const ORCAROUTER: ProviderConfig = {
+  provider: 'orcarouter',
+  label: 'OrcaRouter',
+  addButton: '添加 OrcaRouter 账号',
+  // 「Connect with OrcaRouter」：后端拼 PKCE 授权地址（S256），浏览器授权完成后
+  // 302 回本机 loopback 端口（`/auth/callback-orcarouter`），网关用一次性授权码换
+  // 长期 Key 并落账号。这与 Accio 那条链是同一种形态（同一条通用网页登录入口）。
+  webLogin: {
+    noteHtml: '在你的浏览器里打开 <b>OrcaRouter</b> 的授权页（<code>www.orcarouter.ai/auth</code>）'
+      + '并用 OrcaRouter 账号登录：授权完成后同意页会跳回<b>本机</b>的一个临时端口，'
+      + '网关用一次性授权码（PKCE S256）换取一把长期 API Key 并加入账号列表'
+      + '（授权码只在本机交给网关，界面不显示明文 Key）。'
+      + '<br>没有浏览器、或更习惯自己贴 Key 的话，用下面的「粘贴 API Key」——'
+      + '两条路等价，换回的都是同一把 Key。',
+    button: 'Connect with OrcaRouter',
+    hint: '浏览器打开授权页；完成后自动加入列表，取消即放弃等待',
+    busyText: '等待 OrcaRouter 授权完成…',
+  },
+  manualTitle: '粘贴 API Key',
+  // 两条入口并列展示：这一段是「有现成 Key 的用户」那条路，明确点出另一条
+  manualNoteHtml: '在 OrcaRouter 控制台的密钥管理页创建一把 API Key（形如 <code>sk-orca-…</code>）后粘贴到这里。'
+    + '没有现成的 Key、或想用账号授权直接换一把的话，用上方的 '
+    + '<b>Connect with OrcaRouter</b>（OAuth 2.0 + PKCE）。'
+    + '<br>密钥只在网关侧使用（模型目录与推理都由服务端持 Key 发请求），'
+    + '浏览器不会拿到明文；输入框按密码处理，账号列表里也只显示尾号。',
+  fields: [
+    { key: 'apiKey', label: 'API Key', secret: true, placeholder: 'sk-orca-…' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空则用 Key 尾号' },
+  ],
+  // OrcaRouter 是纯云端服务，没有桌面端登录态可读（与 Accio / ZCode 同一处境）
+  desktop: false,
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -512,6 +569,10 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   CODEARTS,
   // Trae 只有 SOLO 那一家（没有地区分叉，理由见 TRAE 上方那段）
   TRAE,
+  // OrcaRouter 排在末尾：它是**聚合网关**（一个端点后面是多家的模型），
+  // 与前面每一家「一个上游」的形态都不同，造型上也让分组层次自然
+  // —— 与后端注册表 PROVIDERS 的排列一致。
+  ORCAROUTER,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

@@ -31,6 +31,7 @@ mod accio;
 mod autoclaw;
 mod catpaw;
 pub mod codearts;
+mod orcarouter;
 mod qoder;
 mod trae;
 mod zcode;
@@ -306,6 +307,9 @@ impl LoginService {
             // CodeArts 那一轮的 PKCE verifier / DPoP 私钥在自己的待办表里，
             // 不清就要占到 5 分钟超时才还 —— 而用户取消后往往立刻重试。
             self.drop_codearts_pending(state);
+            // OrcaRouter 同理：PKCE 的 verifier 与 state 在自己的待办表里，
+            // 不清会占到 11 分钟 TTL 才还（用户取消后往往立刻重试）。
+            self.drop_orcarouter_pending(state);
             // Trae 这一家的待办表按 state 存，但取消语义是"这一轮不要了"：
             // 本家同时只有一轮，直接整体收摊（close 释放回调端口，正在等回调的
             // 后台任务随之退出）。不这么做就要把端口占到 5 分钟超时才还 ——

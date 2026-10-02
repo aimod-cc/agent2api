@@ -30,6 +30,13 @@
    *  期间任何「顺手取消」（关弹窗时）都必须让路 —— 否则会把一次
    *  刚成功的登录取消掉，界面上表现为「登录成功却提示已取消」。 */
   let flowSettling = false;
+  /** 递增的登录代次。异步响应（URL / 成功 / 失败）回来时先核对代次，
+   *  过期的响应不得改动界面或账号状态（见 pagehide 处理与 start()）。
+   *  一个过期响应必须同时让位于「更新的登录」与「pagehide 之后的复位」。 */
+  let generation = 0;
+  /** 页面是否已被 pagehide 作废（进 bfcache 前的同步复位标志）。
+   *  置位后所有在途响应都被判为过期；新一次 start() 会清掉它。 */
+  let pageInvalidated = false;
 
   const providerLabel = id => window.wbProviders?.labelOf?.(id) || id;
 
@@ -104,8 +111,13 @@
           button_.disabled = true;
           button_.innerHTML = `<span class="spinner"></span>${config.busyText || '等待网页登录…'}`;
         }
+        // 本轮登录的代次：pagehide 或下一次 start() 都会把它作废
+        pageInvalidated = false;
+        generation += 1;
+        const myGeneration = generation;
         try {
           const result = await config.start();
+          if (myGeneration !== generation || pageInvalidated) return;
           if (result?.canceled) {
             toast('已取消登录等待');
             return;
@@ -113,12 +125,16 @@
           flowSettling = true;
           await config.onSuccess(result);
         } catch (error) {
+          if (myGeneration !== generation || pageInvalidated) return;
           toast(`登录失败：${error.message}`, 'err');
         } finally {
           flowSettling = false;
           releaseBusy(); // 释放锁并补跑排队中的刷新（见 releaseBusy 注释）
-          // 以主进程状态为准复位按钮，避免这里与真实状态不一致
-          await syncShellState();
+          // 过期响应不得复位界面：pagehide / 新登录已经或即将接管它
+          if (myGeneration === generation) {
+            // 以主进程状态为准复位按钮，避免这里与真实状态不一致
+            await syncShellState();
+          }
         }
       },
       /** 取消等待（本家在等待时才发请求） */
@@ -169,15 +185,38 @@
     }
   }
 
+  /**
+   * 页面进 bfcache / 关闭前的**同步**复位。
+   *
+   * pagehide 可能发生在等待登录的过程中：浏览器把整页放进 bfcache，恢复时
+   * **不会重新挂载**组件，因此在途响应 finally 里的 `myGeneration === generation`
+   * 守卫会正确地拒绝改动状态 —— 结果就是按钮永久卡在忙碌态。这不是我们想要的
+   * 「正确」。这里必须同步：作废代次 → 立刻复位 busy/hint → 用 keepalive 尽力
+   * 通知服务端取消（拿不到 keepalive 支持也不影响界面已经复位）。
+   */
+  function handlePageHide() {
+    if (typeof window === 'undefined') return;
+    pageInvalidated = true;
+    generation += 1;
+    releaseBusy(); // 同步清掉弹窗级 busy 锁（并补跑排队中的刷新）
+    applyShellState(false, ''); // 同步复位所有控制器的按钮禁用态与 hint 文案
+    try {
+      // 不 await：页面正在卸载。keepalive 让取消请求在页面销毁后仍有机会送达。
+      window.workbuddyDesktop?.cancelLogin?.({ keepalive: true })?.catch?.(() => {});
+    } catch {
+      /* 卸载中取消失败无所谓：服务端 pending 会自行超时作废 */
+    }
+  }
+
   window.wbWebLogin = {
     create,
     refresh: syncShellState,
     isActive: () => loginActive,
     activeProvider: () => loginProvider,
-    /**
-     * 放弃等待中的登录。给定 provider 时只取消该家的流程，避免干扰其它提供商。
-     * 返回是否真的发了取消请求。
-     */
+    /** 暴露给自动化测试与宿主页面显式调用（见 handlePageHide） */
+    handlePageHide,
+    /** 放弃等待中的登录。给定 provider 时只取消该家的流程，避免干扰其它提供商。
+     *  返回是否真的发了取消请求。 */
     async cancelIfActive(provider) {
       if (!loginActive || flowSettling) return false;
       if (provider && loginProvider !== provider) return false;
@@ -186,6 +225,9 @@
       return canceled;
     },
   };
+
+  // 页面进 bfcache / 关闭：同步复位登录锁，不能只靠被代次守卫拦住的 finally
+  window.addEventListener?.('pagehide', handlePageHide);
 
   // 登录进行状态由主进程推送：等待结束（成功/失败/取消）后按钮自动复位
   window.workbuddyDesktop.onLoginState?.(payload =>

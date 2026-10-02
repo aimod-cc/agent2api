@@ -291,6 +291,10 @@ impl ServerState {
         // CodeArts 同理：授权地址由适配器拼（同步无参），而 portal 只认 `port`，
         // 所以端口要在发起登录之前就写在进程级常量里（见该模块 `set_loopback_port`）。
         crate::server::core::providers::codearts::oauth::set_loopback_port(port);
+        // OrcaRouter 同理：PKCE 授权地址里要拼本机回调地址，而
+        // `ProviderAdapter::build_login_url` 是同步无参的（见该模块
+        // `set_loopback_port`）。
+        crate::server::core::providers::orcarouter::login::set_loopback_port(port);
         let config_dir = config::config_dir();
         // 与 Node 版一致：verbose 由环境变量 AGENT2API_VERBOSE=1 打开
         // （旧名 WORKBUDDY_VERBOSE 仍可读，新名优先），

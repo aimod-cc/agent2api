@@ -929,6 +929,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
         ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
         ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
+        // OrcaRouter：无状态（一次 HTTP 请求 = 一次对话），OpenAI 兼容；
+        // 两种认证入口在账号层收敛，适配器只认账号记录里的 apiKey
+        // （见 `orcarouter::adapter` 的模块头）。
+        ProviderKind::OrcaRouter => &super::orcarouter::ORCAROUTER_ADAPTER,
     }
 }
 
@@ -990,6 +994,11 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 不在的话刷新循环根本不会问它，症状是"界面上点了刷新、日志里
         // 一句 trae 都没有"（与"刷了但没取到"是两种完全不同的故障）。
         ProviderKind::Trae,
+        // OrcaRouter 已接真身（两种认证入口 / 凭据 / 目录 / 转发），并且
+        // **真有**远程目录（`GET {api}/models`，`supports_model_refresh()` 为
+        // true，按账号可见范围返回），因此必须在本列表里参与目录刷新调度 ——
+        // 与 Trae 同一理由。
+        ProviderKind::OrcaRouter,
     ]
 }
 
@@ -1155,6 +1164,10 @@ pub fn restore_cached_catalogs() {
     for kind in implemented_kinds() {
         let _ = adapter_for(kind).list_models();
     }
+    // OrcaRouter 的目录不是「句柄首次访问时读缓存」的形态（它的快照槽由
+    // `catalog::restore_cached` 显式装载），所以在这里单独补一次 ——
+    // 位置必须在 `catalog_cache::install` 之后（否则缓存读不回来）。
+    super::orcarouter::catalog::restore_cached();
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();

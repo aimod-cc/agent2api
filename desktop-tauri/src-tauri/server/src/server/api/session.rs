@@ -945,6 +945,93 @@ pub async fn login_accio_callback(
     }
 }
 
+// ─── GET /auth/callback-orcarouter ──────────────────────────
+
+/// OrcaRouter 网页登录（OAuth 2.0 + PKCE S256）的回调。
+///
+/// ── 为什么免鉴权（挂 public 组）──────────────────────────────
+/// 调用方是**用户的浏览器**（同意页完成后顶层导航到我们交给它的 `callback_url`），
+/// 它当然没有我们的 API Key。与 Accio / CatPaw / AutoClaw / CodeArts 几条
+/// loopback 回调同一取舍。
+///
+/// ── 路径是我们自己定的 ──────────────────────────────────────
+/// OrcaRouter 的 `callback_url` 由**发起方**随授权请求带上（同意页只负责把
+/// `?code=…&state=…` 拼回来），因此这里用 `callback-orcarouter` 这个别家不会
+/// 撞的名字 —— 与 Accio 的 `callback-accio` 同一做法。规范里 Flow B（out-of-band）
+/// 那条路的收尾由 `adapter::exchange_login_code` 直接接裸 code，同样落在这个
+/// pending 表上，不另开路由。
+///
+/// ── 任务关联 ────────────────────────────────────────────────
+/// `state` 是我们生成的那个（拼在授权 URL 里），同意页原样带回，因此直接按它
+/// 查任务表即可。state 的常量时间比对与 verifier 的取用都在
+/// `LoginService::finish_orcarouter_login` 里（见该函数的说明）。
+///
+/// 响应是给人看的 HTML（浏览器停在这一页），不走 `ok_json` 那套信封。
+pub async fn login_orcarouter_callback(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let code = params.get("code").cloned().unwrap_or_default();
+    let task_state = params.get("state").cloned().unwrap_or_default();
+    if let Some(error) = params.get("error").filter(|value| !value.trim().is_empty()) {
+        // 拒绝也要清 pending：否则这一轮的 verifier 留在表里等 11 分钟超时，
+        // 而用户通常会立刻重试（与成功路径的清理口径一致）。
+        state.login().drop_orcarouter_pending(&task_state);
+        return oauth_callback_page(400, &format!("登录失败：授权被拒绝（{error}）"));
+    }
+    match state
+        .login()
+        .finish_orcarouter_login(&code, &task_state)
+        .await
+    {
+        Ok(_) => oauth_callback_page(200, "登录成功，已返回网关，可以关闭此页面。"),
+        Err(error) => {
+            // 这一轮已经作废：把 PKCE 的 pending 也丢掉，免得留在表里等超时
+            state.login().drop_orcarouter_pending(&task_state);
+            oauth_callback_page(error.status_code, &format!("登录失败：{}", error.message))
+        }
+    }
+}
+
+// ─── GET /api/providers/orcarouter/models ───────────────────
+
+/// OrcaRouter 的**模型下拉数据源**（`?kind=` / `?modality=` / `?accountId=`）。
+///
+/// ── 为什么必须有这条后端路由（而不是让前端直接打上游）──────────
+/// 目录是账号级的，拉它**必须带用户的 API Key**。浏览器（或任何前端进程）
+/// 绝不该持有那把 Key —— 一旦出现在前端，它就会进 localStorage、进 devtools
+/// 网络面板、进前端日志。因此目录在**服务端**拉取，前端只拿到最小模型元数据
+/// （id / name / 上下文 / 模态 / 思考档位），这条路由的响应里**没有任何凭据**
+/// （`secret_masked: true` 是给界面显示「密钥不会下发」用的）。
+///
+/// ── 能力过滤在服务端 ────────────────────────────────────────
+/// `kind` = `text` / `multimodal` / `embedding` / `image` / `video` / `rerank`，
+/// 多模态时再给 `modality`（`image` / `audio` / `video`）。过滤判据全部来自
+/// 目录元数据（`supported_endpoint_types` + `architecture.input_modalities`），
+/// **未声明能力的一律排除**（fail closed，见 `orcarouter::catalog` 的模块头）。
+///
+/// ── 失败不报 5xx ────────────────────────────────────────────
+/// live 拉取失败时返回 200 + `degraded: true` + 明确标注的已验证兜底清单
+/// （或空列表 + 原因）。界面据此显示「清单可能过期 / 请重试」，而不是让一个
+/// 网络抖动把下拉变成一片红。凭据缺失（还没加账号）同样走这条：`source:
+/// "unavailable"` + 可操作提示。
+pub async fn orcarouter_models(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let kind = params.get("kind").map(String::as_str).unwrap_or("text");
+    let modality = params.get("modality").map(String::as_str);
+    let account_id = params.get("accountId").map(String::as_str).unwrap_or("");
+    let payload = crate::server::core::providers::orcarouter::adapter::list_models_for(
+        state.store(),
+        account_id,
+        kind,
+        modality,
+    )
+    .await;
+    ok_json(payload)
+}
+
 // ─── /oauth/callback（CodeArts portal 的登录回调）─────────────
 
 /// CodeArts 网页登录的回调。**路径不是我们能定的**：portal 只认授权地址里给的

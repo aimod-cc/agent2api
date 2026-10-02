@@ -125,6 +125,15 @@ pub fn panel_router(state: ServerState) -> Router {
             "/auth/callback-accio",
             get(api::session::login_accio_callback),
         )
+        // OrcaRouter 网页登录（OAuth 2.0 + PKCE S256）的 loopback 回调：
+        // **浏览器 302 到这里**（同意页完成后顶层导航到我们交给它的
+        // `callback_url`，查询串带 code / state）。与 Accio 那条同一形态、
+        // 同一理由免鉴权；路径是我们自己定的（OrcaRouter 的 callback_url 由
+        // 发起方给，不必与官方客户端逐字同款），见处理函数的说明。
+        .route(
+            "/auth/callback-orcarouter",
+            get(api::session::login_orcarouter_callback),
+        )
         // CodeArts portal 的登录回调：**路径由上游定死**（它只认我们给的 port，
         // 拼成 `http://127.0.0.1:<port>/oauth/callback`），所以这条不能像上面几家
         // 那样挑一个别家撞不到的名字。GET 收查询串、POST 收表单里的 code。
@@ -351,6 +360,15 @@ pub fn panel_router(state: ServerState) -> Router {
         // 能力位覆盖（纠正对下游声明的那五个字段；只服务内置家，自定义家
         // 走 /api/custom-providers/models 的整表保存，见该 handler 的说明）
         .route("/api/models/capabilities", post(api::model_manage::set_capabilities))
+        // ── OrcaRouter 的模型下拉数据源（`?kind=&modality=&accountId=`）──
+        // 挂 protected：它**用账号的 API Key 真打一次上游目录**
+        // （`GET {api}/models?capability=…`），与 /api/models/refresh 同级敏感。
+        // 响应里**没有任何凭据**（只有最小模型元数据），Key 只活在服务端 ——
+        // 这正是这条路由存在的理由，见处理函数的说明。
+        .route(
+            "/api/providers/orcarouter/models",
+            get(api::session::orcarouter_models),
+        )
         // ── 自定义提供商（用户自建上游端点：存储 + 管理）──
         // 与 /api/models/manage 同级敏感：写配置（customProviders 键）且「新建」
         // 会顺带写账号库，挂 protected。账号侧不经这里 —— 客户端走
