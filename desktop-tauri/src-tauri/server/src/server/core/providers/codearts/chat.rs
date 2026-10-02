@@ -22,6 +22,7 @@
 use serde_json::{json, Value};
 
 use crate::server::core::egress;
+use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::errors::GatewayError;
 
 use super::credentials::Credential;
@@ -1109,5 +1110,324 @@ mod catalog_fixtures {
             std::fs::write(format!("{out}/benefit-gateway-config.json"), &body).unwrap();
             println!("benefit-gateway-config: HTTP {status}, {} bytes", body.len());
         }
+    }
+}
+
+
+/// 透传流上的 **usage 旁路嗅探**（只读，一个字节都不改）。
+///
+/// ── 为什么本家需要它 ─────────────────────────────────────
+/// CodeArts 的上游只有流式，且这一家是把 chunk **原样透传**给客户端的 —— 不经过
+/// `upstream::sse` 的折叠器，而那条 `report_usage` 旁路（流式路径唯一会写请求日志
+/// 用量的地方）只长在折叠器里。后果实测得很干脆：客户端拿得到
+/// `{"prompt_tokens":35,"completion_tokens":333,…}`，而 `requests` 表里
+/// `prompt_tokens` / `completion_tokens` **两列恒为 0**。用量报表、按模型的消耗
+/// 排名、成本读数全部读那张表 —— 于是这一家在报表里像一个从不烧额度的黑洞。
+///
+/// ── 三条成本约束 ────────────────────────────────────────
+///   · **不解析没有嫌疑的行**：先按 `usage` 这五个字节粗筛，一条长回答里的几百帧
+///     绝大多数连一次 JSON 解析都换不来；
+///   · **行缓冲有上限**（[`Self::MAX_LINE_BYTES`]）：超限就丢缓冲。usage 帧是
+///     几十字节量级，丢一个超长行最多漏记一次用量，而不设上限等于让上游的一帧
+///     决定我们的内存占用；
+///   · **绝不改写流**：本类型只消费副本，`push` 的返回值恒为 `()`（保留签名是为
+///     了将来真要改写时看得出这里刻意没做）。
+#[derive(Default)]
+pub struct UsageSniffer {
+    pending: Vec<u8>,
+}
+
+impl UsageSniffer {
+    const MAX_LINE_BYTES: usize = 64 * 1024;
+
+    /// 吃进一段透传字节，把其中完整行里带的 usage 报给 telemetry。
+    pub fn feed(&mut self, bytes: &[u8], telemetry: &RequestTelemetry) {
+        self.pending.extend_from_slice(bytes);
+        loop {
+            let Some(newline) = find_byte(&self.pending, b'\n') else {
+                break;
+            };
+            let line: Vec<u8> = self.pending.drain(..=newline).collect();
+            self.consume_line(&line, telemetry);
+        }
+        if self.pending.len() > Self::MAX_LINE_BYTES {
+            // 一行了无休止地长：丢掉缓冲（不是丢流 —— 流是旁路看的，照旧原样透传）
+            self.pending.clear();
+        }
+    }
+
+    /// 流结束时把最后一段（上游可能不给结尾换行）也看一遍。
+    pub fn finish(&mut self, telemetry: &RequestTelemetry) {
+        if !self.pending.is_empty() {
+            let rest = std::mem::take(&mut self.pending);
+            self.consume_line(&rest, telemetry);
+        }
+    }
+
+    fn consume_line(&self, line: &[u8], telemetry: &RequestTelemetry) {
+        let text = String::from_utf8_lossy(line);
+        let trimmed = text.trim_end_matches(['\r', '\n']);
+        let Some(payload) = trimmed.strip_prefix("data:") else {
+            return;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || !contains_needle(payload.as_bytes(), b"usage") {
+            return;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(payload) else {
+            return;
+        };
+        if let Some(usage) = chunk.get("usage").filter(|value| value.is_object()) {
+            telemetry.report_usage(usage);
+        }
+    }
+}
+
+/// 子串查找（手写而非引依赖：这里只找五个固定字节，`memchr` 那点收益不值得加一个 crate）。
+fn contains_needle(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn find_byte(haystack: &[u8], byte: u8) -> Option<usize> {
+    haystack.iter().position(|value| *value == byte)
+}
+
+#[cfg(test)]
+mod usage_sniffer {
+    //! 嗅探器的四条判据：报得到、跨块拼得上、超长不炸、非 usage 帧不误报。
+
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use crate::server::core::upstream::usage::RequestTelemetry;
+
+    use super::UsageSniffer;
+
+    fn frame(payload: &str) -> String {
+        format!("data: {payload}\n\n")
+    }
+
+    fn reported(telemetry: &RequestTelemetry) -> (i64, i64) {
+        let snapshot = telemetry.snapshot();
+        (snapshot.prompt_tokens, snapshot.completion_tokens)
+    }
+
+    #[test]
+    fn it_reports_a_usage_frame_while_leaving_the_bytes_alone() {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let mut sniffer = UsageSniffer::default();
+        sniffer.feed(
+            frame("{\"choices\":[{\"delta\":{\"content\":\"你\"}}]}").as_bytes(),
+            &telemetry,
+        );
+        sniffer.feed(
+            frame(
+                &json!({"usage": {"prompt_tokens": 35, "completion_tokens": 333, "total_tokens": 368}})
+                    .to_string(),
+            )
+            .as_bytes(),
+            &telemetry,
+        );
+        sniffer.finish(&telemetry);
+        assert_eq!((35, 333), reported(&telemetry), "用量要进请求日志的那两列");
+    }
+
+    #[test]
+    fn a_usage_frame_split_across_two_chunks_is_still_read() {
+        // 上游按 TCP 段吐字节，usage 帧完全可能被劈成两半 —— 只看单个 chunk 的
+        // 实现会在这里静默漏记，而那正是本类型存在的理由
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let mut sniffer = UsageSniffer::default();
+        let whole = frame("{\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}");
+        let head = &whole[..whole.len() - 6];
+        let tail = &whole[whole.len() - 6..];
+        sniffer.feed(head.as_bytes(), &telemetry);
+        assert_eq!((0, 0), reported(&telemetry), "半行还不该被当成一帧解析");
+        sniffer.feed(tail.as_bytes(), &telemetry);
+        sniffer.finish(&telemetry);
+        assert_eq!((7, 9), reported(&telemetry));
+    }
+
+    #[test]
+    fn an_oversized_line_drops_the_buffer_rather_than_growing_forever() {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let mut sniffer = UsageSniffer::default();
+        for _ in 0..80 {
+            sniffer.feed(&[b'x'; 4096], &telemetry);
+        }
+        assert!(
+            sniffer.pending.len() <= UsageSniffer::MAX_LINE_BYTES,
+            "缓冲必须有上限：{}",
+            sniffer.pending.len()
+        );
+        sniffer.finish(&telemetry);
+        assert_eq!((0, 0), reported(&telemetry), "一帧都没读出来也不该报错");
+    }
+
+    #[test]
+    fn frames_without_usage_are_not_parsed_as_one() {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        let mut sniffer = UsageSniffer::default();
+        // `usagex` 之类含前缀的键、以及正文里出现 usage 这个词的文本帧，都不算
+        sniffer.feed(
+            frame("{\"choices\":[{\"delta\":{\"content\":\"about usage today\"}}]}").as_bytes(),
+            &telemetry,
+        );
+        sniffer.feed(
+            frame("{\"usagex\":{\"prompt_tokens\":1}}").as_bytes(),
+            &telemetry,
+        );
+        sniffer.feed("not json at all\n\n".as_bytes(), &telemetry);
+        sniffer.finish(&telemetry);
+        assert_eq!(
+            (0, 0),
+            reported(&telemetry),
+            "误报会把整次请求的用量写成 0 以外的假数"
+        );
+    }
+}
+
+/// 「客户端额度撑不下思考」时的抬额度规则（阈值与形状照 `zcode::reasoning`，
+/// 那条通道上游自己就是这么做的，两处保持一致）。
+pub const SHORT_OUTPUT_TOKENS: i64 = 1024;
+pub const THINKING_RESERVE: i64 = 1024;
+
+/// 某些模型**一定先思考**，而思考与正文共用 `max_tokens` 这一个额度。
+///
+/// 实测（2026-10-02，同一句提示、同一个福利模型）：
+///
+/// | 客户端写法 | 结果 |
+/// |---|---|
+/// | `max_tokens:60` | 正文 **0 字**、reasoning 100 字、`finish=length`（用量 35/60） |
+/// | `max_tokens:1084` | 正文 102 字、reasoning 387 字、`finish=stop` |
+/// | 加 `thinking:{type:"disabled"}` | 正文 81 字、reasoning 0 —— 上游认这一格 |
+/// | 加 `reasoning_effort:"minimal"` / `thinking.budget:32` | **上游不理**，照样想满、正文空 |
+///
+/// 所以"让它少想点"这条路在上游不存在，而"关掉思考"会改变模型行为（同一个名字
+/// 在同一个客户端里两种表现）。抬上限是唯一既不动模型行为、又能让正文出来的救法。
+///
+/// 三条边界：
+///   · **只在客户端额度低于 [`SHORT_OUTPUT_TOKENS`] 时抬** —— 那种请求要的是短回答,
+///     思考模型给不出"又短又有正文"；给得起大额度（含没给）的客户端不关它的事；
+///   · 按该模型声明的 `max_output_tokens` **截顶**，`0`（未声明）时不截 ——
+///     与目录出口"不编一个数"同一口径；
+///   · 只可能把额度**变大**：截顶后仍不大于原值时原样不动（把客户端的 60 改成
+///     更小是替客户端做主，不在本函数的权限里）。
+///
+/// 两种写法都认（`max_tokens` / `max_completion_tokens`），改的是**客户端用了的那个键**，
+/// 不会替客户端新造一个键。返回 `Some((抬前, 抬后))` 让调用方有话可写。
+pub fn reserve_for_thinking(payload: &mut Value, max_output_tokens: i64) -> Option<(i64, i64)> {
+    let key = ["max_tokens", "max_completion_tokens"]
+        .into_iter()
+        .find(|name| payload.get(*name).and_then(Value::as_i64).is_some())?;
+    let client = payload.get(key).and_then(Value::as_i64)?;
+    if client <= 0 || client >= SHORT_OUTPUT_TOKENS {
+        return None;
+    }
+    let wanted = client.saturating_add(THINKING_RESERVE);
+    let next = if max_output_tokens > 0 {
+        wanted.min(max_output_tokens)
+    } else {
+        wanted
+    };
+    if next <= client {
+        return None;
+    }
+    payload
+        .as_object_mut()?
+        .insert(key.to_string(), Value::from(next));
+    Some((client, next))
+}
+
+#[cfg(test)]
+mod thinking_reserve {
+    //! 抬额度的三条边界：只在短额度动手、按模型上限截顶、永不把额度改小。
+
+    use serde_json::json;
+
+    use super::{reserve_for_thinking, SHORT_OUTPUT_TOKENS, THINKING_RESERVE};
+
+    fn max_of(payload: &serde_json::Value) -> i64 {
+        payload
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(-1)
+    }
+
+    #[test]
+    fn a_short_cap_is_raised_by_the_reserve() {
+        let mut payload = json!({"model": "m", "max_tokens": 60});
+        assert_eq!(
+            Some((60, 60 + THINKING_RESERVE)),
+            reserve_for_thinking(&mut payload, 384_000),
+            "实测形状：60 会被思考吃光，正文 0 字"
+        );
+        assert_eq!(
+            60 + THINKING_RESERVE,
+            max_of(&payload),
+            "抬的是「原值 + 预留」，不是阈值 + 预留"
+        );
+    }
+
+    #[test]
+    fn a_generous_cap_is_left_alone() {
+        // 客户端自己给得够（或压根没给）就不关本函数的事 —— 抬别人的大额度
+        // 只是把成本推高，救不了任何请求
+        for cap in [SHORT_OUTPUT_TOKENS, 4096] {
+            let mut payload = json!({"max_tokens": cap});
+            assert_eq!(None, reserve_for_thinking(&mut payload, 384_000));
+            assert_eq!(cap, max_of(&payload), "值不能被改");
+        }
+        let mut absent = json!({"model": "m"});
+        assert_eq!(None, reserve_for_thinking(&mut absent, 384_000));
+        assert!(
+            absent.get("max_tokens").is_none(),
+            "没给额度的请求不该被凭空造一个上限"
+        );
+    }
+
+    #[test]
+    fn the_model_declared_ceiling_caps_the_reserve() {
+        let mut payload = json!({"max_tokens": 60});
+        assert_eq!(
+            Some((60, 80)),
+            reserve_for_thinking(&mut payload, 80),
+            "按模型上限截顶"
+        );
+        assert_eq!(80, max_of(&payload));
+
+        // 上限比原额度还小：不动（把 60 改成 40 是替客户端做主）
+        let mut tight = json!({"max_tokens": 60});
+        assert_eq!(None, reserve_for_thinking(&mut tight, 40));
+        assert_eq!(60, max_of(&tight));
+
+        // 0 = 未声明：不截顶，也绝不编一个数出来
+        let mut unknown = json!({"max_tokens": 60});
+        assert_eq!(
+            Some((60, 60 + THINKING_RESERVE)),
+            reserve_for_thinking(&mut unknown, 0)
+        );
+    }
+
+    #[test]
+    fn the_newer_field_name_is_raised_in_place() {
+        // 生态里两种写法都在跑；改的是客户端用的那个键，不替它新造一个
+        let mut payload = json!({"max_completion_tokens": 100});
+        assert_eq!(
+            Some((100, 100 + THINKING_RESERVE)),
+            reserve_for_thinking(&mut payload, 384_000)
+        );
+        assert_eq!(
+            100 + THINKING_RESERVE,
+            payload["max_completion_tokens"].as_i64().unwrap_or(-1)
+        );
+        assert!(
+            payload.get("max_tokens").is_none(),
+            "不该同时存在两个额度键"
+        );
     }
 }
