@@ -194,11 +194,27 @@ export function identifierOf(account: AccountRecord | null | undefined): string 
   return String(account?.[key] || '')
 }
 
+/**
+ * 到期时刻**归一到毫秒**：库里落盘的单位在秒与毫秒之间漂过 —— CPA 的 auth 文件与
+ * 手工粘贴进来的是 10 位秒，别家与上游刷新响应都是 13 位毫秒。不归一的后果不是
+ * "少三位精度"而是整条账号被判死：`1791009732`（秒）当毫秒读是 1970-01-21，
+ * 有效期那一列直接显示「已过期」，而它的令牌其实还有几天。
+ *
+ * 1e11 这个分界与后端 `providers::trae::Credential::expires_at_ms` **同一个口径**
+ * （1e11 秒 ≈ 公元 5138 年，真正的毫秒时间戳不可能小于它），两处注释互相指着对方，
+ * 改数值时要一起改。0 与负数原样返回：那代表"记录里没给到期时刻"，不能捏成
+ * 一个 1970 年的时间戳。
+ */
+export function expiryMillis(value: unknown): number {
+  const raw = Number(value) || 0
+  if (raw <= 0) return 0
+  return raw < 1e11 ? raw * 1000 : raw
+}
+
 /** token 过期时间戳（毫秒，0 表示记录里没有这个字段） */
 export function tokenExpiryOf(account: AccountRecord | null | undefined): number {
   const key = providerFeatures(providerOf(account)).expiry
-  const value = Number(account?.[key])
-  return Number.isFinite(value) ? value : 0
+  return expiryMillis(account?.[key])
 }
 
 /** 该账号所属 provider 是否有余额概念（没有就不渲染余额按钮，也不参与批量查询） */

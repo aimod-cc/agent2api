@@ -56,8 +56,25 @@ const ACCOUNT_API_ORIGINS: [&str; 2] = ["https://api.trae.cn", "https://api.trae
 
 pub fn client_id_for(variant: &str) -> &'static str {
     match variant {
-        "solo" | "solo-intl" => "en1oxy7wnw8j9n",
-        _ => "ono9krqynydwx5",
+        "solo" | "solo-intl" => SOLO_CLIENT_ID,
+        _ => IDE_CLIENT_ID,
+    }
+}
+
+/// SOLO 那个 OAuth 应用的 ClientID（参考实现同值，`SOLO stable`）。
+pub const SOLO_CLIENT_ID: &str = "en1oxy7wnw8j9n";
+/// 非 SOLO（TRAE CN IDE / 国际版）那一个的 ClientID。
+pub const IDE_CLIENT_ID: &str = "ono9krqynydwx5";
+
+/// 同一张表里的"另一把"：续期时归属未知、或按 variant 推的那把被上游拒了，
+/// 备选就是它（本家只认这两把，见 `client_id_for`）。
+pub fn other_client_id(client_id: &str) -> Option<&'static str> {
+    match client_id {
+        SOLO_CLIENT_ID => Some(IDE_CLIENT_ID),
+        IDE_CLIENT_ID => Some(SOLO_CLIENT_ID),
+        // 来路不明的第三把（将来上游换了应用）不给候选 —— 猜一把没有依据的
+        // ClientID 只是多打一发，不如就让这一家失败得干净
+        _ => None,
     }
 }
 

@@ -80,6 +80,59 @@ pub fn refresh_body(client_id: &str, refresh_token: &str) -> Value {
     json!({"ClientID": client_id, "RefreshToken": refresh_token, "ClientSecret": "-", "UserID": ""})
 }
 
+/// 续期该试哪些 `ClientID`（顺序 = 候选，第一个被上游承认的就用它，并回写进凭据）。
+///
+/// ── 为什么不是一个而是两个 ──────────────────────────────────
+/// `variant` 表达的是**转发面**的谱系，`ClientID` 表达的是**这张 refreshToken
+/// 当初在哪个 OAuth 应用里 mint**，二者可以不一致，而续期只认后者。生产实测
+/// （2026-10-02，NAS 三条从 CPA 迁来的账号）：库里 `variant=solo`，CPA 盘上的
+/// `authClientId` 与当年 `ExchangeToken` 响应的 `Result.ClientID` 却都是
+/// **非 solo** 的 `ono9krqynydwx5` ⇒ 按 variant 推出来 `en1oxy7wnw8j9n` 去续期，
+/// 上游回 `400 {"Code":"10101","__Message.error":"refresh token is not matched
+/// to the client"}`，三条凭据从第一次进入续期窗口起就一直续不上。
+///
+/// 判据不是猜的：拿一枚**假**令牌打同一个端点，回的是
+/// `401 20101 "refresh token is invalid"`（换 ClientID、换 UserID 都一样），
+/// 与上面那条不同形 —— 所以「not matched to the client」说的是"这枚令牌存在，
+/// 但不属于你报的这个 client"，不是"令牌无效"的委婉说法。
+///
+/// 两个候选的成本上限很小：一次成功续期约两周才发生一次，而**失败不换发**
+/// （参考实现第一条规矩），多发一发不会把 refreshToken 用掉。
+pub fn refresh_client_ids(credential: &Credential) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let variant_id = super::oauth::client_id_for(credential.variant());
+    // 顺序 = 可信度：① 凭据里记着的归属（上游自己回显过的）②按 variant 推的
+    // ③ 本家已知表里的另一把（未知归属时的最后一搏，成功就把结果记回凭据）
+    let recorded = credential.auth_client_id.trim();
+    let mut candidates: Vec<&str> = Vec::new();
+    if !recorded.is_empty() {
+        candidates.push(recorded);
+    }
+    candidates.push(variant_id);
+    candidates.extend(super::oauth::other_client_id(variant_id));
+    for id in candidates {
+        let id = id.trim();
+        if !id.is_empty() && !ids.iter().any(|seen| seen == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// 从换证响应里读上游承认的那把 `ClientID`（`Result.ClientID`）。
+///
+/// 读不到给空串 —— 调用方据此**保留**原值，不许把已有字段抹成空。
+pub fn response_client_id(body: &str) -> String {
+    let Ok(parsed) = serde_json::from_str::<Value>(body) else {
+        return String::new();
+    };
+    ["Result", "result"]
+        .iter()
+        .find_map(|key| parsed.get(*key).and_then(Value::as_object))
+        .and_then(|object| first_string(object, &["ClientID", "clientId", "client_id"]))
+        .unwrap_or_default()
+}
+
 /// 解析换证响应。
 ///
 /// 上游把令牌放在 `Result` 里，且字段名有两套写法（`Token` / `token` 等），
@@ -118,6 +171,20 @@ fn first_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Optio
         .map(str::to_string)
 }
 
+/// 上游这次失败是不是在说「归属不对」。**只有**这种失败值得换一把 ClientID 再试。
+///
+/// 反面同样是实测出来的：一枚假令牌打这个端点回的是 `401 20101
+/// "refresh token is invalid"`，与归属无关 —— 那种情况下换 ClientID 只是白撞；
+/// 传输层失败（`Err`）也一样，跟参数无关。少这一格判据，一次续期就要多打
+/// 一到两发没有意义的请求。
+fn attribution_reject(status: u16, body: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let text = body.to_lowercase();
+    text.contains("10101") || text.contains("not matched to the client")
+}
+
 /// 打上游换新凭据（不含存储；调用方负责先落盘再继续）。
 ///
 /// 返回的是**新凭据**（原凭据的其余字段带过来），失败时原凭据不受影响。
@@ -136,30 +203,49 @@ pub async fn refresh_once(
     if !credential.can_refresh() {
         return Err(GatewayError::with_status(401, "Trae 凭据里没有 refreshToken，无法续期（请重新登录）"));
     }
-    let client_id = super::oauth::client_id_for(credential.variant());
-    let body = refresh_body(client_id, credential.refresh_token.trim());
     let headers = vec![("User-Agent", CLIENT_USER_AGENT.to_string())];
     let mut errors = Vec::new();
-    for url in urls {
-        match post_json(url, &body, &headers, Duration::from_secs(30), proxy).await {
-            Ok(reply) if reply.status >= 400 => {
-                errors.push(format!("{} => HTTP {} {}", url, reply.status, trim(&reply.body)));
-            }
-            Ok(reply) => match parse_refresh_response(&reply.body) {
-                Ok((access_token, refresh_token, expires_at_ms)) => {
-                    let mut next = credential.clone();
-                    next.access_token = access_token;
-                    // 上游没回新 refreshToken 时**保留旧的**：清空它等于让账号变成
-                    // "过期后不可恢复"，而参考实现也是这么兜的。
-                    if !refresh_token.is_empty() {
-                        next.refresh_token = refresh_token;
+    // 外层是 ClientID 候选、内层是 host 候选：归属不对时换归属，而不是换域名
+    for client_id in refresh_client_ids(credential) {
+        let body = refresh_body(&client_id, credential.refresh_token.trim());
+        let mut wrong_attribution = false;
+        for url in urls {
+            let outcome = post_json(url, &body, &headers, Duration::from_secs(30), proxy).await;
+            // 每条失败都要带上用的哪把 ClientID：今天的 10101 排查里，
+            // 日志只写了 host 与上游原文，"归属不对"这个原因看不出来
+            let label = format!("{url}（ClientID {client_id}）");
+            match outcome {
+                Ok(reply) if reply.status >= 400 => {
+                    if attribution_reject(reply.status, &reply.body) {
+                        wrong_attribution = true;
                     }
-                    next.expires_at = expires_at_ms;
-                    return Ok(next);
+                    errors.push(format!("{} => HTTP {} {}", label, reply.status, trim(&reply.body)));
                 }
-                Err(reason) => errors.push(format!("{} => {reason}", url)),
-            },
-            Err(error) => errors.push(format!("{} => {}", url, error.message)),
+                Ok(reply) => match parse_refresh_response(&reply.body) {
+                    Ok((access_token, refresh_token, expires_at_ms)) => {
+                        let mut next = credential.clone();
+                        next.access_token = access_token;
+                        // 上游没回新 refreshToken 时**保留旧的**：清空它等于让账号变成
+                        // "过期后不可恢复"，而参考实现也是这么兜的。
+                        if !refresh_token.is_empty() {
+                            next.refresh_token = refresh_token;
+                        }
+                        next.expires_at = expires_at_ms;
+                        // 把上游承认的那把归属记下来（响应里没有就沿用本次用的那把）：
+                        // 下一次续期直接一发命中，不再靠 variant 猜
+                        let acknowledged = response_client_id(&reply.body);
+                        next.auth_client_id = if acknowledged.is_empty() { client_id } else { acknowledged };
+                        return Ok(next);
+                    }
+                    Err(reason) => errors.push(format!("{label} => {reason}")),
+                },
+                Err(error) => errors.push(format!("{label} => {}", error.message)),
+            }
+        }
+        // 换下一把归属的唯一理由：上游明说"这枚令牌不属于你报的这个 client"。
+        // 401（凭据被拒 = 该重登）与传输层失败都不是这个问题，换参数再打只是白撞
+        if !wrong_attribution {
+            break;
         }
     }
     // 4xx 语义原样透出（"凭据被拒（该重登）"与"上游挂了（该重试）"不能长一样）：
@@ -360,6 +446,107 @@ mod tests {
         assert!(credential.can_refresh(), "这条测的是候选列表，不是凭据本身");
     }
 
+    /// 生产实测的形状：库里 `variant=solo`，可这张 refreshToken 当初是在
+    /// **非 solo** 的应用里 mint 的（CPA 文件里的 `authClientId`）。
+    /// 归属必须排在前面 —— 按 variant 推出来的那把是会被上游拒的。
+    #[test]
+    fn the_client_id_that_minted_the_token_is_tried_first() {
+        let credential = Credential {
+            variant: "solo".to_string(),
+            auth_client_id: "ono9krqynydwx5".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(vec!["ono9krqynydwx5".to_string(), "en1oxy7wnw8j9n".to_string()], refresh_client_ids(&credential));
+        // 正对照：改前这里只有 `client_id_for(variant)` 一把（solo 的
+        // en1oxy7wnw8j9n），迁来的凭据每次都拿它去续期 ⇒ 稳定 10101
+        assert_eq!("en1oxy7wnw8j9n", super::super::oauth::client_id_for("solo"));
+    }
+
+    /// 换归属的**唯一**触发条件：`400` + 归属原文。其余失败换了也没用，
+    /// 少这一格判据的话一次续期要多打 1–2 发没有意义的请求。
+    #[test]
+    fn only_the_attribution_rejection_is_worth_another_client_id() {
+        assert!(attribution_reject(400, r#"{"ResponseMetadata":{"Error":{"Code":"10101","Data":{"__Message.error":"refresh token is not matched to the client"}}}}"#));
+        assert!(attribution_reject(400, r#"{"ResponseMetadata":{"Error":{"Code":"10101"}}}"#));
+        // 假令牌那发实测是 401 20101 —— 换 ClientID 不会改变结果
+        assert!(!attribution_reject(401, r#"{"ResponseMetadata":{"Error":{"Code":"20101","Data":{"__Message.error":"refresh token is invalid"}}}}"#));
+        assert!(!attribution_reject(404, "404 page not found"));
+        assert!(!attribution_reject(400, ""));
+    }
+
+    /// 归属未知（老数据 / 手工粘贴没带）时：先按 variant 推的那把，再补已知表里
+    /// 的另一把。生产那三条就属于这一类 —— 迁移把 CPA 的 `authClientId` 丢了。
+    #[test]
+    fn an_unknown_attribution_tries_the_variant_id_then_the_known_other() {
+        let credential = Credential { variant: "solo".to_string(), ..Default::default() };
+        assert_eq!(
+            vec!["en1oxy7wnw8j9n".to_string(), "ono9krqynydwx5".to_string()],
+            refresh_client_ids(&credential),
+            "第一发必须是按 variant 推的，第二发才是备选"
+        );
+        // 归属恰好等于 variant 推出来的那把时，候选要去重（不能白打两次）
+        let same = Credential { variant: "solo".to_string(), auth_client_id: "en1oxy7wnw8j9n".into(), ..Default::default() };
+        assert_eq!(vec!["en1oxy7wnw8j9n".to_string(), "ono9krqynydwx5".to_string()], refresh_client_ids(&same));
+        // 候选上限是本家已知的那两把：认不来的第三把不配再多打一发
+        let unknown = Credential { variant: "solo".into(), auth_client_id: "zz-not-a-client".into(), ..Default::default() };
+        assert_eq!(
+            vec!["zz-not-a-client".to_string(), "en1oxy7wnw8j9n".to_string(), "ono9krqynydwx5".to_string()],
+            refresh_client_ids(&unknown),
+            "记着的那把优先，但仍不该凭空造第三把"
+        );
+    }
+
+    /// 上游回显的归属要能读回来（`Result.ClientID`），非 JSON / 缺键给空串。
+    #[test]
+    fn the_acknowledged_client_id_is_read_back_from_the_response() {
+        let real = r#"{"ResponseMetadata":{"Request":"ExchangeToken"},"Result":{"BoundDeviceID":"e4lw0jv93p6pq2","ClientID":"ono9krqynydwx5","DeviceBindStatus":"BOUND","Token":"t","RefreshToken":"r","TokenExpireAt":1791008748476}}"#;
+        assert_eq!("ono9krqynydwx5", response_client_id(real));
+        for body in ["not json", "{}", r#"{"Result":{}}"#, r#"{"Result":{"ClientID":""}}"#] {
+            assert!(response_client_id(body).is_empty(), "{body:?} 不该读出一个归属");
+        }
+    }
+
+    /// 端到端（进程内 mock，零上游消耗）：第一把归属被 10101 拒掉后，
+    /// 必须换第二把再打，并把上游承认的那把**记进凭据**。
+    /// 改前这条必红 —— 那时只发一把、只打一次，直接返回失败。
+    #[tokio::test]
+    async fn renewal_retries_with_the_other_client_id_and_keeps_the_winner() {
+        let rejected = r#"{"ResponseMetadata":{"Error":{"Code":"10101","Data":{"__Message.error":"refresh token is not matched to the client"}}}}"#.to_string();
+        let accepted = r#"{"Result":{"ClientID":"ono9krqynydwx5","Token":"NEW","RefreshToken":"NEW-R","TokenExpireAt":1791008748476}}"#.to_string();
+        let upstream = MockUpstream::spawn(vec![(400, rejected), (200, accepted)]).await;
+        // 库里什么归属都没记（迁来的老数据），variant=solo ⇒ 第一发只能是 solo 那把
+        let credential = Credential {
+            access_token: "OLD".into(),
+            refresh_token: "OLD-R".into(),
+            variant: "solo".into(),
+            ..Default::default()
+        };
+        let next = refresh_once(&credential, &upstream.urls(&[0]), None).await.expect("第二把归属该换发成功");
+        assert_eq!("NEW", next.access_token);
+        assert_eq!("ono9krqynydwx5", next.auth_client_id, "上游承认的那把必须落进凭据，下次不再猜");
+        assert_eq!(2, upstream.hits(), "换了归属才等于真重试");
+        let sent = upstream.client_ids();
+        assert_eq!(vec!["en1oxy7wnw8j9n".to_string(), "ono9krqynydwx5".to_string()], sent, "两发之间换的就是 ClientID 这一个变量");
+    }
+
+    /// 失败时不许留下任何猜测值：三次候选都没被承认 → 报错，且原凭据一个字段不动。
+    #[tokio::test]
+    async fn a_rejected_renewal_records_no_guessed_client_id() {
+        let rejected = r#"{"ResponseMetadata":{"Error":{"Code":"10101","Data":{"__Message.error":"refresh token is not matched to the client"}}}}"#.to_string();
+        let upstream = MockUpstream::spawn(vec![(400, rejected.clone()), (400, rejected)]).await;
+        let credential = Credential {
+            access_token: "OLD".into(),
+            refresh_token: "OLD-R".into(),
+            variant: "solo".into(),
+            auth_client_id: "ono9krqynydwx5".into(),
+            ..Default::default()
+        };
+        let error = refresh_once(&credential, &upstream.urls(&[0]), None).await.expect_err("两把都被拒就该失败");
+        assert!(error.message.contains("10101"), "上游原文要留在报错里：{}", error.message);
+        assert!(error.message.contains("ClientID ono9krqynydwx5"), "报错要看得出用的是哪把归属：{}", error.message);
+        assert_eq!("ono9krqynydwx5", credential.auth_client_id, "入参凭据不能被改写");
+    }
+
     /// 进程内 mock 上游：按脚本依次回状态码，脚本空了回 500。
     ///
     /// 状态机类逻辑（多 host 轮询、失败不改写、单飞合并）用真 HTTP 打自己
@@ -369,6 +556,8 @@ mod tests {
         pub base: String,
         script: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u16, String)>>>,
         hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// 每次请求的**原文**（用来验"重试真的换了 ClientID"，而不是只数了次数）
+        bodies: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl MockUpstream {
@@ -377,12 +566,19 @@ mod tests {
                 base: String::new(),
                 script: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(script))),
                 hits: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                bodies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             };
             let captured = subject.clone();
-            let app = axum::Router::new().route("/{*path}", axum::routing::post(move |_req: axum::extract::Request| {
+            let app = axum::Router::new().route("/{*path}", axum::routing::post(move |req: axum::extract::Request| {
                 let captured = captured.clone();
                 async move {
                     let hits = captured.hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // 先把请求体抄下来：状态机之外的"换了什么参数"只能这么看
+                    let text = axum::body::to_bytes(req.into_body(), 1 << 20)
+                        .await
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default();
+                    captured.bodies.lock().unwrap().push(text);
                     let (status, body) = match captured.script.lock().unwrap().pop_front() {
                         Some(entry) => entry,
                         None => (500, format!("unexpected call {hits}")),
@@ -397,7 +593,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("mock 监听");
             let address = listener.local_addr().expect("本地地址");
             tokio::spawn(async move { axum::serve(listener, app).await.ok(); });
-            Self { base: format!("http://{address}"), script: subject.script, hits: subject.hits }
+            Self { base: format!("http://{address}"), script: subject.script, hits: subject.hits, bodies: subject.bodies }
         }
 
         fn push(&self, status: u16, body: String) {
@@ -412,6 +608,22 @@ mod tests {
 
         fn hits(&self) -> usize {
             self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// 每次请求体里的 `ClientID`（按到达顺序）。
+        ///
+        /// 只数次数证明不了"换了参数"，必须把发出去的值取回来对。
+        fn client_ids(&self) -> Vec<String> {
+            let guard = self.bodies.lock().unwrap();
+            guard
+                .iter()
+                .map(|text| {
+                    serde_json::from_str::<Value>(text)
+                        .ok()
+                        .and_then(|value| value.get("ClientID").and_then(Value::as_str).map(str::to_string))
+                        .unwrap_or_default()
+                })
+                .collect()
         }
     }
 }

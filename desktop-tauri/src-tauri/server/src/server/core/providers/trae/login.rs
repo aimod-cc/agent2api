@@ -32,7 +32,7 @@ use super::oauth::{
     exchange_auth_code, request_login_guidance, verification_uri, Callback, LoginContext, DEFAULT_LOGIN_HOST,
 };
 use super::profile::{callback_identity, get_user_info, Identity};
-use super::refresh::{refresh_candidates, refresh_once};
+use super::refresh::{refresh_candidates, refresh_once, response_client_id};
 
 /// 登录落盘时写死的两个字段（参考实现 `selfCompleteCN` 同值）。
 ///
@@ -93,7 +93,7 @@ impl Session {
         // 回调带回的 loginHost 优先（它才是这次授权实际发生的站点），
         // 没有就退回发起时 guidance 的那一份。
         let login_host = if callback.login_host.is_empty() { self.login_host.clone() } else { callback.login_host.clone() };
-        let (access_token, refresh_token, expires_at) = if !callback.refresh_token.is_empty() {
+        let (access_token, refresh_token, expires_at, auth_client_id) = if !callback.refresh_token.is_empty() {
             self.exchange_via_refresh_token(&callback, proxy).await
         } else {
             self.exchange_via_auth_code(&callback, &login_host, proxy).await?
@@ -112,6 +112,8 @@ impl Session {
             variant: self.context.variant.clone(),
             device_public_key: self.context.device_public_pem.clone(),
             device_private_key: self.context.device_private_pem.clone(),
+            // 上游在这一次换证里承认的归属，落盘后就不再需要按 variant 猜
+            auth_client_id,
             ..Default::default()
         };
         // 身份是**读数**，不是门槛：GetUserInfo 挂了就用回调回显，两个都没有
@@ -130,7 +132,11 @@ impl Session {
     /// 续期也失败时**不报错**：把这条串既当 accessToken 又当 refreshToken 存下
     /// （参考实现同一条）。判成失败等于把一次已经花掉用户点击的授权丢掉，
     /// 而存下来最坏也只是第一次转发时 401。
-    async fn exchange_via_refresh_token(&self, callback: &Callback, proxy: Option<&ResolvedProxy>) -> (String, String, i64) {
+    async fn exchange_via_refresh_token(
+        &self,
+        callback: &Callback,
+        proxy: Option<&ResolvedProxy>,
+    ) -> (String, String, i64, String) {
         let seed = Credential {
             refresh_token: callback.refresh_token.clone(),
             api_host: DEFAULT_LOGIN_HOST.to_string(),
@@ -141,8 +147,10 @@ impl Session {
             ..Default::default()
         };
         match refresh_once(&seed, &refresh_candidates(&seed.api_host), proxy).await {
-            Ok(next) => (next.access_token, next.refresh_token, next.expires_at),
-            Err(_) => (seed.refresh_token.clone(), seed.refresh_token.clone(), 0),
+            // 第四个位置是上游承认的 ClientID：换证成功时 `refresh_once` 已经把它
+            // 归并进新凭据，这里原样带出去落盘（丢了它，下一次续期又要猜）
+            Ok(next) => (next.access_token, next.refresh_token, next.expires_at, next.auth_client_id),
+            Err(_) => (seed.refresh_token.clone(), seed.refresh_token.clone(), 0, String::new()),
         }
     }
 
@@ -152,11 +160,11 @@ impl Session {
         callback: &Callback,
         login_host: &str,
         proxy: Option<&ResolvedProxy>,
-    ) -> Result<(String, String, i64), GatewayError> {
+    ) -> Result<(String, String, i64, String), GatewayError> {
         let exchanged = exchange_auth_code(&self.context, &callback.auth_code, login_host, proxy).await?;
         // 只有 refreshToken 回来时用它当 accessToken（参考实现 `if accessToken == "" { = refreshToken }`）。
         let access_token = if exchanged.access_token.is_empty() { exchanged.refresh_token.clone() } else { exchanged.access_token };
-        Ok((access_token, exchanged.refresh_token, exchanged.expires_at_ms))
+        Ok((access_token, exchanged.refresh_token, exchanged.expires_at_ms, response_client_id(&exchanged.raw)))
     }
 }
 
@@ -291,10 +299,13 @@ mod tests {
         // **本机没人听的端口**，保证不碰真上游也必然走失败支。
         let session = session().await;
         let callback = Callback { refresh_token: "rt-just-granted".to_string(), ..Default::default() };
-        let (access, refresh, expires) = session.exchange_via_refresh_token(&callback, None).await;
+        let (access, refresh, expires, client_id) = session.exchange_via_refresh_token(&callback, None).await;
         assert_eq!("rt-just-granted", access, "续期失败时 accessToken 用种子串兜底");
         assert_eq!("rt-just-granted", refresh);
         assert_eq!(0, expires);
+        // 失败支不许凭空造一把归属：留空才会走"按 variant 推"的老路，
+        // 编一把出来等于把猜错的值写进凭据，之后每次续期都稳定用错的
+        assert!(client_id.is_empty(), "换证失败时不该记下任何 ClientID，实际 {client_id}");
     }
 
     #[tokio::test]
@@ -307,7 +318,7 @@ mod tests {
             refresh_token: "rt-wins".to_string(),
             ..Default::default()
         };
-        let (access, _, _) = session.exchange_via_refresh_token(&callback, None).await;
+        let (access, _, _, _) = session.exchange_via_refresh_token(&callback, None).await;
         assert_eq!("rt-wins", access, "有续期串时不该去动授权码");
     }
 }

@@ -720,11 +720,19 @@ pub async fn batch_accounts(state: &ServerState, body: &Bytes) -> Response {
 
 /// 刷新账号 token（**按账号所属 provider 分派**）。
 ///
-/// workbuddy 账号走既有的 `AuthService::refresh_account`；小浣熊与 AutoClaw 账号
-/// 各走自家适配器的 `refresh_access_token`；**CatPaw 账号没有可刷新的东西**
+/// workbuddy 账号走既有的 `AuthService::refresh_account`；小浣熊、AutoClaw、
+/// CodeArts、**Trae / ZCode**、Accio、Cline 账号各走自家适配器的
+/// `refresh_access_token`；**CatPaw 账号没有可刷新的东西**
 /// （§9.1：`X-Passport-Token` 过期只能在桌面端重新登录，没有 refreshToken），
 /// 因此这里明确报 400 并说明做法 —— 静默走 workbuddy 的刷新会拿 CatPaw 的凭证
 /// 去打腾讯的鉴权接口。
+///
+/// 漏登记的实际代价（两条都是生产抓到的）：CodeArts 漏的时候用户点「刷新 Token」
+/// 得到 `client key [] not found`；Trae 漏的时候得到
+/// `12153:refresh token failed:10000:token format error`（2026-10-02 15:47:57 实测）——
+/// 两条都长得像"这把凭据坏了"，其实是发错了家的端点。所以**加一家带 refreshToken
+/// 的提供商时，这张分派表必须一起加** —— 它在 `PROVIDERS` 与各 adapter 注册点之外，
+/// 编译器不会提醒，漏了只在用户点按钮时才暴露。
 ///
 /// 为什么不统一到一个抽象：四家的刷新协议毫无共同点，而「刷新」是**管理动作**、
 /// 不是转发链路上的 provider 契约（那条契约的 `refresh_access_token` 是转发时的
@@ -766,6 +774,19 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     // `auth/token/refresh 失败: client key [] not found`）。
     if state.store().codearts_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::CodeArts).await;
+    }
+    // Trae：一次性 refreshToken + 每次换发都轮换，必须走它自己的适配器
+    // （`ExchangeToken`）。**这条也不能省**：漏了就落到下面的 workbuddy 兜底，
+    // 用户点「刷新 Token」收到的是腾讯那侧的错 —— 生产实测（2026-10-02 15:47:57）
+    // 原文是 `auth/token/refresh 失败: 12153:refresh token failed:10000:token format
+    // error`，"token format error" 其实就是**把 Trae 的续期串发给了 workbuddy 的
+    // 鉴权端点**，与账号本身好不好没有任何关系。
+    if state.store().trae_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Trae).await;
+    }
+    // ZCode：同一条理由（它的续期是自家 OAuth 那套，不是 workbuddy 的链）
+    if state.store().zcode_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::Zcode).await;
     }
     // Accio（两个地区）：走适配器的强制刷新（`POST /api/auth/refresh_token`，
     // 结果按「比较再写」回写）。两个地区各查一次 —— 账号集合按 provider 隔离，

@@ -48,6 +48,21 @@ pub struct Credential {
     /// "重建时不许丢"的夹具测试）。这里同样只存不用，但必须存：
     /// 写回凭据时把它抹掉，就等于把这台设备的绑定关系弄断了。
     pub device_private_key: String,
+    /// 这张 refreshToken **当初是在哪个 OAuth 应用里 mint 的**（上游在
+    /// `ExchangeToken` 响应里回显 `Result.ClientID`，CPA 的 auth 文件里同名
+    /// 字段叫 `authClientId`）。
+    ///
+    /// ── 为什么它必须落盘，而不是按 variant 现推 ──────────────
+    /// `variant` 是**转发面**的谱系（本家只服务 SOLO 通道），`ClientID` 是
+    /// **凭据的归属**。两者可以不一致：生产实测（2026-10-02，NAS 三条从 CPA
+    /// 迁来的账号）库里 `variant=solo`，而 CPA 盘上的 `authClientId` 与当年
+    /// 换证响应的 `Result.ClientID` 都是非 solo 的 `ono9krqynydwx5`。按
+    /// variant 现推就会拿 solo 的 `en1oxy7wnw8j9n` 去续期，上游回
+    /// `400 10101 "refresh token is not matched to the client"` —— 三条账号
+    /// 从第一次进入续期窗口起就续不上（假令牌的对照回的是
+    /// `401 20101 "refresh token is invalid"`，两种失败不同形，见 `refresh`）。
+    /// 空串 = 不知道（老数据 / 手工粘贴没带），那时才回退到按 variant 推。
+    pub auth_client_id: String,
 }
 
 /// 国际版谱系（`intl` / `solo-intl`）。
@@ -159,6 +174,18 @@ impl Credential {
                 .map(|value| value as i64)
                 .unwrap_or(0)
         };
+        // OAuth 归属（哪把 ClientID mint 的这张 refreshToken）。四种写法都认：
+        // 本家与 CPA 落盘是 `authClientId`，上游响应回显是 `ClientID`，
+        // 手工粘贴可能给小写 `clientId`；嵌套 `auth{}` 与平铺 payload 两个位置都找。
+        let auth_client_id = [
+            text(auth, "authClientId"),
+            text(auth, "ClientID"),
+            text(auth, "clientId"),
+            text(payload, "authClientId"),
+        ]
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_default();
         let credential = Self {
             access_token: text(auth, "accessToken"),
             refresh_token: text(auth, "refreshToken"),
@@ -173,6 +200,7 @@ impl Credential {
             nickname: text_either(account, auth, "nickname"),
             device_public_key: text(auth, "devicePublicKey"),
             device_private_key: text(auth, "devicePrivateKey"),
+            auth_client_id,
         };
         if credential.access_token.trim().is_empty() && credential.refresh_token.trim().is_empty() {
             return Err("Trae 凭据里既没有 accessToken 也没有 refreshToken".to_string());
@@ -189,7 +217,13 @@ impl Credential {
         let mut fields = vec![
             ("accessToken", json_or_empty(&self.access_token)),
             ("refreshToken", json_or_empty(&self.refresh_token)),
-            ("expiresAt", Value::from(self.expires_at)),
+            // 落盘**统一成毫秒**。本家收到的值在秒与毫秒之间漂过：CPA 的 auth
+            // 文件与手工粘贴是秒（`expiresAt: 1791009732`），上游刷新响应是毫秒。
+            // 存进去是什么单位，决定了面板怎么读它 —— 有效期那一列与别家共用
+            // 同一套按毫秒的读法，存秒的结果是"1970 年到期"，账号一进面板就红着
+            // 显示「已过期」。读取侧本来就有 `expires_at_ms()` 归一（两种都认），
+            // 所以这里写毫秒不会把单位读反，只是让**落盘形状与别家一致**。
+            ("expiresAt", Value::from(self.expires_at_ms())),
             ("domain", json_or_empty(&self.domain)),
             ("apiHost", json_or_empty(&self.api_host)),
             ("machineId", json_or_empty(&self.machine_id)),
@@ -201,6 +235,11 @@ impl Credential {
         }
         if !self.device_private_key.is_empty() {
             fields.push(("devicePrivateKey", Value::String(self.device_private_key.clone())));
+        }
+        // 只在知道的时候写：空串落盘会把 CPA 那边迁来的 `authClientId` 抹掉，
+        // 而那个值一旦没了，续期就又只能按 variant 猜（猜错就是今天的 10101）
+        if !self.auth_client_id.is_empty() {
+            fields.push(("authClientId", Value::String(self.auth_client_id.clone())));
         }
         fields
     }
@@ -347,5 +386,56 @@ mod tests {
             Some(&Value::String("-----BEGIN PRIVATE KEY-----".into())),
             fields.iter().find(|(key, _)| *key == "devicePrivateKey").map(|(_, value)| value),
         );
+    }
+
+    /// OAuth 归属要能**读进来也能写回去**：今天这三条账号的病根就是迁移把它丢了
+    /// （CPA 的 auth 文件里有 `authClientId`，落进本家库里后没人读，于是续期只能
+    /// 按 variant 猜，猜出来的是 solo 那把、上游认的是 IDE 那把）。
+    #[test]
+    fn the_attribution_survives_the_payload_round_trip() {
+        let nested = serde_json::json!({
+            "type": "trae", "provider": "trae",
+            "auth": {"accessToken": "a", "refreshToken": "r", "variant": "solo", "authClientId": "ono9krqynydwx5"},
+            "account": {"uid": "731612159154631"},
+        });
+        let credential = Credential::from_payload(&nested).expect("嵌套形状该收得下");
+        assert_eq!("ono9krqynydwx5", credential.auth_client_id, "CPA 迁来的 authClientId 必须读得回来");
+        let fields = credential.patch_fields();
+        assert!(
+            fields.iter().any(|(key, value)| *key == "authClientId" && value == "ono9krqynydwx5"),
+            "写回里也得带上：{fields:?}"
+        );
+        // 上游响应里那把叫 `ClientID`，手工粘贴可能给小写 —— 都算同一个字段
+        for key in ["ClientID", "clientId"] {
+            let payload = serde_json::json!({"auth": {"accessToken": "a", "refreshToken": "r", key: "ono9krqynydwx5"}});
+            let parsed = Credential::from_payload(&payload).expect("两种写法都该认");
+            assert_eq!("ono9krqynydwx5", parsed.auth_client_id, "{key}");
+        }
+        // 不知道的时候**不写这一格**：把空串落盘会抹掉凭据里已有的归属，
+        // 下一次续期就又要从头猜（与 devicePrivateKey 同一规矩）
+        let bare = Credential { access_token: "a".into(), ..Default::default() }.patch_fields();
+        assert!(!bare.iter().any(|(key, _)| *key == "authClientId"), "{bare:?}");
+    }
+
+    /// 落盘的 `expiresAt` 必须是**毫秒**，不管进来的是秒还是毫秒。
+    ///
+    /// 这条锁的是面板那一列的读数：`1791009732`（秒）当毫秒读就是 1970-01-21，
+    /// 账号一进列表就红着显示「已过期」，而它的令牌其实还有几天。
+    #[test]
+    fn the_patch_writes_the_expiry_in_milliseconds_whatever_comes_in() {
+        let field = |credential: &Credential, want| {
+            credential
+                .patch_fields()
+                .into_iter()
+                .find(|(key, _)| *key == want)
+                .map(|(_, value)| value)
+                .unwrap()
+        };
+        let seconds = Credential { access_token: "a".into(), expires_at: 1_791_009_732, ..Default::default() };
+        let millis = Credential { access_token: "a".into(), expires_at: 1_791_009_732_000, ..Default::default() };
+        assert_eq!(Value::from(1_791_009_732_000i64), field(&seconds, "expiresAt"), "进来是秒也要写成毫秒");
+        assert_eq!(Value::from(1_791_009_732_000i64), field(&millis, "expiresAt"), "进来已经是毫秒就别动它");
+        // 没给到期时刻仍是 0（"未知"），不能被归一化捏成一个 1970 年的时间戳
+        assert_eq!(Value::from(0i64), field(&Credential::default(), "expiresAt"));
     }
 }
