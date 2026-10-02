@@ -51,7 +51,7 @@ OpenAI 客户端 / 任意 SDK
 从 Releases 下载安装包（NSIS，简体中文，默认装到 `C:\Program Files\Agent2API`，安装时需要管理员授权），安装后启动即可，**无需安装 Node 或任何其它运行时**。
 
 1. 首次启动即在应用进程内启动本机网关（端口 3065）并打开主窗口；若检测到旧版本的数据目录或数据文件，会弹窗提示迁移，按指引操作即可。
-2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline / Accio 国际版 / Accio 国内版 / CodeArts / Trae），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上；CodeArts 与 Trae 只有网页登录与粘贴凭证两种）。
+2. 点「账号」页的「添加账号」，选提供商（WorkBuddy / 小浣熊 / CatPaw / AutoClaw 国内版 / AutoClaw 国际版 / Qoder / Cline / Accio 国际版 / Accio 国内版 / CodeArts / Trae / OrcaRouter），再按该家支持的方式完成登录或填写凭证：网页登录、手机验证码、粘贴凭证，或导入本机桌面端登录态（导入不落 token，客户端重新登录后网关自动跟上；CodeArts 与 Trae 只有网页登录与粘贴凭证两种；OrcaRouter 支持直接粘贴 `sk-orca-…` API Key，或点「Connect with OrcaRouter」走 OAuth 2.0 + PKCE 授权换回同一把 Key）。
 3. 把 OpenAI 客户端的 `base_url` 填成 `http://127.0.0.1:3065/v1`，`api_key` 随便填（例如 `sk-local`，未启用鉴权时服务端不校验）。
 
 关闭窗口默认只是最小化到托盘，网关继续在后台转发；要彻底退出请在托盘图标上右键选「退出」。

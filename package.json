@@ -6,6 +6,9 @@
   "private": true,
   "scripts": {
     "build:icon": "node build/make-icon.mjs",
+    "test": "node --test desktop-tauri/ui/*.test.mjs",
+    "server:test": "bash scripts/rust-check.sh test --manifest-path desktop-tauri/src-tauri/server/Cargo.toml",
+    "server:build": "bash scripts/rust-check.sh build --manifest-path desktop-tauri/src-tauri/server/Cargo.toml",
     "tauri:install": "npm --prefix desktop-tauri install",
     "tauri:dev": "npm --prefix desktop-tauri run dev",
     "tauri:build": "npm --prefix desktop-tauri run build"

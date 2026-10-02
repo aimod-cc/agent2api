@@ -1,6 +1,15 @@
 # 依赖目录
 node_modules/
 
+# Python 测试缓存（scripts/orca_evidence 的证据检查）
+__pycache__/
+.pytest_cache/
+
+# OrcaRouter 界面证据（scripts/orca_evidence/test_orcarouter_gui.py 的产物）
+# 由验证流程在跑测试时现场生成，不入库：截图随 PR 正文以图片形式给出，
+# 仓库里只留生成脚本，免得每次跑测试都被判成「补丁改动了仓库」。
+orca-evidence/
+
 # Tauri 工程依赖与构建产物
 desktop-tauri/node_modules/
 desktop-tauri/src-tauri/target/

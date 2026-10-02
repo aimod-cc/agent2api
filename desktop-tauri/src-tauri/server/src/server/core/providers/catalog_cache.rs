@@ -87,6 +87,8 @@ pub const SCOPE_ACCIO_CN: &str = "accioCn";
 pub const SCOPE_CODEARTS: &str = "codearts";
 /// Trae SOLO（`/api/ide/v1/get_detail_param`）
 pub const SCOPE_TRAE: &str = "trae";
+/// OrcaRouter（`GET {api}/models`，账号级目录）
+pub const SCOPE_ORCAROUTER: &str = "orcarouter";
 
 /// 全部 scope（事实来源：`cached_scopes` 按它遍历；新增一家时加在这里）。
 pub const ALL_SCOPES: &[&str] = &[
@@ -102,6 +104,7 @@ pub const ALL_SCOPES: &[&str] = &[
     SCOPE_ACCIO_CN,
     SCOPE_CODEARTS,
     SCOPE_TRAE,
+    SCOPE_ORCAROUTER,
 ];
 
 /// 一份清单缓存

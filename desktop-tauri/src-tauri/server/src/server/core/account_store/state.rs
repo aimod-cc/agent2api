@@ -423,6 +423,44 @@ impl StoredAccount {
             .is_some_and(|key| !key.trim().is_empty())
     }
 
+    /// 记录里的 `apiKey` 明文（trim 后；缺失给空串）。
+    ///
+    /// 与 [`Self::has_api_key`] 同一取值口径（同一个键、同一套 trim 规则），
+    /// 集中在这里让「有没有凭证」与「凭证是什么」两处永不漂移。
+    /// **返回值是凭据**：只允许喂给网关自身的出网路径，绝不进 HTTP 响应、
+    /// 日志、错误或遥测（公开形态只有 `tokenTail`）。
+    pub fn api_key(&self) -> String {
+        self.fields
+            .get("apiKey")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// 这条账号是否被标记为「需要重新授权」（上游 401 后的终端处置）。
+    ///
+    /// 只有 OrcaRouter 会置位（它的凭据是长期 Key、没有 refresh grant，
+    /// 被吊销只能重登，见 `account_store::orcarouter_accounts` 的模块头）。
+    /// 判据取 =true 的布尔值：脏值（字符串 "false" 一类）按未置位处理 ——
+    /// 误报「需要重登」会让用户去做一次不必要的授权，误判「不需要」只是沿用
+    /// 既有行为，代价更小。
+    pub fn needs_reauth(&self) -> bool {
+        matches!(
+            self.fields.get("needsReauth"),
+            Some(Value::Bool(true))
+        )
+    }
+
+    /// 这条账号置位 `needsReauth` 时那把凭据的**指纹**（没有则空串）。
+    ///
+    /// 它是「这次失败针对的是哪一代凭据」的标记：用户重新登录后凭据代改变，
+    /// 一条**旧的**异步 401 因此不能污染新凭据（见 `orcarouter_accounts` 的
+    /// 模块头）。指纹不可反推 Key（SHA-256 前 8 位）。
+    pub fn reauth_generation(&self) -> String {
+        as_text(self.fields.get("reauthGeneration"))
+    }
+
     /// 小浣熊账号的用户 ID（`userId`；workbuddy 侧对应 `uid`）
     pub fn user_id(&self) -> String {
         as_text(self.fields.get("userId"))

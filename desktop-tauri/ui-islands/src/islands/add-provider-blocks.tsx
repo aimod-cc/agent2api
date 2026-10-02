@@ -36,6 +36,7 @@ import {
   Textarea,
 } from '@ui'
 
+import { OrcaModelSelect } from './orca-model-select'
 import {
   ADD_METHODS,
   addButtonTextOf,
@@ -198,7 +199,12 @@ function ManualSection({
             ) : (
               <Input
                 id={id}
-                type='text'
+                // 敏感字段渲染成密码框：**只影响显示**（值照常提交、照常被草稿之外
+                // 的路径清空）。口令式输入让「密钥是否被遮住」成为一条可自动断言
+                // 的界面事实，见 `FieldSpec.secret` 的说明。
+                type={field.secret ? 'password' : 'text'}
+                data-testid={`${config.provider}-${field.key}`}
+                autoComplete={field.secret ? 'off' : undefined}
                 maxLength={maxLengthOf(field)}
                 placeholder={field.placeholder}
                 {...draftProps(id)}
@@ -340,7 +346,13 @@ function WebLoginSection({
       ) : null}
       <div className='field-row'>
         {/* 按钮与提示的文本子节点必须是常量：引擎会直接改它们的 textContent */}
-        <Button id={`${prefix}-web-button`} onClick={() => controllerRef.current?.start()}>
+        <Button
+          id={`${prefix}-web-button`}
+          // OrcaRouter 的这条入口在文案上就叫「Connect with OrcaRouter」（配置里给的
+          // button），自动化按 data-testid 找它来断言「两种认证方式并列可用」。
+          data-testid={`${prefix}-connect`}
+          onClick={() => controllerRef.current?.start()}
+        >
           {web.button}
         </Button>
         {/* 收起时靠 hidden 属性（不是行内 display）：引擎在 waiting 与空闲之间
@@ -536,48 +548,69 @@ export function ProviderBlock({
     [methods.join(',')],
   )
 
+  // OrcaRouter 的两条接入方式是**并列**的（粘贴 API Key / Connect with OrcaRouter）：
+  // 同一把 Key 的两种拿法，不该让用户先在一个分段控件里二选一再看另一半。
+  // 其余各家照旧走「添加方式」分段。
+  const dualAuth = config.provider === 'orcarouter'
+
   return (
     <div className='add-provider-block' hidden={!active}>
-      {config.regionOptions?.length ? (
-        <DialogSection>
-          <h3>地区</h3>
-          <SegmentedControl
-            aria-label={`${config.label} 账号地区`}
-            className={ADD_SEG_CLASS}
-            options={config.regionOptions}
-            value={region}
-            onValueChange={setRegion}
+      <div className='contents'>
+        {dualAuth ? null : config.regionOptions?.length ? (
+          <DialogSection>
+            <h3>地区</h3>
+            <SegmentedControl
+              aria-label={`${config.label} 账号地区`}
+              className={ADD_SEG_CLASS}
+              options={config.regionOptions}
+              value={region}
+              onValueChange={setRegion}
+            />
+          </DialogSection>
+        ) : null}
+
+        {dualAuth ? null : (
+          <DialogSection>
+            <h3>添加方式</h3>
+            <SegmentedControl
+              aria-label={`${config.label} 账号的添加方式`}
+              className={ADD_SEG_CLASS}
+              options={methodOptions}
+              value={effective}
+              onValueChange={value => setMethod(value as MethodId)}
+            />
+          </DialogSection>
+        )}
+
+        {/* 两格并列的宿主：既是两条接入方式的共同锚点（data-testid），
+            也是「仪表盘 + 目录」的布局容器。非双认证的家用 `contents`，
+            子节点直接参与外层竖排，间距与改动前逐字一致。 */}
+        <div
+          className={dualAuth ? 'grid grid-cols-[1fr_1fr] items-start gap-4' : 'contents'}
+          data-testid={dualAuth ? `${config.provider}-auth-methods` : undefined}
+        >
+          <WebLoginSection
+            config={config}
+            mode={webMode}
+            onModeChange={setWebMode}
+            region={region}
+            visible={dualAuth || effective === 'web'}
           />
-        </DialogSection>
-      ) : null}
+          <ManualSection config={config} region={region} visible={dualAuth || effective === 'manual'} />
+        </div>
 
-      <DialogSection>
-        <h3>添加方式</h3>
-        <SegmentedControl
-          aria-label={`${config.label} 账号的添加方式`}
-          className={ADD_SEG_CLASS}
-          options={methodOptions}
-          value={effective}
-          onValueChange={value => setMethod(value as MethodId)}
+        <OauthSection
+          config={config}
+          mode={oauthMode}
+          onModeChange={setOauthMode}
+          visible={effective === 'oauth'}
         />
-      </DialogSection>
+        <SmsSection config={config} visible={effective === 'sms'} />
+        <DesktopSection config={config} visible={effective === 'desktop'} />
 
-      <OauthSection
-        config={config}
-        mode={oauthMode}
-        onModeChange={setOauthMode}
-        visible={effective === 'oauth'}
-      />
-      <SmsSection config={config} visible={effective === 'sms'} />
-      <WebLoginSection
-        config={config}
-        mode={webMode}
-        onModeChange={setWebMode}
-        region={region}
-        visible={effective === 'web'}
-      />
-      <ManualSection config={config} region={region} visible={effective === 'manual'} />
-      <DesktopSection config={config} visible={effective === 'desktop'} />
+        {/* 账号级目录：跟着上面那把 Key 走，与「添加方式」那一格同层并列 */}
+        {dualAuth ? <OrcaModelSelect provider={config.provider} visible={active} /> : null}
+      </div>
     </div>
   )
 }

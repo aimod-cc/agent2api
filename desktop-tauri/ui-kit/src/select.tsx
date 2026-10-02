@@ -63,12 +63,32 @@ type SelectContentProps = Omit<React.ComponentProps<typeof BaseSelect.Popup>, 'c
   className?: string
   /** 与触发器的间距 */
   sideOffset?: number
+  /**
+   * 浮层是否与触发器**重叠**、让选中项的文字与触发器里的值文字左右对齐
+   * （Base UI 的 `alignItemWithTrigger`，默认 true）。
+   *
+   * 选中的那一项文字里有自己的内边距，对齐到触发器里的值文字时浮层会整体
+   * 平移几个像素（对短的、固定的选项列表那是好事：眼动距离更小）。但选项
+   * 内容**长度不可预期**的列表（模型 id、路径）不该用这种对齐 —— 浮层会
+   * 与触发器错开，而「浮层右缘贴着触发器右缘」正是这类列表该有的形态。
+   */
+  alignItemWithTrigger?: boolean
 }
 
-function SelectContent({ className, sideOffset = 4, children, ...props }: SelectContentProps) {
+function SelectContent({
+  className,
+  sideOffset = 4,
+  alignItemWithTrigger,
+  children,
+  ...props
+}: SelectContentProps) {
   return (
     <BaseSelect.Portal>
-      <BaseSelect.Positioner sideOffset={sideOffset} className='z-[35]'>
+      <BaseSelect.Positioner
+        sideOffset={sideOffset}
+        alignItemWithTrigger={alignItemWithTrigger}
+        className='z-[35]'
+      >
         <BaseSelect.Popup
           data-slot='select-content'
           className={cn(

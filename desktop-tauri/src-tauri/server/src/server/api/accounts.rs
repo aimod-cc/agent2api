@@ -569,6 +569,37 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             }
             store.add_trae_account(&credential, import_name, "manual")
         }
+        // OrcaRouter：**粘贴 API Key**（`apiKey`，`sk-orca-…`）→ 手动添加。
+        //
+        // ── 这里刻意不调上游 ────────────────────────────────────
+        // 上游没有「只校验不计费」的稳定接口，发一次探测请求要么计费、要么
+        // 给出一个不能证明任何事的 200（规范明确说前缀不构成「能用」的判据）。
+        // 因此与 Accio / ZCode 同一条口径：凭据落地、有效性留给第一次真实请求
+        // —— 那种失败会被 `classify_error` 如实翻译成 401 + 可操作提示。
+        //
+        // ── 另一条入口（PKCE）不在这条链上 ─────────────────────────
+        // 「Connect with OrcaRouter」走 `POST /api/session/login/start`
+        // （provider=orcarouter）→ 通用网页登录入口 → 适配器的
+        // `exchange_login_code`，最终落在**同一个** `add_orcarouter_account`。
+        // 两条入口在账号层收敛成同一把 Key，下游无从分辨来源 —— 这是本集成的
+        // 核心不变量（见 `providers::orcarouter` 的模块头）。
+        //
+        // `importDesktop` 不提供：OrcaRouter 是纯云端服务，没有桌面端登录态
+        // 可读（与 Accio / ZCode 同一处境），给了入口只会稳定失败。
+        Some(crate::server::core::providers::ProviderKind::OrcaRouter) => {
+            if import_desktop {
+                return management_error(
+                    400,
+                    "OrcaRouter 不支持导入桌面端登录态，请用「Connect with OrcaRouter」\
+                     网页登录或直接粘贴 API Key",
+                );
+            }
+            crate::server::core::providers::orcarouter::adapter::save_manual_credentials(
+                store,
+                &payload,
+                import_name,
+            )
+        }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
             store.add_account(&payload, None)
         }

@@ -116,6 +116,10 @@ pub mod content_block;
 /// 形态调用它 —— 挂在这里与其它子模块并列，便于对照「内置家走适配器、
 /// 自定义家走独立通道」的两条路径。
 pub mod custom;
+/// OrcaRouter（OpenAI 兼容的聚合网关）。它是本注册表里**唯一一家有两种用户
+/// 接入方式**的 provider：粘贴 API Key 与 OAuth 2.0 + PKCE 网页登录，
+/// 两者最终都只产出一把普通 API Key（见 `orcarouter` 的模块头）。
+pub mod orcarouter;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
@@ -283,6 +287,33 @@ pub enum ProviderKind {
     /// `core::auto_checkin` 的提供商清单不含本家。每日签到存在，但要单独授权
     /// 才会接（见 cpa-deploy/notes/agent2api-trae-port-plan.md 的 §8 决策 3）。
     Trae,
+    /// OrcaRouter（`orcarouter`）。OpenAI 兼容的**聚合网关**：一个端点后面
+    /// 路由多家模型提供方（`openai/…` / `anthropic/…` / `google/…` 这类
+    /// `vendor/model` 命名空间的 id 原样保留并原样上行）。
+    ///
+    /// ── 这一家与本文件其余每一家的根本差别：**两种认证入口** ──────
+    /// 其它家的用户接入方式是一套（设备授权 / 网页登录 / 粘贴 token 各一种）。
+    /// OrcaRouter 有**两套**，而且规范要求两套都必须可用：
+    ///   1. **粘贴 API Key**（`sk-orca-…`）—— 沿用各家既有的
+    ///      `POST /api/accounts` 手填路径；
+    ///   2. **Connect with OrcaRouter**（OAuth 2.0 + PKCE S256）—— 走各家
+    ///      既有那条「拉起授权页、等浏览器回本机 loopback 端口」的网页登录
+    ///      链路（`supports_web_login` / `build_login_url` /
+    ///      `exchange_login_code` 三个方法，与 Accio 同一条通用入口）。
+    ///
+    /// ── 两条入口为什么不是两家 provider（刻意不拆）────────────────
+    /// 它们换回的是**同一件东西**：一把属于用户账号的长期 API Key。拆成两家
+    /// 会让「同一把 Key 在两条入口下成为两条账号记录」，并且下游（转发 / 目录 /
+    /// 模型下拉）会被迫区分凭据来源 —— 那正是本集成明确要避免的。因此这里
+    /// **一个 kind**、**一个落账号入口**（`add_orcarouter_account`），两条入口
+    /// 是它上面的两个 adapter 形态，`source` 字段只记录「从哪条路来的」。
+    ///
+    /// ── 与 `custom-` 通道的差别（为什么不复用自定义提供商）────────
+    /// 自定义提供商那条通道是**用户自己填 baseUrl 的任意端点**：它没有远程
+    /// 目录发现、没有两种认证入口、也不该出现在「内置提供商」的语义里。
+    /// OrcaRouter 必须是**一等命名 provider**（下拉、注册表、配置、文档里
+    /// 都有它自己的名字与身份），因此走本枚举而不是那条逃生舱。
+    OrcaRouter,
 }
 
 /// 一个提供商的静态元数据。
@@ -330,6 +361,10 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "zcode-intl", label: "ZCode 国际版" },
     ProviderMeta { id: "codearts", label: "CodeArts" },
     ProviderMeta { id: "trae", label: "Trae" },
+    // OrcaRouter 排在末尾：注册表顺序只用于展示与旧数据迁移，新增家加到末尾
+    // 是既有约定（见本表的说明）。它是**聚合网关**（一个端点后面是多家的模型），
+    // 与前面每一家「一个上游」的形态都不同，排在最后也让界面上的分组层次自然。
+    ProviderMeta { id: "orcarouter", label: "OrcaRouter" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -404,6 +439,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "zcode-intl" => Some(ProviderKind::ZcodeIntl),
         "codearts" => Some(ProviderKind::CodeArts),
         "trae" => Some(ProviderKind::Trae),
+        "orcarouter" => Some(ProviderKind::OrcaRouter),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -436,6 +472,10 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::ZcodeIntl => "zcode-intl",
         ProviderKind::CodeArts => "codearts",
         ProviderKind::Trae => "trae",
+        // OrcaRouter：聚合网关（一个端点后面是多家的模型）。两种认证入口
+        // （粘贴 Key / PKCE 网页登录）在账号层收敛成同一把 Key，见
+        // `account_store::orcarouter_accounts` 的模块头。
+        ProviderKind::OrcaRouter => "orcarouter",
     }
 }
 

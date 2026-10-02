@@ -68,6 +68,7 @@ const PROVIDER_ICONS: Record<string, string> = {
   'zcode-intl': 'assets/providers/zcode.png',
   codearts: 'assets/providers/codearts.png',
   trae: 'assets/providers/trae.png',
+  orcarouter: 'assets/providers/orcarouter.png',
 }
 
 type CardItem = {
