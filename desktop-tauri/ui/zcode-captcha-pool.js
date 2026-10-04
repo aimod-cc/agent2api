@@ -32,13 +32,13 @@
    `pushZcodeCaptchaTokens`（见 desktop-tauri/src-tauri/src/bridge.rs）。 */
 
 (() => {
-  /** 轮询间隔（毫秒）。4 秒是「库存见底到补上」的可接受窗口 */
-  const POLL_MS = 4000;
-  /** 一轮最多铸几个：铸造要一两秒一个，多了会把这个循环拖长，反而误了下一个周期 */
-  const MAX_PER_ROUND = 2;
-  /** 失败后的退让（毫秒）：连续失败时翻倍，最多到上限 */
-  const BACKOFF_MIN_MS = 8000;
-  const BACKOFF_MAX_MS = 60000;
+  /** 轮询间隔（毫秒）。2.5 秒是「库存见底到补上」的平滑窗口 */
+  const POLL_MS = 2500;
+  /** 一轮铸 1 个：单实例单次铸造，避免并发冲突与 DOM 重建竞态 */
+  const MAX_PER_ROUND = 1;
+  /** 失败后的退让（毫秒）：失败时轻度退让，并在连续失败时重置铸造实例 */
+  const BACKOFF_MIN_MS = 3000;
+  const BACKOFF_MAX_MS = 15000;
 
   let timer = 0;
   let running = false;
@@ -50,8 +50,14 @@
 
   const api = () => window.workbuddyDesktop || null;
 
-  function log(message) {
+  function log(message, ...args) {
+    console.log(`[ZCodeCaptcha] ${message}`, ...args);
     if (window.wbApp?.debug) window.wbApp.debug(`[ZCodeCaptcha] ${message}`);
+  }
+
+  function warn(message, ...args) {
+    console.warn(`[ZCodeCaptcha] ${message}`, ...args);
+    if (window.wbApp?.debug) window.wbApp.debug(`[ZCodeCaptcha] [WARN] ${message}`);
   }
 
   /** 拿一次池子概况；桥接不可用（浏览器直开界面）时返回 null，循环安静地退让 */
@@ -127,12 +133,17 @@
         if (!param) break;
         tokens.push({ param, region: config.region || '' });
         // 连续铸造之间留一点间隔：SDK 的同一个实例连着跑两轮会互相干扰
-        await new Promise(resolve => window.setTimeout(resolve, 300));
+        await new Promise(resolve => window.setTimeout(resolve, 500));
       }
       if (tokens.length === 0) {
         // 一个都没铸出来（SDK 不可用 / 正忙）—— 退让，别原地空转
         failures += 1;
-        schedule(Math.min(BACKOFF_MIN_MS * failures, BACKOFF_MAX_MS));
+        if (failures >= 2) {
+          try { window.wbAliyunCaptcha?.resetMint?.(); } catch {}
+        }
+        const delay = Math.min(BACKOFF_MIN_MS * failures, BACKOFF_MAX_MS);
+        warn(`本轮未能铸出令牌（连续失败 ${failures} 次），将在 ${delay}ms 后重试`);
+        schedule(delay);
         return;
       }
       await pushTokens(tokens);
@@ -140,7 +151,10 @@
       schedule(POLL_MS);
     } catch (error) {
       failures += 1;
-      log(`本轮异常：${error?.message || error}`);
+      if (failures >= 2) {
+        try { window.wbAliyunCaptcha?.resetMint?.(); } catch {}
+      }
+      warn(`本轮异常：${error?.message || error}`);
       schedule(Math.min(BACKOFF_MIN_MS * failures, BACKOFF_MAX_MS));
     } finally {
       running = false;

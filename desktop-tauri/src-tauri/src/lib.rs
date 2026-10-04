@@ -300,7 +300,19 @@ pub fn run() {
             // 注：macOS 上这会一并去掉「红绿灯」，本项目面向 Windows
             // （NSIS 安装包），macOS 如需保留要用 titleBarStyle: Overlay
             // 另行适配，此处不做特殊处理。
-            WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+            // ── WebView2 后台保活参数（Windows 专属）──────────────────────
+            // 关闭到托盘或窗口最小化时，Chromium 默认会对后台窗口启用定时器节流
+            // （Timer Throttling）与挂起，导致后台验证码铸造循环（ui/zcode-captcha-pool.js）
+            // 的 setTimeout 被严重降频甚至冻结。解除这三项节流限制以维持后台令牌正常补充。
+            #[cfg(target_os = "windows")]
+            let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
+                .additional_browser_args(
+                    "--disable-background-timer-throttling --disable-backgrounding-occluded-windows --disable-renderer-backgrounding",
+                );
+            #[cfg(not(target_os = "windows"))]
+            let builder = WebviewWindowBuilder::new(app, MAIN_WINDOW_LABEL, WebviewUrl::App("index.html".into()));
+
+            builder
                 .title(app_title())
                 .decorations(false)
                 .inner_size(WIN_WIDTH, WIN_HEIGHT)
