@@ -454,7 +454,9 @@ fn thinking_budget(effort: &str) -> Option<i64> {
 ///   - `content_block_delta`：`text_delta` → `delta.content`；
 ///     `thinking_delta` → `delta.reasoning_content`；
 ///     `input_json_delta` → `delta.tool_calls[…]`；`signature_delta` 丢弃
-///   - `message_delta` → 记 stop_reason 与 `usage.output_tokens`
+///   - `message_delta` → 记 stop_reason 与 usage（output_tokens 照读；
+///     input_tokens / cache_read_input_tokens / cache_creation_input_tokens
+///     有则覆盖 —— ZCode 活动套餐网关只在 message_delta 给完整快照）
 ///   - `message_stop` → 收尾帧 + usage 帧 + `data: [DONE]`
 ///   - `error` → `data: {"error":{…}}` + `data: [DONE]`（与 ForwardStream
 ///     的断流收尾同形状，聚合器据此转 502）
@@ -665,6 +667,24 @@ impl ChatFromAnthropicStream {
                     if let Some(output) = usage.get("output_tokens").and_then(Value::as_i64) {
                         self.output_tokens = output;
                     }
+                    // 官方 Anthropic 这帧只带 output_tokens；ZCode 活动套餐网关
+                    // 却把完整用量快照（input / cache_read / cache_creation）放在
+                    // 这一帧，message_start 反而不给 —— 三项同口径「有则覆盖」，
+                    // 两种上游都取得到
+                    if let Some(input) = usage.get("input_tokens").and_then(Value::as_i64) {
+                        self.input_tokens = input;
+                    }
+                    if let Some(read) =
+                        usage.get("cache_read_input_tokens").and_then(Value::as_i64)
+                    {
+                        self.cache_read = read;
+                    }
+                    if let Some(creation) = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(Value::as_i64)
+                    {
+                        self.cache_creation = creation;
+                    }
                 }
                 Vec::new()
             }
@@ -713,6 +733,9 @@ impl ChatFromAnthropicStream {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": self.output_tokens,
                 "total_tokens": prompt_tokens + self.output_tokens,
+                // 缓存明细按 OpenAI 形态带出：请求统计（`extract_usage`）与
+                // 客户端都从这一帧读，缺了它缓存命中就恒记 0
+                "prompt_tokens_details": { "cached_tokens": self.cache_read },
             },
         })));
         out.push(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
@@ -774,5 +797,45 @@ impl ChatFromAnthropicStream {
             "model": self.model,
             "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ZCode 活动套餐网关的实测形态：`message_start` 的 usage 不带
+    /// `input_tokens`，完整用量快照（含缓存命中）在 `message_delta` 里。
+    /// 此前 message_delta 只读 `output_tokens`，最终 usage 帧把
+    /// `prompt_tokens` 记成 0、缓存命中恒为 0。
+    #[test]
+    fn message_delta_usage_snapshot_feeds_final_frame() {
+        let mut machine = ChatFromAnthropicStream::new("glm-5.3-flash");
+        let mut out = machine.push(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"output_tokens\":1}}}\n\n",
+        );
+        out.extend(machine.push(
+            b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":3157,\"output_tokens\":2118,\"cache_read_input_tokens\":126528}}\n\n",
+        ));
+        out.extend(machine.push(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+
+        let usage = out
+            .iter()
+            .filter_map(|frame| {
+                let text = std::str::from_utf8(&frame[..]).ok()?;
+                let data = text.strip_prefix("data: ")?.trim();
+                serde_json::from_str::<Value>(data).ok()
+            })
+            .find(|chunk| chunk.get("usage").is_some())
+            .and_then(|chunk| chunk.get("usage").cloned())
+            .expect("收尾应有 usage 帧");
+        // chat 口径：prompt_tokens 含缓存命中部分
+        assert_eq!(usage["prompt_tokens"].as_i64(), Some(3157 + 126528));
+        assert_eq!(usage["completion_tokens"].as_i64(), Some(2118));
+        assert_eq!(usage["total_tokens"].as_i64(), Some(3157 + 126528 + 2118));
+        assert_eq!(
+            usage["prompt_tokens_details"]["cached_tokens"].as_i64(),
+            Some(126528)
+        );
     }
 }
