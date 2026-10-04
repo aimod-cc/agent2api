@@ -92,10 +92,11 @@ impl AccountStore {
     ) -> Result<bool, AccountStoreError> {
         let guard = self.guard();
         let Some(mut record) = self.record_by_id(&guard, account_id) else {
-            return Err(AccountStoreError::new(
-                format!("账号 {account_id} 不存在，无法回写凭证"),
-                404,
-            ));
+            // 记录已删除:返回 Stale(Ok(false))而不是 Err——调用方的三态收口里,
+            // Stale 会走 latest_credentials 重读,而 latest 对已删记录给**终态 401**;
+            // 若走 Err 分支会被当成「回写失败但刷新成功」,仍返回新 token——
+            // 账号都没了还发新凭证,是把删除当成了临时故障(上游第 2 轮探针发现)
+            return Ok(false);
         };
         if record.provider() != lobster_id() {
             return Err(AccountStoreError::new(
@@ -430,3 +431,30 @@ trait Pipe: Sized {
     }
 }
 impl<T> Pipe for T {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 删除场景的三态语义(上游第 2 轮探针发现):记录不存在必须返回
+    /// Ok(false)(Stale),让调用方走 latest_credentials 的终态分支;
+    /// 返回 Err 会被当成「回写失败但刷新成功」,账号删了还发新 token。
+    #[test]
+    fn missing_record_reports_stale_not_failure() {
+        let (db, guard) = crate::server::db::test_temp::TempDb::open("lobster-accounts-missing");
+        let store = AccountStore::with_db(Some(db));
+        let _ = guard; // 删文件的守卫:测试结束清理临时库
+        let outcome = store.update_lobster_account_tokens_if_current(
+            "lobster-nonexistent",
+            "old-at",
+            "old-rt",
+            "new-at",
+            "new-rt",
+            None,
+        );
+        assert!(
+            matches!(outcome, Ok(false)),
+            "记录不存在必须是 Ok(false)(Stale),实际: {:?}",
+            outcome.map(|v| v.to_string())
+        );
+    }
+}
