@@ -131,7 +131,11 @@ fn load_desktop_tokens(force: bool) -> Option<(String, String)> {
     if !force {
         if let Ok(guard) = cred_cache().lock() {
             if let Some((cached_mtime, loaded_at, access, refresh)) = guard.as_ref() {
-                if *cached_mtime == mtime && now - *loaded_at < CRED_CACHE_TTL_SECONDS {
+                // loaded_at <= now 防时钟回拨:负年龄恒小于 TTL 会把缓存当永新
+                if *cached_mtime == mtime
+                    && *loaded_at <= now
+                    && now - *loaded_at < CRED_CACHE_TTL_SECONDS
+                {
                     return Some((access.clone(), refresh.clone()));
                 }
             }
@@ -175,26 +179,28 @@ pub fn desktop_tokens() -> Option<(String, String)> {
 
 /// 把刷新后的 token 对回写 App 的 sqlite（kv.auth_tokens 行，事务原子）。
 ///
-/// 失败（库被锁/只读介质/App 已重登录换了内容）只返回 Err 由调用方决定：
-/// 内存里的新 token 仍可用于本次请求，App 下次刷新会再落盘。
-///
-/// `previous_refresh` 是**刷新前**的 refreshToken 快照：比较写回比的是它
-/// （文件当前值 == 本次刷新所用的那枚才允许写）。比刷新后的新值是错的——
-/// 服务端轮换时（正是最需要回写的场景）新旧必然不等，会把唯一正确的回写拒掉。
-/// 写回采用「读出当前整段 JSON → 只替换两个 token 键 → 写回整段」，
-/// **保留 App 可能存进的其它登录态字段**（与 raccoon 的回写同一取向）。
+/// ── 回写的前置契约（上游审计发现 1/2 的修复）──────────────────
+///   1. **行必须存在且可解析**：刷新链绝不「重建」登录态——App 登出后删掉的行、
+///      或损坏的 JSON,被一次在途刷新悄悄重建等于造幽灵登录态。读不到就拒绝。
+///   2. **比较完整 token 对**：行里的 (accessToken, refreshToken) 必须与刷新前
+///      快照完全一致才允许写。只比 refreshToken 会漏掉「重登录但服务端复用了
+///      同一枚 refreshToken、只换了 accessToken」的形态。
+///   3. 写回采用「读出当前整段 JSON → 只替换两个 token 键 → 写回整段」，
+///      **保留 App 可能存进的其它登录态字段**（与 raccoon 的回写同一取向）。
 fn write_auth_tokens_to_db(
+    previous_access: &str,
     previous_refresh: &str,
     access_token: &str,
     refresh_token: &str,
 ) -> Result<(), String> {
     let path = desktop_db_file().ok_or("无法定位 LobsterAI 数据目录")?;
-    write_auth_tokens_to_db_at(&path, previous_refresh, access_token, refresh_token)
+    write_auth_tokens_to_db_at(&path, previous_access, previous_refresh, access_token, refresh_token)
 }
 
 /// 路径可注入的写回主体(单测喂临时 sqlite 用);语义见上面的包装。
 fn write_auth_tokens_to_db_at(
     path: &std::path::Path,
+    previous_access: &str,
     previous_refresh: &str,
     access_token: &str,
     refresh_token: &str,
@@ -207,6 +213,10 @@ fn write_auth_tokens_to_db_at(
     // BEGIN IMMEDIATE 拿写锁后再读再写，杜绝「读-改-写」竞态窗口
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("sqlite 事务开启失败: {error}"))?;
+    let refuse = |conn: &rusqlite::Connection, reason: &str| {
+        let _ = conn.execute_batch("ROLLBACK");
+        Err(reason.to_string())
+    };
     let current_row = conn
         .query_row(
             "SELECT value FROM kv WHERE key='auth_tokens'",
@@ -215,33 +225,31 @@ fn write_auth_tokens_to_db_at(
         )
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    let mut document = match current_row {
-        // 行已存在：先校验它仍是刷新前那份（App 重登录换号时拒绝覆盖 ——
-        // 一次更早发起、更晚返回的刷新把旧凭证盖回去会把用户登出）
-        Some(Value::Object(fields)) => {
-            let current_refresh = fields
-                .get("refreshToken")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if !previous_refresh.is_empty() && current_refresh != previous_refresh {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err("App 的登录态已变化（可能重新登录），拒绝覆盖".to_string());
-            }
-            fields
-        }
-        // 行不存在/不是对象：用最小文档初始化（等价于首次落登录态）
-        _ => serde_json::Map::new(),
+    let Some(Value::Object(mut fields)) = current_row else {
+        // 行不存在 / 损坏 / 非对象:一律拒绝(见模块头契约 1)
+        return refuse(
+            &conn,
+            "App 登录态行缺失或不可解析,拒绝在刷新链里重建(如需恢复请在 LobsterAI App 重新登录)",
+        );
     };
+    let current_access = fields.get("accessToken").and_then(Value::as_str).unwrap_or("");
+    let current_refresh = fields.get("refreshToken").and_then(Value::as_str).unwrap_or("");
+    if !previous_refresh.is_empty()
+        && (current_access != previous_access || current_refresh != previous_refresh)
+    {
+        // 凭证已被换掉(App 重登录 / 另一轮刷新先落地):拒绝覆盖
+        return refuse(&conn, "App 的登录态已变化（可能重新登录），拒绝覆盖");
+    }
     // 只替换两个 token 键,其余字段原样保留
-    document.insert(
+    fields.insert(
         "accessToken".to_string(),
         Value::String(access_token.to_string()),
     );
-    document.insert(
+    fields.insert(
         "refreshToken".to_string(),
         Value::String(refresh_token.to_string()),
     );
-    let payload = serde_json::to_string(&Value::Object(document))
+    let payload = serde_json::to_string(&Value::Object(fields))
         .map_err(|error| format!("序列化凭证失败: {error}"))?;
     let written = conn.execute(
         "INSERT OR REPLACE INTO kv (key, value, updated_at) VALUES (?1, ?2, ?3)",
@@ -504,21 +512,37 @@ async fn call_refresh_api(
     Ok(next)
 }
 
-/// 刷新结果落地：按来源回写。回写失败不阻断本次请求（内存 token 仍有效），
-/// 但**桌面端 sqlite 的回写失败升为可见日志**——模块头把回写定义为「安全必需」，
-/// 它的失败若只留 verbose，用户侧只看到「刷新成功」，随后 App 被登出时无从归因。
-/// （账号存储侧的 `Ok(false)` 是并发保护命中，属正常路径，保持 verbose 并注明。）
+/// 刷新结果落地：按来源回写,三态收口（上游审计发现 2 的修复）：
+///   - `Ok(Written)` → 用刷新结果;
+///   - `Stale`(凭证已被换掉/行缺失) → **改读当前最新凭证**,绝不把被拒的旧结果
+///     当成功返回——「拒绝落盘却继续用旧结果」会让日志与行为自相矛盾;
+///   - `Err`(真失败) → 可见日志 + 仍返回刷新结果(刷新本身成功;调用链对回写
+///     失败的消费契约见模块头「已知限制」)。
 fn apply_refresh(
     store: &AccountStore,
     previous: &LobsterCredentials,
     next: &LobsterCredentials,
 ) -> Result<LobsterCredentials, GatewayError> {
-    let outcome: Result<(), String> = match next.origin {
+    /// 落地判定:Written=已写入;Stale=被拒(并发保护/行缺失);Err=真失败
+    enum Landed {
+        Written,
+        Stale,
+    }
+    let landed: Result<Landed, String> = match next.origin {
         CredentialOrigin::DesktopDb => write_auth_tokens_to_db(
+            &previous.access_token,
             &previous.refresh_token,
             &next.access_token,
             &next.refresh_token,
-        ),
+        )
+        .map(|()| Landed::Written)
+        .or_else(|reason| {
+            if reason.contains("拒绝") {
+                Ok(Landed::Stale)
+            } else {
+                Err(reason)
+            }
+        }),
         CredentialOrigin::AccountStore => store
             .update_lobster_account_tokens_if_current(
                 &next.id,
@@ -528,23 +552,22 @@ fn apply_refresh(
                 &next.refresh_token,
                 next.expires_at,
             )
-            .map(|written| {
-                if !written {
-                    // 凭证已被用户重导/换号：改用记录里的最新凭证，不用旧结果
-                    logging::verbose(
-                        "[Lobster]",
-                        &format!("账号 {} 的刷新结果已过期（并发保护命中，凭证已被更换），改用当前凭证", previous.id),
-                    );
-                }
-            })
+            .map(|written| if written { Landed::Written } else { Landed::Stale })
             .map_err(|error| error.message),
     };
-    match outcome {
-        Ok(()) => Ok(next.clone()),
+    match landed {
+        Ok(Landed::Written) => Ok(next.clone()),
+        Ok(Landed::Stale) => {
+            logging::verbose(
+                "[Lobster]",
+                &format!("账号 {} 的刷新结果已过期（凭证被更换或登录态缺失），改读当前凭证", previous.id),
+            );
+            latest_credentials(store, previous)
+        }
         Err(reason) => {
             let visible = next.origin == CredentialOrigin::DesktopDb;
             let line = format!(
-                "账号 {} 刷新成功但回写失败: {reason}（桌面端登录态未更新，App 侧可能仍持有旧凭证）",
+                "账号 {} 刷新成功但回写失败: {reason}（登录态未落盘，后续请求可能仍用旧凭证）",
                 previous.id
             );
             if visible {
@@ -553,6 +576,33 @@ fn apply_refresh(
                 logging::verbose("[Lobster]", &line);
             }
             Ok(next.clone())
+        }
+    }
+}
+
+/// 拒绝落盘后重读当前凭证（raccoon 的 `latest_credentials` 同一语义）。
+///
+/// 桌面来源失效缓存后重读 sqlite；账号来源重读记录，记录已被删除时明确失败
+/// ——「账号被删」绝不能变成「拿别的凭证继续」。
+fn latest_credentials(
+    store: &AccountStore,
+    previous: &LobsterCredentials,
+) -> Result<LobsterCredentials, GatewayError> {
+    match previous.origin {
+        CredentialOrigin::DesktopDb => {
+            if let Ok(mut guard) = cred_cache().lock() {
+                *guard = None;
+            }
+            desktop_credentials()
+        }
+        CredentialOrigin::AccountStore => {
+            if store.lobster_account_record(&previous.id).is_none() {
+                return Err(GatewayError::with_status(
+                    401,
+                    format!("账号 {} 已被删除，本次刷新结果作废", previous.id),
+                ));
+            }
+            snapshot_for(store, &previous.id)
         }
     }
 }
@@ -710,8 +760,8 @@ mod tests {
             .ok()
             .unwrap();
         }
-        // ① 服务端轮换 refreshToken:守卫比「刷新前」的旧值 → 允许写入
-        let wrote = write_auth_tokens_to_db_at(&db, "old-rt", "new-at", "new-rt");
+        // ① 服务端轮换 refreshToken:守卫比「刷新前」的完整 token 对 → 允许写入
+        let wrote = write_auth_tokens_to_db_at(&db, "old-at", "old-rt", "new-at", "new-rt");
         assert!(wrote.is_ok(), "轮换场景必须允许回写: {:?}", wrote.err());
         let value: String = rusqlite::Connection::open(&db)
             .ok()
@@ -730,7 +780,9 @@ mod tests {
         // ② 只替换两个 token 键,App 的其它登录态字段保留
         assert_eq!(doc.get("userId").and_then(|v| v.as_str()), Some("u-9"));
         // ③ App 已重登录换了 refreshToken:previous 对不上 → 拒绝且不改文件
-        assert!(write_auth_tokens_to_db_at(&db, "old-rt", "x-at", "x-rt").is_err());
+        assert!(write_auth_tokens_to_db_at(&db, "new-at", "old-rt", "x-at", "x-rt").is_err());
+        // ③' 只换 accessToken(refreshToken 复用)同样拒绝 —— 比较的是完整 token 对
+        assert!(write_auth_tokens_to_db_at(&db, "other-at", "new-rt", "y-at", "y-rt").is_err());
         let after: String = rusqlite::Connection::open(&db)
             .ok()
             .and_then(|conn| {
@@ -743,6 +795,28 @@ mod tests {
             })
             .unwrap_or_default();
         assert!(after.contains("new-rt"), "拒绝后文件内容不得被改动");
+
+        // ④ 行缺失(App 登出后被删):刷新链拒绝重建(上游审计发现 1)
+        let empty = dir.join("empty.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&empty).ok().unwrap();
+            conn.execute_batch("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER)")
+                .ok()
+                .unwrap();
+        }
+        let rebuilt = write_auth_tokens_to_db_at(&empty, "old-at", "old-rt", "z-at", "z-rt");
+        assert!(rebuilt.is_err(), "登录态行缺失时不得在刷新链里重建");
+        let row: Option<String> = rusqlite::Connection::open(&empty)
+            .ok()
+            .and_then(|conn| {
+                conn.query_row(
+                    "SELECT value FROM kv WHERE key='auth_tokens'",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+            });
+        assert!(row.is_none(), "拒绝后不得残留任何登录态行");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

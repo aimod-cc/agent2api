@@ -140,7 +140,11 @@ pub(super) fn invalidate_quota_cache(account_id: &str) {
 /// 拉积分：profile-summary 主轨，quota 回落。
 async fn fetch_credit_data(token: &str) -> Result<Value, QueryFailure> {
     match request_json("/api/user/profile-summary", token).await {
-        Ok(data) => Ok(normalize_profile_summary(&data)),
+        // 主轨解析不出任何数值(总额与批次全不可读)时按失败处理 → 回落 quota,
+        // 不把「无法解析」静默报成余额 0(上游审计发现 5)
+        Ok(data) => normalize_profile_summary(&data).ok_or_else(|| {
+            QueryFailure::Failed("profile-summary 响应无可解析余额".to_string())
+        }),
         // 主轨的 401 直接透出：回落口径用同一个 token 也只会再 401 一次
         Err(QueryFailure::AuthExpired(message)) => Err(QueryFailure::AuthExpired(message)),
         Err(main_failure) => {
@@ -206,13 +210,18 @@ async fn request_json(path: &str, token: &str) -> Result<Value, QueryFailure> {
     Ok(if data.is_null() { payload } else { data })
 }
 
-/// profile-summary → 归一形状（creditItems 批次明细按剩余量降序）
-fn normalize_profile_summary(data: &Value) -> Value {
+/// profile-summary → 归一形状（creditItems 批次明细按剩余量降序）；
+/// 总额与批次都解析不出时返回 None（调用方回落 quota，不把「无法解析」报成 0）。
+fn normalize_profile_summary(data: &Value) -> Option<Value> {
     let items = normalize_credit_items(data.get("creditItems"));
-    let total = data
+    let explicit_total = data
         .get("totalCreditsRemaining")
         .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
+        .filter(|value| value.is_finite());
+    if explicit_total.is_none() && items.is_empty() {
+        return None;
+    }
+    let total = explicit_total
         .unwrap_or_else(|| {
             items
                 .iter()
@@ -221,13 +230,15 @@ fn normalize_profile_summary(data: &Value) -> Value {
         })
         // 与 quota 口径同款钳制:负余额按 0 展示(欠费态由 raw 可辨)
         .max(0.0);
+    // 字典序取最小:上游实测给**同一格式**的 ISO-8601 串,此情形下字典序有效;
+    // 若上游混用时区/精度/异构格式会得出错值(留观察,见 verify-results 台账)。
     let earliest_expiry = items
         .iter()
         .filter_map(|item| item.get("expiresAt").and_then(Value::as_str))
         .filter(|text| !text.is_empty())
         .min()
         .unwrap_or("");
-    json!({
+    Some(json!({
         "available": total,
         "unit": "积分",
         "wallets": items,
@@ -244,7 +255,7 @@ fn normalize_profile_summary(data: &Value) -> Value {
             .and_then(Value::as_i64)
             .unwrap_or(0),
         "raw": data,
-    })
+    }))
 }
 
 /// creditItems → 精简批次明细（creditsRemaining 非数值的条目丢弃，按剩余降序）
@@ -311,7 +322,10 @@ fn normalize_quota(data: &Value) -> Value {
         used = number("creditsUsed").unwrap_or(0.0);
         remaining = number("creditsRemaining");
     }
-    let remaining = remaining.unwrap_or((total - used).max(0.0));
+    // 显式值与推导值统一钳制:负余额按 0 展示(上游审计发现 5 后半)
+    let remaining = remaining
+        .unwrap_or_else(|| (total - used).max(0.0))
+        .max(0.0);
     json!({
         "available": remaining,
         "unit": "积分",
@@ -375,6 +389,18 @@ mod tests {
         assert_eq!(norm.get("available").and_then(Value::as_f64), Some(0.0));
     }
 
+    /// 主轨无可解析数值 → None(回落 quota),不报 0(上游审计发现 5)
+    #[test]
+    fn profile_summary_unparseable_returns_none() {
+        assert!(normalize_profile_summary(&json!({ "totalCreditsRemaining": "broken" })).is_none());
+        assert!(normalize_profile_summary(&json!({})).is_none());
+        // 有任一可解析来源仍成功
+        assert!(normalize_profile_summary(&json!({
+            "creditItems": [ { "creditsRemaining": 5.0 } ]
+        }))
+        .is_some());
+    }
+
     #[test]
     fn profile_summary_uses_total_and_sorts_items() {
         let data = json!({
@@ -388,7 +414,7 @@ mod tests {
             ],
             "availableResetCount": 2,
         });
-        let norm = normalize_profile_summary(&data);
+        let norm = normalize_profile_summary(&data).unwrap();
         assert_eq!(norm.get("available").and_then(Value::as_f64), Some(120.0));
         assert_eq!(
             norm.get("source").and_then(Value::as_str),

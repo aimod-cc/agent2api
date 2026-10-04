@@ -78,5 +78,5 @@ curl -X POST http://localhost:3065/api/accounts/checkin \
 ## 已知边界
 
 - 凭证依赖本机 LobsterAI App 的登录态（macOS）；App 未登录时添加账号会如实报「未找到本机登录态」。
-- 上游仅流式：`stream:false` 由网关聚合还原，首字节延迟与流式一致。
+- 上游仅流式：`stream:false` 由网关聚合还原——客户端要等完整生成后才拿到响应（总延迟等于完整生成时长），不是流式的逐帧到达。
 - 签到活动「今日」由服务端按活动时区判定（实测 Asia/Shanghai），本地不做日历计算。

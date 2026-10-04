@@ -66,6 +66,17 @@ fn fallback_models() -> Vec<Value> {
 
 /// 兜底条目（已是聚合层键名形态）
 fn entry(model_id: &str, name: &str, supports_images: bool, max_input: Option<i64>) -> Value {
+    entry_with_video(model_id, name, supports_images, false, max_input)
+}
+
+/// 完整形态（上游目录声明了 video 输入模态时用；聚合层认 `supportsVideo`）
+fn entry_with_video(
+    model_id: &str,
+    name: &str,
+    supports_images: bool,
+    supports_video: bool,
+    max_input: Option<i64>,
+) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("id".to_string(), json!(format!("{MODEL_PREFIX}{model_id}")));
     object.insert("name".to_string(), Value::String(name.to_string()));
@@ -73,7 +84,24 @@ fn entry(model_id: &str, name: &str, supports_images: bool, max_input: Option<i6
         object.insert("maxInputTokens".to_string(), Value::from(max_input));
     }
     object.insert("supportsImages".to_string(), Value::Bool(supports_images));
+    if supports_video {
+        object.insert("supportsVideo".to_string(), Value::Bool(true));
+    }
     Value::Object(object)
+}
+
+/// 从目录条目的 `input` 数组读模态：(支持图像, 支持 video)
+fn input_modalities(model: &Value) -> (bool, bool) {
+    model
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|items| {
+            (
+                items.iter().any(|item| item.as_str() == Some("image")),
+                items.iter().any(|item| item.as_str() == Some("video")),
+            )
+        })
+        .unwrap_or((false, false))
 }
 
 /// 目录的内部状态：**已落地**的清单（远程刷新的产物）+ 刷新元信息。
@@ -140,16 +168,12 @@ fn parse_openclaw_models_from(path: &std::path::Path) -> Option<Vec<Value>> {
             .map(str::trim)
             .filter(|text| !text.is_empty())
             .unwrap_or(id);
-        let supports_images = model
-            .get("input")
-            .and_then(Value::as_array)
-            .map(|items| items.iter().any(|item| item.as_str() == Some("image")))
-            .unwrap_or(false);
+        let (supports_images, supports_video) = input_modalities(model);
         let max_input = model
             .get("contextWindow")
             .and_then(Value::as_i64)
             .filter(|value| *value > 0);
-        out.push(entry(id, name, supports_images, max_input));
+        out.push(entry_with_video(id, name, supports_images, supports_video, max_input));
     }
     (!out.is_empty()).then_some(out)
 }
@@ -184,7 +208,8 @@ fn openclaw_models() -> Vec<Value> {
 
 // ─── 对外清单 ───────────────────────────────────────────────
 
-/// 当前清单：远程成功过用远程的，否则 openclaw.json，最后静态兜底。
+/// 当前清单：远程落地过用远程缓存，否则 openclaw.json（动态读、mtime 跟随），
+/// 最后静态兜底。
 pub fn list() -> Vec<Value> {
     let state = read_state();
     if !state.models.is_empty() {
@@ -223,8 +248,11 @@ pub fn strip_model_prefix(model: &str) -> String {
 pub async fn refresh(token: &str, force: bool) -> ModelRefreshOutcome {
     if !force {
         let state = read_state();
+        let now = logging::now_ms();
+        // fetched_at <= now 防时钟回拨（持久化恢复的旧值在回拨后负年龄恒小于 TTL）
         if !state.models.is_empty()
-            && logging::now_ms() - state.fetched_at < CATALOG_CACHE_TTL_MS
+            && state.fetched_at <= now
+            && now - state.fetched_at < CATALOG_CACHE_TTL_MS
         {
             return ModelRefreshOutcome::unchanged();
         }
@@ -271,10 +299,18 @@ pub async fn refresh(token: &str, force: bool) -> ModelRefreshOutcome {
             }
         }
     }
-    // 来源 2：App 同步的 openclaw.json（本地文件，字段最全）
+    // 来源 2：App 同步的 openclaw.json（本地文件，字段最全）。
+    // **不落地内存状态**（上游审计发现 6）：list() 对本地来源保持动态读取
+    // （openclaw_models 自带 mtime 缓存，App 更新即刻跟随）；落地会把它冻结在
+    // 刷新那一刻，还会让 remote_refreshed() 把本地来源谎报成远程。只汇报条数。
     let local = openclaw_models();
     if !local.is_empty() {
-        return land(local);
+        let count = local.len();
+        logging::verbose(
+            "[Models]",
+            &format!("LobsterAI 目录沿用本机 App 同步清单（{count} 个，mtime 跟随）"),
+        );
+        return ModelRefreshOutcome::refreshed(count);
     }
     ModelRefreshOutcome::failed("LobsterAI 模型目录不可用（远程未返回且本机没有 App 目录）")
 }
@@ -307,12 +343,8 @@ fn parse_remote_models(payload: &Value) -> Vec<Value> {
             .or_else(|| item.get("max_input_tokens"))
             .and_then(Value::as_i64)
             .filter(|value| *value > 0);
-        let supports_images = item
-            .get("input")
-            .and_then(Value::as_array)
-            .map(|items| items.iter().any(|v| v.as_str() == Some("image")))
-            .unwrap_or(false);
-        out.push(entry(id, name, supports_images, max_input));
+        let (supports_images, supports_video) = input_modalities(&item);
+        out.push(entry_with_video(id, name, supports_images, supports_video, max_input));
     }
     out
 }

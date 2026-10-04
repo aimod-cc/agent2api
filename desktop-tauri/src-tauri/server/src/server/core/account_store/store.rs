@@ -690,8 +690,12 @@ pub(crate) fn live_desktop_credentials(record: &StoredAccount) -> Option<(String
     // `expires_at` 换算成毫秒：会话契约是毫秒（`record.expires_at()` 的口径），
     // JWT 的 exp 是秒。
     if record.provider() == super::LOBSTER_PROVIDER_ID && record.is_desktop() {
-        let (access_token, refresh_token) =
-            crate::server::core::providers::lobster::credentials::desktop_tokens()?;
+        // 桌面登录态**缺失时返回空对而不是 None**（上游审计发现 8）：None 会让
+        // 会话回落到导入时的旧副本——于是面板显示正常、转发用旧 token、刷新报
+        // 缺失，三种视角互相矛盾。空对让转发如实 401「缺少 accessToken」，
+        // 与刷新/签到/公开形态（available=false）一致。
+        let (access_token, refresh_token) = crate::server::core::providers::lobster::credentials::desktop_tokens()
+            .unwrap_or_default();
         let expires_at =
             crate::server::core::providers::lobster::credentials::jwt_exp_seconds(&access_token)
                 .map(|seconds| seconds as f64 * 1000.0)

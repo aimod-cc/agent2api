@@ -351,17 +351,18 @@ impl AccountStore {
         } else {
             None
         };
-        let (token_tail, expires_ms, has_refresh) = match live {
-            // `live_desktop_credentials` 的 expires_at 已是毫秒（f64）
-            Some((token, refresh_token, expires_at_ms)) => (
-                if token.is_empty() {
-                    stored_tail
-                } else {
-                    token_tail(&token)
-                },
+        let (token_tail, expires_ms, has_refresh, live_missing) = match live {
+            // `live_desktop_credentials` 的 expires_at 已是毫秒（f64）。
+            // 桌面账号读不到实时登录态时（live 为空对）：字段全部清空 +
+            // available=false —— 「App 已登出」要让面板与转发看到同一个事实，
+            // 而不是回落到导入时的旧副本装作正常（上游审计发现 8）。
+            Some((token, refresh_token, expires_at_ms)) if !token.is_empty() => (
+                token_tail(&token),
                 (expires_at_ms > 0.0).then_some(expires_at_ms).or(stored_expires_ms),
                 !refresh_token.is_empty(),
+                false,
             ),
+            Some((_, _, _)) => (String::new(), None, false, true),
             None => (
                 stored_tail,
                 stored_expires_ms,
@@ -370,6 +371,7 @@ impl AccountStore {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .is_empty(),
+                false,
             ),
         };
         let mut public = Map::new();
@@ -414,8 +416,9 @@ impl AccountStore {
             "rateLimits".to_string(),
             record.get("rateLimits").cloned().unwrap_or_else(|| Value::Object(Map::new())),
         );
-        // 与其余家的公开形态同口径：可用性由凭证链路如实反映，默认可用
-        public.insert("available".to_string(), Value::Bool(true));
+        // 桌面账号实时登录态缺失（App 登出）→ available=false,与转发侧的
+        // 「缺少 accessToken」401 是同一个事实的两面
+        public.insert("available".to_string(), Value::Bool(!live_missing));
         Value::Object(public)
     }
 }
