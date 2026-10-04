@@ -133,6 +133,16 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // 且它记的「签到钱包」与模型调用真正扣的积分池是两笔钱 —— 不给按钮，免得给一个
   // 点了必然报错（或报出一个对不上官方数字的余额）的入口。
   trae: { usage: true, checkin: false, edition: false, identifier: 'uid', expiry: 'expiresAt' },
+  // LobsterAI（网易有道，PR-2 全链路）：`usage: true` 对应 providers::lobster::balance
+  //   （profile-summary 的积分真余额 + creditItems 批次明细，quota 老口径回落）。
+  // `checkin: true` 对应 providers::lobster::checkin（activity 系统三步签到，与后端
+  //   billing::checkin / CHECKIN_PROVIDERS 的分派同源同口径）。
+  // `expiry: 'jwtExpiresAt'` —— 公开形态把 JWT 的 exp 统一换算成毫秒
+  //   （落盘记录里是秒，换算点见 to_lobster_public_account）。
+  // `edition: false` —— 只有一家；凭证来自本机 App 的 sqlite（macOS）或手动粘贴。
+  // identifier 不指向用户字段：JWT 里没有稳定的用户标识，兜底的 userId 取不到
+  // 时详情行自动少一项，比拿 tokenTail 冒充账号标识诚实。
+  lobster: { usage: true, checkin: true, edition: false, identifier: 'userId', expiry: 'jwtExpiresAt' },
 }
 
 /**

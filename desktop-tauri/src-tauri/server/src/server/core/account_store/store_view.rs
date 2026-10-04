@@ -242,6 +242,10 @@ impl AccountStore {
             // 所以这里没有 `is_trae_family` —— 将来接国际版时另立 kind、
             // 另开一个分支，不要往本家的记录上挂 `region` 字段。
             self.to_trae_public_account(record)
+        } else if record.provider() == super::LOBSTER_PROVIDER_ID {
+            // LobsterAI（PR-2）：desktop / jwtExpiresAt / path 等自家字段，
+            // 凭证与转发链路见 `providers::lobster`
+            self.to_lobster_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

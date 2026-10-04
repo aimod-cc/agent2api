@@ -20,9 +20,8 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::server::core::providers::lobster::credentials::{
-    extract_credentials, read_auth_tokens_from_db, snapshot_for_desktop,
-};
+use crate::server::core::account_store::store::live_desktop_credentials;
+use crate::server::core::providers::lobster::credentials::snapshot_for_desktop;
 use crate::server::core::providers::{kind_id, ProviderKind};
 use crate::server::logging;
 
@@ -58,6 +57,91 @@ fn token_tail(token: &str) -> String {
 }
 
 impl AccountStore {
+    /// 取 LobsterAI 的账号记录（`raccoon_account_record` 同构）：
+    /// `account_id` 非空按 id 直取（provider 必须是 lobster）；空则取本家队首
+    /// （仅启用账号，排序交给内存）。没有记录返回 None（调用方回落桌面 sqlite）。
+    pub fn lobster_account_record(&self, account_id: &str) -> Option<Value> {
+        let _guard = self.guard();
+        let lobster = lobster_id();
+        if !account_id.is_empty() {
+            let record = self.record_by_id(&_guard, account_id)?;
+            return (record.provider() == lobster).then(|| record.to_value());
+        }
+        let mut candidates: Vec<StoredAccount> = self
+            .records_for_provider(&_guard, lobster)
+            .into_iter()
+            .filter(StoredAccount::enabled)
+            .collect();
+        candidates.sort_by_key(StoredAccount::order_key);
+        candidates.into_iter().next().map(|item| item.to_value())
+    }
+
+    /// 刷新后的凭证回写账号记录（**比较-再写**：记录里仍是刷新前那份凭证时才写，
+    /// `raccoon` 的 `update_raccoon_account_tokens_if_current` 同一语义）。
+    ///
+    /// 返回 `Ok(true)` = 已写入；`Ok(false)` = 记录里的凭证已被更换（用户重导/
+    /// 换号），本次结果不落盘（调用方改用最新快照）；`Err` = 记录不存在或写失败。
+    pub fn update_lobster_account_tokens_if_current(
+        &self,
+        account_id: &str,
+        previous_access: &str,
+        previous_refresh: &str,
+        next_access: &str,
+        next_refresh: &str,
+        expires_at: Option<i64>,
+    ) -> Result<bool, AccountStoreError> {
+        let guard = self.guard();
+        let Some(mut record) = self.record_by_id(&guard, account_id) else {
+            return Err(AccountStoreError::new(
+                format!("账号 {account_id} 不存在，无法回写凭证"),
+                404,
+            ));
+        };
+        if record.provider() != lobster_id() {
+            return Err(AccountStoreError::new(
+                format!("账号 {account_id} 不是 LobsterAI 账号"),
+                400,
+            ));
+        }
+        let stored_access = record
+            .fields()
+            .get("accessToken")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let stored_refresh = record
+            .fields()
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if stored_access != previous_access || stored_refresh != previous_refresh {
+            return Ok(false);
+        }
+        let fields = record.fields_mut();
+        fields.insert(
+            "accessToken".to_string(),
+            Value::String(next_access.to_string()),
+        );
+        fields.insert(
+            "refreshToken".to_string(),
+            Value::String(next_refresh.to_string()),
+        );
+        fields.insert("tokenTail".to_string(), Value::String(token_tail(next_access)));
+        match expires_at {
+            Some(exp) => {
+                fields.insert("jwtExpiresAt".to_string(), json!(exp));
+            }
+            None => {
+                fields.remove("jwtExpiresAt");
+            }
+        }
+        record.set_updated_at(logging::now_ms());
+        let updated = record.clone();
+        self.with_conn(&guard, |conn| sql::put(conn, &updated))?;
+        Ok(true)
+    }
+
     /// 手动添加 LobsterAI 账号（accessToken + refreshToken 必填）。
     pub fn add_lobster_account(
         &self,
@@ -237,6 +321,103 @@ impl AccountStore {
         );
         Ok(account)
     }
+
+    /// 公开形态（进面板账号列表与 `/api/accounts`；仿 `to_raccoon_public_account`）。
+    ///
+    /// ── 桌面端账号的实时值 ─────────────────────────────────────
+    /// 桌面账号的真值活在 App 的 sqlite 里（记录里的副本是导入那一刻的快照），
+    /// `tokenTail` / `jwtExpiresAt` / `hasRefreshToken` 优先用实时值 —— 与
+    /// raccoon 的公开形态同一取向：登录态消失表现为字段变空，而不是整条
+    /// 记录看起来还是好的。
+    ///
+    /// ── `jwtExpiresAt` 的口径 ───────────────────────────────────
+    /// 落盘记录里存的是 JWT 的 exp（**秒**），公开形态统一换算成**毫秒** ——
+    /// 全仓的过期时间口径（`tokenExpiresAt` / `expiresAt`）都是毫秒，前端
+    /// `tokenExpiryOf` 按毫秒渲染，秒值会显示成 1970 年。
+    pub fn to_lobster_public_account(&self, record: &StoredAccount) -> Value {
+        let proxy = crate::server::core::proxies::describe_account_proxy(Some(&record.proxy()));
+        let stored_tail = record
+            .get("tokenTail")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let stored_expires_ms = record
+            .get("jwtExpiresAt")
+            .and_then(Value::as_i64)
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| seconds as f64 * 1000.0);
+        let live = if record.is_desktop() {
+            live_desktop_credentials(record)
+        } else {
+            None
+        };
+        let (token_tail, expires_ms, has_refresh) = match live {
+            // `live_desktop_credentials` 的 expires_at 已是毫秒（f64）
+            Some((token, refresh_token, expires_at_ms)) => (
+                if token.is_empty() {
+                    stored_tail
+                } else {
+                    token_tail(&token)
+                },
+                (expires_at_ms > 0.0).then_some(expires_at_ms).or(stored_expires_ms),
+                !refresh_token.is_empty(),
+            ),
+            None => (
+                stored_tail,
+                stored_expires_ms,
+                !record
+                    .get("refreshToken")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .is_empty(),
+            ),
+        };
+        let mut public = Map::new();
+        public.insert("id".to_string(), Value::String(record.id().to_string()));
+        public.insert(
+            "provider".to_string(),
+            Value::String(record.provider()),
+        );
+        public.insert("name".to_string(), Value::String(record.name()));
+        public.insert("tokenTail".to_string(), Value::String(token_tail));
+        public.insert(
+            "jwtExpiresAt".to_string(),
+            expires_ms
+                .map(crate::server::core::account_store::state::json_number)
+                .unwrap_or(Value::Null),
+        );
+        public.insert("hasRefreshToken".to_string(), Value::Bool(has_refresh));
+        public.insert("desktop".to_string(), Value::Bool(record.is_desktop()));
+        public.insert(
+            "source".to_string(),
+            Value::String(
+                record
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("manual")
+                    .to_string(),
+            ),
+        );
+        if let Some(path) = record.get("path").and_then(Value::as_str) {
+            if !path.is_empty() {
+                public.insert("path".to_string(), Value::String(path.to_string()));
+            }
+        }
+        public.insert("priority".to_string(), Value::from(record.priority()));
+        public.insert("enabled".to_string(), Value::Bool(record.enabled()));
+        public.insert("addedAt".to_string(), Value::from(record.added_at()));
+        public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
+        public.insert("proxy".to_string(), proxy);
+        // 限额冷却标记（选路层读它决定「该账号对该模型是否在冷却期」，
+        // 与 raccoon 公开形态的注释同一理由）；默认空对象
+        public.insert(
+            "rateLimits".to_string(),
+            record.get("rateLimits").cloned().unwrap_or_else(|| Value::Object(Map::new())),
+        );
+        // 与其余家的公开形态同口径：可用性由凭证链路如实反映，默认可用
+        public.insert("available".to_string(), Value::Bool(true));
+        Value::Object(public)
+    }
 }
 
 /// 把一个值塞给单参数函数（避开 `Iterator::pipe` 命名冲突）。
@@ -246,10 +427,3 @@ trait Pipe: Sized {
     }
 }
 impl<T> Pipe for T {}
-
-/// 占位：保留 read_auth_tokens_from_db 与 extract_credentials 引用路径以免编译告警
-#[allow(dead_code)]
-fn _unused_keep_alive() {
-    let _ = read_auth_tokens_from_db;
-    let _ = extract_credentials;
-}
