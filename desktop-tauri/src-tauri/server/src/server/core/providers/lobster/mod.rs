@@ -86,20 +86,28 @@ impl ProviderAdapter for LobsterAdapter {
             ));
         }
         let mut outbound = body.clone();
-        if let Some(object) = outbound.as_object_mut() {
-            let requested = object
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            object.insert(
-                "model".to_string(),
-                Value::String(models::strip_model_prefix(&requested)),
-            );
-            // 上游仅流式（stream:false 也回 SSE，参考实现 实测结论）——
-            // 统一按流式发，避免「客户端要聚合、上游回 SSE」的歧义
-            object.insert("stream".to_string(), Value::Bool(true));
+        let Some(object) = outbound.as_object_mut() else {
+            // 非对象 body（数组/字符串）没法做前缀剥离与 stream 改写，
+            // 静默放行会把 stream:false 原样发给只流式的上游（协议错配且难定位）
+            return Err(GatewayError::with_status(
+                400,
+                "请求体必须是 JSON 对象（LobsterAI 转发需要改写 model 与 stream 字段）",
+            ));
+        };
+        let requested = object
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let stripped = models::strip_model_prefix(&requested);
+        if stripped.is_empty() {
+            // "lobster-"（剥完为空）或没有 model 字段:发空模型名只会换来上游 404
+            return Err(GatewayError::with_status(400, "缺少有效的 model 字段"));
         }
+        object.insert("model".to_string(), Value::String(stripped));
+        // 上游仅流式（stream:false 也回 SSE）——统一按流式发，
+        // 避免「客户端要聚合、上游回 SSE」的歧义
+        object.insert("stream".to_string(), Value::Bool(true));
         let headers: Vec<(String, String)> = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             ("Accept".to_string(), "text/event-stream".to_string()),

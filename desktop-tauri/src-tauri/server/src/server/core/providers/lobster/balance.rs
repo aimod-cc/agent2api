@@ -53,11 +53,18 @@ enum QueryFailure {
     Failed(String),
 }
 
-/// 进程级额度缓存（key = 账号 id；值 = (拉取时刻, 归一结果)）
-fn quota_cache() -> &'static Mutex<HashMap<String, (i64, Value)>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (i64, Value)>>> = OnceLock::new();
+/// 进程级额度缓存（key = 账号 id；值 = (拉取时刻, Ok(归一结果) | Err(失败文案))）
+///
+/// 成功与失败都缓存（401 除外，见模块头）；失败也缓存后，被删账号/陈旧账号的
+/// 条目靠容量上限兜底（超出即整表重建，额度缓存丢了只是多打一次上游）。
+fn quota_cache() -> &'static Mutex<HashMap<String, (i64, Result<Value, String>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (i64, Result<Value, String>)>>> =
+        OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
+
+/// 缓存容量上限（历史出现过的不同账号 id 数远小于此；超出整表重建）
+const QUOTA_CACHE_MAX_ENTRIES: usize = 64;
 
 /// 查询某账号的积分余额（归一化形状见 `ProviderAdapter::query_usage` 的文档）。
 ///
@@ -80,13 +87,15 @@ pub(super) async fn query_usage(
     {
         let now = crate::server::logging::now_ms();
         let cached = quota_cache().lock().ok().and_then(|guard| {
-            guard
-                .get(&cache_key)
-                .filter(|(fetched_at, _)| now - *fetched_at < QUOTA_CACHE_TTL_MS)
-                .map(|(_, value)| value.clone())
+            guard.get(&cache_key).filter(|(fetched_at, _)| {
+                // fetched_at <= now 防时钟回拨:负年龄恒小于 TTL,会把旧值当永新
+                *fetched_at <= now && now - *fetched_at < QUOTA_CACHE_TTL_MS
+            }).map(|(_, value)| value.clone())
         });
-        if let Some(value) = cached {
-            return Ok(value);
+        match cached {
+            Some(Ok(value)) => return Ok(value),
+            Some(Err(message)) => return Err(GatewayError::with_status(502, message)),
+            None => {}
         }
     }
     let credentials = credentials::snapshot_for(store, account_id)?;
@@ -97,13 +106,22 @@ pub(super) async fn query_usage(
         ));
     }
     let outcome = fetch_credit_data(&credentials.access_token).await;
-    match outcome {
-        Ok(value) => {
-            if let Ok(mut guard) = quota_cache().lock() {
-                guard.insert(cache_key, (crate::server::logging::now_ms(), value.clone()));
+    // 401 不缓存(模块头契约:调用方要走刷新重试);其余成功/失败都缓存
+    if !matches!(outcome, Err(QueryFailure::AuthExpired(_))) {
+        let cached = match &outcome {
+            Ok(value) => Ok(value.clone()),
+            Err(QueryFailure::Failed(message)) => Err(message.clone()),
+            Err(QueryFailure::AuthExpired(_)) => unreachable!(),
+        };
+        if let Ok(mut guard) = quota_cache().lock() {
+            if guard.len() >= QUOTA_CACHE_MAX_ENTRIES {
+                guard.clear();
             }
-            Ok(value)
+            guard.insert(cache_key, (crate::server::logging::now_ms(), cached));
         }
+    }
+    match outcome {
+        Ok(value) => Ok(value),
         Err(QueryFailure::AuthExpired(message)) => Err(GatewayError::with_status(401, message)),
         Err(QueryFailure::Failed(message)) => Err(GatewayError::with_status(502, message)),
     }
@@ -200,7 +218,9 @@ fn normalize_profile_summary(data: &Value) -> Value {
                 .iter()
                 .filter_map(|item| item.get("balance").and_then(Value::as_f64))
                 .sum()
-        });
+        })
+        // 与 quota 口径同款钳制:负余额按 0 展示(欠费态由 raw 可辨)
+        .max(0.0);
     let earliest_expiry = items
         .iter()
         .filter_map(|item| item.get("expiresAt").and_then(Value::as_str))

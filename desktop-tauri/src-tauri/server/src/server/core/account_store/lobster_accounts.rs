@@ -49,11 +49,11 @@ fn pick_token(object: &Map<String, Value>, keys: &[&str]) -> String {
     String::new()
 }
 
-/// token 指纹（最后 4 字符），UI 列展示用
+/// token 指纹（最后 4 个字符），UI 列展示用（按 char 切,与 raccoon 同款）
 fn token_tail(token: &str) -> String {
-    let bytes = token.as_bytes();
-    let start = bytes.len().saturating_sub(4);
-    String::from_utf8_lossy(&bytes[start..]).into_owned()
+    let chars: Vec<char> = token.chars().collect();
+    let start = chars.len().saturating_sub(4);
+    chars[start..].iter().collect::<String>()
 }
 
 impl AccountStore {

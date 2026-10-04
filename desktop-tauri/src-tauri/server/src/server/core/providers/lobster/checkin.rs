@@ -73,7 +73,7 @@ struct CheckinState {
 }
 
 /// 查签到实时状态；无可用活动时返回 None（文案由调用方给）。
-async fn fetch_checkin_state(token: &str) -> Result<Option<CheckinState>, String> {
+async fn fetch_checkin_state(token: &str) -> Result<Option<CheckinState>, (u16, String)> {
     // 第 1 步：slot（展示位 → 当前可用活动）
     let slot_query = format!(
         "?placement={CHECKIN_PLACEMENT}&clientVersion={CLIENT_VERSION_FALLBACK}\
@@ -128,14 +128,15 @@ async fn fetch_checkin_state(token: &str) -> Result<Option<CheckinState>, String
     }))
 }
 
-/// 带鉴权请求（GET/POST），解包 `{code, message, data}`；网络/HTTP 失败给文案。
-/// 401/403 抛 `GatewayError(401)`（调用方走刷新重试），其余失败给 502 文案。
+/// 带鉴权请求（GET/POST），解包 `{code, message, data}`。
+/// 失败带状态码返回：401/403 = 凭证被拒（调用方映射 401，面板据此提示重新登录），
+/// 其非 2xx = 上游故障。不在这里抛 GatewayError——三个调用点的收口口径不同。
 async fn authed_request(
     method: &str,
     path: &str,
     body: Option<&Value>,
     token: &str,
-) -> Result<Value, String> {
+) -> Result<Value, (u16, String)> {
     let url = format!("{}{path}", super::DEFAULT_LLM_BASE_URL);
     let mut headers = vec![
         ("Accept".to_string(), "application/json".to_string()),
@@ -152,23 +153,21 @@ async fn authed_request(
         Ok(response) => response,
         Err(error) => {
             return Err(if error.is_timeout() {
-                "签到接口超时".to_string()
+                (0u16, "签到接口超时".to_string())
             } else {
-                format!("签到接口请求失败: {error}")
+                (0u16, format!("签到接口请求失败: {error}"))
             })
         }
     };
     let payload = response.payload.unwrap_or(Value::Null);
     if !response.ok {
-        return Err(format!(
-            "签到接口返回 HTTP {}: {}",
-            response.status,
-            payload
-                .get("message")
-                .or_else(|| payload.get("msg"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-        ));
+        let message = payload
+            .get("message")
+            .or_else(|| payload.get("msg"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return Err((response.status, format!("签到接口返回 HTTP {}: {message}", response.status)));
     }
     Ok(payload)
 }
@@ -185,9 +184,9 @@ pub async fn claim_daily_checkin(
     let adapter_token = ensure_token(store, account_id).await?;
     let account_key = account_key_of(store, account_id);
 
-    let state = fetch_checkin_state(&adapter_token)
-        .await
-        .map_err(|message| GatewayError::with_status(502, message))?;
+    let state = fetch_checkin_state(&adapter_token).await.map_err(|(status, message)| {
+        classify_transport_failure(status, message)
+    })?;
     let Some(state) = state else {
         return Ok(json!({
             "success": false,
@@ -226,7 +225,7 @@ pub async fn claim_daily_checkin(
     });
     let claim = authed_request("POST", &claim_path, Some(&claim_body), &adapter_token)
         .await
-        .map_err(|message| GatewayError::with_status(502, message))?;
+        .map_err(|(status, message)| classify_transport_failure(status, message))?;
     let code = claim.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code == 0 {
         balance::invalidate_quota_cache(&account_key);
@@ -263,6 +262,15 @@ pub async fn claim_daily_checkin(
         "success": false,
         "msg": format!("签到失败（code {code}）: {message}"),
     }))
+}
+
+/// 传输层失败 → GatewayError 的统一口径：401/403 = 凭证被拒（面板提示重新登录），
+/// 0 = 网络失败，其余 = 上游故障（502）。
+fn classify_transport_failure(status: u16, message: String) -> GatewayError {
+    if status == 401 || status == 403 {
+        return GatewayError::with_status(401, "LobsterAI 凭证已失效，请打开 LobsterAI App 重新登录后再签到");
+    }
+    GatewayError::with_status(502, message)
 }
 
 /// 取可用 token（临期先刷新）。凭证缺失 / 刷新失败给 401 终态文案。
