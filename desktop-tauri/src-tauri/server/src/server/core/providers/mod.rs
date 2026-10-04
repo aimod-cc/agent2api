@@ -116,6 +116,7 @@ pub mod content_block;
 /// 形态调用它 —— 挂在这里与其它子模块并列，便于对照「内置家走适配器、
 /// 自定义家走独立通道」的两条路径。
 pub mod custom;
+pub mod lobster;
 pub mod qoder;
 pub mod raccoon;
 pub mod refresh_flight;
@@ -283,6 +284,9 @@ pub enum ProviderKind {
     /// `core::auto_checkin` 的提供商清单不含本家。每日签到存在，但要单独授权
     /// 才会接（见 cpa-deploy/notes/agent2api-trae-port-plan.md 的 §8 决策 3）。
     Trae,
+    /// LobsterAI（网易有道）。凭证实现见 `lobster/`。本枚举是 PR-1 接入
+    /// 注册表与添加分派的最小切片（桌面端导入 + 手动添加），转发由 PR-2 完成。
+    Lobster,
 }
 
 /// 一个提供商的静态元数据。
@@ -330,6 +334,7 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta { id: "zcode-intl", label: "ZCode 国际版" },
     ProviderMeta { id: "codearts", label: "CodeArts" },
     ProviderMeta { id: "trae", label: "Trae" },
+    ProviderMeta { id: "lobster", label: "LobsterAI" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -403,6 +408,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "zcode" => Some(ProviderKind::Zcode),
         "zcode-intl" => Some(ProviderKind::ZcodeIntl),
         "codearts" => Some(ProviderKind::CodeArts),
+        "lobster" => Some(ProviderKind::Lobster),
         "trae" => Some(ProviderKind::Trae),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
@@ -436,6 +442,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::ZcodeIntl => "zcode-intl",
         ProviderKind::CodeArts => "codearts",
         ProviderKind::Trae => "trae",
+        ProviderKind::Lobster => "lobster",
     }
 }
 
