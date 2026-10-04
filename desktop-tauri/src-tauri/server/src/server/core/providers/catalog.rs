@@ -119,8 +119,13 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
             super::trae::models::remote_refreshed(),
             super::trae::models::last_refreshed_at(),
         ),
-        // LobsterAI 目录在 PR-2 接 `/api/proxy/v1/models` 远程刷新前都是空
-        ProviderKind::Lobster => (false, 0),
+        // LobsterAI：远程目录（`/api/proxy/v1/models`）落地过就算远程来源；
+        // 从未落地时 `list()` 自行回落 openclaw.json / 静态兜底（与 raccoon
+        // 的「远程 / 兜底」两级同一语义，这里只报远程那一档的事实）。
+        ProviderKind::Lobster => (
+            super::lobster::models::remote_refreshed(),
+            super::lobster::models::last_refreshed_at(),
+        ),
     }
 }
 
