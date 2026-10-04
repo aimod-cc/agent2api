@@ -108,6 +108,18 @@ impl ProviderAdapter for LobsterAdapter {
         // 上游仅流式（stream:false 也回 SSE）——统一按流式发，
         // 避免「客户端要聚合、上游回 SSE」的歧义
         object.insert("stream".to_string(), Value::Bool(true));
+        // 强制流式的伴生义务:上游按 OpenAI 规范只在 `stream_options.include_usage`
+        // 为真时才在末帧回 usage——客户端原本要非流式(响应体自带 usage),被我们
+        // 改成流式后就拿不到 usage 了。替它带上;客户端显式给过则尊重原值。
+        // (上游审计第 1 轮五处裁定的 NOT_VERIFIED 项:线上 usage 完整性)
+        // 判据是「客户端带没带 stream_options」而不是「值是不是 true」——
+        // 显式 false 也是明确意图(它自己放弃 usage),一并尊重
+        if object.get("stream_options").is_none() {
+            object.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
         let headers: Vec<(String, String)> = vec![
             ("Content-Type".to_string(), "application/json".to_string()),
             ("Accept".to_string(), "text/event-stream".to_string()),
@@ -255,5 +267,48 @@ impl ProviderAdapter for LobsterAdapter {
     ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>>
     {
         Box::pin(async move { balance::query_usage(store, account_id).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account() -> Value {
+        serde_json::json!({ "auth": { "accessToken": "a.b.c" } })
+    }
+
+    /// 强制流式的伴生义务:未带 stream_options 的请求体注入 include_usage;
+    /// 客户端显式给过(含显式 false)则尊重原值
+    #[test]
+    fn stream_forwarding_carries_include_usage() {
+        let body = serde_json::json!({
+            "model": "lobster-glm-5.3-flash",
+            "stream": false,
+            "messages": [{ "role": "user", "content": "hi" }],
+        });
+        let plan = LobsterAdapter.build_chat_request(&account(), &body, &HeaderMap::new())
+            .expect("构造请求");
+        assert_eq!(plan.body.get("stream"), Some(&Value::Bool(true)));
+        assert_eq!(
+            plan.body.pointer("/stream_options/include_usage"),
+            Some(&Value::Bool(true)),
+            "非流式请求被改为流式后,必须替客户端带上 include_usage"
+        );
+        assert_eq!(plan.body.get("model"), Some(&Value::String("glm-5.3-flash".into())));
+
+        // 客户端显式 false:尊重(它自己放弃了流式 usage,聚合层 usage 为 null 是它的选择)
+        let body = serde_json::json!({
+            "model": "lobster-glm-5.3-flash",
+            "stream": true,
+            "stream_options": { "include_usage": false },
+            "messages": [],
+        });
+        let plan = LobsterAdapter.build_chat_request(&account(), &body, &HeaderMap::new())
+            .expect("构造请求");
+        assert_eq!(
+            plan.body.pointer("/stream_options/include_usage"),
+            Some(&Value::Bool(false)),
+        );
     }
 }
