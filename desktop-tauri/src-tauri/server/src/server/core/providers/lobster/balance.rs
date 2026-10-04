@@ -139,23 +139,21 @@ pub(super) fn invalidate_quota_cache(account_id: &str) {
 
 /// 拉积分：profile-summary 主轨，quota 回落。
 async fn fetch_credit_data(token: &str) -> Result<Value, QueryFailure> {
-    match request_json("/api/user/profile-summary", token).await {
-        // 主轨解析不出任何数值(总额与批次全不可读)时按失败处理 → 回落 quota,
-        // 不把「无法解析」静默报成余额 0(上游审计发现 5)
-        Ok(data) => normalize_profile_summary(&data).ok_or_else(|| {
-            QueryFailure::Failed("profile-summary 响应无可解析余额".to_string())
-        }),
-        // 主轨的 401 直接透出：回落口径用同一个 token 也只会再 401 一次
+    // 主轨「请求失败」与「响应无可解析余额」统一折成同一档失败再回落 quota
+    // (上游第 3 轮·发现 2:解析失败产生在 Ok 分支内部,旧的 match 结构下
+    // 不会再进 Err 分支,回落从未真正发生——探针实测只发了一次请求)
+    let main_failure: QueryFailure = match request_json("/api/user/profile-summary", token).await {
+        Ok(data) => match normalize_profile_summary(&data) {
+            Some(value) => return Ok(value),
+            None => QueryFailure::Failed("profile-summary 响应无可解析余额".to_string()),
+        },
+        Err(QueryFailure::AuthExpired(message)) => return Err(QueryFailure::AuthExpired(message)),
+        Err(failure) => failure,
+    };
+    match request_json("/api/user/quota", token).await {
+        Ok(data) => Ok(normalize_quota(&data)),
         Err(QueryFailure::AuthExpired(message)) => Err(QueryFailure::AuthExpired(message)),
-        Err(main_failure) => {
-            match request_json("/api/user/quota", token).await {
-                Ok(data) => Ok(normalize_quota(&data)),
-                Err(QueryFailure::AuthExpired(message)) => {
-                    Err(QueryFailure::AuthExpired(message))
-                }
-                Err(_) => Err(main_failure),
-            }
-        }
+        Err(_) => Err(main_failure),
     }
 }
 

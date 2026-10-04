@@ -302,10 +302,21 @@ pub async fn refresh(token: &str, force: bool) -> ModelRefreshOutcome {
     // 来源 2：App 同步的 openclaw.json（本地文件，字段最全）。
     // **不落地内存状态**（上游审计发现 6）：list() 对本地来源保持动态读取
     // （openclaw_models 自带 mtime 缓存，App 更新即刻跟随）；落地会把它冻结在
-    // 刷新那一刻，还会让 remote_refreshed() 把本地来源谎报成远程。只汇报条数。
+    // 刷新那一刻，还会让 remote_refreshed() 把本地来源谎报成远程。
+    // 汇报口径（上游第 3 轮·发现 5）：内存里已有远程缓存时,本地可读只是
+    // 「远程失败的兜底」,活动清单仍是缓存——报 unchanged 如实反映,不能报
+    // refreshed(那会说「已采用本地目录」而 list() 实际返回旧缓存);
+    // 没有远程缓存时本地就是活动来源,list() 动态读它,报 refreshed(条数)。
     let local = openclaw_models();
     if !local.is_empty() {
         let count = local.len();
+        if remote_refreshed() {
+            logging::verbose(
+                "[Models]",
+                &format!("LobsterAI 远程目录未取到,沿用现有缓存(本机 App 清单 {count} 个仅作兜底)"),
+            );
+            return ModelRefreshOutcome::unchanged();
+        }
         logging::verbose(
             "[Models]",
             &format!("LobsterAI 目录沿用本机 App 同步清单（{count} 个，mtime 跟随）"),
