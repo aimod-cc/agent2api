@@ -596,13 +596,46 @@ fn latest_credentials(
             desktop_credentials()
         }
         CredentialOrigin::AccountStore => {
-            if store.lobster_account_record(&previous.id).is_none() {
+            // **只读一次记录,并从这一份直接构造**(上游第 3 轮·发现 1,
+            // 第 4 轮复检确认此修复此前未落盘):旧写法「查存在 → snapshot_for」
+            // 两次读盘,之间记录被删的话 snapshot_for 会对 None 回落到本机桌面
+            // 账号——显式刷新 A 的请求拿着桌面 B 的凭证回去(签到按 A 归属执行
+            // B 的操作)。不复用 snapshot_for:它的桌面回落是「默认选号」语义,
+            // 对显式 id 是错的。显式 id 的「记录被删」与「凭证为空」一律终态。
+            let Some(record) = store.lobster_account_record(&previous.id) else {
                 return Err(GatewayError::with_status(
                     401,
                     format!("账号 {} 已被删除，本次刷新结果作废", previous.id),
                 ));
+            };
+            let access_token = record
+                .get("accessToken")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if access_token.is_empty() {
+                return Err(GatewayError::with_status(
+                    401,
+                    format!("账号 {} 的当前凭证为空，本次刷新结果作废", previous.id),
+                ));
             }
-            snapshot_for(store, &previous.id)
+            Ok(LobsterCredentials {
+                id: record
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                access_token,
+                refresh_token: record
+                    .get("refreshToken")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                expires_at: record
+                    .get("jwtExpiresAt")
+                    .and_then(Value::as_i64),
+                origin: CredentialOrigin::AccountStore,
+            })
         }
     }
 }
