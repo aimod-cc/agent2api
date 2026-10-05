@@ -242,6 +242,15 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "lobster" => {
+            // LobsterAI 的每日签到走 activity 系统三步链（slot → context →
+            // check_in，幂等键 + 配置版本号），见 `providers::lobster::checkin`
+            let claim =
+                crate::server::core::providers::lobster::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         // 兜底只服务默认那家（WorkBuddy）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。

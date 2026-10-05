@@ -929,6 +929,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
         ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
         ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
+        ProviderKind::Lobster => &super::lobster::LOBSTER_ADAPTER,
     }
 }
 
@@ -990,6 +991,10 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 不在的话刷新循环根本不会问它，症状是"界面上点了刷新、日志里
         // 一句 trae 都没有"（与"刷了但没取到"是两种完全不同的故障）。
         ProviderKind::Trae,
+        // LobsterAI 在本列表里 = PR-2 已接真身（转发 / 目录 / 额度 / 签到）。
+        // 它有远程目录（`/api/proxy/v1/models` + openclaw.json 本地回落），
+        // 不在的话同样会出现"点了刷新、日志里一句 lobster 都没有"。
+        ProviderKind::Lobster,
     ]
 }
 

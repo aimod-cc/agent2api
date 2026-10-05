@@ -491,6 +491,32 @@ const TRAE: ProviderConfig = {
   ],
 }
 
+/**
+ * LobsterAI（网易有道）。
+ *
+ * ── 两条添加路径（后端 `api::accounts::add_account` 的 lobster 分支）────
+ *   · 手动粘贴：accessToken + refreshToken 两样都必填（这家上游的
+ *     refreshToken 参与续期轮换，少它到期就只能重粘）；
+ *   · 桌面端导入（推荐）：读本机 App 的 sqlite 登录态（macOS）。
+ *
+ * ── 没有「网页登录」───────────────────────────────────────────
+ * 上游没有 OAuth/设备授权那种可回调的登录协议，凭证只能从 App 的库或
+ * 粘贴来 —— 与参考实现的两条路径一致，不硬造第三条。
+ */
+const LOBSTER: ProviderConfig = {
+  provider: 'lobster',
+  label: 'LobsterAI',
+  manualTitle: '粘贴 accessToken / refreshToken',
+  manualNote: '两样都从 LobsterAI App 的登录态里来（macOS 客户端）。缺 refreshToken 的账号到期后无法自动续期，需要重新粘贴。',
+  fields: [
+    { key: 'accessToken', label: 'accessToken', rows: 3, placeholder: '粘贴 accessToken（一长串 JWT，三段点分）' },
+    { key: 'refreshToken', label: 'refreshToken', rows: 2, placeholder: '必填，到期自动续期用它换新 token' },
+    { key: 'name', label: '备注名', optional: true, placeholder: '可选，留空自动生成' },
+  ],
+  desktopNote: '读本机 LobsterAI App 当前登录态，每次实时读取（删掉这条记录不影响 App 登录态）。App 重新登录后重新导入即可。',
+  desktopHint: '读取 ~/Library/Application Support/LobsterAI/lobsterai.sqlite，需已在 LobsterAI App 登录（仅 macOS）',
+}
+
 /** 内置家的表单块，顺序与旧 ADD_FORMS 一致（只影响 DOM 里的块顺序，不影响界面） */
 export const BUILTIN_CONFIGS: ProviderConfig[] = [
   RACCOON,
@@ -512,6 +538,9 @@ export const BUILTIN_CONFIGS: ProviderConfig[] = [
   CODEARTS,
   // Trae 只有 SOLO 那一家（没有地区分叉，理由见 TRAE 上方那段）
   TRAE,
+  // LobsterAI 排在内置家的末尾（PR-2 全链路；BUG-1：不在这张表里时
+  // 点「添加 LobsterAI」会掉进「即将上线」的兜底文案）
+  LOBSTER,
 ]
 
 /** WorkBuddy 的块 id（结构特殊，单独一个组件） */

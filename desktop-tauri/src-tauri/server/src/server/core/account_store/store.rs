@@ -682,6 +682,26 @@ pub(crate) fn live_desktop_credentials(record: &StoredAccount) -> Option<(String
             credentials.expires_at.unwrap_or(0.0),
         ));
     }
+    // LobsterAI 桌面端登录态：实时读 App 的 sqlite（kv.auth_tokens，带 mtime+TTL
+    // 缓存，见 `lobster::credentials` 的模块头）。PR-1 的导入在记录里落了一份
+    // token 副本，但真值活在 App 的库里 —— App 自己刷新回写后，副本就旧了；
+    // 网关刷新回写 sqlite 后同理。少了这一支，桌面账号的转发会拿着过期副本
+    // 稳定 401，而记录里的副本看起来一切正常。
+    // `expires_at` 换算成毫秒：会话契约是毫秒（`record.expires_at()` 的口径），
+    // JWT 的 exp 是秒。
+    if record.provider() == super::LOBSTER_PROVIDER_ID && record.is_desktop() {
+        // 桌面登录态**缺失时返回空对而不是 None**（上游审计发现 8）：None 会让
+        // 会话回落到导入时的旧副本——于是面板显示正常、转发用旧 token、刷新报
+        // 缺失，三种视角互相矛盾。空对让转发如实 401「缺少 accessToken」，
+        // 与刷新/签到/公开形态（available=false）一致。
+        let (access_token, refresh_token) = crate::server::core::providers::lobster::credentials::desktop_tokens()
+            .unwrap_or_default();
+        let expires_at =
+            crate::server::core::providers::lobster::credentials::jwt_exp_seconds(&access_token)
+                .map(|seconds| seconds as f64 * 1000.0)
+                .unwrap_or(0.0);
+        return Some((access_token, refresh_token, expires_at));
+    }
     if record.provider() != super::RACCOON_PROVIDER_ID || !record.is_desktop() {
         return None;
     }

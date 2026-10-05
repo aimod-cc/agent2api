@@ -60,12 +60,15 @@ pub const DEFAULT_TIME: &str = "00:01";
 ///     活动列表里只有促销），由 `billing::checkin::supports_checkin` 按 edition
 ///     排除。中国版里 Free 套餐账号也可能没有被下发活动（实测如此），那种情况
 ///     实现返回一条中性结果（「当前没有可领取的签到活动」），不算失败。
+///   - **LobsterAI**：activity 系统三步签到（slot → context → check_in，
+///     `providers::lobster::checkin`）。仅 macOS（凭证来自本机 App 的 sqlite），
+///     其它平台没有账号可签，批量路径自然跳过。
 ///
 /// 这是「有签到活动」的清单，不是「有积分概念」的清单：CatPaw 有积分查询但
 /// 没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 5] =
-    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder"];
+pub const CHECKIN_PROVIDERS: [&str; 6] =
+    ["workbuddy", "raccoon", "autoclaw", "autoclaw-intl", "qoder", "lobster"];
 
 /// 缺省的签到提供商集合（全选）
 pub fn default_providers() -> Vec<String> {
