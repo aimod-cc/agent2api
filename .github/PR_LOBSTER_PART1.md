@@ -14,12 +14,12 @@ PR-1 **故意不**接：
 - `build_chat_request` 转发（PR-1 显式返回 501：`build_chat_request` 报「等待 PR-2」）
 - 模型目录远程刷新（`/api/proxy/v1/models`）
 - 额度查询（profile-summary / quota）
-- 每日签到（activity slot 三步 + 积分领取守护线程）
+- 每日签到（activity slot 三步,接入既有定时签到调度）
 - Token 主动刷新与回写 sqlite（JWT 2h 内有效，超期需要重新打开 LobsterAI App 让 App 自带刷新通道续期）
 
 为什么：转发路径涉及面大（OpenAI 兼容层 + SSE 解析 + 模型名前缀去重），单独冲刺风险高。先把账号与注册表这层落地，方便你视觉验收（App 里能看到 LobsterAI provider 与你导入的账号），同时给后续 PR-2 提供干净起点。
 
-## 改动面（5 文件小改 + 2 新文件）
+## 改动面（代码 7 文件 + PR 描述文档 2 份,合计 9 文件）
 
 ```
 M desktop-tauri/src-tauri/server/src/server/api/accounts.rs       (+10)  分派加 Lobster

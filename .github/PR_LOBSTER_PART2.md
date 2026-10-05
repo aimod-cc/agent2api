@@ -42,7 +42,7 @@ M ui-islands …/add-account-configs.ts   表单配置（修「即将上线」�
 M ui-islands …/accounts-domain.ts       能力位 usage / checkin / expiry
 ```
 
-测试 8 个：前缀剥离 / 远程与 openclaw 目录解析 / quota 五分支归一 / profile-summary 批次排序 / JWT 解码与临期判定。
+单元测试 13 个：前缀剥离 / 远程与 openclaw 目录解析（含 video 模态）/ quota 五分支归一 / profile-summary 批次排序与不可解析回落 / JWT 解码与临期判定 / 凭证回写四态（轮换写入、字段保留、换号拒绝、行缺失不重建）/ include_usage 两态 / 同秒撞号拒绝。验证环境：macOS（Apple Silicon）、提交当日实测（cargo test 全量绿；curl 清单为实测结果）。
 
 ## 复验清单（全部实测通过）
 
@@ -55,7 +55,7 @@ curl -N -X POST http://localhost:3065/v1/chat/completions \
 # 2. 非流式（上游仅流式，网关聚合成标准 JSON 响应）
 curl -X POST http://localhost:3065/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"lobster-deepseek-v4-flash","stream":false,"messages":[…]}'
+  -d '{"model":"lobster-deepseek-v4-flash","stream":false,"messages":[{"role":"user","content":"只说两个字:收到"}]}'
 
 # 3. 模型目录（26 款）
 curl -s http://localhost:3065/v1/models | \
@@ -77,6 +77,16 @@ curl -X POST http://localhost:3065/api/accounts/checkin \
 
 ## 已知边界
 
-- 凭证依赖本机 LobsterAI App 的登录态（macOS）；App 未登录时添加账号会如实报「未找到本机登录态」。
+- **平台边界**：「桌面端导入」读本机 App 的 sqlite 登录态，仅 macOS；**手动粘贴凭证**不依赖 App 路径，理论上跨平台，但仅在 macOS 实测——其它平台未验证，不宣称支持。
+- 「模型目录 26 款」为提交当日某 App 版本的 openclaw.json 快照样本，不是契约；目录以刷新时点为准。
+- 凭证依赖有效的 LobsterAI 登录态；App 未登录时添加账号会如实报「未找到本机登录态」。
 - 上游仅流式：`stream:false` 由网关聚合还原——客户端要等完整生成后才拿到响应（总延迟等于完整生成时长），不是流式的逐帧到达。
 - 签到活动「今日」由服务端按活动时区判定（实测 Asia/Shanghai），本地不做日历计算。
+
+
+## 已知限制（如实披露，非闭环）
+
+- **凭证回写失败的窗口**：转发链会尽量直接消费刷新结果，但比较基准取自外层会话，可能早于适配器本次刷新的实际输入——该窗口下沿用存储中的旧凭证，可能再次鉴权失败（由 401 重试链兜底，不保证恢复成功）。余额查询路径刷新成功后仍重读存储，回写失败时重试可能仍用旧凭证。
+- **编排层终态**：账号被删除等终态失败，编排层当前仍按「暂时失败」沿用旧会话尝试。
+- **模型目录缓存的升级边界**：缓存的目录不带来源标记；本 PR 是该字段的**首个公开版本**，不承诺对内部测试版缓存的来源迁移（远程/本地混存时以缓存为准）。
+- 观察项（未在线上捕获；相关聚合器加固在**另行拟议的基线改进**中，本 PR 未包含）：SSE 流内嵌业务错误帧的实际形态；通用聚合器收尾规则对全部内置上游的兼容性（codearts/trae 走各自聚合器，其绿灯不作通用证明）。

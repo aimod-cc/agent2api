@@ -193,6 +193,25 @@ impl AccountStore {
                     409,
                 ));
             }
+            // 同 provider 撞 id(id 按 jwt exp 派生,同秒签发会撞):仅当
+            // accessToken 一致(同一账号的重导入/覆盖更新)才放行覆盖;
+            // token 不同而 id 相同 = 大概率是**另一个账号**在同秒签发,
+            // 静默合并会拿新凭证顶掉旧账号还沿用旧名——按不同账号拒绝,
+            // 由用户改名或重新导入区分
+            if existing
+                .get("accessToken")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                != access_token
+            {
+                return Err(AccountStoreError::new(
+                    format!(
+                        "账号 id「{id}」已存在且凭证不同(可能是同秒签发的另一个账号)，\
+                         如确认要覆盖请先删除原账号",
+                    ),
+                    409,
+                ));
+            }
         }
 
         let record_name = existing
@@ -438,6 +457,47 @@ mod tests {
     /// 删除场景的三态语义(上游第 2 轮探针发现):记录不存在必须返回
     /// Ok(false)(Stale),让调用方走 latest_credentials 的终态分支;
     /// 返回 Err 会被当成「回写失败但刷新成功」,账号删了还发新 token。
+    /// 同 provider 撞 id 的防合并回归(id 按 jwt exp 派生,同秒签发的两个账号会撞):
+    /// token 相同 = 同账号覆盖更新(放行);token 不同 = 另一个账号,拒绝 409
+    #[test]
+    fn same_id_different_token_is_refused_as_another_account() {
+        let (db, guard) = crate::server::db::test_temp::TempDb::open("lobster-collision");
+        let store = AccountStore::with_db(Some(db));
+        let first = store
+            .add_lobster_account(
+                &serde_json::json!({
+                    "accessToken": "header.eyJleHAiOjE5MDAwMDAwMDB9.sig-a",
+                    "refreshToken": "rt-a",
+                }),
+                None,
+            )
+            .expect("首个账号应可添加");
+        let id = first.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+        // 同 id 同 token:覆盖更新放行
+        store
+            .add_lobster_account(
+                &serde_json::json!({
+                    "accessToken": "header.eyJleHAiOjE5MDAwMDAwMDB9.sig-a",
+                    "refreshToken": "rt-a2",
+                }),
+                None,
+            )
+            .expect("同 token 重导入应覆盖更新");
+        // 同 id 不同 token(同秒 exp):按另一个账号拒绝
+        let refused = store.add_lobster_account(
+            &serde_json::json!({
+                "accessToken": "header.eyJleHAiOjE5MDAwMDAwMDB9.sig-b",
+                "refreshToken": "rt-b",
+            }),
+            None,
+        );
+        assert!(
+            refused.is_err(),
+            "同 id 不同 token 必须拒绝(两个账号同秒签发不得静默合并)"
+        );
+        drop(guard);
+    }
+
     #[test]
     fn missing_record_reports_stale_not_failure() {
         let (db, guard) = crate::server::db::test_temp::TempDb::open("lobster-accounts-missing");
