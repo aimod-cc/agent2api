@@ -95,6 +95,7 @@ pub mod codearts_accounts;
 pub mod custom_accounts;
 pub mod priority;
 pub mod qoder_accounts;
+pub mod lobster_accounts;
 pub mod raccoon_accounts;
 pub mod raccoon_import;
 pub mod sql;

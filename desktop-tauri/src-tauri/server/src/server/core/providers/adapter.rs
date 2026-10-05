@@ -929,6 +929,7 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
         ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
         ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
+        ProviderKind::Lobster => &super::lobster::LOBSTER_ADAPTER,
     }
 }
 

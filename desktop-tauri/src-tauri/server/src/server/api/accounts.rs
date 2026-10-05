@@ -569,6 +569,16 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             }
             store.add_trae_account(&credential, import_name, "manual")
         }
+        Some(crate::server::core::providers::ProviderKind::Lobster) => {
+            // LobsterAI：桌面端实时登录态（推荐）/ 手动粘贴两条路。手动路径
+            // 只接 accessToken + refreshToken 两字段（PR-1 不做刷新），ref 字段
+            // 可选——服务端读 desktop 路径时它有值；用户从 UI 粘贴时可留空。
+            if import_desktop {
+                store.import_lobster_desktop_account("manual")
+            } else {
+                store.add_lobster_account(&payload, import_name)
+            }
+        }
         Some(crate::server::core::providers::ProviderKind::WorkBuddy) | None => {
             store.add_account(&payload, None)
         }
