@@ -1,5 +1,7 @@
 # feat(lobster): PR-1 LobsterAI（网易有道）provider 最小切片
 
+
+> **审查说明以 PR 正文为唯一权威**;本文件是草稿存档,与正文不一致时以正文为准。
 ## 这是什么
 
 PR-1 把 LobsterAI（网易有道）接进 Agent2API 的**账号与注册表层**。改完后：
@@ -19,7 +21,7 @@ PR-1 **故意不**接：
 
 为什么：转发路径涉及面大（OpenAI 兼容层 + SSE 解析 + 模型名前缀去重），单独冲刺风险高。先把账号与注册表这层落地，方便你视觉验收（App 里能看到 LobsterAI provider 与你导入的账号），同时给后续 PR-2 提供干净起点。
 
-## 改动面（代码 7 文件 + PR 描述文档 2 份,合计 9 文件）
+## 改动面（8 个代码文件 + 1 份 PR 描述文档）
 
 ```
 M desktop-tauri/src-tauri/server/src/server/api/accounts.rs       (+10)  分派加 Lobster
@@ -38,7 +40,7 @@ A desktop-tauri/src-tauri/server/src/server/core/providers/lobster/mod.rs       
 - **ProviderAdapter 占位**：写完 trait 的必填签名（`kind` / `list_models` / `build_chat_request` / `classify_error` / `ensure_access_token` / `refresh_models`）；`list_models` 返回空、`build_chat_request` 返回 501；保证 `adapter_for` 穷举 match 编译通过 + 不破坏现有路径。
 - **凭证来源**：桌面端 `~/Library/Application Support/LobsterAI/lobsterai.sqlite` 的 `kv.auth_tokens` 行（accessToken + refreshToken）。PR-1 不缓存、每次读盘（桌面端导入是低频操作够用）；PR-2 加 mtime + TTL。
 - **账号 ID**：`lobster-{jwt.exp 或 tokenTail 后 4}`，与 raccoon `user-{userId}`、`trae` 的 sha256 不撞空间（与撞 id 保护已就位）。
-- **去重**：复用本仓的「撞 id 保护」语义（`existing.user_id() != lobster_id` 时 409），与 zcode_accounts 同款。
+- **去重**：撞 id 保护——id 被其它 provider 占用时 409（比较的是 `provider` 字段），与 zcode_accounts 同款。
 
 ## 复验清单（按顺序）
 

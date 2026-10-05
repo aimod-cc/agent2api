@@ -196,8 +196,9 @@ impl AccountStore {
             // 同 provider 撞 id(id 按 jwt exp 派生,同秒签发会撞):仅当
             // accessToken 一致(同一账号的重导入/覆盖更新)才放行覆盖;
             // token 不同而 id 相同 = 大概率是**另一个账号**在同秒签发,
-            // 静默合并会拿新凭证顶掉旧账号还沿用旧名——按不同账号拒绝,
-            // 由用户改名或重新导入区分
+            // 静默合并会拿新凭证顶掉旧账号还沿用旧名——按不同账号拒绝;
+            // 确为同一账号时,删除原账号后重新添加即可(id 由 exp 派生,
+            // 与名字无关,改名不能避开撞号)
             if existing
                 .get("accessToken")
                 .and_then(Value::as_str)
@@ -491,10 +492,37 @@ mod tests {
             }),
             None,
         );
-        assert!(
-            refused.is_err(),
-            "同 id 不同 token 必须拒绝(两个账号同秒签发不得静默合并)"
+        let error = refused.err().expect("同 id 不同 token 必须拒绝(两个账号同秒签发不得静默合并)");
+        assert_eq!(error.status_code, 409, "按不同账号拒绝应给 409");
+        // 拒绝后原记录不得被改动:凭证仍是第一份的 token
+        let (db2, guard2) = crate::server::db::test_temp::TempDb::open("lobster-collision-verify");
+        let store2 = AccountStore::with_db(Some(db2));
+        store2
+            .add_lobster_account(
+                &serde_json::json!({
+                    "accessToken": "header.eyJleHAiOjE5MDAwMDAwMDB9.sig-a",
+                    "refreshToken": "rt-a",
+                }),
+                None,
+            )
+            .ok();
+        let refused2 = store2.add_lobster_account(
+            &serde_json::json!({
+                "accessToken": "header.eyJleHAiOjE5MDAwMDAwMDB9.sig-b",
+                "refreshToken": "rt-b",
+            }),
+            None,
         );
+        assert!(refused2.is_err());
+        let kept = store2
+            .lobster_account_record("lobster-1900000000")
+            .expect("拒绝后原记录仍在");
+        assert_eq!(
+            kept.get("accessToken").and_then(Value::as_str),
+            Some("header.eyJleHAiOjE5MDAwMDAwMDB9.sig-a"),
+            "拒绝路径不得改动原记录凭证"
+        );
+        drop(guard2);
         drop(guard);
     }
 

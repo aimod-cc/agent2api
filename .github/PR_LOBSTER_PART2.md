@@ -1,7 +1,10 @@
 # feat(lobster): PR-2 转发流式 + 模型目录 + 额度查询 + 每日签到
 
+
+> **审查说明以 PR 正文为唯一权威**;本文件是草稿存档,与正文不一致时以正文为准。
 > Part 2 of 2, completes the LobsterAI（网易有道）integration.
-> 依赖 #PR-1（注册表 + 凭证读取 + 账号导入），两个 PR 按顺序独立可审。
+> 依赖 **#82**（注册表 + 凭证读取 + 账号导入）。base 为 main，本 PR 的提交含 Part 1；
+> **增量审阅请看**：[lobster/pr-1...lobster/pr-2](https://github.com/cat-xierluo/agent2api-1/compare/lobster/pr-1...lobster/pr-2)。
 
 ## 这是什么
 
