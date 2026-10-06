@@ -84,15 +84,15 @@ pub fn supports_checkin(account: &Value) -> bool {
         .get("provider")
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
-    // CodeArts 与 Trae 两家都没有「签到」链路，必须先排除：
-    // `checkin_for` 的分派 match 把「不在范围里的家」报成「未接入」，而这两家
-    // 的按钮在界面上由能力位 `checkin: false` 收起 —— 这一层是批量路径
-    // （`resolve_checkin_targets` 的 filter）与 API 直调的兜底，双保险。
+    // CodeArts 没有「签到」链路，必须先排除：`checkin_for` 的分派 match 把
+    // 「不在范围里的家」报成「未接入」，而它的按钮在界面上由能力位
+    // `checkin: false` 收起 —— 这一层是批量路径（`resolve_checkin_targets` 的
+    // filter）与 API 直调的兜底，双保险。
     // 注意 CodeArts 的每日福利**不是**签到（那是 ops 福利领取，独立的「领福利」
     // 按钮，见 `providers::codearts::welfare`），与这条链无交集。
-    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID
-        || provider == crate::server::core::account_store::TRAE_PROVIDER_ID
-    {
+    // Trae 2026-09-29 起**在这条链上**（`providers::trae::checkin`：SOLO 转积分制后
+    // 模型调用花的就是签到钱包那份钱），不要再把它加回排除表。
+    if provider == crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID {
         return false;
     }
     !crate::server::core::account_store::is_accio_family(provider)
@@ -240,6 +240,18 @@ pub async fn checkin_for(
                 crate::server::core::providers::qoder::checkin::claim_daily_checkin(store, &id)
                     .await
                     .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
+        "trae" => {
+            // SOLO 那一条通道的每日签到（`providers::trae::checkin`）。它的
+            // `alreadyCompleted` / 中性结果都由实现自己给：活动未下发、
+            // 凭据没有 deviceId、国际版谱系这三格都不算失败，也不落当日台账
+            // （除"已签"那格），免得定时链把一次"没得签"当成"没签成"反复重打。
+            let claim = crate::server::core::providers::trae::checkin::claim_daily_checkin(
+                store, &id,
+            )
+            .await
+            .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
         "loomy" => {
