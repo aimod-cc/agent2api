@@ -63,11 +63,13 @@ pub const STREAM_ABORTED: &str = "响应流未完整下发（客户端中断或�
 /// 只当字节比对，不认识任何协议 —— 这是 `api::pipeline` 的既定边界
 /// （见模块头：「本模块不认识任何具体协议」）。
 ///
-/// 匹配串**必须带帧尾**：收尾帧在线上是完整的一帧（`data: [DONE]\n\n` /
-/// `event: response.completed\n`），带上 `\n` 才不会误命中正文里出现的同名字符串
-/// —— 模型完全可以吐出一段包含 `data: [DONE]` 的文字，那种命中会让一次**真的**
-/// 中断被记成成功。这个精度是刻意的：宁可少认（退化成改前的行为，
-/// 只是多一条摘要），也不能把真实中断洗成成功。
+/// 匹配串**必须带帧尾**（至少一个真换行）：收尾帧在线上是完整的一帧
+/// （`data:[DONE]\n` / `event: response.completed\n`），带上 `\n` 才不会误命中正文里
+/// 出现的同名字符串 —— 模型完全可以吐出一段包含 `data: [DONE]` 的文字，那种命中会让
+/// 一次**真的**中断被记成成功。一个真换行就够这个精度：JSON 字符串里的换行必须转义
+/// （`\n` 在字节上是反斜杠加 n），SSE 的 `data:` 字段也不允许内嵌裸换行，所以
+/// 「特征串紧跟一个真换行」只可能出现在帧边界上。这个精度是刻意的：宁可少认
+/// （退化成改前的行为，只是多一条摘要），也不能把真实中断洗成成功。
 pub type TerminalFrames = &'static [&'static [u8]];
 
 /// SSE 收尾帧的字节特征表（三条入口各取自己那几条）。
@@ -75,8 +77,30 @@ pub type TerminalFrames = &'static [&'static [u8]];
 /// 单独定义在这几个常量里而不是散在调用点：它们与各状态机的产出是**成对**
 /// 的事实，写在一起才能一眼看出「谁跟谁对得上」。
 pub mod terminal {
-    /// Chat Completions：`ReasoningCoalescer` 透传的 `data: [DONE]\n\n`
-    pub const CHAT: super::TerminalFrames = &[b"data: [DONE]\n\n"];
+    /// Chat Completions：`data:[DONE]`，冒号后可省空格、行尾可为 LF / CRLF。
+    ///
+    /// ── 为什么是四条而不是原来那一条 ────────────────────────
+    /// 生产实测（2026-10-02，`requests`×`request_raw` 联表，取正文没撞采集上限的
+    /// 383 条「响应流未完整下发」行）：**381 条的响应正文里本来就有 DONE 帧**，
+    /// 只是写的是 `data:[DONE]\n\n` —— 冒号后面**没有那个空格**。原表只收
+    /// `data: [DONE]\n\n`，于是走**字节透传**的 CodeArts（1176 条，占全部中断行的
+    /// 98%）每一次按帧收尾都被记成中断，再被「失败清零 token」的归一连带抹掉用量。
+    /// 经 `ReasoningCoalescer`（`upstream::sse`）的路径由我们自己重写那帧，所以带着
+    /// 空格、一直是命中的 —— 这也解释了为什么这个 bug 只在这一家身上成规模地出现。
+    ///
+    /// SSE 规范里冒号后的**那一个**空格是可选的（解析时剥掉至多一个），所以匹配侧
+    /// 必须两种写法都认，而不是要求上游照我们的写法发。`\r\n` 同一取向：多一种行尾
+    /// 只是多一条特征串，少一种就又是一批假中断。
+    ///
+    /// 帧尾只要求**一个**换行（改前要两个）：多的那个空行不是帧的一部分，
+    /// 「DONE 之后没有空行」的真收尾会被它漏掉，而它换来的精度是零（见
+    /// [`super::TerminalFrames`] 的说明：裸换行只可能出现在帧边界）。
+    pub const CHAT: super::TerminalFrames = &[
+        b"data: [DONE]\n",
+        b"data:[DONE]\n",
+        b"data: [DONE]\r\n",
+        b"data:[DONE]\r\n",
+    ];
     /// Responses：正常收尾 `response.completed`，失败收尾 `response.failed`
     pub const RESPONSES: super::TerminalFrames =
         &[b"event: response.completed\n", b"event: response.failed\n"];
@@ -988,4 +1012,261 @@ pub fn sha256_hex(body: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    //! 收尾帧特征表。这三张表决定「客户端提前挂断」算不算一次成功收尾，
+    //! 而判错方向的代价是不对称的：漏认 ⇒ 成功请求被记成中断、连带被
+    //! 「失败清零」抹掉用量（生产上 1176 行就是这个形状）；多认 ⇒ 把真实
+    //! 中断洗成成功（报表再也看不出断流）。所以这一组用例两头都要钉住。
+
+    use super::{terminal, RecordContext, RecordingStream, TerminalFrames, TerminalScan};
+
+    /// 生产实测到的收尾帧写法（CodeArts 走字节透传，上游发什么就下发什么）：
+    /// 冒号后面**没有**那个空格。取自 `request_raw.response_body` 的真实尾巴。
+    const UNSPACED_DONE: &str = "data:[DONE]\n\n";
+    /// 我们自己重写的那一帧（`ReasoningCoalescer` 与各转换器的收尾）带空格。
+    const SPACED_DONE: &str = "data: [DONE]\n\n";
+    /// 改前的整张 Chat 表 —— 正对照用：同一份字节，旧表认不出的必须认不出。
+    const OLD_CHAT: TerminalFrames = &[b"data: [DONE]\n\n"];
+    /// 最后一帧的内容部分（带 finish_reason 与 usage，与生产同一形状）
+    const LAST_CHUNK: &str = r#"data: {"id":"c1","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":71476}}"#;
+
+    /// 按某条入口的特征表喂完这些片段，返回「是否认出了收尾帧」。
+    fn seen_after(frames: TerminalFrames, chunks: &[&str]) -> bool {
+        let mut scan = TerminalScan::new(frames);
+        for chunk in chunks {
+            scan.push(chunk.as_bytes());
+        }
+        scan.seen
+    }
+
+    /// 最长特征的长度（匹配窗口的上界由它决定）。
+    fn longest(frames: TerminalFrames) -> usize {
+        frames.iter().map(|frame| frame.len()).max().unwrap_or(0)
+    }
+
+    /// 这次改动的本体：透传写法必须认得出来。最后一句是正对照 —— 同一份字节
+    /// 喂给改前那张表，必须**不**命中，否则那 1176 行假中断就不是这个原因。
+    #[test]
+    fn unspaced_done_counts_as_terminal() {
+        assert!(seen_after(terminal::CHAT, &[LAST_CHUNK, UNSPACED_DONE]));
+        let old_table_hits = seen_after(OLD_CHAT, &[LAST_CHUNK, UNSPACED_DONE]);
+        assert!(!old_table_hits, "旧表若能命中，那 1176 行就不是这个原因");
+    }
+
+    /// 带空格的写法不能因为加了新特征而漏掉 —— 那是改前唯一命中的形状，
+    /// 经 `ReasoningCoalescer` 的各家全靠左它。
+    #[test]
+    fn spaced_done_still_counts() {
+        assert!(seen_after(terminal::CHAT, &[LAST_CHUNK, SPACED_DONE]));
+        assert!(seen_after(OLD_CHAT, &[LAST_CHUNK, SPACED_DONE]), "旧表绿的不许变红");
+    }
+
+    /// CRLF 行尾（上游按 SSE 规范用 `\r\n` 时）两种空格写法都算收尾。
+    #[test]
+    fn crlf_line_endings_count() {
+        assert!(seen_after(terminal::CHAT, &["data: [DONE]\r\n\r\n"]));
+        assert!(seen_after(terminal::CHAT, &["data:[DONE]\r\n\r\n"]));
+    }
+
+    /// 收尾帧被 TCP 分片切开仍然要认出来 —— 跨 chunk 的窗口就是为它存在的；
+    /// 反过来，帧没吐完就断（只到 `data:[DON`）仍然**不**算收尾，那是真中断。
+    #[test]
+    fn only_a_whole_frame_counts_when_chunks_split() {
+        let split = &[LAST_CHUNK, "\n\ndata:[DON", "E]\n\n"];
+        assert!(seen_after(terminal::CHAT, split));
+        assert!(seen_after(terminal::CHAT, &["\n\ndata:[DON", "E]\n\n"]));
+        // 「只差一字节」的切法：窗口只留 longest-1，这种切法最容易暴露算错保留量
+        assert!(seen_after(terminal::CHAT, &["data:[DONE]", "\n"]));
+        let half_frame = seen_after(terminal::CHAT, &["data:[DON", "E]"]);
+        assert!(!half_frame, "半截帧不算收尾");
+    }
+
+    /// 精度边界：模型把 `data: [DONE]` 当**正文**吐出来时不算收尾。JSON 里的换行
+    /// 必须转义（字节上是反斜杠加 n），SSE 的 `data:` 字段也不允许内嵌裸换行，
+    /// 所以特征串要求的那个裸换行不会被正文命中。
+    #[test]
+    fn done_echoed_inside_content_is_not_a_terminal_frame() {
+        let echoed = "data: {\"content\":\"示例：data: [DONE]\\n\\n 就是结束标记\"}\n\n";
+        assert!(!seen_after(terminal::CHAT, &[echoed]));
+        let unspaced = "data: {\"content\":\"示例：data:[DONE] 就是结束标记\"}\n\n";
+        assert!(!seen_after(terminal::CHAT, &[unspaced]));
+        // 凑出了 `data:[DONE]` 但后面跟的不是换行 → 仍不算
+        let near_miss = &["data:[DONE", "\", \"x\":1}", "\n"];
+        assert!(!seen_after(terminal::CHAT, near_miss));
+    }
+
+    /// 匹配窗口必须有界：一次 SSE 响应动辄数百 KB，窗口跟着涨等于把整条响应
+    /// 复制进内存（改造前真出过这个形状的问题，所以窗口只留 longest-1 字节）。
+    #[test]
+    fn scan_window_stays_bounded() {
+        let chunk = "data: {\"content\":\"很长的一段回答内容\"}\n\n";
+        let mut scan = TerminalScan::new(terminal::CHAT);
+        for _ in 0..2000 {
+            scan.push(chunk.as_bytes());
+        }
+        let cap = longest(terminal::CHAT).saturating_sub(1);
+        assert!(scan.window.len() <= cap, "窗口留了 {} 字节，上限 {}", scan.window.len(), cap);
+    }
+
+    /// 另外两条入口的特征原样不动（帧名带协议前缀，不存在空格方言问题）。
+    /// 这条钉的是「本次改动只碰了 Chat」，而特征表是逐入口给出的 —— 传错一张
+    /// 表就等于给那条入口悄悄换了判据。
+    #[test]
+    fn other_entries_keep_their_own_frames() {
+        assert!(seen_after(terminal::RESPONSES, &["event: response.completed\n"]));
+        assert!(seen_after(terminal::RESPONSES, &["event: response.failed\n"]));
+        assert!(seen_after(terminal::ANTHROPIC, &["event: message_stop\n"]));
+        // DONE 是 Chat 方言：喂给另外两张表都不该命中
+        assert!(!seen_after(terminal::RESPONSES, &[UNSPACED_DONE, SPACED_DONE]));
+        assert!(!seen_after(terminal::ANTHROPIC, &[UNSPACED_DONE, SPACED_DONE]));
+    }
+
+    // ── 记账结果本身（匹配器之外还有两处代码）──────────────────
+    //
+    // 上面那组只证明「认得出收尾帧」。但红色与 0 token 来自**另外两处**：
+    // `Drop` 写进去的 `fallback_error`，加上 `NewRequestEntry::normalize` 的
+    // 「失败清零」。所以这里用一条真流 + 一个真统计库把结果读回来对质，
+    // 正反各一条：收尾帧之后挂断 ⇒ 绿且有用量；收尾帧之前挂断 ⇒ 仍然红。
+
+    use std::sync::Arc;
+
+    use axum::body::Bytes;
+    use futures::{Stream, StreamExt};
+    use serde_json::Value;
+
+    use crate::server::core::upstream::usage::RequestTelemetry;
+    use crate::server::db::Db;
+    use crate::server::request_stats::{RequestQuery, RequestStats, Retention};
+
+    /// 临时库的 RAII 守卫：**返回给调用点持有**（只在创建时删一次的写法会让
+    /// 用例失败或提前 return 时把目录留下，累积成几百个）。
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 一个只属于本次用例的统计库（进程号 + 计数 + tag 三重去重）
+    fn temp_stats(tag: &str) -> (Arc<RequestStats>, TempDir) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("api-pipeline-{}-{}-{id}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = Db::open(&dir.join("agent2api.db")).expect("临时库应当能建起来");
+        (Arc::new(RequestStats::with_db(Some(db), || Retention::default())), TempDir(dir))
+    }
+
+    /// 建一条上下文：用量按生产实测的那份填（71476 / 56）
+    fn context_for(stats: Arc<RequestStats>) -> (RecordContext, Arc<RequestTelemetry>) {
+        let telemetry = Arc::new(RequestTelemetry::new());
+        telemetry.report_usage(&serde_json::json!({
+            "prompt_tokens": 71476, "completion_tokens": 56, "total_tokens": 71532
+        }));
+        let context = RecordContext {
+            stats,
+            telemetry: telemetry.clone(),
+            started_at: crate::server::logging::now_ms(),
+            model: "deepseek-v4.1-flash".to_string(),
+            client_model: "deepseek-v4.1-flash".to_string(),
+            client_reasoning: String::new(),
+            // 模拟真实流量：不是模型测试发起的（见 `RecordContext::is_test`）
+            is_test: false,
+            status: 200,
+            raw_request: None,
+            raw_response: None,
+        };
+        (context, telemetry)
+    }
+
+    /// 「内容帧 + 收尾帧 + **永远不再给 EOF**」——最后一帧之后上游还挂着，
+    /// 正是 Qoder 那类客户端的做法：读到收尾帧就地挂断，连接由**客户端**先关。
+    fn stream_ending_at(
+        frames: Vec<&'static [u8]>,
+    ) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin {
+        futures::stream::iter(frames.into_iter().map(|frame| Ok(Bytes::from_static(frame))))
+            .chain(futures::stream::pending::<Result<Bytes, std::io::Error>>())
+    }
+
+    /// 取回那条明细（本次用例的库里只有一条）
+    fn only_row(stats: &RequestStats) -> serde_json::Value {
+        let query = RequestQuery {
+            offset: 0,
+            limit: Some(5),
+            model: None,
+            provider: None,
+            status: None,
+            start: None,
+            end: None,
+        };
+        let page = stats.query_requests(&query);
+        let entries = page.get("entries").and_then(Value::as_array);
+        entries
+            .and_then(|list| list.first().cloned())
+            .unwrap_or_else(|| panic!("应当恰好落一条明细，实际读到 {page}"))
+    }
+
+    /// 走一遍「已下发这些帧、之后上游不再给 EOF」的流，然后在客户端的位置丢弃它，
+    /// 返回真正落库的那一行。三个用例只差在**帧**与**特征表**上，判据的差别才是真的。
+    async fn record_after_hangup(frames: &[&'static [u8]], terminals: TerminalFrames) -> Value {
+        let (stats, _dir) = temp_stats("row");
+        let (context, _telemetry) = context_for(stats.clone());
+        let mut stream = RecordingStream::with_terminals(
+            Box::new(stream_ending_at(frames.to_vec())),
+            context,
+            terminals,
+        );
+        // 把已知的几帧消费掉（第二帧起就可能命中收尾特征）
+        for _ in 0..frames.len() {
+            assert!(stream.next().await.is_some(), "这一帧应当能取到");
+        }
+        // 再 poll 一次：上游还挂着（`stream_ending_at` 后面接了 pending）
+        let still_pending =
+            futures::future::poll_fn(|cx| match std::pin::Pin::new(&mut stream).poll_next(cx) {
+                std::task::Poll::Ready(_) => std::task::Poll::Ready(false),
+                std::task::Poll::Pending => std::task::Poll::Ready(true),
+            })
+            .await;
+        assert!(still_pending, "客户端挂断前流必须还没有结束，否则走不到 Drop 那条分支");
+        drop(stream);
+        only_row(&stats)
+    }
+
+    /// 正例：透传的 `data:[DONE]`（冒号后没空格）已经下发，客户端随即挂断 ⇒
+    /// 行是绿的、用量必须留着。这就是生产那 1176 行的形状。
+    #[tokio::test]
+    async fn hangup_right_after_unspaced_done_records_success_with_usage() {
+        let row =
+            record_after_hangup(&[LAST_CHUNK.as_bytes(), UNSPACED_DONE.as_bytes()], terminal::CHAT).await;
+        assert_eq!(row["status"], Value::from(200), "状态码照原样：{row}");
+        assert!(row["error"].is_null(), "收尾帧之后挂断不该记成中断：{row}");
+        assert_eq!(row["promptTokens"], Value::from(71476), "用量不能被清零：{row}");
+        assert_eq!(row["completionTokens"], Value::from(56), "用量不能被清零：{row}");
+    }
+
+    /// 同一份字节、同一套丢弃动作，喂给**改前那张表** ⇒ 必须是红且 0 token。
+    /// 这条是上一条的正对照：没有它，「绿」可能只是因为这套脚手架根本不写库。
+    #[tokio::test]
+    async fn the_old_needle_would_have_recorded_the_same_stream_as_an_abort() {
+        let row = record_after_hangup(&[LAST_CHUNK.as_bytes(), UNSPACED_DONE.as_bytes()], OLD_CHAT).await;
+        let error = row["error"].as_str().unwrap_or("");
+        assert!(error.contains("未完整下发"), "旧表下这条必须仍是中断：{row}");
+        assert_eq!(row["promptTokens"], Value::from(0), "旧口径的失败清零：{row}");
+    }
+
+    /// 反面对照：客户端在收尾帧**之前**就挂断 ⇒ 仍然是中断、仍然是红。
+    /// 少了这条，正例就只是「什么都不报」的空跑 —— 任何把中断一律写成成功的改动
+    /// 都能同时过两条，只有成对出现才说明判据真的落在收尾帧上。
+    #[tokio::test]
+    async fn hangup_before_the_terminal_frame_stays_an_abort() {
+        let row = record_after_hangup(&[LAST_CHUNK.as_bytes()], terminal::CHAT).await;
+        let error = row["error"].as_str().unwrap_or("");
+        assert!(error.contains("未完整下发"), "真中断必须留摘要：{row}");
+        assert_eq!(row["promptTokens"], Value::from(0), "失败的行按契约清零：{row}");
+    }
 }
