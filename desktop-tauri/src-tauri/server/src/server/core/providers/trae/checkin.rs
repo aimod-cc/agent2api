@@ -257,16 +257,16 @@ pub enum Outcome {
 /// 拿到状态与（必要时）领取+回查后的判定。
 ///
 /// `before` 是本轮第一发状态；`after` 是领取后用**同一个设备号**的回查；
-/// `claim` 是领取那一发的状态（回查失败时为 None，此时不能假装成功）。
-pub fn decide(before: &Status, claim: i64, after: Option<&Status>) -> Outcome {
+/// `claim` 是领取那一发的响应（这里只读它的 code 与 message，数额仍归回查读）。
+pub fn decide(before: &Status, claim: &Status, after: Option<&Status>) -> Outcome {
     if !before.enable {
         return Outcome::NotEnabled;
     }
     if before.done_today() {
         return Outcome::AlreadyCheckedIn(before.award());
     }
-    if claim != CODE_OK {
-        return Outcome::Rejected(claim, String::new());
+    if claim.code != CODE_OK {
+        return Outcome::Rejected(claim.code, claim.message.clone());
     }
     match after {
         // 回查确认：奖励数按回查那份读（官方在 claim 里并不保证给数额）
@@ -327,16 +327,22 @@ async fn run(
     let device_id = checkin_device_id();
     let before = status(base, credential, &variant, &device_id, proxy).await?;
     if !before.enable || before.done_today() {
-        return Ok(complete(decide(&before, CODE_OK, None), &device_id));
+        // 这一条分支根本没打领取；`decide` 在读 claim 之前就返回了，给一个空响应占位。
+        return Ok(complete(decide(&before, &Status::default(), None), &device_id));
     }
-    let claimed = claim(base, credential, &variant, &device_id, proxy).await?;
-    if claimed != CODE_OK {
-        return Ok(complete(decide(&before, claimed, None), &device_id));
+    let claim = claim(base, credential, &variant, &device_id, proxy).await?;
+    if claim.code != CODE_OK {
+        // 拒绝行要把第一发的状态读数带上（`with_status_probe`）—— 未知码的含义
+        // 只能从「状态说什么 × 领取拒不拒」这个组合里夹出来。
+        return Ok(with_status_probe(
+            complete(decide(&before, &claim, None), &device_id),
+            &before,
+        ));
     }
     // 同设备号回查。回查本身失败（网络/会话）时按"未确认"处理 ——
     // 一发没被确认的 claim 报成成功，就是给用户一个假成功。
     let after = status(base, credential, &variant, &device_id, proxy).await.ok();
-    Ok(complete(decide(&before, claimed, after.as_ref()), &device_id))
+    Ok(complete(decide(&before, &claim, after.as_ref()), &device_id))
 }
 
 /// 今日奖励的**两部分**（基础 + 加成）。
@@ -412,34 +418,28 @@ fn complete(outcome: Outcome, device_id: &str) -> Value {
         Outcome::Rejected(code, message) => {
             row.insert("success".into(), json!(false));
             row.insert("code".into(), json!(code));
+            // 上游给了文案就原样带出，没给才说"未给"。这里不许猜含义 ——
+            // 参考实现那份「1001=已领取」出自 **WorkBuddy** 的码表
+            //（`credits.ts`，打的是 `/v2/billing/meter/daily-checkin`），跨家搬码表
+            // 正是我们把别家结论当自家事实的那类错。
+            let reason = if message.is_empty() {
+                "上游未给文案"
+            } else {
+                message.as_str()
+            };
             row.insert(
                 "msg".into(),
                 json!(if code == CODE_REJECTED {
                     format!(
-                        "官方拒绝本次签到（{code}）：{}探测体与两种鉴权方案都试过；\
-                         这一码多数是设备画像/产品谱系问题，不是名额拥挤，当日不再自动重试",
-                        if message.is_empty() {
-                            "上游未给文案"
-                        } else {
-                            message.as_str()
-                        }
+                        "官方拒绝本次签到（{code}）：{reason} —— 三种探测体与两种鉴权方案都试过；\
+                         这一码多数是设备画像/产品谱系问题，不是名额拥挤，当日不再自动重试"
                     )
                 } else {
-                    // 上游对未知业务码经常**不给文案**（实测：SOLO 有一档账号连打三次都回
-                    // `code:1001` 且 `message` 为空），照原样拼出来就是一行
-                    // 「官方拒绝本次签到（1001）：」—— 等于什么也没说。
-                    // 兜底只补两件有依据的事：我们试过哪些方案、这码我们没有依据。
-                    // ⚠️ 不猜它的含义 —— 参考实现那份「1001=已领取」出自 **WorkBuddy** 的
-                    // 码表（`credits.ts` 打的是 `/v2/billing/meter/daily-checkin`），
-                    // 跨家搬码表正是我们把别家结论当自家事实的那类错。
-                    let reason = if message.is_empty() {
-                        "上游未给文案"
-                    } else {
-                        message.as_str()
-                    };
-                    // ⚠️ 这句里不许出现「已签到」「已领取」：批量层
-                    // `billing::checkin::checkin_completed_today` 是**按文案子串**判
-                    // "当日用过"的，写进去就等于把一次失败伪装成已签、当日不再重试。
+                    // ⚠️ 兜底句里不许出现「已签到」「已领取」：批量层
+                    // `billing::checkin::checkin_completed_today` 是**按 msg 子串**判
+                    // "当日用过"的，写进去就等于把一次失败洗成已签、当日不再重试。
+                    //（上游自己给的文案落在 `{reason}` 里，那一格若真说"已领取"，
+                    //  被批量层当成当日已办是对上游原话的忠实执行，不是我们的加工。）
                     format!(
                         "官方拒绝本次签到（{code}）：{reason}；这一码本家没有实测依据，\
                          只按失败上报（探测体与两种鉴权方案都试过），当日台账不落"
@@ -467,6 +467,29 @@ fn complete(outcome: Outcome, device_id: &str) -> Value {
     Value::Object(row)
 }
 
+/// 把「本轮第一发状态读到了什么」原样挂到**拒绝行**上。
+///
+/// 为什么这一格值钱：未知业务码自己不含信息，能把它夹出来的是状态与领取的
+/// **组合形状**。今天（2026-10-07）就卡在两可之间：状态说 `enable:true` 且今日
+/// 未签，领取回 1001。上游在这一发上到底有没有给文案，我们**不知道** ——
+/// 旧实现把 message 扔了，所以那段空白证明不了任何事（见 `claim` 的说明）。
+/// 「活动开着但对这个账号今日不发货」和「有份额但被资格/风控拒了」这两种情形
+/// 在只带 code 的日志里长得一模一样；带上 `statusCredits` 就能一眼分开
+///（同一秒领到钱的另两个号，状态报的是 200）。
+///
+/// 只挂在拒绝行：成功行的数额走 `awarded`（回查那份），挂两份会供出两个不同的数。
+fn with_status_probe(row: Value, status: &Status) -> Value {
+    let mut row = row;
+    if let Some(map) = row.as_object_mut() {
+        map.insert("statusEnable".into(), json!(status.enable));
+        map.insert("statusCheckedIn".into(), json!(status.checked_in));
+        map.insert("statusDidCheckedIn".into(), json!(status.did_checked_in));
+        map.insert("statusCredits".into(), json!(status.credits));
+        map.insert("statusExtraCredits".into(), json!(status.extra_credits));
+    }
+    row
+}
+
 /// 状态查询（一轮里会发两次：领取前与领取后回查）。
 async fn status(
     base: &str,
@@ -479,16 +502,22 @@ async fn status(
     Ok(status_of(&payload))
 }
 
-/// 领取。只回业务码 —— 上游在 claim 里不保证给奖励数额，数额由回查读。
+/// 领取。回被采纳那份响应的 code 与 message（数额仍由回查读 —— 上游在 claim 里
+/// 不保证给奖励数额，但它的**文案**是本家判别未知码的唯一线索，必须留下）。
+///
+/// 2026-10-07 之前这里返回 `i64`：message 解析完就被扔了，`decide` 再把
+/// `Outcome::Rejected` 的文案写成 `String::new()`，于是日志里永远是
+/// 「官方拒绝本次签到（1001）：」这一句空话 —— 而我当时把它读成了
+/// 「**上游**没给文案」，还写进了注释。空的那一格在我们自己手里。
 async fn claim(
     base: &str,
     credential: &Credential,
     variant: &str,
     device_id: &str,
     proxy: Option<&crate::server::core::proxies::ResolvedProxy>,
-) -> Result<i64, GatewayError> {
+) -> Result<Status, GatewayError> {
     let payload = round_trip(base, EP_CHECKIN_CLAIM, variant, device_id, credential, proxy).await?;
-    Ok(payload.get("code").and_then(Value::as_i64).unwrap_or(CODE_OK))
+    Ok(status_of(&payload))
 }
 
 /// 一发「方案 × 探测体」的往返，返回被采纳的那份响应体。
@@ -575,6 +604,11 @@ async fn post_checkin(
 mod tests {
     use super::*;
 
+    /// 领取那一发的响应（`decide` 只读它的 code 与 message）。
+    fn claim_reply(code: i64) -> Status {
+        Status { code, ..Status::default() }
+    }
+
     #[test]
     fn the_solo_lineage_probes_the_solo_source_first() {
         // 我们这条通道只有 SOLO。探测顺序错了的后果不是报错，而是每天一发 9074
@@ -652,14 +686,14 @@ mod tests {
         assert!(status.done_today());
         assert_eq!(
             Outcome::AlreadyCheckedIn(Award { credits: 100, extra_credits: 0 }),
-            decide(&status, CODE_OK, None)
+            decide(&status, &claim_reply(CODE_OK), None)
         );
     }
 
     #[test]
     fn an_disabled_activity_is_a_neutral_result_not_a_failure() {
         let status = status_of(&json!({"enable": false}));
-        assert_eq!(Outcome::NotEnabled, decide(&status, CODE_OK, None));
+        assert_eq!(Outcome::NotEnabled, decide(&status, &claim_reply(CODE_OK), None));
         let row = complete(Outcome::NotEnabled, "1234567890123456");
         assert_eq!(Some(false), row["success"].as_bool());
         assert!(
@@ -674,8 +708,8 @@ mod tests {
         // 都回 code:0），回查未翻转视同失败。这里三种"没确认"都必须落 Unconfirmed。
         let open = status_of(&json!({"enable": true}));
         let not_flipped = status_of(&json!({"enable": true, "checked_in": false}));
-        assert_eq!(Outcome::Unconfirmed, decide(&open, CODE_OK, Some(&not_flipped)));
-        assert_eq!(Outcome::Unconfirmed, decide(&open, CODE_OK, None), "回查本身失败也不算成功");
+        assert_eq!(Outcome::Unconfirmed, decide(&open, &claim_reply(CODE_OK), Some(&not_flipped)));
+        assert_eq!(Outcome::Unconfirmed, decide(&open, &claim_reply(CODE_OK), None), "回查本身失败也不算成功");
 
         let row = complete(Outcome::Unconfirmed, "1111222233334444");
         assert_eq!(Some(false), row["success"].as_bool());
@@ -688,7 +722,7 @@ mod tests {
     fn a_confirmed_claim_reports_the_award_and_marks_success() {
         let open = status_of(&json!({"enable": true}));
         let after = status_of(&json!({"enable": true, "checked_in": true, "credits": 300, "extra_credits": 100}));
-        assert_eq!(Outcome::Claimed(Award { credits: 300, extra_credits: 100 }), decide(&open, CODE_OK, Some(&after)));
+        assert_eq!(Outcome::Claimed(Award { credits: 300, extra_credits: 100 }), decide(&open, &claim_reply(CODE_OK), Some(&after)));
         let row = complete(Outcome::Claimed(Award { credits: 300, extra_credits: 100 }), "1111111111111111");
         assert_eq!(Some(true), row["success"].as_bool());
         assert!(row["msg"].as_str().unwrap_or_default().contains("400"), "收益数字要进日志");
@@ -750,6 +784,30 @@ mod tests {
         let text = named["msg"].as_str().unwrap_or_default();
         assert!(text.contains("名额已满"), "上游给了文案必须原样带出：{text}");
         assert!(text.contains("4001"), "{text}");
+    }
+
+    /// 领取那一发的**文案**必须活到判定结果里。
+    ///
+    /// 这条用例钉的是 2026-10-07 之前存在的一个结构性洞：`claim()` 返回 `i64`，
+    /// `decide()` 再把 `Outcome::Rejected` 的文案写成 `String::new()`，于是官方
+    /// 无论说什么都进不了日志 —— 而那条永远为空的 message 曾被我们当成
+    /// "上游不给文案"这一条**实测结论**写进注释。空栏要在被审计的路径上核赋值。
+    #[test]
+    fn the_claim_response_carries_its_copy_into_the_verdict() {
+        let open = status_of(&json!({"enable": true}));
+        let refused = status_of(&json!({"code": 1001, "message": "该账号暂不符合领取条件"}));
+        assert_eq!(
+            Outcome::Rejected(1001, "该账号暂不符合领取条件".to_string()),
+            decide(&open, &refused, None)
+        );
+        // 0 之外的码不能悄悄退化成"没文案"
+        let crowded = status_of(&json!({"code": CODE_REJECTED, "message": "当前参与用户太多，请稍后再试"}));
+        let row = complete(decide(&open, &crowded, None), "9777777777777777");
+        assert!(
+            row["msg"].as_str().unwrap_or_default().contains("当前参与用户太多"),
+            "9074 的官方原话要出现在句子里：{}",
+            row["msg"].as_str().unwrap_or_default()
+        );
     }
 
     #[test]
@@ -958,6 +1016,58 @@ mod tests {
                 );
             }
             assert_eq!(seen[0].device_id, seen[3].device_id, "整轮共用一个号");
+        }
+
+        /// 领取被拒时的**整条线索**都要留在结果行里：官方的文案 + 第一发状态的读数。
+        ///
+        /// 这一格对着两个各自独立会坏的地方：
+        ///   · 旧实现的 `claim()` 返回 `i64`，官方文案在解析完就被扔了（日志里那句
+        ///     「（1001）：」的空格就是我们自己造的，不是上游的性质）；
+        ///   · 只有 code 的拒绝行让「活动开着但今日不发货」和「有份额但被资格/风控拒」
+        ///     长得一模一样，而这两件事的处理方式相反（前者认了，后者要查画像）。
+        /// 所以断言要成对：credits=0 与 credits=200 两种被拒，各自读出各自的数。
+        #[tokio::test]
+        async fn a_refused_claim_keeps_the_official_copy_and_the_status_readout() {
+            // 1001 走的是"非 9074 → 换鉴权方案"那一档，所以领取这一发会打两次
+            //（Cloud-IDE-JWT 与 Bearer 各一次），两种方案都用尽才收尾。
+            let refused = r#"{"code":1001,"message":"该账号暂不符合领取条件"}"#;
+            let (zero, seen) = one_round(vec![
+                r#"{"code":0,"enable":true,"checked_in":false,"did_checked_in":false,"credits":0,"extra_credits":0}"#,
+                refused,
+                refused,
+            ])
+            .await;
+            assert_eq!(Some(false), zero["success"].as_bool());
+            assert_eq!(Some(1001), zero["code"].as_i64());
+            let msg = zero["msg"].as_str().unwrap_or_default();
+            assert!(msg.contains("该账号暂不符合领取条件"), "官方文案必须进消息：{msg}");
+            assert!(msg.contains("1001"), "码要留在句子里：{msg}");
+            assert_eq!(
+                Some(true),
+                zero["statusEnable"].as_bool(),
+                "状态说活动开着，这件事本身是判据：{zero}"
+            );
+            assert_eq!(Some(false), zero["statusCheckedIn"].as_bool());
+            assert_eq!(Some(0), zero["statusCredits"].as_i64(), "今日份额读数要跟着走：{zero}");
+            assert!(zero.get("alreadyCompleted").is_none(), "被拒不等于当日已办");
+            assert_eq!(3, seen.len(), "状态 + 两种鉴权方案各一发领取，然后收摊：{seen:?}");
+            assert!(seen[1].authorization.starts_with("Cloud-IDE-JWT "), "{}", seen[1].authorization);
+            assert!(seen[2].authorization.starts_with("Bearer "), "{}", seen[2].authorization);
+            assert_eq!(seen[1].device_id, seen[2].device_id, "换方案不许换号");
+
+            // 反对照：同一个码、同样被拒，但状态报了 200 —— 这一格必须读出 200，
+            // 否则上面的 0 只是"永远输出 0"的假绿。
+            let (rich, _) = one_round(vec![
+                r#"{"code":0,"enable":true,"checked_in":false,"credits":200,"extra_credits":0}"#,
+                refused,
+                refused,
+            ])
+            .await;
+            assert_eq!(
+                Some(200),
+                rich["statusCredits"].as_i64(),
+                "有份额却被拒与今日不发货，日志要分得开：{rich}"
+            );
         }
 
         #[tokio::test]
