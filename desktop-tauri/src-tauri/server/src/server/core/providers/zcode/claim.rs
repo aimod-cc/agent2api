@@ -112,6 +112,20 @@ pub struct CaptchaConfig {
     pub scene_id: String,
     /// SDK 站点地区（`window.AliyunCaptchaConfig.region`）
     pub region: String,
+    /// 上游说**推理请求**可以不带验证码头（`configs.captcha.skip_model_request`）。
+    ///
+    /// 2026-10-01 16:44 UTC 实测：`{"enabled":true,"prefix":"no8xfe","region":"cn",
+    /// "sceneId":"11xygtvd","skip_model_request":true}` —— 四个组合（app_version
+    /// 3.14.0 / 3.14.4 × platform darwin-arm64 / linux-x64）返回**逐字相同**，
+    /// 也就是说这一格与客户端版本无关，是服务端下发的开关。
+    ///
+    /// `enabled` 与它是**两件事**：前者管领取/登录这类交互流程还要不要滑块，
+    /// 后者只管 `…/anthropic/v1/messages` 那条推理路。因此不能拿 `enabled`
+    /// 推断推理免码 —— 那样会在上游把这一格翻回 `false` 时继续白铸令牌。
+    ///
+    /// 缺这一格按 `false` 收（照旧要码）：本家此前的全部行为都建立在「每条
+    /// 请求都要一枚令牌」上，把「没下发」读成「免码」等于让一次配置缺失误开门。
+    pub skip_model_request: bool,
 }
 
 /// 取风控配置（`GET {zcode}/api/v1/client/configs?app_version=&platform=`）。
@@ -139,13 +153,23 @@ pub async fn captcha_config(
             }
         })?;
     let payload = response.payload.unwrap_or(Value::Null);
+    Ok(parse_captcha_config(&payload))
+}
+
+/// 从 `GET /api/v1/client/configs` 的**整份响应**里读出 captcha 段（纯函数）。
+///
+/// 单独成函数的理由：这条链上只有这一处需要「上游那份 JSON 长什么样」的知识，
+/// 收成纯函数后，测试可以直接喂一份抓下来的真实响应（见 `captcha_config` 的
+/// 测试模块），而不必起一台假服务器 —— 而 `skip_model_request` 这一格恰恰是
+/// 整套免码判定的唯一依据，它必须钉在**实测过的字节**上。
+///
+/// 返回 `None` = 没有 captcha 段、或 SDK 必填的两格（`prefix` / `sceneId`）缺
+/// 任一（那时前端连初始化都做不出来，见调用方说明）。
+pub(super) fn parse_captcha_config(payload: &Value) -> Option<CaptchaConfig> {
     let captcha = payload
         .get("data")
         .and_then(|value| value.get("configs"))
-        .and_then(|value| value.get("captcha"));
-    let Some(captcha) = captcha else {
-        return Ok(None);
-    };
+        .and_then(|value| value.get("captcha"))?;
     let text = |key: &str| {
         captcha
             .get(key)
@@ -157,9 +181,9 @@ pub async fn captcha_config(
     let prefix = text("prefix");
     let scene_id = text("sceneId");
     if prefix.is_empty() || scene_id.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(CaptchaConfig {
+    Some(CaptchaConfig {
         enabled: captcha.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         prefix,
         scene_id,
@@ -168,7 +192,13 @@ pub async fn captcha_config(
             let value = text("region");
             if value.is_empty() { "ga".to_string() } else { value }
         },
-    }))
+        // **缺这一格 = 要码**（见字段说明：宁可白铸一枚令牌，不要发一个
+        // 上游可能拒的无头请求 —— 3007 那次往返是要付账号行为分的）
+        skip_model_request: captcha
+            .get("skip_model_request")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 /// 领取出错时**优先复核风控配置**（模块头第 3007 档的处置，见 `claim` 的文档）。
@@ -699,4 +729,75 @@ pub(super) fn urlencode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod captcha_config_vectors {
+    //! `configs.captcha` 的解析，钉在**抓下来的真实响应**上。
+    //!
+    //! 这一格现在是整套免码判定的唯一依据（`skip_model_request`），而它的形状
+    //! 只有上游能告诉我们 —— 手写一份"想象中的响应"等于把猜测当证据。
+    //! 载荷出处：2026-10-01 16:44 UTC 从 `https://zcode.z.ai/api/v1/client/configs`
+    //! 抓的 captcha 段，四个组合（app_version 3.14.0/3.14.4 × platform
+    //! darwin-arm64/linux-x64）返回逐字相同，所以这里只需一份。
+
+    use serde_json::json;
+
+    use super::parse_captcha_config;
+
+    #[test]
+    fn the_live_captcha_segment_parses_as_captured() {
+        let config = parse_captcha_config(&json!({
+            "code": 0,
+            "msg": "",
+            "data": {"configs": {"captcha": {
+                "enabled": true, "prefix": "no8xfe", "region": "cn",
+                "sceneId": "11xygtvd", "skip_model_request": true
+            }}}
+        }))
+        .expect("这份响应是上游真实给过的");
+        assert!(
+            config.enabled,
+            "领取那条路仍然要滑块 —— 它和推理免码是两件事"
+        );
+        assert_eq!("no8xfe", config.prefix);
+        assert_eq!("11xygtvd", config.scene_id);
+        assert_eq!("cn", config.region, "站点地区上游给了就别自己兜底成 ga");
+        assert!(
+            config.skip_model_request,
+            "这一格是免码上线的全部依据，不能被解析成 false"
+        );
+    }
+
+    #[test]
+    fn an_absent_skip_flag_still_requires_a_token() {
+        // 缺 `skip_model_request`（上游还没下发这一格）= 照旧要码。
+        // 判反了的代价不对称：免码判错每条请求撞一次 3007（烧账号行为分），
+        // 要码判错只是白铸一枚令牌。
+        let config = parse_captcha_config(&json!({
+            "data": {"configs": {"captcha": {
+                "enabled": true, "prefix": "no8xfe", "sceneId": "11xygtvd"
+            }}}
+        }))
+        .expect("prefix 与 sceneId 齐了就认这份配置");
+        assert!(!config.skip_model_request);
+        assert_eq!(
+            "ga", config.region,
+            "没给 region 时的兜底（阿里云默认站点）"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_segment_is_not_a_config_at_all() {
+        // 缺 sceneId 时前端连 SDK 都初始化不出来 —— 按「没有配置」处理，
+        // 而不是给出一份字段为空的对象（调用方会拿它去弹滑块，然后当场失败）
+        assert!(
+            parse_captcha_config(&json!({"data": {"configs": {"captcha": {
+                "enabled": true, "prefix": "no8xfe"
+            }}}}))
+            .is_none()
+        );
+        assert!(parse_captcha_config(&json!({"data": {"configs": {}} })).is_none());
+        assert!(parse_captcha_config(&json!({})).is_none());
+    }
 }

@@ -198,6 +198,9 @@ pub async fn captcha_config(state: &ServerState, account_id: &str) -> axum::resp
             "prefix": config.prefix,
             "sceneId": config.scene_id,
             "region": config.region,
+            // 推理侧那一格单独给出去：它与 `enabled` 是两件事（后者管领取的滑块），
+            // 界面/排障要能看出「上游此刻只免推理码」
+            "skipModelRequest": config.skip_model_request,
         })),
         Err(error) => management_error(error.status_code, error.message),
     }

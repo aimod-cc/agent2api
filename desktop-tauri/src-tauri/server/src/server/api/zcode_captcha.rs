@@ -52,10 +52,15 @@ fn stats_json(state: &ServerState) -> Value {
             "startPlanAccounts".to_string(),
             Value::from(start_plan_accounts as u64),
         );
-        // 铸造器唯一需要的那个布尔：有账号要走这条路、且库存不足目标
+        // 铸造器唯一需要的那个布尔：有账号要走这条路、库存不足目标、
+        // **且上游此刻确实要令牌**。第三个条件是新加的（`skip_model_request`）：
+        // 免码期还让界面每隔几秒去阿里云铸一枚，等于白烧风控配额 —— 那东西
+        // 撞上限之后是整段铸不出来（参考实现为此做过熔断），比多等一会儿严重。
         object.insert(
             "needsTokens".to_string(),
-            Value::Bool(start_plan_accounts > 0 && ready < POOL_TARGET as u64),
+            Value::Bool(
+                captcha::required() && start_plan_accounts > 0 && ready < POOL_TARGET as u64,
+            ),
         );
         // 顺手给一个**可用的账号 id**：铸造器还要拿它去问上游那份风控配置
         // （sceneId / prefix / region）。让界面自己去读账号列表会把「哪些账号
@@ -63,6 +68,14 @@ fn stats_json(state: &ServerState) -> Value {
         object.insert(
             "captchaAccountId".to_string(),
             account_id.map(Value::String).unwrap_or(Value::Null),
+        );
+        // **本地闸门**的当前状态（见 `providers::readiness`）：令牌池空过一次，
+        // 选路就会暂时绕开这一家。界面与排障都要能看见这件事 —— 否则「明明有
+        // 令牌了请求还是不打到这一家」与「这家坏了」在现象上完全一样。
+        // 数组为空 = 没有闸门挡着。
+        object.insert(
+            "localGates".to_string(),
+            Value::Array(crate::server::core::providers::readiness::snapshot()),
         );
     }
     body

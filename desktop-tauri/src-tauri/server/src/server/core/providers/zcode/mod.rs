@@ -72,12 +72,18 @@
 //!      Failed`）而不是签名 —— 因此本家先不做，靠 `coding_key` 把凭证换对。
 //!      哪天真被 `VERIFY_SIGNATURE_INVALID` 拒了，再照参考实现的
 //!      `src/proxy/client-signing.ts` 补。
-//!   3. **活动套餐通道上的人机验证**（2026-09-28 实测：**每条请求都要**，不是偶发）：
-//!      推理端点缺 `X-Aliyun-Captcha-Verify-Param` 一律回 `400 {"code":3007}`。
-//!      Rust 侧铸不出这种令牌（要跑阿里云 SDK），但**桌面端的 WebView 能** ——
-//!      由界面静默铸造、经 `POST /api/zcode/captcha` 进池，转发层每条请求取一个，
-//!      见 [`captcha`]。headless / Docker 部署没有 WebView，那条通道在那里不可用
-//!      （请用编码套餐通道），错误文案会如实说明。
+//!   3. ~~活动套餐通道上的人机验证~~ —— **2026-10-01 起改为「听上游的」**：
+//!      2026-09-28 实测推理端点缺 `X-Aliyun-Captcha-Verify-Param` 一律回
+//!      `400 {"code":3007}`，于是当时做成了「桌面端 WebView 静默铸令牌 →
+//!      `POST /api/zcode/captcha` 进池 → 转发层每条请求取一个」（见 [`captcha`]），
+//!      headless / Docker 上这条通道因此不可用。后来上游在
+//!      `GET /api/v1/client/configs` 里下发了
+//!      `configs.captcha.skip_model_request: true`（2026-10-01 实测，与客户端版本
+//!      无关），也就是说**推理请求**这一侧它此刻不要令牌了。现在这一格由
+//!      [`config_sync`] 每 5 分钟同步、`plan.rs` 照它决定要不要带那两个头，
+//!      上游回 3007 则当场翻回「要码」（代价被钉在最多一次往返）。
+//!      **仍然没解决的一半**：上游把这一格改回 `false` 之后，headless 部署就又
+//!      用不了这条通道了 —— 铸令牌仍然只有 WebView 会。
 
 use serde_json::Value;
 
@@ -87,6 +93,7 @@ pub mod balance;
 pub mod captcha;
 pub mod claim;
 pub mod coding_key;
+pub mod config_sync;
 pub mod credentials;
 pub mod models;
 pub mod oauth;

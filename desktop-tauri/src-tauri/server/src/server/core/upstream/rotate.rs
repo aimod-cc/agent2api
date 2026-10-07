@@ -44,6 +44,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::server::core::proxies::ResolvedProxy;
+use crate::server::core::providers::readiness;
 use crate::server::core::routing;
 use crate::server::errors::{self, GatewayError};
 use crate::server::logging;
@@ -242,20 +243,41 @@ pub(super) use crate::server::core::routing::CooldownKeys;
 /// 收窄只做「过滤」，不报错也不回退：钉住的账号不在这几家（账号被删了、
 /// 或认错了家）时得到的是空池 —— 上游那条路径会照常给出「这些家都没有账号」
 /// 的既有语义，不会静默换一个账号去跑。
+///
+/// ── 本地就绪闸门也在这里摘人 ────────────────────────────
+/// 被 `readiness` 挡住的 provider 整个不进候选池（判据与理由见那个模块的模块头：
+/// 那是一条**还没出本机就注定失败**的通道，比如 ZCode 活动套餐在 headless 上没有
+/// 验证码令牌）。摘在这里而不是摘在 `pick_account_by_priority` 里，是因为三级选路
+/// （正常挑 → 恢复最早 → 按余量挤占）读的都是这一份池子 —— 写在下游任一级的话，
+/// 闸门挡不住另外两级，而第二、三级恰恰是「明知可能失败也要再试一次」的地方。
+///
+/// **全被挡住时照旧返回原池**：闸门是优化，不是准入。如果 `providers` 里每一家
+/// 都被挡住（或这次只点名了被挡的那一家），宁可让请求照原路走一遍、把错误如实
+/// 落在这条通道上，也不要在候选池层面伪装成「这家没有账号」—— 那会让第三级的
+/// 文案说出不存在的事实，用户会去查一个本来有账号的账号页。
 pub(super) fn accounts_in_providers(
     service: &UpstreamService,
     providers: &[&str],
     pinned: Option<&str>,
 ) -> Vec<Value> {
     let snapshot = service.store.list_accounts();
-    routing::accounts_of(&snapshot)
+    let accounts: Vec<Value> = routing::accounts_of(&snapshot)
         .into_iter()
         .filter(|account| providers.contains(&provider_of(account)))
         .filter(|account| match pinned {
             Some(id) => routing::account_id(account) == Some(id),
             None => true,
         })
-        .collect()
+        .collect();
+    let routable: Vec<Value> = accounts
+        .iter()
+        .filter(|account| !readiness::gated(provider_of(account)))
+        .cloned()
+        .collect();
+    if routable.is_empty() {
+        return accounts;
+    }
+    routable
 }
 
 /// 组装选路结果；代理解析失败时把提示**带进选路结果**（本次回退直连）。

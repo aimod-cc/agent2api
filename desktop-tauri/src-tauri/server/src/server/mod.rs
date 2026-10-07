@@ -674,6 +674,11 @@ impl ServerState {
         // 服务器停机时进程会结束，任务随之消失。用 crate::spawn_task
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
+        // ZCode 活动套餐的「推理要不要验证码令牌」由上游配置说，每 5 分钟同步一次
+        // （判据、代价与三条口径见 `providers::zcode::config_sync` 的模块头）。
+        // 不进上面那张定时任务表：它没有「用户可配的间隔」、也不产生任何运行状态
+        // 要展示，硬塞进去只会多一条没人会去动的设置行。
+        core::providers::zcode::config_sync::spawn(state.store.clone());
 
         Ok(state)
     }

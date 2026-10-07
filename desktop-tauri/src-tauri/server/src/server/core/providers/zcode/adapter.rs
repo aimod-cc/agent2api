@@ -308,9 +308,14 @@ impl ProviderAdapter for ZcodeAdapter {
             });
         let code = error_body.get("code").and_then(Value::as_i64);
         // 3007 是「验证码令牌被拒」的信号：既回给用户（见 `plan::code_hint`），
-        // 也记进令牌池 —— 界面据此把库存立刻补齐（见 `captcha` 的模块头）
+        // 也记进令牌池 —— 界面据此把库存立刻补齐（见 `captcha` 的模块头）。
+        //
+        // 同时它是「推理免码」这件事的**唯一证伪手段**：上游哪天把
+        // `skip_model_request` 收回去、或压根不认这个开关，我们手上不会有别的
+        // 信号。所以让它当场把结论翻回「要码」，免码路线的代价就被钉在
+        // 最多一次 3007 往返（见 `captcha::note_challenge_and_require_token`）。
         if code == Some(3007) {
-            super::captcha::note_challenge();
+            super::captcha::note_challenge_and_require_token();
         }
         let message = match code.and_then(super::plan::code_hint) {
             Some(hint) => format!("上游返回 {status}: {raw}（{hint}）"),
