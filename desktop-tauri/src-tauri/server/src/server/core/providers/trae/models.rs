@@ -147,10 +147,24 @@ pub fn catalog_url() -> String {
 pub const REMOTE_CATALOG_FUNCTIONS: [&str; 3] =
     ["solo_agent_remote", "solo_work_remote", "solo_design_remote"];
 
+/// 待判别的场景候选 —— 一发一个，不并进上面那三个。
+///
+/// 为什么分开问：把未知名字混进同一次查询里，上游若整体回 400 我们就同时丢掉
+/// 了基线读数和"是哪个名字惹的祸"。一发一个场景，才知道谁是真存在的。
+///   · `chat_v3` —— 出自 `caigee-cmd/cli2api` 的 CHANGELOG（它说整个目录默认走
+///     这个场景，且只有它带 Max 档）。`Trae2api-cn` 全仓零命中，所以这是一条
+///     **待验**说法，不是两家一致的事实。
+///   · `solo_agent_lite` —— 出自 `Trae2api-cn` 自己的分组回退逻辑
+///     （`src/trae_client.py:1330-1345`：请求的档位没有就用它的 lite 同胞），
+///     它读得到这个兄弟场景名，但没把它列进默认查询串。
+/// 只在用户手点「刷新模型」（`force=true`）时发：这是判别用的一发，不该让每小时的
+/// 自动刷新替它付配额。
+pub const CATALOG_PROBE_FUNCTIONS: [&str; 2] = ["chat_v3", "solo_agent_lite"];
+
 /// remote 目录的 URL（查询串驱动，没有请求体）。
-pub fn remote_catalog_url() -> String {
-    let functions = REMOTE_CATALOG_FUNCTIONS.join(",");
-    format!("{AGENT_BASE_URL}/api/remote/v1/models?functions={functions}&show_custom_model=true")
+pub fn remote_catalog_url(functions: &[&str]) -> String {
+    let joined = functions.join(",");
+    format!("{AGENT_BASE_URL}/api/remote/v1/models?functions={joined}&show_custom_model=true")
 }
 
 /// 一份 remote 目录响应 → `(场景, 该场景收录的模型裸名)`。
@@ -282,6 +296,7 @@ pub fn parse_catalog(payload: &Value) -> Vec<Value> {
 async fn fetch_remote_catalog(
     prepared: &[(String, String)],
     proxy: Option<&ResolvedProxy>,
+    functions: &[&str],
 ) -> Result<Vec<(String, Vec<String>)>, GatewayError> {
     let mut with_web = prepared.to_vec();
     with_web.push(("X-Trae-Client-Type".to_string(), "web".to_string()));
@@ -289,7 +304,9 @@ async fn fetch_remote_catalog(
         .iter()
         .map(|(name, value)| (name.as_str(), value.clone()))
         .collect();
-    let reply = get_json(&remote_catalog_url(), &pairs, std::time::Duration::from_secs(20), proxy).await?;
+    let reply =
+        get_json(&remote_catalog_url(functions), &pairs, std::time::Duration::from_secs(20), proxy)
+            .await?;
     if reply.status >= 400 {
         let head: String = reply.body.chars().take(120).collect();
         return Err(GatewayError::new(format!(
@@ -446,7 +463,7 @@ pub async fn refresh(
         .filter_map(|item| item.get("id").and_then(Value::as_str))
         .map(|id| super::payload::sanitize_model_name(id, "solo"))
         .collect();
-    match fetch_remote_catalog(&prepared, proxy).await {
+    match fetch_remote_catalog(&prepared, proxy, &REMOTE_CATALOG_FUNCTIONS).await {
         Ok(groups) => {
             let remote_total: usize = groups.iter().map(|(_, names)| names.len()).sum();
             let missing = remote_only_names(&ours, &groups);
@@ -476,6 +493,52 @@ pub async fn refresh(
             "[Models]",
             &format!("Trae remote 目录对照失败（不影响本通道目录）：{}", error.message),
         ),
+    }
+    // ── 场景探针：一发一个候选，只在手点「刷新模型」时发 ──────────────────
+    // 判别对象是 cli2api 那句"整个目录默认走 `chat_v3`、且只有它带 Max 档"。
+    // 三种回答都要能分开，否则下一次会去查错的方向：
+    //   · 给回这一组 → 场景真存在，多出来的名字就是 G2 的可服务面；
+    //   · 200 但没有这一组 → 上游不认这个 function 名（"不存在"，不是"没权限"）；
+    //   · 4xx/5xx → 整体被拒，把状态码与原话头记下来。
+    // 一次点刷新多发 2 发目录查询，换掉的是"要不要照那份 CHANGELOG 动手"这个判断。
+    if force {
+        for function in CATALOG_PROBE_FUNCTIONS {
+            match fetch_remote_catalog(&prepared, proxy, &[function]).await {
+                Ok(groups) => match groups.iter().find(|(name, _)| *name == function) {
+                    Some((_, names)) => {
+                        let one = vec![(function.to_string(), names.clone())];
+                        let missing = remote_only_names(&ours, &one);
+                        logging::log(
+                            "[Models]",
+                            &format!(
+                                "Trae 场景探针 {function}：{} 个名字，本通道看不见的 {} 个",
+                                names.len(),
+                                missing.len()
+                            ),
+                        );
+                        logging::verbose(
+                            "[Models]",
+                            &format!("Trae 场景探针 {function} 看不见的：{}", missing.join(", ")),
+                        );
+                    }
+                    None => logging::log(
+                        "[Models]",
+                        &format!(
+                            "Trae 场景探针 {function}：上游答了 200 但没给这一组（回来的场景：{}）",
+                            groups
+                                .iter()
+                                .map(|(name, _)| name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    ),
+                },
+                Err(error) => logging::log(
+                    "[Models]",
+                    &format!("Trae 场景探针 {function} 失败：{}", error.message),
+                ),
+            }
+        }
     }
     ModelRefreshOutcome::refreshed(count)
 }
@@ -552,13 +615,22 @@ mod tests {
 
     #[test]
     fn the_remote_catalog_url_lists_every_scene_in_one_query() {
-        let url = remote_catalog_url();
+        let url = remote_catalog_url(&REMOTE_CATALOG_FUNCTIONS);
         assert!(url.starts_with("https://trae-api-cn.mchost.guru/api/remote/v1/models?"), "{url}");
         for function in REMOTE_CATALOG_FUNCTIONS {
             assert!(url.contains(function), "{function} 必须在同一次查询里：{url}");
         }
         assert!(url.contains("show_custom_model=true"), "不带这个参数就看不到租户自定义模板：{url}");
         assert!(!url.contains('%'), "逗号在查询串里是合法字符，不许被预编码：{url}");
+
+        // 探针必须**单独成发**：混进基线那一次里，一个未知场景名就能把
+        // 已经拿到的 53 个名字一起赔掉（而这正是我们要留着当对照的那份读数）。
+        let probe = remote_catalog_url(&["chat_v3"]);
+        assert!(probe.contains("chat_v3"), "{probe}");
+        for function in REMOTE_CATALOG_FUNCTIONS {
+            assert!(!probe.contains(function), "探针那一发不许带基线场景：{probe}");
+        }
+        assert!(CATALOG_PROBE_FUNCTIONS.contains(&"chat_v3"), "cli2api 那句要能被问到");
     }
 
     #[test]
