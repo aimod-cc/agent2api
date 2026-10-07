@@ -283,17 +283,7 @@ impl ProviderAdapter for ZcodeAdapter {
     /// 少数业务码（3007 人机验证 / 3012 身份块 / 3001 参数）再补一句可执行的
     /// 提示（[`super::plan::code_hint`]）—— 分类动作不变，只是把「为什么」说清。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
-        let raw = error_body
-            .get("message")
-            .or_else(|| error_body.get("msg"))
-            .or_else(|| {
-                error_body
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-            })
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
+        let raw = error_text(error_body)
             // 上游的 401 是**空体**（实测：`Content-Length: 0`），而这正是
             // 活动套餐通道上最常见的一种失败（套餐 JWT 用坏了）—— 照旧给
             // 「上游错误」四个字，用户只会看到「上游返回 401: 上游错误」，
@@ -331,6 +321,26 @@ impl ProviderAdapter for ZcodeAdapter {
         // 状态在 message 中，未知业务码不猜测为凭证失效或额度用尽。
         let status = if (200..300).contains(&status) { 502 } else { status };
         content_block::classify_or_fatal(status, error_body, message, code)
+    }
+
+    /// 活动套餐门上的 `400 model not allowed` 不在同一账号上重发（模块头扩展 11）。
+    ///
+    /// 一手读数（2026-10-07 20:33，dev 实例）：`glm-5.2` 打到
+    /// `POST /api/v1/zcode-plan/anthropic/v1/messages` 回 400「model not allowed」，
+    /// 编排层按设置页那一档连做三次原地重发、各等 5 秒，整条请求 20.8s ——
+    /// 其中 15 秒花在一个**不可能换结论**的判定上（它拒的是模型名，不是这个账号）。
+    ///
+    /// ── 为什么只认这一句、不扩 ──────────────────────────────────────
+    /// 同一家活动套餐门上的 `429 model concurrency limit exceeded` 是**限额**：
+    /// 该退避、该冷却、该换号（20:50:14 实测走的就是那条正确路径，0 次原地重发）。
+    /// 把两种「名字出现在文案里」混成一条，就会把该再试一次的抖动也砍掉。
+    /// 状态码也只收 400：`model not allowed` 是这道门的授权判定，别家/别的码
+    /// 上没有对应的观测，不替上游猜。
+    fn resends_same_body_in_place(&self, status: u16, error_body: &Value) -> bool {
+        if status != 400 {
+            return true;
+        }
+        !matches!(error_text(error_body), Some(text) if text.contains("model not allowed"))
     }
 
     /// 取可用令牌：只读账号会话里的 `accessToken`，**不续期**（见模块头）。
@@ -403,6 +413,26 @@ impl ProviderAdapter for ZcodeAdapter {
     > {
         Box::pin(async move { super::balance::query_usage(store, account_id).await })
     }
+}
+
+/// 上游错误体里的**那句原话**（两条判定共用：`classify_error` 的文案与
+/// [`ZcodeAdapter::resends_same_body_in_place`] 的否决）。
+///
+/// ── 为什么要多认一段 `error.message` ─────────────────────────
+/// 活动套餐通道说 Anthropic 协议，它的错误体是
+/// `{"type":"error","error":{"type":"...","message":"..."}}` —— 顶层没有
+/// `message`/`msg`。不多认这一段，那条通道上所有错误都会退化成「上游错误」，
+/// 用户看不到「套餐已到期」「人机验证」这类关键原文。
+///
+/// 两条判定必须读**同一个取值链**：否则会出现「分类侧认到了这句话、重发侧没认到」
+/// 这种分裂结论（一处按限额走、另一处按请求级走），而那正是本方法要消除的那 15 秒。
+fn error_text(body: &Value) -> Option<&str> {
+    body.get("message")
+        .or_else(|| body.get("msg"))
+        .or_else(|| body.get("error").and_then(|error| error.get("message")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
 }
 
 /// 从账号会话里读访问令牌。
@@ -517,5 +547,76 @@ fn ensure_include_usage(body: &mut Value) {
         options
             .entry("include_usage".to_string())
             .or_insert_with(|| json!(true));
+    }
+}
+
+#[cfg(test)]
+mod in_place_retry {
+    //! 「同一份字节还要不要再在这个账号上发一次」这一格的判据。
+    //!
+    //! 形状与实测同源（2026-10-07，dev 实例）：活动套餐门拒名字时的错误体是
+    //! Anthropic 形态 `{"type":"error","error":{"message":"model not allowed"}}`，
+    //! 顶层没有 `message` —— 所以用例必须按那棵树写，不然测的是我们想象中的上游。
+
+    use serde_json::json;
+
+    use crate::server::core::providers::adapter::{adapter_for, ProviderAdapter, UpstreamErrorClass};
+    use crate::server::core::providers::ProviderKind;
+
+    fn anthropic(text: &str) -> serde_json::Value {
+        json!({"type": "error", "error": {"type": "invalid_request_error", "message": text}})
+    }
+
+    #[test]
+    fn a_name_the_channel_refuses_is_not_resent_in_place() {
+        let adapter = adapter_for(ProviderKind::Zcode);
+        assert!(
+            !adapter.resends_same_body_in_place(400, &anthropic("model not allowed")),
+            "上游按模型名拒这条通道：同一份 body 重发第三次与第一次必然同一个结论"
+        );
+    }
+
+    /// 正对照：**同一家**里那些该再试一次的失败，一格都不许被这否决砍掉。
+    ///
+    /// 少了这一条，`resends_same_body_in_place` 写成 `status == 400 => false` 也会全绿，
+    /// 而那会把「上游偶尔 400 抖一下」这类真正需要退避的抖动一起治没 —— 症状是偶发失败
+    /// 不再自愈，比白等 15 秒难查得多。
+    #[test]
+    fn other_failures_still_get_their_in_place_budget() {
+        let adapter = adapter_for(ProviderKind::Zcode);
+        // 同一状态码、别的判定：报文参数非法之类仍按设置页那一档重发
+        assert!(adapter.resends_same_body_in_place(400, &anthropic("messages: expected array")));
+        // 限额（20:50:14 实测的形状）：该退避、该冷却、该换号
+        assert!(adapter.resends_same_body_in_place(429, &anthropic("model concurrency limit exceeded")));
+        // 上游自己的抖动
+        assert!(adapter.resends_same_body_in_place(500, &anthropic("internal error")));
+        // 空体（401 那一类）：本方法不动它，交给分类那侧的按状态码文案
+        assert!(adapter.resends_same_body_in_place(401, &json!({})));
+    }
+
+    /// 否决是**本家-local** 的：默认实现必须让别家一个字都不变。
+    #[test]
+    fn the_veto_does_not_leak_into_other_providers() {
+        for kind in [ProviderKind::Trae, ProviderKind::WorkBuddy, ProviderKind::CatPaw] {
+            let adapter = adapter_for(kind);
+            assert!(
+                adapter.resends_same_body_in_place(400, &anthropic("model not allowed")),
+                "{kind:?} 没有对这句文案的观测，不该跟着取消原地重发"
+            );
+        }
+    }
+
+    /// 两条判定读的是**同一份取值链**：分类侧认到了而重发侧没认到，就会出现
+    /// 「文案里写着 model not allowed，却还是白重发三次」那种分裂结论。
+    #[test]
+    fn the_same_text_feeds_both_the_copy_and_the_veto() {
+        let body = anthropic("model not allowed");
+        let classified = adapter_for(ProviderKind::Zcode).classify_error(400, &body);
+        let message = match classified {
+            UpstreamErrorClass::Fatal { message, .. } => message,
+            other => panic!("400 应按透传档处理，实际 {other:?}"),
+        };
+        assert!(message.contains("model not allowed"), "文案要保住上游原话：{message}");
+        assert!(!adapter_for(ProviderKind::Zcode).resends_same_body_in_place(400, &body));
     }
 }

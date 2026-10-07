@@ -1935,6 +1935,11 @@ async fn send_with_retry(
             None
         } else if direct_switch_status(i64::from(status)) {
             None
+        } else if !adapter.resends_same_body_in_place(status, &body) {
+            // 适配器判定「这份 body 重发一遍不可能换结论」（契约扩展 11）。
+            // 只撤原地重发这一件事：分类动作照旧，所以下面那条终端错误路径与
+            // 动作 3 的换号顺延都不受影响 —— 换一家可能是另一个结论。
+            None
         } else {
             adapter
                 .retry_advice(&body, budget.used(), budget.total)
