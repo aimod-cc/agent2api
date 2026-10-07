@@ -425,7 +425,25 @@ fn complete(outcome: Outcome, device_id: &str) -> Value {
                         }
                     )
                 } else {
-                    format!("官方拒绝本次签到（{code}）：{message}")
+                    // 上游对未知业务码经常**不给文案**（实测：SOLO 有一档账号连打三次都回
+                    // `code:1001` 且 `message` 为空），照原样拼出来就是一行
+                    // 「官方拒绝本次签到（1001）：」—— 等于什么也没说。
+                    // 兜底只补两件有依据的事：我们试过哪些方案、这码我们没有依据。
+                    // ⚠️ 不猜它的含义 —— 参考实现那份「1001=已领取」出自 **WorkBuddy** 的
+                    // 码表（`credits.ts` 打的是 `/v2/billing/meter/daily-checkin`），
+                    // 跨家搬码表正是我们把别家结论当自家事实的那类错。
+                    let reason = if message.is_empty() {
+                        "上游未给文案"
+                    } else {
+                        message.as_str()
+                    };
+                    // ⚠️ 这句里不许出现「已签到」「已领取」：批量层
+                    // `billing::checkin::checkin_completed_today` 是**按文案子串**判
+                    // "当日用过"的，写进去就等于把一次失败伪装成已签、当日不再重试。
+                    format!(
+                        "官方拒绝本次签到（{code}）：{reason}；这一码本家没有实测依据，\
+                         只按失败上报（探测体与两种鉴权方案都试过），当日台账不落"
+                    )
                 }),
             );
             None
@@ -708,6 +726,30 @@ mod tests {
         let row = complete(Outcome::AlreadyCheckedIn(Award { credits: 120, extra_credits: 0 }), "4444444444444444");
         assert_eq!(Some(true), row["alreadyCompleted"].as_bool());
         assert!(row["msg"].as_str().unwrap_or_default().contains("已签到"));
+    }
+
+    /// 未知业务码 + 上游不给文案时，句子仍然必须说得出东西；上游给了文案就必须原样带出来。
+    /// 这两条成对才有意义 —— 只断言"含兜底词"的话，实现永远输出兜底也能过。
+    /// 第三、四条钉的是本家特有的雷：批量层 `checkin_completed_today` 是**按 msg 子串**
+    /// 判「当日用过」的，这句里混进「已签到/已领取」就把一次失败洗成已签、当日不再重试。
+    #[test]
+    fn an_unknown_rejection_code_still_explains_itself() {
+        let empty = complete(Outcome::Rejected(1001, String::new()), "7777777777777777");
+        let msg = empty["msg"].as_str().unwrap_or_default();
+        assert!(msg.contains("1001"), "码要留在句子里：{msg}");
+        assert!(msg.contains("上游未给文案"), "空文案要有兜底：{msg}");
+        assert!(!msg.ends_with('：'), "不许留一个以冒号收尾的空句子：{msg}");
+        assert_eq!(Some(false), empty["success"].as_bool());
+        assert!(empty.get("alreadyCompleted").is_none(), "没有依据就不许写已用标记");
+        assert!(
+            !msg.contains("已签到") && !msg.contains("已领取"),
+            "这两个子串会被批量层判成当日已办：{msg}"
+        );
+
+        let named = complete(Outcome::Rejected(4001, "名额已满".to_string()), "8888888888888888");
+        let text = named["msg"].as_str().unwrap_or_default();
+        assert!(text.contains("名额已满"), "上游给了文案必须原样带出：{text}");
+        assert!(text.contains("4001"), "{text}");
     }
 
     #[test]
