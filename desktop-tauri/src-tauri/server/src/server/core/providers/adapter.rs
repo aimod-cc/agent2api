@@ -665,7 +665,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::fallback_retry_advice` 的说明）—— 分辨它是谁，只有本家知道。
     /// 一手例子是 ZCode 活动套餐的 `400 model not allowed`：那是**模型名授权**判定，
     /// 同一份 body 重发第三次与第一次必然同一个结论，三次之间还各等 5 秒
-    /// （2026-10-07 20:33 实测：三次原地重发 + 换号，整条请求 20.8s，其中 15s 白等）。
+    /// （2026-10-07 20:22:28 实测：三次原地重发 + 换号，整条请求 20.8s，其中 15s 白等）。
     /// 而同一家里的 `429 model concurrency limit exceeded` 是限额，该退避、该换号，
     /// 一个字都不能混 —— 这层区分没法写在 `upstream/` 里。
     ///

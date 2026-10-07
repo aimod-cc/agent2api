@@ -325,7 +325,7 @@ impl ProviderAdapter for ZcodeAdapter {
 
     /// 活动套餐门上的 `400 model not allowed` 不在同一账号上重发（模块头扩展 11）。
     ///
-    /// 一手读数（2026-10-07 20:33，dev 实例）：`glm-5.2` 打到
+    /// 一手读数（2026-10-07 20:22:28，dev 实例）：`glm-5.2` 打到
     /// `POST /api/v1/zcode-plan/anthropic/v1/messages` 回 400「model not allowed」，
     /// 编排层按设置页那一档连做三次原地重发、各等 5 秒，整条请求 20.8s ——
     /// 其中 15 秒花在一个**不可能换结论**的判定上（它拒的是模型名，不是这个账号）。
