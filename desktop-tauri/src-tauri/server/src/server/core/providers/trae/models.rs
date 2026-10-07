@@ -404,13 +404,10 @@ pub fn function_for_model_in(models: &[Value], config_name: &str, fallback: &str
     fallback.to_string()
 }
 
-/// 出站点用的那一句：读内存里那张表。
-pub fn function_for_model(config_name: &str) -> String {
-    function_for_model_in(
-        &snapshot().models,
-        config_name,
-        super::payload::function_for("solo"),
-    )
+/// 出站点用的那一句：读内存里那张表，认不出来时回落到调用点按 variant 算出的值
+/// （= 合并之前的老行为，一条都不变）。
+pub fn function_for_model(config_name: &str, fallback: &str) -> String {
+    function_for_model_in(&snapshot().models, config_name, fallback)
 }
 
 /// 除了主场景，还要把哪些场景的明细表并进广告表。
