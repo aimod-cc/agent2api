@@ -123,8 +123,17 @@ pub fn last_refreshed_at() -> i64 {
 /// 每个模型的 prompt 一起回传（体积），后者要的是多段 prompt 结构。参考实现
 /// 逐字这么发，向量里也原样记着，别"顺手优化"成别的组合。
 pub fn catalog_body(variant: &str) -> Value {
+    catalog_body_for_function(super::payload::function_for(variant))
+}
+
+/// 同一张体，但 `function` 由调用方给定 —— 场景探针要用它问 `chat_v3`。
+///
+/// 七个键与参考实现逐字相同（见 `catalog_body` 的说明），只有 `function` 这一格
+/// 换成参数。这一步是整条判别里最便宜的一格：如果 IDE 明细表也认 `chat_v3`，
+/// 那些模型就**既有元数据、又有可发的 function**，一个 token 都不用花。
+pub fn catalog_body_for_function(function: &str) -> Value {
     json!({
-        "function": super::payload::function_for(variant),
+        "function": function,
         "config_names": Value::Null,
         "need_prompt": false,
         "current_config_info": Value::Null,
@@ -319,6 +328,38 @@ async fn fetch_remote_catalog(
         return Err(GatewayError::new("remote 目录响应不是合法 JSON"));
     };
     Ok(parse_remote_catalog(&payload))
+}
+
+/// 用给定 function 问一次 **IDE 明细目录**（探针专用；主路径仍走 `refresh` 那一发）。
+///
+/// 这一发才是判别的关键：remote 的 `/models` 只给名字，而我们要广告一个模型得先有
+/// `context_window_tokens` / `multimodal` / `native_function_call` 这些明细字段。
+/// 所以"remote 里有 24 个名字"本身不说明我们能用；明细表认不认 `chat_v3` 才说明。
+async fn fetch_detail_catalog(
+    prepared: &[(String, String)],
+    proxy: Option<&ResolvedProxy>,
+    function: &str,
+) -> Result<Vec<Value>, GatewayError> {
+    let pairs: Vec<(&str, String)> = prepared
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.clone()))
+        .collect();
+    let reply = post_json(
+        &catalog_url(),
+        &catalog_body_for_function(function),
+        &pairs,
+        std::time::Duration::from_secs(20),
+        proxy,
+    )
+    .await?;
+    if reply.status >= 400 {
+        let head: String = reply.body.chars().take(120).collect();
+        return Err(GatewayError::new(format!("明细目录 HTTP {}：{}", reply.status, head.trim())));
+    }
+    let Some(payload) = reply.json() else {
+        return Err(GatewayError::new("明细目录响应不是合法 JSON"));
+    };
+    Ok(parse_catalog(&payload))
 }
 
 /// 一条目录条目（聚合形态）。
@@ -538,6 +579,18 @@ pub async fn refresh(
                     &format!("Trae 场景探针 {function} 失败：{}", error.message),
                 ),
             }
+            // 同一个场景名再问一次我们自己在用的那张明细表：光有 remote 的名字
+            // 不能广告（缺 `context_window_tokens` 等明细字段），明细表认了才谈得上服务。
+            match fetch_detail_catalog(&prepared, proxy, function).await {
+                Ok(entries) => logging::log(
+                    "[Models]",
+                    &format!("Trae 场景探针 {function}：IDE 明细表 {} 条", entries.len()),
+                ),
+                Err(error) => logging::log(
+                    "[Models]",
+                    &format!("Trae 场景探针 {function}：IDE 明细表失败 —— {}", error.message),
+                ),
+            }
         }
     }
     ModelRefreshOutcome::refreshed(count)
@@ -611,6 +664,25 @@ mod tests {
 
         // 完全没有 `data.list` 时给空表，而不是 panic（release 是 panic=abort）
         assert!(parse_remote_catalog(&json!({"code": 1})).is_empty());
+    }
+
+    /// 探针问明细表时必须复用**同一张体**，只换 `function`。
+    /// 七个键里任何一个变了，上游给的就不是同一张表 —— 那次探到的"不存在"
+    /// 可能是形状造成的，而不是场景名。
+    #[test]
+    fn the_probe_catalog_body_differs_from_the_real_one_only_by_function() {
+        let real = catalog_body("solo");
+        let probe = catalog_body_for_function("chat_v3");
+        let real_map = real.as_object().expect("目录体是对象");
+        let probe_map = probe.as_object().expect("探针体是对象");
+        assert_eq!(real_map.keys().collect::<Vec<_>>(), probe_map.keys().collect::<Vec<_>>(), "键集与顺序都不许变");
+        assert_eq!("chat_v3", probe_map["function"].as_str().unwrap_or_default());
+        for key in real_map.keys() {
+            if key == "function" {
+                continue;
+            }
+            assert_eq!(real_map[key], probe_map[key], "{key} 不该被探针改动");
+        }
     }
 
     #[test]
