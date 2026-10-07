@@ -153,6 +153,10 @@ pub fn catalog_url() -> String {
 /// `GET /api/remote/v1/models?functions=solo_agent_remote,solo_work_remote,`
 /// `solo_design_remote&show_custom_model=true`）。
 /// 我们自己的那张表走的是 IDE 侧 `get_detail_param`，两者不是一张表。
+///
+/// 这一条是 **GET /models**，只读、不起沙箱。remote 那条**会话**通道
+///（`POST /chat_sessions`）不在本文件里、也不接进转发路径 —— 一次会话会在账号
+/// 后面起一台云端机器，实测证据与决定都写在 `refresh` 里那段对照注释上。
 pub const REMOTE_CATALOG_FUNCTIONS: [&str; 3] =
     ["solo_agent_remote", "solo_work_remote", "solo_design_remote"];
 
@@ -611,8 +615,20 @@ pub async fn refresh(
     // 我们看不见"的名单 —— 它现在只进日志，**不改广告表**：
     // "看不见"是事实，"看得见就能用"不是。这些名字大多挂在 B 族（remote 会话
     // 协议）的执行器上，拿到我们这条通道上会得到流内 4001（与 `errors.rs` 那份
-    // 死名单同一类形状）。等 B 族接上，这份差集才变成待办清单；在那之前它的价值
-    // 是让那次评估有数可依，而不是让人凭 19 条就判断"trae 只有这些模型"。
+    // 死名单同一类形状）。
+    //
+    // ── B 族量过了，并**决定不接**（2026-10-07 19:26，一发真实会话）────────
+    // remote 不是"另一种 chat 端点"，是 **agent 运行时**：`POST /chat_sessions`
+    // 一次 = 在账号后面起一台云端沙箱。那一发的证据链是 `sandbox_name=
+    // run-harness-<sid>-…` 的 `platform_timing`、`session_title_message` /
+    // `session_icon_message` / 5 条 `plan_item`，42 秒内**没有任何 assistant 文本**，
+    // 收尾是 `error` 事件与会话 status 3→6、消息 `message_type=task` + `failed`。
+    // 所以要接它得同时做三件事：给会话落一个 project/environment、把 agent 事件流
+    // 翻成 chat delta、接受分钟级延迟与沙箱副作用 —— 那不"补一个通道"，是第二个产品。
+    // 这份对照因此**留在只读侧**（只进日志、不进转发路径）：它的用处是让"trae 只有
+    // 19/24 条模型"这种判断有数可依，Max(1M) 档在那边也一并记着，别照着这份名单
+    // 往我们这条通道上加模型。复现脚本 `cpa-deploy/scripts/trae_remote_session_probe.py`
+    //（默认只读，`--create` 才会起沙箱）。
     let ours: Vec<String> = snapshot()
         .models
         .iter()
