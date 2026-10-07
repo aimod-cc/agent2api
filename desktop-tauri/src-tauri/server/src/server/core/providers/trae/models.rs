@@ -168,6 +168,16 @@ pub const REMOTE_CATALOG_FUNCTIONS: [&str; 3] =
 ///     它读得到这个兄弟场景名，但没把它列进默认查询串。
 /// 只在用户手点「刷新模型」（`force=true`）时发：这是判别用的一发，不该让每小时的
 /// 自动刷新替它付配额。
+///
+/// ── 两个候选都已实测，各跑过两轮（18:23:54 与 19:17:10，读回完全同形）──────
+///   · `chat_v3`：remote 24 个名字 / IDE 明细表 21 条，明细表里**我们没广告的 0 个**，
+///     remote 侧"看不见"的 3 个 = agnes-2.0-flash、deepseek-v4-flash、deepseek-v4-pro。
+///     → 存在、且能给明细表，已进 [`MERGE_CATALOG_FUNCTIONS`]。
+///   · `solo_agent_lite`：remote 22 个名字 / 明细表 20 条，"没广告的"同样 **0 个**，
+///     remote 侧"看不见"的是**同样那 3 个**。
+///     → 存在，但比 `chat_v3` 少两个名字、且一个新模型都供不出来，所以**不并**：
+///     并进来只是每轮多打一发上游。那 3 个名字是死名单里的（见 `errors.rs`），
+///     "在 remote 目录里看得见"与"我们的通道收它"是两件事。
 pub const CATALOG_PROBE_FUNCTIONS: [&str; 2] = ["chat_v3", "solo_agent_lite"];
 
 /// remote 目录的 URL（查询串驱动，没有请求体）。
@@ -412,10 +422,13 @@ pub fn function_for_model(config_name: &str, fallback: &str) -> String {
 
 /// 除了主场景，还要把哪些场景的明细表并进广告表。
 ///
-/// 这一格是"能不能多服务模型"的总开关：探针实测 IDE 明细表对 `chat_v3` 答得出
-/// 21 条（18:18:26），而它家 cli2api 的路由规则也是"按目录收录关系决定发哪个
-/// function"。真正把它留下要靠一发真实对话验 `llm_utils_chat` 收不收这个 function ——
-/// 验不过就把这个数组清空，改动只有一行。
+/// 这一格是"能不能多服务模型"的总开关。`chat_v3` 留下的依据不是目录读数而是
+/// **真实对话**：18:29:15 那两轮转发带着 `function=chat_v3` 发 `llm_utils_chat`，
+/// glm-5.3-flash 与 kimi-k2.8-preview 各拿回 200 与正常用量（18+69 / 90+82），
+/// 也就是这条通道收这个 function。要回退就把这个数组清空，改动只有一行。
+///
+/// `solo_agent_lite` 不在这里：它供不出一个新名字（见 [`CATALOG_PROBE_FUNCTIONS`]
+/// 的那两轮实测），并进来只多一发上游调用。
 pub const MERGE_CATALOG_FUNCTIONS: [&str; 1] = ["chat_v3"];
 
 /// 把额外场景的明细表并进来：只并**我们这张表里没有**的名字，已有的不许被覆盖。
