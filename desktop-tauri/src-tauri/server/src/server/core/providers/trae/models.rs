@@ -451,7 +451,7 @@ async fn merge_extra_scenes(
                 let mut added = 0usize;
                 for mut entry in extra.drain(..) {
                     let name = bare_name(&entry);
-                    if name.is_empty() || have.iter().any(|held| *held == name) {
+                    if name.is_empty() || have.contains(&name) {
                         continue;
                     }
                     have.push(name);
@@ -595,7 +595,7 @@ pub async fn refresh(
     }
     // 主表盖主场景：`chat_v3` 专属的名字是后面合并进来的，两者出站的 `function`
     // 不同，不盖就分不出来。
-    stamp_function(&mut models, &super::payload::function_for(credential.variant()));
+    stamp_function(&mut models, super::payload::function_for(credential.variant()));
     // 先合并再落缓存与内存表 —— 顺序反了就会出现"缓存里 19 条、内存里 23 条"
     // 那种重启后模型凭空消失的形状。
     merge_extra_scenes(&prepared, proxy, &mut models).await;
