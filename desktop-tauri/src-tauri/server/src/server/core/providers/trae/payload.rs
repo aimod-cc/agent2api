@@ -105,7 +105,10 @@ pub fn prepare_body(source: &Value, variant: &str, resolved_model: &str) -> Valu
     if let Some(messages) = obj.get("messages") {
         out.insert("messages".to_string(), messages.clone());
     }
-    out.insert("function".to_string(), json!(function_for(variant)));
+    // `function` 按**模型**选，不按凭据谱系：目录实测 `chat_v3` 是另一张明细表
+    // 的场景名（`models.rs` 的合并与探针），拿 `solo_work_lite` 发它专属的模型
+    // 会得到流内 4001。目录里没有这个名字时回落到 variant 的老行为。
+    out.insert("function".to_string(), json!(super::models::function_for_model(&model)));
     out.insert("stream".to_string(), json!(true));
     out.insert("config_name".to_string(), json!(model));
     out.insert("model".to_string(), json!(model));

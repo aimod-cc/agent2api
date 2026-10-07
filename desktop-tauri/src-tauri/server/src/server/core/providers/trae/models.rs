@@ -362,6 +362,105 @@ async fn fetch_detail_catalog(
     Ok(parse_catalog(&payload))
 }
 
+/// 把"这一批条目是哪个场景给的"盖到条目上。
+///
+/// 必须能区分，因为出站 body 里的 `function` 要按它选：把 `chat_v3` 专属的模型
+/// 用 `solo_work_lite` 发出去，症状是流内 4001（与 `errors.rs` 那份死名单同一类
+/// 失败形状），而 4001 看起来像"这个模型坏了"，不像"我们发错了场景"。
+fn stamp_function(entries: &mut [Value], function: &str) {
+    for entry in entries {
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("catalogFunction".to_string(), Value::String(function.to_string()));
+        }
+    }
+}
+
+/// 一条目录条目的**裸模型名**（去掉我们加的广告后缀）。
+fn bare_name(entry: &Value) -> String {
+    entry
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| super::payload::sanitize_model_name(id, "solo"))
+        .unwrap_or_default()
+}
+
+/// 这个模型该用哪个 `function` 发（纯函数版，便于单测）。
+///
+/// 命中目录条目 → 用它带来时盖的那个场景；没命中 → 回落到 `fallback`
+/// （= 今天的行为）。目录里没这个名字的模型大多是上游刚下架或租户自定义占位，
+/// 那些情况保持原样发比猜一个场景更安全。
+pub fn function_for_model_in(models: &[Value], config_name: &str, fallback: &str) -> String {
+    let wanted = config_name.trim();
+    for entry in models {
+        if bare_name(entry) == wanted {
+            if let Some(function) = entry.get("catalogFunction").and_then(Value::as_str) {
+                if !function.trim().is_empty() {
+                    return function.to_string();
+                }
+            }
+            break;
+        }
+    }
+    fallback.to_string()
+}
+
+/// 出站点用的那一句：读内存里那张表。
+pub fn function_for_model(config_name: &str) -> String {
+    function_for_model_in(
+        &snapshot().models,
+        config_name,
+        super::payload::function_for("solo"),
+    )
+}
+
+/// 除了主场景，还要把哪些场景的明细表并进广告表。
+///
+/// 这一格是"能不能多服务模型"的总开关：探针实测 IDE 明细表对 `chat_v3` 答得出
+/// 21 条（18:18:26），而它家 cli2api 的路由规则也是"按目录收录关系决定发哪个
+/// function"。真正把它留下要靠一发真实对话验 `llm_utils_chat` 收不收这个 function ——
+/// 验不过就把这个数组清空，改动只有一行。
+pub const MERGE_CATALOG_FUNCTIONS: [&str; 1] = ["chat_v3"];
+
+/// 把额外场景的明细表并进来：只并**我们这张表里没有**的名字，已有的不许被覆盖。
+///
+/// 先到先留的取向与 `/v1/models` 的 first-wins 一致；反过来（让 chat_v3 覆盖主表）
+/// 会让同一条目两套元数据互相打架，而我们没有任何依据说哪套更新。
+async fn merge_extra_scenes(
+    prepared: &[(String, String)],
+    proxy: Option<&ResolvedProxy>,
+    models: &mut Vec<Value>,
+) {
+    for function in MERGE_CATALOG_FUNCTIONS {
+        let mut have: Vec<String> = models.iter().map(bare_name).collect();
+        match fetch_detail_catalog(prepared, proxy, function).await {
+            Ok(mut extra) => {
+                let mut added = 0usize;
+                for mut entry in extra.drain(..) {
+                    let name = bare_name(&entry);
+                    if name.is_empty() || have.iter().any(|held| *held == name) {
+                        continue;
+                    }
+                    have.push(name);
+                    added += 1;
+                    // 盖场景就在进表之前盖：拿 `models[len-added..]` 事后补一段，
+                    // 会在同一个表达式里对 `models` 既可变借又不可变借（编译期就拦下了，
+                    // 但那处的正确修法是把两段逻辑拆开，反而更容易写错边界）。
+                    stamp_function(std::slice::from_mut(&mut entry), function);
+                    models.push(entry);
+                }
+                logging::log(
+                    "[Models]",
+                    &format!("Trae 目录合并 {function}：新增 {added} 条（合计 {} 条）", models.len()),
+                );
+            }
+            Err(error) => logging::log(
+                "[Models]",
+                &format!("Trae 目录合并 {function} 跳过：{}", error.message),
+            ),
+        }
+    }
+}
+
 /// 一条目录条目（聚合形态）。
 ///
 /// `supportsToolCall` 取**上游说的**而不是我们硬编码的：`extra_config` 里带
@@ -471,7 +570,7 @@ pub async fn refresh(
     let Some(payload) = reply.json() else {
         return ModelRefreshOutcome::failed("上游目录响应不是合法 JSON".to_string());
     };
-    let models = parse_catalog(&payload);
+    let mut models = parse_catalog(&payload);
     if models.is_empty() {
         // 这条文案不能写成"上游没有模型"就完事：真实原因多半是
         // `X-Ide-Version-Code` 那一道版本闸门（版本不对时上游给的是**另一张表**
@@ -480,6 +579,12 @@ pub async fn refresh(
             "上游目录里没有可见模型（config_info_list 缺失/为空？IdeVersionCode={IDE_VERSION_CODE}）"
         ));
     }
+    // 主表盖主场景：`chat_v3` 专属的名字是后面合并进来的，两者出站的 `function`
+    // 不同，不盖就分不出来。
+    stamp_function(&mut models, &super::payload::function_for(credential.variant()));
+    // 先合并再落缓存与内存表 —— 顺序反了就会出现"缓存里 19 条、内存里 23 条"
+    // 那种重启后模型凭空消失的形状。
+    merge_extra_scenes(&prepared, proxy, &mut models).await;
     let count = models.len();
     let now = logging::now_ms();
     // 先落持久化缓存（不持内存锁：两把锁不能嵌套），再换内存里那张表。
@@ -582,10 +687,29 @@ pub async fn refresh(
             // 同一个场景名再问一次我们自己在用的那张明细表：光有 remote 的名字
             // 不能广告（缺 `context_window_tokens` 等明细字段），明细表认了才谈得上服务。
             match fetch_detail_catalog(&prepared, proxy, function).await {
-                Ok(entries) => logging::log(
-                    "[Models]",
-                    &format!("Trae 场景探针 {function}：IDE 明细表 {} 条", entries.len()),
-                ),
+                Ok(entries) => {
+                    // 只报条数没用：21 条里可能 19 条就是我们已有的，那才是"多不出
+                    // 一个模型"。把明细表的名字一起过一遍差集，才看得见真新增。
+                    let detail: Vec<String> = entries
+                        .iter()
+                        .filter_map(|item| item.get("id").and_then(Value::as_str))
+                        .map(|id| super::payload::sanitize_model_name(id, "solo"))
+                        .collect();
+                    let groups = vec![(function.to_string(), detail.clone())];
+                    let missing = remote_only_names(&ours, &groups);
+                    logging::log(
+                        "[Models]",
+                        &format!(
+                            "Trae 场景探针 {function}：IDE 明细表 {} 条，其中我们没广告的 {} 个",
+                            entries.len(),
+                            missing.len()
+                        ),
+                    );
+                    logging::verbose(
+                        "[Models]",
+                        &format!("Trae 场景探针 {function} 明细表新增：{}", missing.join(", ")),
+                    );
+                }
                 Err(error) => logging::log(
                     "[Models]",
                     &format!("Trae 场景探针 {function}：IDE 明细表失败 —— {}", error.message),
@@ -669,6 +793,38 @@ mod tests {
     /// 探针问明细表时必须复用**同一张体**，只换 `function`。
     /// 七个键里任何一个变了，上游给的就不是同一张表 —— 那次探到的"不存在"
     /// 可能是形状造成的，而不是场景名。
+    /// 出站 `function` 按模型选：`chat_v3` 专属的名字要用 `chat_v3` 发，
+    /// 主表来的要用主场景发，目录里没有的名字回落到老行为。
+    /// 三条缺一不可 —— 只测第一条的话，实现"永远返回 chat_v3"也能过。
+    #[test]
+    fn each_model_carries_the_scene_it_came_from() {
+        let table = vec![
+            json!({"id": "glm-5.3-flash-solo", "catalogFunction": "chat_v3"}),
+            json!({"id": "kimi-k3-solo", "catalogFunction": "solo_work_lite"}),
+            json!({"id": "no-stamp-solo"}),
+        ];
+        assert_eq!(
+            "chat_v3",
+            function_for_model_in(&table, "glm-5.3-flash", "solo_work_lite"),
+            "合并进来的名字必须按它来的场景发"
+        );
+        assert_eq!(
+            "solo_work_lite",
+            function_for_model_in(&table, "kimi-k3", "solo_work_lite"),
+            "主表来的不许被合并改写成别的场景"
+        );
+        assert_eq!(
+            "solo_work_lite",
+            function_for_model_in(&table, "no-stamp", "solo_work_lite"),
+            "没盖场景的条目（老缓存/内置清单）走老行为"
+        );
+        assert_eq!(
+            "solo_work_lite",
+            function_for_model_in(&table, "根本不在表里", "solo_work_lite"),
+            "目录不认识的名字要回落，而不是猜一个场景"
+        );
+    }
+
     #[test]
     fn the_probe_catalog_body_differs_from_the_real_one_only_by_function() {
         let real = catalog_body("solo");
