@@ -66,14 +66,26 @@
 //!   网关没有理由替它吞掉。另加两个**验证码头**（`…VERIFY_PARAM_HEADER` /
 //!   `…VERIFY_REGION_HEADER`），理由见下面那一段。
 //!
-//! ── 人机验证：每条请求都要一个令牌（见 [`super::captcha`]）────
-//! 少了 `X-Aliyun-Captcha-Verify-Param`，这个端点一律回
-//! `400 {"code":3007,"msg":"captcha verify failed"}`（2026-09-28 实测：**不是
-//! 偶发挑战，是常规门禁**）。令牌由桌面端的 WebView 静默铸造、推进
-//! [`super::captcha`] 的池子，本模块每条请求取一个；池子空时**如实失败**并
-//! 给出可执行的提示（headless / Docker 没有 WebView，这条通道在那里不可用）。
-//! 上游回 3007 时把它记进池子计数（[`super::captcha::note_challenge`]），
+//! ── 人机验证：**要不要**令牌由上游配置说（见 [`super::captcha`]）──
+//! 2026-09-28 实测：少 `X-Aliyun-Captcha-Verify-Param` 这个端点一律回
+//! `400 {"code":3007,"msg":"captcha verify failed"}` —— **不是偶发挑战，是常规门禁**。
+//! 令牌由桌面端的 WebView 静默铸造、推进 [`super::captcha`] 的池子，本模块取一个。
+//!
+//! 2026-10-01 起这一格改成**听上游的**：`GET /api/v1/client/configs` 里有
+//! `configs.captcha.skip_model_request: true`（实测与客户端版本无关），也就是
+//! 官方客户端此刻在推理请求上**不带**这两个头。[`super::config_sync`] 每 5 分钟
+//! 同步一次，本模块照 [`super::captcha::required`] 决定「取一枚带上」还是「整个
+//! 不带」；上游真回了 3007 就当场翻回要码（[`super::captcha::note_challenge_and_require_token`]），
+//! 所以免码路线最坏的代价是**一次** 3007 往返。
+//!
+//! 池子空而配置说要码时，本模块**如实失败**并给出可执行的提示（headless / Docker
+//! 没有 WebView，那条通道在那种部署上就是不可用）；上游回 3007 也记进池子计数，
 //! 界面据此立刻补货。
+//!
+//! 池子空这一条给的是**专用状态码** `556`（判据与理由见 [`readiness`]）而不是
+//! 503，并顺手登记一道 provider 级闸门：那是「本机发不出去」而不是「这家拒了
+//! 请求」，编排层据此换下一个候选家，选路据此暂时绕开这一家。写死 503 的版本会
+//! 把整份请求终止在这里 —— 生产上 `attempts=1`、别家明明能答的这个模型名直接报错。
 //!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic，取值一律走 Option 链。
@@ -86,7 +98,9 @@ use serde_json::{json, Map, Value};
 use crate::server::core::prompt::GatewayBlocks;
 use crate::server::core::protocol::anthropic_outbound;
 use crate::server::core::providers::adapter::{ChatRequestPlan, UpstreamResponse};
+use crate::server::core::providers::readiness;
 use crate::server::errors::GatewayError;
+use crate::server::logging;
 
 use super::region::Region;
 
@@ -250,33 +264,36 @@ pub(super) fn build_request(
         override_blocks.as_ref(),
     )?;
 
-    // ── 人机验证令牌（一次一用，每个请求取一个）──────────────────
-    // 取不到就**当场失败**而不是发一个缺头的请求：上游对缺令牌的响应是
-    // 400 + 3007（一句英文），用户看到的是「网关报了个英文错」；这里的文案
-    // 才说得清「谁该补令牌、去哪儿补」。
-    let Some((captcha_param, captcha_region)) = super::captcha::take() else {
-        return Err(GatewayError::with_status(
-            503,
-            "活动套餐通道需要人机验证令牌，当前令牌池为空：\
-             令牌由桌面端界面自动铸造，请确认应用界面正在运行\
-             （headless 部署无法铸造，请在账号设置里把「使用套餐」切回编码套餐）",
-        ));
+    // ── 人机验证令牌（要就要、不要就**整个不带**）────────────────
+    // 要不要带由上游自己下发的那格配置决定（`configs.captcha.skip_model_request`，
+    // 见 [`super::config_sync`] 与 [`super::captcha::required`]）：
+    //   · 要 —— 取一枚令牌（一次一用）。取不到就**当场失败**而不是发一个缺头的
+    //     请求：上游对缺令牌的响应是 400 + 3007（一句英文），用户看到的是「网关
+    //     报了个英文错」；这里的文案才说得清「谁该补令牌、去哪儿补」。
+    //     处置本身在 [`captcha_pool_empty`]。
+    //   · 不要 —— 两个头**一个都不写**。这里必须是「键不存在」而不是「键在值为空」：
+    //     空值会被序列化成 `""`，上游那侧把它当成一个畸形 proof（比缺头更容易触发
+    //     风控），参考实现为此专门踩过一次。
+    let captcha_headers: Vec<(String, String)> = if super::captcha::required() {
+        match super::captcha::take() {
+            Some((param, region)) => {
+                let mut pairs = vec![(super::captcha::VERIFY_PARAM_HEADER.to_string(), param)];
+                if !region.trim().is_empty() {
+                    pairs.push((super::captcha::VERIFY_REGION_HEADER.to_string(), region));
+                }
+                pairs
+            }
+            None => return Err(captcha_pool_empty(provider_id)),
+        }
+    } else {
+        Vec::new()
     };
     let mut headers: Vec<(String, String)> = vec![
         ("Content-Type".to_string(), "application/json".to_string()),
         ("Authorization".to_string(), format!("Bearer {jwt}")),
         ("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
-        (
-            super::captcha::VERIFY_PARAM_HEADER.to_string(),
-            captcha_param,
-        ),
     ];
-    if !captcha_region.trim().is_empty() {
-        headers.push((
-            super::captcha::VERIFY_REGION_HEADER.to_string(),
-            captcha_region,
-        ));
-    }
+    headers.extend(captcha_headers);
     // 身份头与编码套餐那条同源（同一个函数、同一套取值），只是 UA 多一个
     // Anthropic SDK 后缀 —— 两处若各写一份，改一处必然漏另一处
     headers.extend(super::adapter::identity_headers(Some(ANTHROPIC_SDK_UA)));
@@ -298,6 +315,38 @@ pub(super) fn build_request(
         // （见 `upstream::translate`）
         response: UpstreamResponse::Anthropic,
     })
+}
+
+/// 令牌池为空的**处置**：登记本地闸门 + 给出本地前置条件错误。
+///
+/// 状态码用 [`readiness::LOCAL_PRECONDITION_STATUS`]（556）而不是 503：这一条是
+/// **本地前置条件**（这台机器铸不出令牌），一次上游往返都没发生。编排层按这个码
+/// 决定「顺延下一个候选家」而不是终止整份请求；取证上也只有专属码才能把「从未
+/// 发出去的请求」与「上游真回了 503」分开（理由与实测形状见 `readiness` 模块头）。
+///
+/// 顺手登记闸门：headless 上令牌池**恒空**，不登记的话每条请求都要先撞一次本地
+/// 失败才轮得到别家。`hold` 返回 `true` = 本次让它从放行变成挡住 —— 日志只在
+/// 这一刻打，逐请求打会刷屏。
+///
+/// 单独成函数的理由：`build_request` 的其余部分要读系统配置、工作目录、OS 版本
+/// 与那份官方提示词资源，为了一个状态码把它们全拖进测试不值得。判据在此，测试也
+/// 在此（见文件末尾的 `local_precondition`）。
+fn captcha_pool_empty(provider_id: &str) -> GatewayError {
+    let message = "活动套餐通道需要人机验证令牌，当前令牌池为空：\
+         令牌由桌面端界面自动铸造，请确认应用界面正在运行\
+         （headless 部署无法铸造，请在账号设置里把「使用套餐」切回编码套餐）";
+    if readiness::hold(provider_id, message) {
+        logging::console_line(
+            "[Routing]",
+            &format!(
+                "⚠️ {provider_id} 的活动套餐通道在本机发不出去（令牌池为空），\
+                 选路暂时绕开这一家；桌面端界面开始铸造令牌后会自动恢复，\
+                 否则最长 {} 秒重新探一次",
+                readiness::GATE_TTL_MS / 1000
+            ),
+        );
+    }
+    GatewayError::with_status(i32::from(readiness::LOCAL_PRECONDITION_STATUS), message)
 }
 
 /// 客户端原始请求里的输出额度（chat 侧两个字段名都认，与
@@ -804,4 +853,217 @@ fn trace_headers() -> Vec<(String, String)> {
         headers.push(("x-zcode-trace-id".to_string(), id));
     }
     headers
+}
+
+#[cfg(test)]
+mod local_precondition {
+    //! 令牌池为空那一条的**处置**：专属状态码、登记闸门、以及那句可执行的出路。
+    //!
+    //! ── 为什么测试要绕过 [`captcha_pool_empty`] 直接打 `build_request` ──
+    //! 走内部函数等于只断言「我写的常数确实是 556」—— 那条用例在 `readiness`
+    //! 里已经有更直白的版本。这里要钉的是**接线**：真的那条路径（账号走
+    //! `start-plan`、模型名已点名、官方提示词资源可解析）在令牌池为空时确实落到
+    //! 556 并挡住这一家。`build_request` 在取令牌之前不碰网络，代价只是一次
+    //! 本地装配。
+    //!
+    //! ── 假令牌为什么写成那个形状 ────────────────────────────
+    //! [`super::super::captcha::push`] 会丢掉「不足 5 个数字」的 param（阿里云
+    //! V3 的 proof 是 JWT，里面一定有数字；畸形值入池只会在发出去之后换来一次
+    //! 3007）。所以对照组里那颗假令牌必须**带数字**，否则 `take()` 返回 None，
+    //! 正对照测的仍是失败分支 —— 那种绿是空跑。
+    //!
+    //! 令牌池与闸门表都是**进程级**状态：用例之间靠 [`readiness::lock_for_tests`]
+    //! 串行，靠那颗假令牌把池子填满/取空（`take()` 一次一用，用完自然回到空池）。
+
+    use axum::http::HeaderMap;
+    use serde_json::json;
+
+    use super::super::region::Region;
+    use super::build_request;
+    use crate::server::core::providers::readiness;
+    use crate::server::core::providers::zcode::captcha;
+
+    /// 一条「足够走到取令牌那一步」的请求：有 jwt、有点名的模型名。
+    fn session_on_start_plan() -> serde_json::Value {
+        json!({
+            "jwt": "package-login-state",
+            "deviceMid": "mid-under-test",
+            "zcodePlan": "start-plan",
+        })
+    }
+
+    fn chat_body() -> serde_json::Value {
+        json!({
+            "model": "glm-5.3-flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "只回一个字"}],
+        })
+    }
+
+    /// 一颗形状合法的假令牌（含足量数字，见模块头那条说明）。
+    fn fake_certificate() -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(2026_09_30_001);
+        let digits = 100_000_000_000_000_u64 + (now % 899_999_999_999_999);
+        format!("fake-cert-{digits}.payload.sig")
+    }
+
+    #[test]
+    fn an_empty_token_pool_fails_locally_and_gates_the_home() {
+        let _slot = readiness::lock_for_tests();
+        readiness::clear_for_tests();
+        // 前提：池子是空的。本文件之外没有别的用例往这座池子里放东西，而
+        // `take()` 一次一用，上一条的对照组必然把它取走 —— 这里仍显式确认一次，
+        // 免得将来新增用例把这条变成「其实有令牌，所以断言的是成功路径」。
+        assert_eq!(0, captcha::ready(), "对照组前提：令牌池为空");
+
+        let error = build_request(
+            Region::Cn,
+            &session_on_start_plan(),
+            &chat_body(),
+            &HeaderMap::new(),
+        )
+        .err()
+        .expect("没有令牌的 start-plan 请求必须失败");
+        assert_eq!(
+            i64::from(readiness::LOCAL_PRECONDITION_STATUS),
+            i64::from(error.status_code),
+            "本地发不出去要说成 556：编排层按这个数字决定顺延，取证按它分组"
+        );
+        assert_ne!(
+            503, error.status_code,
+            "与「上游真回了 503」/「选不出账号」分开：那两类都另有所指"
+        );
+        assert!(
+            error.message.contains("切回编码套餐"),
+            "那句唯一可执行的出路不能被改没：{message}",
+            message = error.message
+        );
+        assert!(
+            readiness::gated("zcode"),
+            "当场登记闸门，下一条请求就不必再撞一次本地失败"
+        );
+        assert!(!readiness::gated("catpaw"), "另一家没道理被牵连");
+        readiness::clear_for_tests();
+    }
+
+    #[test]
+    fn the_same_request_builds_once_the_pool_has_a_token() {
+        let _slot = readiness::lock_for_tests();
+        readiness::clear_for_tests();
+        // 正对照：同一份请求、同一个账号，只把令牌池从空改成有一颗 —— 于是上一条
+        // 的失败确定是「缺令牌」造成的，而不是这条路径本身走不通（装配坏了会一路
+        // 400/500，那也会让上一条看起来像成功修好了）。
+        //
+        // 先立一道闸门再推令牌：闸门「入库当场撤掉」这件事因此是被断言的。反过来
+        // 直接断言「推完没闸门」会靠「本来就没有闸门」蒙绿（上一条用例已经清过表，
+        // 那种绿什么都没说）。
+        assert!(
+            readiness::hold("zcode", "令牌池为空"),
+            "前置：这一家正被本地闸门挡着"
+        );
+        captcha::push(&fake_certificate(), "cn");
+        assert_eq!(
+            1,
+            captcha::ready(),
+            "畸形值会被丢掉：入池没成功就等于没做正对照"
+        );
+        assert!(
+            !readiness::gated("zcode"),
+            "令牌入库当场撤闸门（不等 TTL 到期）"
+        );
+
+        let plan = build_request(
+            Region::Cn,
+            &session_on_start_plan(),
+            &chat_body(),
+            &HeaderMap::new(),
+        )
+        .expect("有一颗令牌时，同一条路径应当构造得出请求");
+        assert!(
+            plan.url.contains("/zcode-plan/anthropic/v1/messages"),
+            "走的是活动套餐那条门：{}",
+            plan.url
+        );
+        let header_names: Vec<String> = plan
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        assert!(
+            header_names.contains(&"x-aliyun-captcha-verify-param".to_string()),
+            "令牌真的挂在头上了：{header_names:?}"
+        );
+        assert_eq!(0, captcha::ready(), "一次一用：这条请求把那颗令牌吃掉了");
+        readiness::clear_for_tests();
+    }
+}
+
+#[cfg(test)]
+mod token_free_channel {
+    //! 上游说「推理不必附令牌」时，那两个头**整个不存在**。
+    //!
+    //! 为什么单独立一条：这一格由后台循环每 5 分钟同步，值会变；而"免码"落错的
+    //! 形态很特别 —— 写成空头（`x-aliyun-captcha-verify-param: ""`）比不写更糟，
+    //! 上游把它当畸形 proof，参考实现为此专门踩过一次。所以断言的是**键不存在**，
+    //! 不是「值为空」。
+    //!
+    //! 池子在这一条里被显式留空（`ready == 0`）：那样「构造成功」这件事才只能是
+    //! 免码带来的，而不是恰好有一颗令牌。与 `local_precondition` 共用同一把
+    //! 全局槽锁（令牌池、闸门表、`required` 结论都是进程级状态）。
+
+    use axum::http::HeaderMap;
+    use serde_json::json;
+
+    use super::super::region::Region;
+    use super::build_request;
+    use crate::server::core::providers::readiness;
+    use crate::server::core::providers::zcode::captcha;
+
+    #[test]
+    fn a_token_free_request_carries_neither_captcha_header() {
+        let _slot = readiness::lock_for_tests();
+        readiness::clear_for_tests();
+        assert_eq!(0, captcha::ready(), "前置：池子是空的");
+        assert!(
+            captcha::required(),
+            "前置：默认结论是要码（免码结论由下面的同步写入）"
+        );
+        assert!(
+            captcha::set_required(false),
+            "同步到 skip_model_request=true"
+        );
+
+        let plan = build_request(
+            Region::Cn,
+            &json!({"jwt": "package-login-state", "deviceMid": "mid-under-test"}),
+            &json!({
+                "model": "glm-5.3-flash",
+                "stream": true,
+                "messages": [{"role": "user", "content": "只回一个字"}],
+            }),
+            &HeaderMap::new(),
+        )
+        .expect("免码 + 池子为空，这条请求也应当构造得出来（这正是 headless 上要解决的场景）");
+        let names: Vec<String> = plan
+            .headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        assert!(
+            !names.iter().any(|name| name.contains("captcha")),
+            "两个验证码头都不该出现，连空值也不行：{names:?}"
+        );
+        assert!(
+            names.contains(&"authorization".to_string())
+                && names.contains(&"anthropic-version".to_string()),
+            "其余头照旧（别把免码写成少发一组头）：{names:?}"
+        );
+        assert_eq!(0, captcha::ready(), "免码时不该消耗任何令牌");
+
+        // 复原：这条用例之后跑的用例都假定「要码」是默认结论
+        assert!(captcha::set_required(true));
+    }
 }

@@ -82,6 +82,7 @@ use crate::server::core::providers::adapter::{
     adapter_for, ProviderAdapter, RetryAdvice, UpstreamErrorClass,
 };
 use crate::server::core::providers::custom::forward as custom_forward;
+use crate::server::core::providers::readiness;
 use crate::server::core::providers::router::route_for_forward;
 use crate::server::core::providers::{kind_from_id, kind_id, meta, ProviderKind};
 use crate::server::errors::GatewayError;
@@ -159,11 +160,92 @@ fn take_switch(switches_left: &mut usize, total: usize) -> bool {
     true
 }
 
+/// 失败之后往队列的下一个账号**顺延**：动作 3 与「构造期本地失败」共用的一条路。
+///
+/// 做四件事，顺序与原来逐字一致：把这一轮的账号记进 `tried_ids` → 问队列还有没有
+/// 没试过的账号 → 扣一次换号预算 → 打一行顺延日志。返回 `true` = 调用方应当
+/// `continue 'accounts`；返回 `false` = 「没有下一个账号」或「换号预算用尽」，
+/// 调用方把本次错误原样返回客户端。
+///
+/// ── 为什么预算在「问完有没有下一个」之后才扣 ────────────────
+/// 队列里没人时这次失败就是终态，不该白吃一个换号额度。反过来写的话，「最后一个
+/// 账号失败」也会把额度扣光，而同一份请求后面的判定读的就是这个额度。
+///
+/// ── 为什么这两个调用点共用一个函数 ─────────────────────────
+/// 判据与记账必须完全同源 —— 「一次请求最多牵连几个账号」这条闸门迟早只在一处
+/// 生效。两处各写一遍的话，改预算口径的人要同时记得两个地方。
+/// （**不含** 429 降级与会话式/自定义那两条：429 那条不受换号预算管、还要写限额
+/// 事件，会话式与自定义的措辞与记账号的时机也不同 —— 见各自的代码处说明。）
+///
+/// `stage` 只影响日志措辞（「转发失败」/「在本机就发不出去」），不参与任何判定。
+#[allow(clippy::too_many_arguments)]
+fn defer_to_next_account(
+    service: &UpstreamService,
+    provider_ids: &[&str],
+    cooldown_keys: &rotate::CooldownKeys<'_>,
+    tried_ids: &mut Vec<String>,
+    target: &RouteTarget,
+    session: &Value,
+    provider_id: &str,
+    model: &str,
+    stage: &str,
+    status_code: i32,
+    switches_left: &mut usize,
+    switch_total: usize,
+    pinned: Option<&str>,
+) -> bool {
+    if let Some(account_id) = target.account_id.clone() {
+        if !tried_ids.contains(&account_id) {
+            tried_ids.push(account_id);
+        }
+    }
+    let Some(next) =
+        rotate::pick_next_account(service, provider_ids, cooldown_keys, tried_ids, pinned)
+    else {
+        return false;
+    };
+    if !take_switch(switches_left, switch_total) {
+        return false;
+    }
+    let next_home = {
+        let next_provider = rotate::provider_of(&next);
+        if next_provider == provider_id {
+            String::new()
+        } else {
+            format!(
+                "，切换提供商 → {}",
+                kind_from_id(next_provider)
+                    .map(|kind| meta(kind).label)
+                    .unwrap_or(next_provider)
+            )
+        }
+    };
+    // 只在终端：请求日志那侧由「本轮明细（账号 + 错误）+ 下一轮的明细」完整表达
+    // 这条顺延链 —— 这行日志里除了这两者之外没有第三个信息。
+    logging::console_line(
+        "[Upstream]",
+        &format!(
+            "⚠️ 账号 {} 对模型 {model} {stage}（HTTP {status_code}），\
+             按队列顺延 → {}（优先级 {}{next_home}）",
+            account_label(target.account.as_ref(), &target.account_id.clone().unwrap_or_default(), &session),
+            account_display(&next),
+            next.get("priority")
+                .and_then(Value::as_i64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        ),
+    );
+    true
+}
+
 /// 瞬时 HTTP 状态码：适配器没声明专属重试时，按全局重试设置原样重发再看一眼。
 ///
 /// 只收 408（请求超时）与 5xx（网关 / 服务器错误）—— 都是上游或链路自己的
 /// 抖动，重试才有意义。**不含 429**：那是限额，走「账号冷却 + 换号」的分类
 /// 动作（见模块头的三个动作），对同一账号原地重试只会白等一个间隔。
+/// **也不含 [`readiness::LOCAL_PRECONDITION_STATUS`]（556）**：那个码说的是
+/// 「这一次转发从未发生」，原地重发第二次与第一次的结果必然是同一个失败 ——
+/// 它的出路只有换号一条（见 [`defer_to_next_account`]）。
 const TRANSIENT_RETRY_STATUSES: &[u16] = &[408, 500, 502, 503, 504];
 
 /// 这次的失败状态码是否命中「指定错误码直接换号」名单（设置页「通用 → 请求重试」）。
@@ -832,6 +914,40 @@ async fn attempt_queue(
                         Some(i64::from(error.status_code)),
                         Some(&error.message),
                     );
+                    // ── 构造期的**本地**失败：这一家还没出本机就发不出去 ──────
+                    // 判据是状态码而不是文案（556，见 `readiness` 模块头）：适配器
+                    // 在**构造请求时**发现本地前置条件不成立（当前唯一用户是 ZCode
+                    // 活动套餐缺验证码令牌），一次上游往返都没发生。
+                    //
+                    // 改造前这里一律 `return Err`，于是这种失败会**终止整份请求**
+                    // —— 生产上的形状是 `attempts=1`、明细里只有这一家、503，而同一
+                    // 个模型名在别几家都能答。换号顺延本来就不该只看「发出去之后
+                    // 上游怎么回」：既然本地就判定不可用，队列里的下一家有机会。
+                    //
+                    // 其余构造期错误（400 缺模型名 / 转换失败、401 账号缺凭证、
+                    // 500 内部坏了）继续**直接终止**：那些是「这份请求本身坏了」，
+                    // 换个账号发的是同一份坏请求，换满预算只会把一次 400 变成四条
+                    // 400，并把真实原因埋进顺延链里。
+                    if i32::from(readiness::LOCAL_PRECONDITION_STATUS) != error.status_code {
+                        return Err(error);
+                    }
+                    if defer_to_next_account(
+                        service,
+                        provider_ids,
+                        &cooldown_keys,
+                        &mut tried_ids,
+                        &target,
+                        &session,
+                        provider_id,
+                        &model,
+                        "在本机就发不出去",
+                        error.status_code,
+                        &mut switches_left,
+                        switch_total,
+                        ctx.pinned_account,
+                    ) {
+                        continue 'accounts;
+                    }
                     return Err(error);
                 }
             };
@@ -1178,55 +1294,27 @@ async fn attempt_queue(
                     // 换号受「切换账号重试次数」约束（`switches_left`）：额度用尽
                     // 时即使队列里还有人也不再顺延 —— 这是「一次请求最多牵连几个
                     // 账号」的唯一闸门（429 那条降级路径不受它管，见设置页说明）。
-                    if let Some(account_id) = target.account_id.clone() {
-                        if !tried_ids.contains(&account_id) {
-                            tried_ids.push(account_id);
-                        }
-                    }
-                    match rotate::pick_next_account(
+                    //
+                    // 记账与顺延本身在 [`defer_to_next_account`]：它与「构造期本地
+                    // 失败」共用同一条路，判据不该有两份。
+                    if defer_to_next_account(
                         service,
                         provider_ids,
                         &cooldown_keys,
-                        &tried_ids,
+                        &mut tried_ids,
+                        &target,
+                        &session,
+                        provider_id,
+                        &model,
+                        "转发失败",
+                        failure.error.status_code,
+                        &mut switches_left,
+                        switch_total,
                         ctx.pinned_account,
                     ) {
-                        Some(next) => {
-                            if !take_switch(&mut switches_left, switch_total) {
-                                return Err(failure.error);
-                            }
-                            let next_home = {
-                                let next_provider = rotate::provider_of(&next);
-                                if next_provider == provider_id {
-                                    String::new()
-                                } else {
-                                    format!(
-                                        "，切换提供商 → {}",
-                                        kind_from_id(next_provider)
-                                            .map(|kind| meta(kind).label)
-                                            .unwrap_or(next_provider)
-                                    )
-                                }
-                            };
-                            // 只在终端：请求日志那侧由「本轮明细（账号 + 错误）
-                            // + 下一轮的明细」完整表达这条顺延链 —— 这条日志
-                            // 里除了这两者之外没有第三个信息。
-                            logging::console_line(
-                                "[Upstream]",
-                                &format!(
-                                    "⚠️ 账号 {} 对模型 {model} 转发失败（HTTP {}），\
-                                     按队列顺延 → {}（优先级 {}{next_home}）",
-                                    account_label(target.account.as_ref(), &target.account_id.clone().unwrap_or_default(), &session),
-                                    failure.error.status_code,
-                                    account_display(&next),
-                                    next.get("priority").and_then(Value::as_i64)
-                                        .map(|value| value.to_string())
-                                        .unwrap_or_else(|| "-".to_string()),
-                                ),
-                            );
-                            continue 'accounts;
-                        }
-                        None => return Err(failure.error),
+                        continue 'accounts;
                     }
+                    return Err(failure.error);
                 }
             }
         };
@@ -1980,5 +2068,38 @@ async fn send_with_retry(
             }
         };
         return Err(OutboundFailure { class, error });
+    }
+}
+
+#[cfg(test)]
+mod local_failure {
+    //! 「本机就发不出去」这一条在编排层的两条判据。
+    //!
+    //! 顺延链本身（构造期失败 → 换下一个候选家）要真实的账号与选路，留给生产
+    //! 对拍（NAS 上 -14 与 -15 的 `attempts` 差异就是它的证据）。这里钉的是两个
+    //! 容易被顺手改掉的口径。
+
+    use super::readiness;
+    use super::TRANSIENT_RETRY_STATUSES;
+    use super::direct_switch_status;
+
+    #[test]
+    fn a_local_failure_is_never_resent_in_place() {
+        // 556 不在瞬时名单里：原地重发的第二次与第一次必然得到同一个失败
+        // （令牌池不会因为多等 5 秒就有货），而每一次重发都要客户端多等一个间隔。
+        assert!(
+            !TRANSIENT_RETRY_STATUSES.contains(&readiness::LOCAL_PRECONDITION_STATUS),
+            "本地前置条件的出路只有换号一条"
+        );
+        // 对照组：上游真的 503 仍然原地重发 —— 别把这条名单整块清空
+        assert!(TRANSIENT_RETRY_STATUSES.contains(&503));
+    }
+
+    #[test]
+    fn the_local_status_is_not_a_user_configurable_switch_code() {
+        // 「指定错误码直接换号」名单是用户配的（默认 402）。556 不该依赖它：
+        // 用户把名单清空也挡不住本地失败换号，反过来用户点名 556 也不该有额外效果。
+        // 这条用例的存在是为了让「改成走名单」这个念头先撞上说明。
+        assert!(!direct_switch_status(i64::from(readiness::LOCAL_PRECONDITION_STATUS)));
     }
 }

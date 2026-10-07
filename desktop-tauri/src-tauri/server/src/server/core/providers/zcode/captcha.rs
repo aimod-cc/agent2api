@@ -42,13 +42,22 @@
 //! 「使用套餐」切回编码套餐）。不要伪造一个令牌、也不要静默降级：上游会用
 //! 3007 把请求挡回来，用户只会看到一句看不懂的英文。
 //!
+//! 「不可用」现在会被**记住**：`plan.rs` 在取不到令牌的那一次登记一道本地闸门
+//! （[`readiness`]），选路随后暂时绕开这一家、请求落到别的承载家；令牌一入池就
+//! 由 [`push`] 撤掉闸门（[`ungate`]）。绕不开的是判据本身 —— 这条通道需要的是
+//! 一个**本机铸不出**的东西，网关没有义务替它编一个。
+//!
 //! ── 硬约束 ──────────────────────────────────────────────────
 //! release 是 `panic=abort`：本文件零 unwrap/expect/panic；锁中毒退化成空池。
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::{json, Value};
+
+use crate::server::core::providers::readiness;
+use crate::server::logging;
 
 /// 请求头：阿里云验证码 proof（参考实现 `RETRY_HEADERS.PARAM` 逐字相同）
 pub(super) const VERIFY_PARAM_HEADER: &str = "x-aliyun-captcha-verify-param";
@@ -104,20 +113,41 @@ pub fn push(param: &str, region: &str) -> usize {
         return ready();
     }
     let now = crate::server::logging::now_ms();
-    let Ok(mut pool) = pool().lock() else {
-        return 0;
+    // 池锁只在这个块里拿着：块末就放。下面撤闸门要走**另一把**锁（readiness 的
+    // 注册表），两把锁嵌套就会有一条未来的死锁路径（谁先谁后全靠这里的写法）。
+    let stock = {
+        let Ok(mut pool) = pool().lock() else {
+            return 0;
+        };
+        pool.entries.push_back(Entry {
+            param: param.to_string(),
+            region: region.trim().to_string(),
+            at: now,
+        });
+        while pool.entries.len() > POOL_MAX {
+            pool.entries.pop_front();
+        }
+        pool.minted = pool.minted.saturating_add(1);
+        pool.last_mint_at = now;
+        pool.entries.len()
     };
-    pool.entries.push_back(Entry {
-        param: param.to_string(),
-        region: region.trim().to_string(),
-        at: now,
-    });
-    while pool.entries.len() > POOL_MAX {
-        pool.entries.pop_front();
+    ungate();
+    stock
+}
+
+/// 令牌进池 → 撤掉 ZCode 两地的**本地闸门**。
+///
+/// 为什么在这儿撤而不是让闸门自己到期：闸门的存在意义是「headless 上这条通道
+/// 恒不可用，别把请求送进去」，而一枚令牌入库就是那个前提**当场被推翻**的证据。
+/// 等到期（[`readiness::GATE_TTL_MS`]）最坏会让这一家白躲两分钟 —— 对正在跑
+/// WebView 铸造的桌面端来说，这就是「明明有令牌了还绕着走」。
+///
+/// 两地一起撤：池子是全局一份、不绑地区（见模块头的「与账号无关」），国内版铸
+/// 出来的令牌国际版同样能用，所以国际版的闸门也没有理由继续立着。
+fn ungate() {
+    for region in super::region::Region::ALL {
+        readiness::release(region.provider_id());
     }
-    pool.minted = pool.minted.saturating_add(1);
-    pool.last_mint_at = now;
-    pool.entries.len()
 }
 
 /// 取一个令牌（FIFO：先铸先用，避免新令牌被旧令牌挤到过期）。
@@ -148,6 +178,95 @@ pub fn note_challenge() {
         pool.rejected = pool.rejected.saturating_add(1);
         pool.last_challenge_at = now;
     }
+}
+
+/// 记一次「上游确实回了 3007」，并把「推理免码」的结论**翻回要码**。
+///
+/// 为什么 3007 必须能翻这个结论：它是这条链上**唯一**能证伪 `skip_model_request`
+/// 的观测。免码上线后如果上游哪天把这一格改回 `false`（或直接不认这个开关），
+/// 我们手上不会有任何配置侧的信号 —— 只有 3007 会说话。让它当场改回要码，
+/// 免码路线的代价就被钉在「**最多一次** 3007 往返」上，而不是每次都撞。
+pub fn note_challenge_and_require_token() {
+    note_challenge();
+    set_required(true);
+}
+
+// ── 「此刻到底要不要一枚令牌」这个结论长在哪 ───────────────────
+//
+// 判据来自上游自己的配置（`configs.captcha.skip_model_request`，见
+// [`super::claim::CaptchaConfig`]），由 [`super::config_sync`] 每 5 分钟同步一次；
+// 3007 会当场把它翻回「要码」（[`note_challenge_and_require_token`]）。
+//
+// 默认值 = **要码**。这不是保守主义：headless 部署上「要码」的后果只是这个模型名
+// 由别家承载（见 `core::providers::readiness` 那条顺延路），而「免码」判错的后果是
+// 每条请求都白撞一次 3007、逐次消耗账号行为分。两边代价不对称。
+
+/// 结论本体（`true` = 每条模型请求都要一枚令牌）
+static TOKEN_REQUIRED: AtomicBool = AtomicBool::new(true);
+/// 上一次同步到配置的时刻（0 = 启动至今没同步成功过；面板与排障读它）
+static LAST_SYNC_AT: AtomicI64 = AtomicI64::new(0);
+
+/// `ZCODE_REQUIRE_CAPTCHA`：把它设成 `1` / `true` / `on` 就**无条件要码**，
+/// 上游那格配置不再有影响。
+///
+/// 留这个口子有两个用途：上游哪天「配置说免码、实际照拒」时，部署方不必等我们
+/// 改代码；以及对比排障时要能一行环境变量把两条路径切来切去。读一次就定死
+/// （`OnceLock`）—— 进程活到一半改环境变量不会生效，那本来就不是它的用法。
+fn env_forces_token() -> bool {
+    static FORCED: OnceLock<bool> = OnceLock::new();
+    *FORCED.get_or_init(|| {
+        let raw = std::env::var("ZCODE_REQUIRE_CAPTCHA")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        matches!(raw.as_str(), "1" | "true" | "yes" | "on")
+    })
+}
+
+/// 现在发这条模型请求**要不要**取一枚令牌。
+pub fn required() -> bool {
+    env_forces_token() || TOKEN_REQUIRED.load(Ordering::SeqCst)
+}
+
+/// 写入结论（配置同步与 3007 两处）。返回 `true` = 这次**改变了**结论。
+///
+/// 改变时打一行终端日志，并在改回「免码」时顺手撤掉本地闸门 —— 那道闸门存在的
+/// 前提就是「本机铸不出令牌而这条通道需要令牌」，前提没了还挡着，就把一条已经
+/// 能用的通道永久关在候选池外了。
+pub fn set_required(required: bool) -> bool {
+    if env_forces_token() && !required {
+        // 环境变量说「照旧要码」：上游那格配置不再能翻这个结论，否则 `ZCODE_REQUIRE_CAPTCHA`
+        // 会被五分钟一次的同步悄悄冲掉 —— 部署方按下的开关必须是最终结论
+        return false;
+    }
+    let changed = TOKEN_REQUIRED.swap(required, Ordering::SeqCst) != required;
+    if !changed {
+        return false;
+    }
+    if required {
+        logging::console_line(
+            "[ZCode]",
+            "🔒 活动套餐通道改回「每条请求都要一枚验证码令牌」（上游配置翻回、或它刚拒了一次免码请求）",
+        );
+    } else {
+        logging::console_line(
+            "[ZCode]",
+            "🔓 上游配置说模型请求不必再附验证码令牌（skip_model_request）：\
+             活动套餐通道改为免码直发，桌面端停止铸造令牌",
+        );
+        ungate();
+    }
+    true
+}
+
+/// 记下一次**成功**同步配置的时刻。
+pub fn note_synced() {
+    LAST_SYNC_AT.store(crate::server::logging::now_ms(), Ordering::SeqCst);
+}
+
+/// 上次同步配置的时刻（0 = 本次启动至今没同步成功过）
+pub fn last_sync_at() -> i64 {
+    LAST_SYNC_AT.load(Ordering::SeqCst)
 }
 
 /// 当前可用库存（不含过期条目）
@@ -181,6 +300,10 @@ pub fn stats() -> Value {
         .unwrap_or(0);
     json!({
         "ready": ready,
+        // 「上游此刻要不要每条模型请求附一枚令牌」——界面据此决定要不要铸造
+        // （false 时白铸就是在烧阿里云风控配额，见 `required` 的说明）
+        "required": required(),
+        "lastSyncAt": last_sync_at(),
         "ttlMs": TOKEN_TTL_MS,
         "oldestAgeMs": oldest_age_ms,
         "minted": pool.minted,
