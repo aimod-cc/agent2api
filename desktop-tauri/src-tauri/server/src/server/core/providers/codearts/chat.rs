@@ -128,6 +128,13 @@ pub fn build_upstream_request(
         // 让上游在最后一帧带上 usage（不要求它就永远不会给）
         object.insert("stream_options".to_string(), json!({ "include_usage": true }));
     }
+    // 夹上限必须发生在序列化之前 —— 签名覆盖的就是这串字节
+    for (key, from, to) in clamp_output_budget(&mut payload) {
+        crate::server::logging::verbose(
+            "[CodeArts]",
+            &format!("客户端 {key} {from} 超过上游硬上限，夹到 {to}（超了上游整条拒收）"),
+        );
+    }
     let body = serde_json::to_vec(&payload)
         .map_err(|error| GatewayError::with_status(400, format!("请求体序列化失败：{error}")))?;
     let mut headers = profile.headers(model);
@@ -462,6 +469,79 @@ mod tests {
     /// 2026-09-21 从真上游抓到的额度耗尽信封。
     const QUOTA_FRAME: &str = r#"{"error_code":"InferHub.4291.200","error_msg":"insufficient quota","details":[{"error_code":"InferHub.4291.200","error_msg":"modelId: glm-5.3-flash"}]}"#;
     const CONTENT_FRAME: &str = r#"{"id":"c1","model":"GLM-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"2"},"finish_reason":"stop"}]}"#;
+
+    #[test]
+    fn oversized_output_budget_is_clamped_before_the_request_is_signed() {
+        // 目录自述值（GLM-5.2 写 131072）照发会被整条拒收：
+        // InferHub.001001005.400。所以要在序列化之前夹 —— 夹晚了签的是原值，
+        // 发出去的仍是超限那串字节。
+        let profile = HeaderProfile::default();
+        let (_, _, body) = build_upstream_request(
+            "https://snap-access.cn-north-4.myhuaweicloud.com",
+            "GLM-5.2",
+            json!({ "messages": [{"role": "user", "content": "hi"}], "max_tokens": 131072 }),
+            false,
+            false,
+            &profile,
+            None,
+        )
+        .expect("应当能构造请求");
+        let sent: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            super::CHANNEL_MAX_OUTPUT_TOKENS,
+            sent["max_tokens"].as_i64().unwrap_or(-1),
+            "超限的 max_tokens 必须夹到硬上限"
+        );
+
+        // 另一种写法同样要夹（实测两种写法撞同一条边）
+        let (_, _, body) = build_upstream_request(
+            "https://snap-access.cn-north-4.myhuaweicloud.com",
+            "GLM-5.2",
+            json!({ "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 400000000 }),
+            false,
+            false,
+            &profile,
+            None,
+        )
+        .expect("应当能构造请求");
+        let sent: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            super::CHANNEL_MAX_OUTPUT_TOKENS,
+            sent["max_completion_tokens"].as_i64().unwrap_or(-1)
+        );
+    }
+
+    #[test]
+    fn clamp_only_touches_values_above_the_cap() {
+        // 到线值不动（65536 实测收）
+        let mut ok = json!({ "max_tokens": super::CHANNEL_MAX_OUTPUT_TOKENS });
+        assert!(super::clamp_output_budget(&mut ok).is_empty());
+        assert_eq!(super::CHANNEL_MAX_OUTPUT_TOKENS, ok["max_tokens"].as_i64().unwrap());
+
+        // 线上一格就夹，并回留痕（夹前夹后都给，否则日志里像凭空改了客户端的值）
+        let mut over = json!({ "max_tokens": super::CHANNEL_MAX_OUTPUT_TOKENS + 1 });
+        assert_eq!(
+            vec![("max_tokens".to_string(), super::CHANNEL_MAX_OUTPUT_TOKENS + 1, super::CHANNEL_MAX_OUTPUT_TOKENS)],
+            super::clamp_output_budget(&mut over)
+        );
+
+        // 没给 = 不新造键：缺省时上游自己给默认，实测能正常答
+        let mut absent = json!({ "messages": [] });
+        assert!(super::clamp_output_budget(&mut absent).is_empty());
+        assert!(absent.get("max_tokens").is_none());
+
+        // 非整数与负数不碰：那不是"超限"，是客户端写错了，替它做主是另一件事
+        let mut junk = json!({ "max_tokens": "131072", "max_completion_tokens": -5 });
+        assert!(super::clamp_output_budget(&mut junk).is_empty());
+        assert_eq!("131072", junk["max_tokens"]);
+        assert_eq!(-5, junk["max_completion_tokens"].as_i64().unwrap());
+
+        // 两个键同时给：各自夹各自，不合并成一个键
+        let mut both = json!({ "max_tokens": 200000, "max_completion_tokens": 100000 });
+        assert_eq!(2, super::clamp_output_budget(&mut both).len());
+        assert_eq!(super::CHANNEL_MAX_OUTPUT_TOKENS, both["max_tokens"].as_i64().unwrap());
+        assert_eq!(super::CHANNEL_MAX_OUTPUT_TOKENS, both["max_completion_tokens"].as_i64().unwrap());
+    }
 
     #[test]
     fn request_carries_the_model_headers_and_benefit_flag() {
@@ -1295,6 +1375,49 @@ mod usage_sniffer {
 /// 那条通道上游自己就是这么做的，两处保持一致）。
 pub const SHORT_OUTPUT_TOKENS: i64 = 1024;
 pub const THINKING_RESERVE: i64 = 1024;
+
+/// 上游对**单次输出额度**的硬上限：65536。
+///
+/// 数值是逐格打边界打出来的，不是抄来的：同一账号、同一通道上按
+/// 65536 / 65537 / 70000 / 98304 / 100000 / 131071 / 131072 / 262144 / 400000000
+/// 逐个送 —— **65536 收，65537 起整条被拒**，回
+/// `InferHub.001001005.400 The request param is invalid`。
+/// 福利通道与 agent 通道同判，`max_tokens` 与 `max_completion_tokens` 两种写法同判
+/// （试过 deepseek-v4.1-flash / GLM-5.2 / deepseek-v4-flash-0731 / glm-5.3-flash）。
+/// 被拒的几发都在 0.2 秒内回来，是收请求前判掉的，所以探针不消耗产出。
+///
+/// ⚠️ **目录自述的 `max_tokens` 不能当请求上限用**：同一批目录响应里
+/// GLM-5.2 写 131072、deepseek-v4.1-flash 写 384000，而这两个数发过去都是 400 ——
+/// 那是"模型能力"，不是"这条通道收下的值"。
+pub const CHANNEL_MAX_OUTPUT_TOKENS: i64 = 65536;
+
+/// 把客户端给的输出额度夹进 [`CHANNEL_MAX_OUTPUT_TOKENS`]，返回改过的
+/// `(键名, 夹前, 夹后)` 供留痕。
+///
+/// 为什么必须有：这三个数经 `/v1/models` 广告出去，客户端照它写值就**必然失败** ——
+/// 也就是"按说明书用"的请求反而一定要不到回答。夹在签名之前（而不是只夹目录出口），
+/// 是因为目录有缓存、模型也可能从别的路径进来，而请求侧这一道谁都绕不过。
+///
+/// 三条边界与既有的 [`reserve_for_thinking`] 同一口径：**只夹不改大、不新造键** ——
+/// 客户端没给 `max_tokens` 就不填（缺省时上游自己给默认，实测能正常回答），
+/// 值不超过上限的原样不动，非整数与负数不碰。
+pub fn clamp_output_budget(payload: &mut Value) -> Vec<(String, i64, i64)> {
+    let mut changed = Vec::new();
+    let Some(object) = payload.as_object_mut() else {
+        return changed;
+    };
+    for key in ["max_tokens", "max_completion_tokens"] {
+        let Some(client) = object.get(key).and_then(Value::as_i64) else {
+            continue;
+        };
+        if client <= CHANNEL_MAX_OUTPUT_TOKENS {
+            continue;
+        }
+        object.insert(key.to_string(), Value::from(CHANNEL_MAX_OUTPUT_TOKENS));
+        changed.push((key.to_string(), client, CHANNEL_MAX_OUTPUT_TOKENS));
+    }
+    changed
+}
 
 /// 某些模型**一定先思考**，而思考与正文共用 `max_tokens` 这一个额度。
 ///

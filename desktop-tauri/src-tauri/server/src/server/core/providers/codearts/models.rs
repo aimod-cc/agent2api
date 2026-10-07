@@ -156,7 +156,7 @@ pub fn parse_builtin(body: &str) -> Result<Vec<ModelConfig>, String> {
             display_name: if model_name.is_empty() { id.clone() } else { model_name },
             description: text(entry, "model_desc"),
             context_length: number(entry, "context_window"),
-            max_output_tokens: number(entry, "max_tokens"),
+            max_output_tokens: capped_output(entry, "max_tokens"),
             supports_images: entry.get("supports_images").and_then(Value::as_bool).unwrap_or(false),
             credit_display: credit_display_of(entry),
             id,
@@ -207,7 +207,7 @@ pub fn parse_agent_detail(body: &str, language: &str) -> Result<Vec<ModelConfig>
             display_name: if model_name.is_empty() { id.clone() } else { model_name },
             description,
             context_length: number(&parameters, "context_window"),
-            max_output_tokens: number(&parameters, "max_tokens"),
+            max_output_tokens: capped_output(&parameters, "max_tokens"),
             supports_images: parameters.get("supports_images").and_then(Value::as_bool).unwrap_or(false),
             credit_display: credit_display_of(&entry),
             id,
@@ -284,7 +284,7 @@ pub fn parse_benefit(body: &str) -> Result<Vec<ModelConfig>, String> {
             display_name: if name.is_empty() { id.clone() } else { name },
             description: String::new(),
             context_length: number(&entry, "context_window"),
-            max_output_tokens: number(&entry, "max_tokens"),
+            max_output_tokens: capped_output(&entry, "max_tokens"),
             supports_images: false,
             // 福利网关的条目没有 `credit`（实测三个源里只有 agent 与 builtin 带），
             // 留空 = 界面那一列显示 `—`，不是"倍率为 0"。
@@ -514,6 +514,21 @@ fn text(value: &Value, key: &str) -> String {
 
 fn number(value: &Value, key: &str) -> i64 {
     value.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+/// 目录自述的 `max_tokens` **不能当请求上限用**：这一家对单次输出额度的硬上限实测
+/// 是 65536（65537 起回 `InferHub.001001005.400`），而目录里 GLM-5.2 写 131072、
+/// deepseek-v4.1-flash 写 384000 —— 照它发必然失败。所以出口先夹一遍
+/// （请求侧 `chat::clamp_output_budget` 是第二道，绕不过的那道）。
+///
+/// `0` = "目录没给"，原样留着：把"不知道"编成一个数是另一件事。
+fn capped_output(value: &Value, key: &str) -> i64 {
+    let declared = number(value, key);
+    if declared <= 0 {
+        declared
+    } else {
+        declared.min(super::chat::CHANNEL_MAX_OUTPUT_TOKENS)
+    }
 }
 
 /// `credit[]` → 倍率文案（`ratio_display`）。
@@ -1175,4 +1190,46 @@ mod restart_tests {
         }
         out
     }
+
+    /// 三个解析口的 `max_output_tokens` 都要夹进上游硬上限。
+    ///
+    /// 单独钉这条的理由：这三个数会经 `/v1/models` 广告出去，客户端照它写值
+    /// 就必然被拒（实测 65537 起 `InferHub.001001005.400`）。
+    #[test]
+    fn advertised_output_budget_never_exceeds_the_channel_cap() {
+        let cap = crate::server::core::providers::codearts::chat::CHANNEL_MAX_OUTPUT_TOKENS;
+
+        let builtin = parse_builtin(
+            r#"{"builtinModels":[{"model_id":"deepseek-v4.1-flash","model_name":"D","context_window":1000000,"max_tokens":384000}]}"#,
+        )
+        .expect("builtin 可解析");
+        assert_eq!(1, builtin.len(), "夹具得先真的被解析出来");
+        assert_eq!(cap, builtin[0].max_output_tokens, "384000 这种自述值要夹到硬上限");
+
+        let agent = parse_agent_detail(
+            // 字段集与兄弟用例同形：`display_enabled` 缺了整条会被过滤掉，
+            // 那时 agent[0] 会 index-out-of-bounds 而不是断言失败 —— 别把那种形状当"夹住了"
+            r#"{"gpts":{"models":[{"model_alias":"GLM-5.2","model_name":"G","model_parameters":{"enabled":true,"display_enabled":true,"context_window":202752,"max_tokens":131072}}]}}"#,
+            "zh_cn",
+        )
+        .expect("agent 可解析");
+        assert_eq!(1, agent.len(), "夹具得先真的被解析出来，否则下面的断言是空跑");
+        assert_eq!(cap, agent[0].max_output_tokens, "agent 源同一条边");
+
+        let benefit = parse_benefit(
+            r#"{"error_code":"0000","result":{"models":[{"model_id":"glm-5.3-flash","model_name":"F","context_window":1048576,"max_tokens":393216}]}}"#,
+        )
+        .expect("福利可解析");
+        assert_eq!(1, benefit.len(), "夹具得先真的被解析出来");
+        assert_eq!(cap, benefit[0].max_output_tokens, "福利源同一条边");
+
+        // 对照：到线值与"未声明(0)"都不许被改 —— 0 是"不知道"，不是"上限是 0"
+        let within = parse_benefit(
+            r#"{"error_code":"0000","result":{"models":[{"model_id":"a","max_tokens":65536},{"model_id":"b"}]}}"#,
+        )
+        .expect("对照可解析");
+        assert_eq!(65536, within[0].max_output_tokens, "到线值原样");
+        assert_eq!(0, within[1].max_output_tokens, "目录没给就留 0，不编一个数");
+    }
 }
+
