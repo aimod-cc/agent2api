@@ -20,20 +20,25 @@
 //! 套餐剩余 + 签到钱包」）。也就是说签到到账的那一份确实是 SOLO 转发在花的钱，
 //! 不做签到等于每天白丢一笔额度。
 //! 前科那半句的真正内容也不是"签到会被封"，而是**签到姿势**会被风控：
-//!   · 设备号复用（`scheduler.go:36-39`：同号"可疑诱发"）；
+//!   · 设备号复用（`scheduler.go:36-39`：同号"可疑诱发"）——这一条我们做对了，
+//!     每轮全新 16 位数字号（见 `checkin_device_id`）；
 //!   · `req_source` 与令牌的产品谱系错配（`scheduler.go:25-28`：v0.12.41 反编译
-//!     官方双版定案，错配即 9074，并非单纯名额限流）；
-//!   · 同一账号混用多套客户端身份（`upstream/headers.go:67`：画像对不上）。
-//! 这三条都有确定的做对方式，下面逐条钉住，因此本家的态度从"不碰"改成
-//! "**按定稿姿势碰，且每天只花该花的几次请求**"。
+//!     官方双版定案，错配即 9074）——**这一条本家从未复现过**，而且同族端点的
+//!     另一家实测给的是相反的成因（9074 按 device id 限流）。据此已经把探测体
+//!     序列收成恒定的一发 `{}`，两条说法都留在 `CODE_REJECTED` 的注释里等判别；
+//!   · 同一账号混用多套客户端身份（`upstream/headers.go:67`：画像对不上）——
+//!     本模块只发一套 ug 画像，换鉴权方案时也只动 `Authorization` 一个头。
+//! 因此本家的态度从"不碰"改成"**按定稿姿势碰，且每天只花该花的几次请求**"。
 //!
 //! ── 一轮到底发几个请求（这是本模块的安全边界）──────────────────
-//! 状态 1 发 + （未签时）领取 1 发 + 回查 1 发 = **常态 3 发**，最坏（探测体
-//! 全 9074 或鉴权方案要回退）每发内部最多 3 次尝试。本模块**不**实现参考实现
-//! 那套当日指数退避重试定时器（1m→2m→…→2h，当日 10 次，`scheduler.go:225-231`）：
+//! 状态 1 发 + （未签时）领取 1 发 + 回查 1 发 = **常态 3 发**；每发内部最多
+//! 两种鉴权方案（请求体恒 `{}`，见 `probe_bodies`），所以最坏 6 发。
+//! 撞上 `1001`（服务端作废这张 JWT）时驱动会**换发新令牌后再走一整轮**，
+//! 但封顶两轮 —— 一次点击不该变成六发以上，这正是我们不加参考实现那套
+//! 当日指数退避重试定时器（1m→2m→…→2h，当日 10 次，`scheduler.go:225-231`）的理由：
 //! 那套是为「0 点整官方重置瞬间的洪峰」调的，而本仓的定时签到时刻由用户在
 //! 设置页决定（默认 00:01），再叠一层后台重试会把「一天三次」变成「一天几十次」，
-//! 恰好是上面第 1 条前科的成因。撞 9074 时本模块如实回报、当日不再自动重试，
+//! 恰好是前科第 1 条的成因。撞 9074 时本模块如实回报、当日不再自动重试，
 //! 用户想再试就点面板那颗按钮 —— 一次点击一轮，行为可预期。
 //!
 //! ── claim 的 `code:0` 是**假成功**陷阱 ──────────────────────
@@ -57,7 +62,7 @@ use serde_json::{Value, json};
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
-use super::adapter::{account_proxy, read_record, renew_if_due};
+use super::adapter::{account_proxy, read_record, renew_forced, renew_if_due};
 use super::credentials::Credential;
 use super::errors::classify;
 use super::http::post_json;
@@ -72,12 +77,31 @@ const EP_CHECKIN_CLAIM: &str = "/trae/api/v2/ug/checkin_credits/claim";
 const CODE_OK: i64 = 0;
 /// 业务码：`当前参与用户太多，请稍后再试`。
 ///
-/// ⚠️ 这个名字是本家踩过的最大的一个坑：它**不只是**名额限流。参考实现
-/// v0.12.41 反编译官方两个版本后定案 —— `req_source` 与令牌的产品谱系错配
-/// 同样回 9074（`scheduler.go:25-28`）。所以拿到 9074 的第一反应应该是
-/// 「谱系探测对不对」，而不是「等一会儿再试」。本模块因此按参考实现的做法
-/// 把探测体**逐个试**（见 `probe_bodies`），而不是只发一个就下结论。
+/// 这一码有两家**相反**的说法，而我们自己一次都没观测到过：
+///   · 参考实现 v0.12.41 反编译官方两个版本后定案 —— `req_source` 与令牌的产品谱系
+///     错配同样回 9074（`scheduler.go:25-28`）。本模块过去就是照这条做探测体序列的。
+///   · 同族端点上的另一家公开实现（`Trae2api-cn` @ `0075bb66`）实测相反：
+///     「Probing showed 9074 is device-scoped: the same account claims successfully
+///     on a freshly derived id」（`src/trae_client.py:512-531`）。
+/// 判别证据在我们手里是零：生产与测试两台的日志里 `9074` 一次都没出现过
+///（2026-10-07 各库 `count(*) from logs where message like '%9074%'` = 0），
+/// 而我们每轮用的就是全新 device id —— 按后一家的说法这正是"不该撞 9074"的形状。
+/// 所以这里不再为它准备第二种请求体（见 `probe_bodies`）：撞到就一发即回报、
+/// 当日不自动重试。**谁先在自己的日志里攒出一次 9074，谁的说法才算数。**
 const CODE_REJECTED: i64 = 9074;
+
+/// 业务码：**服务端已作废这张 JWT**，而本地 `expiredAt` 看不出来。
+///
+/// 出处是**同一族端点**（`ug/checkin_credits/*` + `pay/ide_user_ent_usage`，与我们
+/// 完全相同）上的第三方判定：它把 `code == 1001` 与文案 `not able to authenticate`
+/// 一并当作鉴权失效，动作是走 `ExchangeToken` 换新 JWT 后**重放一次**
+///（`src/main.py:9270-9277` 的 `_checkin_auth_failed`、`src/auth.py:483-491` 的
+/// `refresh_account`，后者的 docstring 明写「`expired_at` 单独预测不到」）。
+/// 参考实现那份码表里没有这一码。所以这条既不是"我们的实测"也不是"别家的码表"，
+/// 而是一条**同家同面的待验假设** —— 验它的动作就是驱动里那次"换发 + 重放一轮"：
+/// 领到了 ⇒ 假设成立；换发也失败 ⇒ 叫用户重新登录，两种结果都比原来那句
+/// 「本家没有实测依据」有用。
+const CODE_TOKEN_DEAD: i64 = 1001;
 
 /// 单次请求超时。与 `usage.rs` 同一个数：这条族没有流式，`egress` 默认的
 /// 600 秒读超时（那是留给 SSE 的）会把一次批量签到拖成整页转圈。
@@ -87,7 +111,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const ERROR_BODY_HEAD: usize = 200;
 
 /// 鉴权方案。参考实现 `client.go:563-566,639-641,692-696`：
-/// `Cloud-IDE-JWT` 优先，`Bearer` 兜底；非 9074 的业务码才换方案（9074 换体）。
+/// `Cloud-IDE-JWT` 优先，`Bearer` 兜底；非 9074 的业务码才换方案
+///（9074 走"换探测体"那一支 —— 而探测体现在只有一发，所以 9074 实际是一发即回报）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Scheme {
     Jwt,
@@ -110,18 +135,20 @@ impl Scheme {
     }
 }
 
-/// 该谱系的探测体序列（参考实现 `client.go:594-607` 的字面对齐）。
+/// 签到这一发的请求体：**恒为空对象**（序列形状保留，见下）。
 ///
-/// `req_source` 是**客户端产品谱系**（1=TRAE IDE / 2=SOLO、TraeWork），
-/// 不是用户的套餐档位（`:579-587`）。我们这条通道是 SOLO，所以 `2` 必须排第一；
-/// 排在后面是兜底：万一某账号其实是 IDE 谱系签的发，第一条会 9074，第二条才对。
-/// 空体 `{}` 也在序列里（上游对缺省值的处理是第三条退路）。
-pub fn probe_bodies(variant: &str) -> Vec<Value> {
-    match variant {
-        "solo" => vec![json!({ "req_source": 2 }), json!({ "req_source": 1 }), json!({})],
-        // cn（TRAE IDE 谱系）：1 优先，缺省次之，SOLO 号最后（参考实现同一顺序）
-        _ => vec![json!({ "req_source": 1 }), json!({}), json!({ "req_source": 2 })],
-    }
+/// 这里以前是三种 `req_source` 轮询（逐字照参考实现 `client.go:594-607`），
+/// 理由是「谱系错配会 9074」。改成一条的依据有两条，都不是我猜的：
+///   · 同族端点的另一家实现**恒发 `{}`** —— `src/trae_client.py:594-606` 的
+///     `_post_checkin(url, json={}, …)`；而 `req_source` 在它那儿出现在
+///     **另一条接口**上（`pay/ide_user_ent_usage`，`:642-667`），本来就不是签到在读的字段；
+///   · 我们自己的日志里 9074 命中为 0（见 `CODE_REJECTED` 的注释），
+///     也就是说那套"三种体 × 两种方案"最多 6 发的序列，一直在防一件从未发生过的事。
+/// `round_trip` 仍按"体用尽则收"分派，所以现在的形状是**一发即回报**；
+/// 真在自己日志里攒出一次 9074 时，这里就是加回序列的挂点（因此 `variant`
+/// 参数保留，调用点不必再翻一遍）。
+pub fn probe_bodies(_variant: &str) -> Vec<Value> {
+    vec![json!({})]
 }
 
 /// 一轮签到的**设备号**：16 位随机数字串。
@@ -217,10 +244,14 @@ fn flag(payload: &Value, key: &str) -> bool {
 
 /// 一次往返后的业务码判定：`true` = 采纳这份响应（码为 0 或体里有可用字段）。
 ///
-/// 参考实现在这里分三路（`client.go:744-746,810-812`）：码 0 → 收；
-/// 码 9074 → **换下一个探测体**（同方案）；其它非零 → **换下一个鉴权方案**。
-/// 本函数把这个决策做成纯函数，好让那条分派被单测钉住 —— 它决定的是
-/// 「谱系错配时能不能自己找回正确的 req_source」，写成循环里的 if 就没人测得到。
+/// 参考实现分三路（`client.go:744-746,810-812`）：码 0 → 收；码 9074 → **换下一个
+/// 探测体**（同方案）；其它非零 → **换下一个鉴权方案**。本函数把这个决策做成纯函数，
+/// 好让那条分派被单测钉住 —— 写成循环里的 if 就没人测得到。
+///
+/// 比参考实现多一档 `GiveUp`（1001）：既然这一码按同族端点的外部实测判为
+/// 「服务端已作废这张 JWT」，换 `Bearer` 重试就还是拿同一张死令牌去打 ——
+/// 那一发不会改变结果，只会把一次点击变成两发配额。换发在驱动那一层做。
+/// 这也是它与"其它非零码"的分界：未知码值得再试一种鉴权写法，已知的鉴权失效不值得。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Probe {
     /// 采纳这一发
@@ -229,12 +260,16 @@ pub enum Probe {
     NextBody,
     /// 其它非零码：换下一个鉴权方案（方案用尽则整体失败）
     NextScheme,
+    /// 1001：这一发就是终点 —— 换方案用的还是**同一张已被作废的 token**，
+    /// 再打一遍只是多花一次配额。真正的处置在驱动那一层（换发新令牌后重放整轮）。
+    GiveUp,
 }
 
 pub fn probe_for(code: i64) -> Probe {
     match code {
         CODE_OK => Probe::Accept,
         CODE_REJECTED => Probe::NextBody,
+        CODE_TOKEN_DEAD => Probe::GiveUp,
         _ => Probe::NextScheme,
     }
 }
@@ -275,11 +310,30 @@ pub fn decide(before: &Status, claim: &Status, after: Option<&Status>) -> Outcom
     }
 }
 
+/// 这一行结果是不是「服务端把这张 JWT 作废了」。
+///
+/// 判据两条并列，因为 1001 有时**不带文案**（我们生产实测就是这样）：
+/// 只认码会在文案到位时仍走一遍；只认文案会在文案缺失时整条失效。
+/// 文案两种写法都要认 —— 上游与参考实现各自转述过 `not able to authenticate`
+/// 和 `unable to authenticate`（见 `run` 的 host 说明），差一个词就漏判。
+pub fn needs_reauth(row: &Value) -> bool {
+    if row.get("code").and_then(Value::as_i64) == Some(CODE_TOKEN_DEAD) {
+        return true;
+    }
+    let message = row.get("msg").and_then(Value::as_str).unwrap_or_default();
+    message.contains("not able to authenticate") || message.contains("unable to authenticate")
+}
+
 /// Trae 账号的每日签到。
 ///
 /// 与 `query_usage` 同一条凭证链：读记录 → 组凭据 → 解代理 → **临期先续期**
 /// （参考实现 `scheduler.go:137-143` 的"签到前保鲜"：token 过期时签到必撞会话类
 /// 错误，而那一发错误看起来像"账号不行了"，会把健康账号拖进冷却）。
+///
+/// 之上多一条 **1001 的换发重放**：`renew_if_due` 是按本地 `expiredAt` 判临期的，
+/// 而 `CODE_TOKEN_DEAD` 的意义恰恰是"本地那张表看不出来"。所以这一码要单独走
+/// `renew_forced`（无视临期直接换发），再打**一轮**，总共两轮封顶 ——
+/// 一次点击不该变成六发请求，那正是参考实现那条当日指数退避我们把掉的原因。
 pub async fn claim_daily_checkin(
     store: &AccountStore,
     account_id: &str,
@@ -288,7 +342,34 @@ pub async fn claim_daily_checkin(
     let credential = Credential::from_payload(&record).map_err(GatewayError::new)?;
     let proxy = account_proxy(&record)?;
     let credential = renew_if_due(store, &record, &credential, proxy.as_ref()).await?;
-    run(&credential, proxy.as_ref(), UG_HOST).await
+    let first = run(&credential, proxy.as_ref(), UG_HOST).await?;
+    if !needs_reauth(&first) {
+        return Ok(first);
+    }
+    let renewed = match renew_forced(store, &record, &credential, proxy.as_ref()).await {
+        Ok(renewed) => renewed,
+        Err(error) => {
+            // 连 refreshToken 都换不出新令牌：这才是真的"要重新登录"。
+            // 原行留着（码、文案都在），只在后面接一句我们做了什么的实话说。
+            // ⚠️ 追加的句子不许出现「已签到」「已领取」，理由见 `complete`。
+            let mut row = first;
+            if let Some(map) = row.as_object_mut() {
+                map.insert("reauthAttempted".to_string(), json!(true));
+                map.insert("reauthFailed".to_string(), json!(true));
+                let head = map.get("msg").and_then(Value::as_str).unwrap_or_default().to_string();
+                map.insert(
+                    "msg".to_string(),
+                    json!(format!("{head}；换发新令牌也失败（{}），请在「账号」页重新登录", error.message)),
+                );
+            }
+            return Ok(row);
+        }
+    };
+    let mut row = run(&renewed, proxy.as_ref(), UG_HOST).await?;
+    if let Some(map) = row.as_object_mut() {
+        map.insert("reauthAttempted".to_string(), json!(true));
+    }
+    Ok(row)
 }
 
 /// 一轮签到（凭证 → 结果行）。`base` 让单测能把这三发指向假上游：
@@ -326,6 +407,16 @@ async fn run(
     // 一轮一个号，三发之间不变（见 `checkin_device_id` 的说明）
     let device_id = checkin_device_id();
     let before = status(base, credential, &variant, &device_id, proxy).await?;
+    // 状态那一发自己回**非零业务码**时必须原样报成拒绝，不许退化成"活动没开"。
+    // 退化是真的会发生过的形状：`status_of` 对缺字段一律按 `enable=false` 收，
+    // 于是 1001（这张 JWT 已被服务端作废）会被翻成「当前没有可领取的签到活动」——
+    // 把一个鉴权失败报成一件中性事，用户与定时链都会据此放弃这个账号。
+    if before.code != CODE_OK {
+        return Ok(complete(
+            Outcome::Rejected(before.code, before.message.clone()),
+            &device_id,
+        ));
+    }
     if !before.enable || before.done_today() {
         // 这一条分支根本没打领取；`decide` 在读 claim 之前就返回了，给一个空响应占位。
         return Ok(complete(decide(&before, &Status::default(), None), &device_id));
@@ -418,34 +509,39 @@ fn complete(outcome: Outcome, device_id: &str) -> Value {
         Outcome::Rejected(code, message) => {
             row.insert("success".into(), json!(false));
             row.insert("code".into(), json!(code));
-            // 上游给了文案就原样带出，没给才说"未给"。这里不许猜含义 ——
-            // 参考实现那份「1001=已领取」出自 **WorkBuddy** 的码表
-            //（`credits.ts`，打的是 `/v2/billing/meter/daily-checkin`），跨家搬码表
-            // 正是我们把别家结论当自家事实的那类错。
+            // 上游给了文案就原样带出，没给才说"未给"。
             let reason = if message.is_empty() {
                 "上游未给文案"
             } else {
                 message.as_str()
             };
-            row.insert(
-                "msg".into(),
-                json!(if code == CODE_REJECTED {
-                    format!(
-                        "官方拒绝本次签到（{code}）：{reason} —— 三种探测体与两种鉴权方案都试过；\
-                         这一码多数是设备画像/产品谱系问题，不是名额拥挤，当日不再自动重试"
-                    )
-                } else {
-                    // ⚠️ 兜底句里不许出现「已签到」「已领取」：批量层
-                    // `billing::checkin::checkin_completed_today` 是**按 msg 子串**判
-                    // "当日用过"的，写进去就等于把一次失败洗成已签、当日不再重试。
-                    //（上游自己给的文案落在 `{reason}` 里，那一格若真说"已领取"，
-                    //  被批量层当成当日已办是对上游原话的忠实执行，不是我们的加工。）
-                    format!(
-                        "官方拒绝本次签到（{code}）：{reason}；这一码本家没有实测依据，\
-                         只按失败上报（探测体与两种鉴权方案都试过），当日台账不落"
-                    )
-                }),
-            );
+            // ⚠️ 三个分支的文案都不许出现「已签到」「已领取」：批量层
+            // `billing::checkin::checkin_completed_today` 是**按 msg 子串**判"当日用过"的，
+            // 写进去就把一次失败洗成已签、当日不再重试。
+            //（上游自己给的文案落在 `{reason}` 里，那一格若真说"已领"，被批量层当成
+            //  当日已办是对上游原话的忠实执行，不是我们的加工。）
+            let text = if code == CODE_REJECTED {
+                // 两种读法并列写出来，因为**我们还没有自己的证据**选一个：
+                // 参考实现说谱系/画像，外部实测说 device id 维度限流；我们库里 9074 = 0 次。
+                format!(
+                    "官方拒绝本次签到（{code}）：{reason}；这一码有两说 —— 参考实现判产品谱系/设备画像错配，\
+                     同族端点的外部实测判「按 device id 限流、换张派生号就领得到」，而我们自己的日志里\
+                     还没出现过一次 9074。本轮只发了一发（每轮本就是全新 device id），当日不再自动重试"
+                )
+            } else if code == CODE_TOKEN_DEAD {
+                format!(
+                    "官方拒绝本次签到（{code}）：{reason}；这一码在同族端点上被判为「服务端已作废这张登录态」\
+                     （本地到期时间看不出来），处置是换发新令牌后重放一轮 —— 见紧邻的上下两条记录"
+                )
+            } else {
+                // 不猜含义 —— 参考实现那份「1001=已领取」出自 **WorkBuddy** 的码表
+                //（`credits.ts`，打的是 `/v2/billing/meter/daily-checkin`），跨家搬码表
+                // 正是我们把别家结论当自家事实的那类错。
+                format!(
+                    "官方拒绝本次签到（{code}）：{reason}；这一码本家没有实测依据，只按失败上报，当日台账不落"
+                )
+            };
+            row.insert("msg".into(), json!(text));
             None
         }
         Outcome::Unconfirmed => {
@@ -540,7 +636,7 @@ async fn round_trip(
     let mut scheme = Scheme::Jwt;
     let mut last = json!({});
     loop {
-        for body in &bodies {
+        for (index, body) in bodies.iter().enumerate() {
             let reply =
                 post_checkin(&url, body, variant, device_id, &credential.access_token, scheme, proxy)
                     .await?;
@@ -549,7 +645,17 @@ async fn round_trip(
             last = payload;
             match probe_for(code) {
                 Probe::Accept => return Ok(last),
-                Probe::NextBody => continue,
+                Probe::GiveUp => return Ok(last),
+                Probe::NextBody => {
+                    // **体序列用尽就是这一发的终点**。这一格在只有一个体的今天
+                    // 是主路径：9074 不是鉴权方案的错，换 Bearer 再打一遍只是
+                    // 多花一次上游配额，还正好踩在"9074 之后再查 status 会加重
+                    // 限流"那条外部实测上。
+                    if index + 1 == bodies.len() {
+                        return Ok(last);
+                    }
+                    continue;
+                }
                 Probe::NextScheme => break,
             }
         }
@@ -609,20 +715,23 @@ mod tests {
         Status { code, ..Status::default() }
     }
 
+    /// 签到请求体恒 `{}` —— 这条用例钉的是**删掉**的东西：三种 `req_source` 轮询。
+    ///
+    /// 删的依据写在 `probe_bodies` 的注释里（同族端点的外部实测恒发 `{}`、
+    /// `req_source` 属于 `pay/ide_user_ent_usage`、我们自己的日志里 9074 = 0 次）。
+    /// 两条断言成对才有意义：只断长度会把 `vec![json!({"req_source":2})]` 这种
+    /// 回潮放过去，只断空对象会把"三种体各发一遍"放过去。
     #[test]
-    fn the_solo_lineage_probes_the_solo_source_first() {
-        // 我们这条通道只有 SOLO。探测顺序错了的后果不是报错，而是每天一发 9074
-        //（参考实现 v0.12.41 的定案：req_source 必须与令牌谱系一致）。
-        let solo = probe_bodies("solo");
-        assert_eq!(Some(2), solo[0].get("req_source").and_then(Value::as_i64), "SOLO 首发必须是 req_source=2");
-        assert_eq!(Some(1), solo[1].get("req_source").and_then(Value::as_i64));
-        assert!(solo[2].as_object().is_some_and(|map| map.is_empty()), "第三条退路是空体");
-        assert_eq!(3, solo.len());
-
-        // IDE 谱系反过来（照参考实现的另一条序列）
-        let cn = probe_bodies("cn");
-        assert_eq!(Some(1), cn[0].get("req_source").and_then(Value::as_i64));
-        assert_eq!(Some(2), cn[2].get("req_source").and_then(Value::as_i64));
+    fn the_checkin_body_is_one_empty_object_for_every_lineage() {
+        for variant in ["solo", "cn", "intl", "没见过的谱系"] {
+            let bodies = probe_bodies(variant);
+            assert_eq!(1, bodies.len(), "{variant} 不该带第二种请求体：{bodies:?}");
+            assert!(
+                bodies[0].as_object().is_some_and(|map| map.is_empty()),
+                "{variant} 的签到体必须是空对象，`req_source` 不是这一族在读的字段：{}",
+                bodies[0]
+            );
+        }
     }
 
     #[test]
@@ -639,13 +748,32 @@ mod tests {
     }
 
     #[test]
-    fn code_9074_switches_the_probe_body_and_any_other_code_switches_the_scheme() {
+    fn code_9074_exhausts_the_body_sequence_and_any_other_code_switches_the_scheme() {
         assert_eq!(Probe::Accept, probe_for(0));
-        assert_eq!(Probe::NextBody, probe_for(CODE_REJECTED), "9074 先怀疑谱系，换体不换方案");
-        assert_eq!(Probe::NextScheme, probe_for(1001));
+        // 9074 仍然走"换体"这一支；探测体现在只剩一发，所以这一支等效于**一发即回报**。
+        // 这条断言留着不是因为它现在多做了一件事，而是它钉住"9074 不换鉴权方案"：
+        // 真在自己日志里攒出一次 9074、要加回体序列时，别顺手把方案也换掉。
+        assert_eq!(Probe::NextBody, probe_for(CODE_REJECTED), "9074 换体不换方案（体只有一发 ⇒ 即收）");
+        assert_eq!(
+            Probe::GiveUp,
+            probe_for(CODE_TOKEN_DEAD),
+            "1001 拿同一张已作废的令牌换方案，只是多花一发配额"
+        );
         assert_eq!(Probe::NextScheme, probe_for(9004), "缺 did 那类码不是拥挤，换方案也无用但要按非拥挤路径收尾");
         assert_eq!(Some(Scheme::Bearer), Scheme::Jwt.next());
         assert_eq!(None, Scheme::Bearer.next(), "两种方案都试过就收，不能无限重试");
+    }
+
+    /// `1001` 的两条识别路径都要认（码、以及两种文案写法），而且非 1001 不许误触发。
+    /// 触发条件写窄了会漏（我们生产实测 1001 **不带文案**），写宽了会把普通拒绝
+    /// 变成一次昂贵的换发重放 —— 四条断言两头都要钉。
+    #[test]
+    fn only_a_dead_token_asks_for_a_reissue() {
+        assert!(needs_reauth(&json!({"code": 1001, "msg": ""})), "空文案也要认：码单独成立");
+        assert!(needs_reauth(&json!({"code": 0, "msg": "上游说 we are not able to authenticate you"})));
+        assert!(needs_reauth(&json!({"code": 0, "msg": "…unable to authenticate…"}),), "两种写法都要认");
+        assert!(!needs_reauth(&json!({"code": 9074, "msg": "当前参与用户太多"})), "拥挤不是鉴权失效");
+        assert!(!needs_reauth(&json!({"success": true, "msg": "签到成功"})));
     }
 
     #[test]
@@ -972,9 +1100,10 @@ mod tests {
             assert!(seen[1].path.ends_with("/claim"), "第二发必须是领取：{}", seen[1].path);
             assert!(seen[2].path.ends_with("/status"), "第三发是回查：{}", seen[2].path);
 
-            // SOLO 谱系必须第一个就发 req_source=2。顺序错了的失败形态是每天一发
-            // 9074，而上游的文案是"参与用户太多" —— 会把人引向"等一等"，真因却是谱系
-            assert_eq!(r#"{"req_source":2}"#, seen[0].body.replace(' ', ""), "SOLO 首发探测体");
+            // 三发的请求体都必须是空对象（`probe_bodies` 只剩一发的事实形状）
+            for call in &seen {
+                assert_eq!("{}", call.body.replace(' ', ""), "签到体恒为空对象：{}", call.body);
+            }
             for call in &seen {
                 assert_eq!("Cloud-IDE-JWT TOK", call.authorization, "ug 族的鉴权前缀");
             }
@@ -989,33 +1118,46 @@ mod tests {
             }
         }
 
+        /// 9074 现在一发即回报：状态那第一发撞上 9074，既不该换鉴权方案再打，
+        /// 更不该继续去打领取与回查（外部实测明确写了「9074 之后马上查 status
+        /// 只会加重上游限流」）。这一格是 `round_trip` 里"体用尽即收"那条分支的
+        /// 唯一覆盖 —— 少了它，把 `return Ok(last)` 写成 `break` 也能全绿。
         #[tokio::test]
-        async fn a_9074_retries_the_next_probe_body_on_the_same_scheme() {
-            let (row, seen) = one_round(vec![
-                r#"{"code":9074,"message":"当前参与用户太多，请稍后再试"}"#,
-                r#"{"code":0,"enable":true,"checked_in":false}"#,
-                r#"{"code":0}"#,
-                r#"{"code":0,"enable":true,"checked_in":true,"credits":50}"#,
-            ])
-            .await;
-
-            assert_eq!(Some(true), row["success"].as_bool());
-            assert_eq!(Some(50), row["awarded"].as_i64());
-            assert_eq!(4, seen.len(), "9074 换体后继续走领取+回查：{seen:?}");
-            assert_eq!(r#"{"req_source":2}"#, seen[0].body.replace(' ', ""));
-            assert_eq!(
-                r#"{"req_source":1}"#,
-                seen[1].body.replace(' ', ""),
-                "9074 的下一步是换**探测体**（同谱系序列的第二条）"
+        async fn a_9074_on_the_status_shot_stops_after_one_call() {
+            let (row, seen) = one_round(vec![r#"{"code":9074,"message":"当前参与用户太多，请稍后再试"}"#]).await;
+            assert_eq!(Some(false), row["success"].as_bool());
+            assert_eq!(Some(CODE_REJECTED), row["code"].as_i64());
+            assert_eq!(1, seen.len(), "9074 就该一发即收：{seen:?}");
+            assert!(
+                seen[0].authorization.starts_with("Cloud-IDE-JWT "),
+                "不许顺手换 Bearer 再打一遍：{}",
+                seen[0].authorization
             );
-            for call in &seen[..2] {
-                assert!(
-                    call.authorization.starts_with("Cloud-IDE-JWT "),
-                    "9074 不许换鉴权方案（那是另一种失败的分派）：{}",
-                    call.authorization
-                );
-            }
-            assert_eq!(seen[0].device_id, seen[3].device_id, "整轮共用一个号");
+            let msg = row["msg"].as_str().unwrap_or_default();
+            assert!(msg.contains("9074"), "{msg}");
+            assert!(
+                msg.contains("两说") || (msg.contains("谱系") && msg.contains("device")),
+                "这一码有两家相反的说法，文案要都摆出来，别替读者选一个：{msg}"
+            );
+        }
+
+        /// 状态那一发回 1001 时**不许**被翻成「当前没有可领取的签到活动」。
+        ///
+        /// 旧实现真的会这样：`status_of` 对缺字段一律按 `enable=false` 收，
+        /// 于是任何非零业务码都退化成 NotEnabled —— 把一个鉴权失败报成一件中性事，
+        /// 定时链与用户都会据此把这个账号放弃。这条用例就是那一步的补丁。
+        #[tokio::test]
+        async fn a_dead_token_is_never_reported_as_no_activity() {
+            let (row, seen) = one_round(vec![r#"{"code":1001}"#]).await;
+            assert_eq!(Some(false), row["success"].as_bool());
+            assert_eq!(Some(CODE_TOKEN_DEAD), row["code"].as_i64());
+            let msg = row["msg"].as_str().unwrap_or_default();
+            assert!(
+                !msg.contains("没有可领取的签到活动"),
+                "1001 被洗成\"活动没开\"就是这条回归：{msg}"
+            );
+            assert!(msg.contains("登录态") || msg.contains("令牌"), "要说清下一步是什么：{msg}");
+            assert_eq!(1, seen.len(), "状态一发就该收：{seen:?}");
         }
 
         /// 领取被拒时的**整条线索**都要留在结果行里：官方的文案 + 第一发状态的读数。
@@ -1028,12 +1170,11 @@ mod tests {
         /// 所以断言要成对：credits=0 与 credits=200 两种被拒，各自读出各自的数。
         #[tokio::test]
         async fn a_refused_claim_keeps_the_official_copy_and_the_status_readout() {
-            // 1001 走的是"非 9074 → 换鉴权方案"那一档，所以领取这一发会打两次
-            //（Cloud-IDE-JWT 与 Bearer 各一次），两种方案都用尽才收尾。
+            // 1001 走 `GiveUp` 那一档：领取只打一发（换 Bearer 用的还是同一张令牌）。
+            // 状态 1 发 + 领取 1 发 = 2 发，第 3 发一次都没有。
             let refused = r#"{"code":1001,"message":"该账号暂不符合领取条件"}"#;
             let (zero, seen) = one_round(vec![
                 r#"{"code":0,"enable":true,"checked_in":false,"did_checked_in":false,"credits":0,"extra_credits":0}"#,
-                refused,
                 refused,
             ])
             .await;
@@ -1050,16 +1191,18 @@ mod tests {
             assert_eq!(Some(false), zero["statusCheckedIn"].as_bool());
             assert_eq!(Some(0), zero["statusCredits"].as_i64(), "今日份额读数要跟着走：{zero}");
             assert!(zero.get("alreadyCompleted").is_none(), "被拒不等于当日已办");
-            assert_eq!(3, seen.len(), "状态 + 两种鉴权方案各一发领取，然后收摊：{seen:?}");
+            assert_eq!(2, seen.len(), "状态 + 一发领取就收摊，换方案那一发是空转：{seen:?}");
             assert!(seen[1].authorization.starts_with("Cloud-IDE-JWT "), "{}", seen[1].authorization);
-            assert!(seen[2].authorization.starts_with("Bearer "), "{}", seen[2].authorization);
-            assert_eq!(seen[1].device_id, seen[2].device_id, "换方案不许换号");
+            assert!(
+                seen.iter().all(|call| !call.authorization.starts_with("Bearer ")),
+                "1001 不许再拿同一张令牌换 Bearer 打一遍：{seen:?}"
+            );
+            assert_eq!(seen[0].device_id, seen[1].device_id, "整轮共用一个号");
 
             // 反对照：同一个码、同样被拒，但状态报了 200 —— 这一格必须读出 200，
             // 否则上面的 0 只是"永远输出 0"的假绿。
             let (rich, _) = one_round(vec![
                 r#"{"code":0,"enable":true,"checked_in":false,"credits":200,"extra_credits":0}"#,
-                refused,
                 refused,
             ])
             .await;
