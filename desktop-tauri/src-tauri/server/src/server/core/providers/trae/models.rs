@@ -64,13 +64,14 @@ use serde_json::{Value, json};
 
 use crate::server::core::providers::adapter::ModelRefreshOutcome;
 use crate::server::core::providers::catalog_cache;
+use crate::server::errors::GatewayError;
 use crate::server::logging;
 use crate::server::core::proxies::ResolvedProxy;
 
 use super::credentials::Credential;
 use super::errors::config_is_solo_agent_only;
 use super::headers::{IDE_VERSION_CODE, solo_headers, HeaderIdentity};
-use super::http::{Reply, post_json};
+use super::http::{Reply, get_json, post_json};
 use super::{AGENT_BASE_URL, MODELS_PATH};
 
 /// 远程目录缓存有效期（与另外几家同为 1 小时；上游改表不需要秒级可见）。
@@ -138,6 +139,84 @@ pub fn catalog_url() -> String {
     format!("{AGENT_BASE_URL}{MODELS_PATH}")
 }
 
+/// remote 侧目录的场景名单 —— 外部那家实现把这一条当作**唯一**的目录来源
+///（`Trae2api-cn@0075bb66` `src/trae_client.py:1294`：
+/// `GET /api/remote/v1/models?functions=solo_agent_remote,solo_work_remote,`
+/// `solo_design_remote&show_custom_model=true`）。
+/// 我们自己的那张表走的是 IDE 侧 `get_detail_param`，两者不是一张表。
+pub const REMOTE_CATALOG_FUNCTIONS: [&str; 3] =
+    ["solo_agent_remote", "solo_work_remote", "solo_design_remote"];
+
+/// remote 目录的 URL（查询串驱动，没有请求体）。
+pub fn remote_catalog_url() -> String {
+    let functions = REMOTE_CATALOG_FUNCTIONS.join(",");
+    format!("{AGENT_BASE_URL}/api/remote/v1/models?functions={functions}&show_custom_model=true")
+}
+
+/// 一份 remote 目录响应 → `(场景, 该场景收录的模型裸名)`。
+///
+/// 形状是**按场景分组**的：`data.list[]` 每项带 `function`（旧一点的写法是
+/// `agent_type`）与 `models[]`（`src/trae_client.py:1301-1330` 的同一读法）。
+/// 名字取 `name`，缺 `name` 的条目丢掉 —— 认不出来的名字不能进对照表，
+/// 那会把"我们看不见的模型"虚报成"看不见的乱码"。
+pub fn parse_remote_catalog(payload: &Value) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    let Some(list) = payload
+        .pointer("/data/list")
+        .or_else(|| payload.get("list"))
+        .and_then(Value::as_array)
+    else {
+        return groups;
+    };
+    for group in list {
+        let function = group
+            .get("function")
+            .or_else(|| group.get("agent_type"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if function.is_empty() {
+            continue;
+        }
+        let names: Vec<String> = group
+            .get("models")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("name").and_then(Value::as_str))
+                    .map(|name| name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        match groups.iter_mut().find(|(existing, _)| *existing == function) {
+            Some((_, bucket)) => bucket.extend(names),
+            None => groups.push((function, names)),
+        }
+    }
+    groups
+}
+
+/// remote 里有、我们自己那张表里没有的名字（大小写不敏感，按首次出现顺序）。
+///
+/// 这一条差集就是 G1 要的答案 —— 「我们看不见哪些模型」是可数的，
+/// 而"看不见"与"用不了"是两件事：接不了 B 族之前，这些名字**不能**进广告表。
+pub fn remote_only_names(ours: &[String], groups: &[(String, Vec<String>)]) -> Vec<String> {
+    let lowered: Vec<String> = ours.iter().map(|name| name.to_lowercase()).collect();
+    let mut seen: Vec<String> = Vec::new();
+    for (_, names) in groups {
+        for name in names {
+            let key = name.to_lowercase();
+            if !lowered.contains(&key) && !seen.iter().any(|held| held.to_lowercase() == key) {
+                seen.push(name.clone());
+            }
+        }
+    }
+    seen
+}
+
 /// 上游响应 → 清单（**纯函数**，由向量 `catalog` 段钉住）。
 ///
 /// 条目顺序保留上游给的顺序：`/v1/models` 的阅读顺序与官方客户端一致，
@@ -193,6 +272,36 @@ pub fn parse_catalog(payload: &Value) -> Vec<Value> {
         out.push(item);
     }
     out
+}
+
+/// 拉一次 remote 目录（只读对照用）。
+///
+/// 头是在我们这套 ug/IDE 画像上**只加一个** `X-Trae-Client-Type: web`：
+/// 外部实现给 remote 用的就是这组（`src/trae_client.py:859-880`）。这一发失败
+/// 不影响本通道目录 —— 它是观测，不是依赖，所以调用方拿 `Err` 只写一条 verbose。
+async fn fetch_remote_catalog(
+    prepared: &[(String, String)],
+    proxy: Option<&ResolvedProxy>,
+) -> Result<Vec<(String, Vec<String>)>, GatewayError> {
+    let mut with_web = prepared.to_vec();
+    with_web.push(("X-Trae-Client-Type".to_string(), "web".to_string()));
+    let pairs: Vec<(&str, String)> = with_web
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.clone()))
+        .collect();
+    let reply = get_json(&remote_catalog_url(), &pairs, std::time::Duration::from_secs(20), proxy).await?;
+    if reply.status >= 400 {
+        let head: String = reply.body.chars().take(120).collect();
+        return Err(GatewayError::new(format!(
+            "remote 目录 HTTP {}：{}",
+            reply.status,
+            head.trim()
+        )));
+    }
+    let Some(payload) = reply.json() else {
+        return Err(GatewayError::new("remote 目录响应不是合法 JSON"));
+    };
+    Ok(parse_remote_catalog(&payload))
 }
 
 /// 一条目录条目（聚合形态）。
@@ -323,6 +432,51 @@ pub async fn refresh(
         guard.fetched_at = now;
     }
     logging::log("[Models]", &format!("Trae 模型目录已刷新（{count} 个模型）"));
+    // ── G1 的只读对照：remote 目录里哪些名字是我们看不见的 ─────────────
+    // 我们那张表是从 IDE 侧 `get_detail_param` 按 `function=solo_work_lite` 拿的；
+    // 外部那家实现的目录**只有** remote 这一处来源。两边的差集就是"上游有、
+    // 我们看不见"的名单 —— 它现在只进日志，**不改广告表**：
+    // "看不见"是事实，"看得见就能用"不是。这些名字大多挂在 B 族（remote 会话
+    // 协议）的执行器上，拿到我们这条通道上会得到流内 4001（与 `errors.rs` 那份
+    // 死名单同一类形状）。等 B 族接上，这份差集才变成待办清单；在那之前它的价值
+    // 是让那次评估有数可依，而不是让人凭 19 条就判断"trae 只有这些模型"。
+    let ours: Vec<String> = snapshot()
+        .models
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(|id| super::payload::sanitize_model_name(id, "solo"))
+        .collect();
+    match fetch_remote_catalog(&prepared, proxy).await {
+        Ok(groups) => {
+            let remote_total: usize = groups.iter().map(|(_, names)| names.len()).sum();
+            let missing = remote_only_names(&ours, &groups);
+            logging::log(
+                "[Models]",
+                &format!(
+                    "Trae 目录对照：remote {} 个场景 / {} 个名字，本通道 {} 条，看不见的 {} 个",
+                    groups.len(),
+                    remote_total,
+                    ours.len(),
+                    missing.len()
+                ),
+            );
+            let shape: Vec<String> = groups
+                .iter()
+                .map(|(function, names)| format!("{function}={}", names.len()))
+                .collect();
+            logging::verbose("[Models]", &format!("Trae remote 场景分布：{}", shape.join(", ")));
+            if !missing.is_empty() {
+                logging::verbose(
+                    "[Models]",
+                    &format!("Trae 本通道看不见的模型名：{}", missing.join(", ")),
+                );
+            }
+        }
+        Err(error) => logging::verbose(
+            "[Models]",
+            &format!("Trae remote 目录对照失败（不影响本通道目录）：{}", error.message),
+        ),
+    }
     ModelRefreshOutcome::refreshed(count)
 }
 
@@ -358,6 +512,53 @@ mod tests {
 
     fn document() -> Value {
         serde_json::from_str(VECTORS).expect("向量必须是合法 JSON")
+    }
+
+    #[test]
+    fn the_remote_catalog_grouping_and_the_diff_are_read_from_the_documented_shape() {
+        // 形状照外部实现读的那份：`data.list[]` 每项 `function` + `models[]`，
+        // 旧写法里场景名在 `agent_type` 上 —— 两条都得认，否则对照表会静默变空。
+        let payload = json!({
+            "data": {"list": [
+                {"function": "solo_agent_remote", "models": [
+                    {"name": "glm-5.3"}, {"name": " kimi-k2.8-preview "}, {"name": ""}, {"config_name": "no-name"},
+                ]},
+                {"agent_type": "solo_work_remote", "models": [{"name": "glm-5.3"}, {"name": "Doubao-Seed-Code"}]},
+            ]}
+        });
+        let groups = parse_remote_catalog(&payload);
+        assert_eq!(2, groups.len(), "两个场景都要认出来：{groups:?}");
+        assert_eq!("solo_agent_remote", groups[0].0);
+        // 空名与没有 `name` 字段的条目丢掉：认不出来的名字进对照表只会虚报差额
+        assert_eq!(vec!["glm-5.3", "kimi-k2.8-preview"], groups[0].1, "去空白、丢空名：{:?}", groups[0].1);
+        assert_eq!("solo_work_remote", groups[1].0, "`agent_type` 那一写也要认");
+
+        // 差集：大小写不敏感、跨场景去重、我们已有的不许出现
+        let ours = vec!["GLM-5.3-solo".to_string()];
+        let ours: Vec<String> = ours
+            .iter()
+            .map(|id| super::super::payload::sanitize_model_name(id, "solo"))
+            .collect();
+        let missing = remote_only_names(&ours, &groups);
+        assert_eq!(
+            vec!["kimi-k2.8-preview", "Doubao-Seed-Code"],
+            missing,
+            "大小写要减掉、跨场景不许重复：{missing:?}"
+        );
+
+        // 完全没有 `data.list` 时给空表，而不是 panic（release 是 panic=abort）
+        assert!(parse_remote_catalog(&json!({"code": 1})).is_empty());
+    }
+
+    #[test]
+    fn the_remote_catalog_url_lists_every_scene_in_one_query() {
+        let url = remote_catalog_url();
+        assert!(url.starts_with("https://trae-api-cn.mchost.guru/api/remote/v1/models?"), "{url}");
+        for function in REMOTE_CATALOG_FUNCTIONS {
+            assert!(url.contains(function), "{function} 必须在同一次查询里：{url}");
+        }
+        assert!(url.contains("show_custom_model=true"), "不带这个参数就看不到租户自定义模板：{url}");
+        assert!(!url.contains('%'), "逗号在查询串里是合法字符，不许被预编码：{url}");
     }
 
     #[test]
