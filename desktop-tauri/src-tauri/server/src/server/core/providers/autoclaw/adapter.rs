@@ -533,12 +533,25 @@ fn brand_headers() -> Vec<(String, String)> {
     ]
 }
 
-/// 平台标识（源实现 `platformTm()`）
+/// 平台标识（源实现 `platformTm()`）。
+///
+/// 上游只认官方桌面端存在的平台：`X-Tm: linux` 会被回 403
+/// （`{"message":"forbidden"}`，约 0.9s，非空响应体）。
+///
+/// 实测（固定请求体、只变「账号 × `X-Tm`」，每格 2 轮，结果 100% 一致）：
+/// 被上游绑为 Windows 的国际版账号收到 `X-Tm: linux` 一律 403，
+/// 而 `win` / `mac` / 不带该头均 200；更早添加的账号不受该头约束（四格全 200）。
+/// 进一步二分：上游只拒绝**恰好等于 `linux`** 的值，`windows` / `other` /
+/// 带尾空格的 `win  ` 也都放行。
+///
+/// 服务端 / Docker 镜像跑在 Linux 上，`cfg!(target_os = "linux")` 恒真，
+/// 于是每个出站请求都带 `X-Tm: linux`，被绑为 Windows 的账号经网关调用必然 403
+/// （每次还在同一账号原地重发 3×5s 才降级）。容器里不存在"真实平台"可选，
+/// 且官方桌面端只有 Windows / macOS，Linux 不是上游认得的客户端平台，
+/// 故 linux 分支回落为 `win`；macOS 桌面端（Tauri 构建）行为不变。
 fn platform_tm() -> &'static str {
     if cfg!(target_os = "macos") {
         "mac"
-    } else if cfg!(target_os = "linux") {
-        "linux"
     } else {
         "win"
     }
