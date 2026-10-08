@@ -85,9 +85,9 @@ pub fn supports_checkin(account: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or(crate::server::core::providers::DEFAULT_PROVIDER_ID);
     // CodeArts 没有「签到」链路，必须先排除：`checkin_for` 的分派 match 把
-    // 「不在范围里的家」报成「未接入」，而它的按钮在界面上由能力位
-    // `checkin: false` 收起 —— 这一层是批量路径（`resolve_checkin_targets` 的
-    // filter）与 API 直调的兜底，双保险。
+    // 「不在范围里的家」报成「未接入」，签到中心那边则按 `CHECKIN_PROVIDERS`
+    // 分桶（本家不在清单里，落到「没有签到链路」那组）—— 这一层是批量路径
+    // （`resolve_checkin_targets` 的 filter）与 API 直调的兜底，双保险。
     // 注意 CodeArts 的每日福利**不是**签到（那是 ops 福利领取，独立的「领福利」
     // 按钮，见 `providers::codearts::welfare`），与这条链无交集。
     // Trae 2026-09-29 起**在这条链上**（`providers::trae::checkin`：SOLO 转积分制后
