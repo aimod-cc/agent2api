@@ -311,6 +311,45 @@ impl BillingService {
                         .or_else(|| value.get("message").and_then(Value::as_str))
                 })
                 .unwrap_or("");
+            // 「今天已签到」不是错误：WorkBuddy 国内版在当日已领过时，`daily-checkin`
+            // 返回的是 **HTTP 400 + 文案「今天已签到，请明天再来」**，而不是
+            // HTTP 200 + 非 0 code（后者才是 `checkin.rs` 原先设想的形态，见
+            // `checkin_completed_today` 的注释）。不放行的话，这条正常终态会被
+            // 整条丢成 `Err`，于是 `claim` 为 null，导致：
+            //   1. `checkin_completed_today` 永远判不出「今天已签」，`mark_checkin`
+            //      不被调用 → 面板的「已签到」标识永远不亮、`checkinAt` 恒为 null；
+            //   2. 定时签到的 `lastResult` 恒定「成功领取 0/N」，用户看不出其实签成了，
+            //      会反复重试或去查凭证。
+            //
+            // 判据刻意收得很紧，只放行**明确说「今天已领过」**的那一种：
+            //   · 只认 400 / 409 —— 400 是实测的，409 是防御性放行（详见
+            //     `is_duplicate_claim` 的说明）；
+            //   · 只认 `msg` 文案含「已签到 / 已领取」—— 与 `checkin_completed_today`
+            //     的第 3 条判据同源，两处必须一致，否则放行了却仍判不出「已完成」；
+            //   · 只在签到领取那条调用点上开（`tolerate_duplicate_claim`）。
+            // 不满足任何一条就照旧报错：`checkin.rs` 特意强调过**不能宽到「只要
+            // 没报错就算已签到」**，否则网络错误、凭证失效会被误判成已签到而白丢
+            // 一天（实测见过批次撞风控全部未领取的情形）。
+            if options.tolerate_duplicate_claim {
+                if is_duplicate_claim(response.status, detail) {
+                    logging::verbose(
+                        "[Billing]",
+                        &format!("签到重复领取（HTTP {}），按「今日已完成」处理: {detail}", response.status),
+                    );
+                    return Ok(BillingCall { code, msg, request_id, data: Value::Null, raw: payload });
+                }
+                // 开了容错却**没**命中：最可能是上游改了文案（判据是文案匹配，
+                // 见 `is_duplicate_claim`）。留一条现场 —— 否则「面板又不像 #137
+                // 那样亮了」会查无实据：没有这条日志，文案漂移与真故障在日志里
+                // 长得一模一样，排查要从头再来一遍。verbose 级，正常运行时不出声。
+                logging::verbose(
+                    "[Billing]",
+                    &format!(
+                        "签到领取返回 HTTP {}，未命中「重复领取」文案，按错误处理: {detail}",
+                        response.status
+                    ),
+                );
+            }
             let message = if detail.is_empty() {
                 format!("计费接口返回 HTTP {}", response.status)
             } else {
@@ -419,7 +458,14 @@ impl BillingService {
         let result = self
             .call_billing(
                 BILLING_DAILY_CHECKIN,
-                CallOptions { session: Some(&active), expect_code_ok: false, ..Default::default() },
+                CallOptions {
+                    session: Some(&active),
+                    expect_code_ok: false,
+                    // 重复领取（HTTP 400 +「今天已签到」）要按「今日已完成」返回，
+                    // 而不是丢成 `Err` —— 详见 `call_billing` 里那段说明。
+                    tolerate_duplicate_claim: true,
+                    ..Default::default()
+                },
             )
             .await?;
         Ok(normalize_daily_claim(result))
@@ -494,4 +540,89 @@ fn assert_checkin_supported(session: &Value) -> Result<(), BillingError> {
         return Err(BillingError::new("国际版账号暂无签到活动", 400));
     }
     Ok(())
+}
+
+/// 这次非 2xx 响应是否表示「今天已经领过了」（签到重复领取）。
+///
+/// 抽成独立函数是为了能被直接测试：判断依据是「状态码 + 文案」两个外部事实，
+/// 不需要起 HTTP 服务，所以断言可以钉在边界上（码、文案）。
+///
+/// 判据刻意收得很紧 —— `checkin.rs` 的 `checkin_completed_today` 注释里写过
+/// 「不能宽到『只要没报错就算已签到』」，否则网络错误、凭证失效会被误判成已
+/// 签到而白丢一天。这里同理：
+///   · **只认 400 / 409**：**400 是实测的**（WorkBuddy 国内版当日已签到就是
+///     400 +「今天已签到，请明天再来」）；**409 是防御性放行**，无实测证据 ——
+///     留着的理由是「重复领取」在某些实现里会用 409 Conflict 表达，而漏放的
+///     代价（面板不亮、统计失真，即 #137）比多放一点更大。500/502/504 是真故障，
+///     放行会让一次没签上的日子被记成已签，**绝不放**；
+///   · **只认文案命中**：与 `checkin_completed_today` 第 3 条判据同源。两处
+///     必须一致 —— 只放宽状态码而文案判不出来，等于放行了却仍显示「未签到」；
+///   · 401/403 在调用点之前就被拦下（登录态问题），到不了这里。
+///
+/// `detail` 是 `msg`（或回退的 `message`）原文，空串表示上游没给文案 —— 空串
+/// 不含关键词，自然落到「不放过」，正是想要的失败方向。
+fn is_duplicate_claim(status: u16, detail: &str) -> bool {
+    matches!(status, 400 | 409) && (detail.contains("已签到") || detail.contains("已领取"))
+}
+
+#[cfg(test)]
+mod tests {
+    //! `is_duplicate_claim` 的边界：只有「重复领取」那一种非 2xx 才该被放行。
+    //! 其余一律保持报错 —— 把真故障静默成「已签到」会让用户白丢一天的积分。
+    use super::is_duplicate_claim;
+
+    /// 上游真实的 400 文案（WorkBuddy 国内版当日已签到时的原话）。
+    const REAL_DUPLICATE: &str = "今天已签到，请明天再来";
+
+    #[test]
+    fn real_duplicate_message_is_recognized() {
+        assert!(is_duplicate_claim(400, REAL_DUPLICATE));
+        assert!(is_duplicate_claim(409, REAL_DUPLICATE));
+    }
+
+    #[test]
+    fn both_claim_wording_variants_are_recognized() {
+        // 「已领取」是另一家的说法（AutoClaw），文案判据与 checkin.rs 保持同源
+        assert!(is_duplicate_claim(400, "今天已领取过了"));
+        assert!(is_duplicate_claim(409, "该奖励已签到"));
+    }
+
+    #[test]
+    fn only_400_and_409_are_tolerated() {
+        // 500/502/504 是真故障：放行会把「今天一次都没签上」记成已签到
+        for status in [500, 502, 503, 504, 429, 404] {
+            assert!(!is_duplicate_claim(status, REAL_DUPLICATE), "status={status} 不该被放行");
+        }
+    }
+
+    #[test]
+    fn non_duplicate_message_still_fails() {
+        // 同为 400，但文案与「重复领取」无关 —— 必须照旧报错
+        for detail in ["参数错误", "请求内容不是有效 JSON", "活动已结束", ""] {
+            assert!(!is_duplicate_claim(400, detail), "detail={detail:?} 不该被放行");
+        }
+    }
+
+    #[test]
+    fn empty_detail_is_not_tolerated() {
+        // 上游没给文案时无法证明是重复领取，失败方向必须偏向「报错」
+        assert!(!is_duplicate_claim(400, ""));
+        assert!(!is_duplicate_claim(409, ""));
+    }
+
+    /// **已知边界（不是「通过」，是「记录」）**：判据是**文案关键词**匹配，不是
+    /// 语义理解，所以含「已签到」但意思不同的文案会被误放行。
+    ///
+    /// 这几条断言的是**当前实现的实际行为**，写成测试是为了让这个弱点显式可见 ——
+    /// 而不是像原来那样用「活动已结束」（**不含**关键词）做反例，看起来守住了边界，
+    /// 其实只守住了关键词的拼写。真要收紧到语义层，得改成「400 后回读
+    /// `BILLING_CHECKIN_STATUS` 确认 `today_checked_in`」这类判据（多一次上游请求），
+    /// 当前判断不值得这个代价 —— 误放行的前提是上游在 400 里恰好写了含「已签到」
+    /// 的**非重复领取**文案，这个组合没有出现过。
+    #[test]
+    fn known_boundary_keyword_match_is_not_semantic() {
+        // 含「已签到」但并非「今天已领过」：会被误放行（已知弱点）
+        assert!(is_duplicate_claim(400, "该活动已签到结束"));
+        assert!(is_duplicate_claim(400, "签到功能已领取完毕待下期"));
+    }
 }

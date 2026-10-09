@@ -55,6 +55,12 @@ pub(super) struct CallOptions<'a> {
     pub(super) query: Option<&'a str>,
     /// false 时非 0 code 也返回（签到重复领取要读 msg）
     pub(super) expect_code_ok: bool,
+    /// 签到的「今天已领过」容错：400/409 且文案命中时返回 `Ok` 而不是 `Err`。
+    ///
+    /// **只给签到领取那一条调用点开**，因为「重复领取」只在这一条动作上是正常
+    /// 终态；同样的码在余额、套餐、企业额度那些接口上意味着真的出错，放宽会把
+    /// 故障静默成成功。
+    pub(super) tolerate_duplicate_claim: bool,
     pub(super) locale: Option<&'a str>,
 }
 
@@ -66,6 +72,8 @@ impl Default for CallOptions<'_> {
             query: None,
             // Node 的默认值是 true（`expectCodeOk = true`）
             expect_code_ok: true,
+            // 默认关：只有显式打开的那条调用点才容错
+            tolerate_duplicate_claim: false,
             locale: None,
         }
     }

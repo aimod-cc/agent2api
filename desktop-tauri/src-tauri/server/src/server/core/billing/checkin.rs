@@ -515,3 +515,210 @@ pub async fn run_checkin(
         "skipped": skipped,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    //! 签到「今天已签」判据的边界。
+    //!
+    //! ── 为什么这里要有一条**闭环**测试 ──────────────────────────
+    //! 上游（`billing::call_billing`）与下游（本模块的 `checkin_completed_today`）
+    //! 各判一次「今天已领过」，两处都靠**文案**：前者决定要不要把 HTTP 400 放行成
+    //! `Ok`，后者决定要不要落 `checkinAt`。两处必须同源 —— 只放宽一处，就会出现
+    //! 「放行了却仍判不出已完成」（面板不亮）或「判得出但先被丢成 Err」（`claim`
+    //! 为 null）这两种半截修复。`closed_loop_tolerated_400_reaches_completed` 把
+    //! 这条链整条钉住，是本次修复（上游 issue #137）唯一的端到端回归保护。
+    use super::checkin_completed_today;
+    use crate::server::core::billing::request::BillingCall;
+    use crate::server::core::billing::{is_duplicate_claim, normalize_daily_claim, BillingService};
+    use serde_json::{json, Value};
+
+    /// 上游真实的 400 文案（WorkBuddy 国内版当日已签到时的原话）。
+    const REAL_DUPLICATE: &str = "今天已签到，请明天再来";
+
+    // ── 下游判据本身 ────────────────────────────────────────────
+
+    #[test]
+    fn success_and_already_completed_are_done() {
+        // 第 1 条：本次真的领到了
+        assert!(checkin_completed_today(&json!({"success": true, "code": 0})));
+        // 第 2 条：上游明确告知（AutoClaw 的 daily_signin 带这个字段）
+        assert!(checkin_completed_today(&json!({"success": false, "alreadyCompleted": true})));
+    }
+
+    #[test]
+    fn message_wording_marks_today_done() {
+        // 第 3 条：WorkBuddy 只把「今日已签到」放在文案里，没有码位可用
+        assert!(checkin_completed_today(&json!({"success": false, "msg": REAL_DUPLICATE})));
+        assert!(checkin_completed_today(&json!({"success": false, "msg": "该奖励已领取"})));
+    }
+
+    #[test]
+    fn real_failures_are_never_mistaken_for_done() {
+        // 核心不变量（见本文件上方 `checkin_completed_today` 的注释）：失败行与
+        // 「今天已签到」是两回事，把前者当作已签到会白丢一天积分 —— 实测见过
+        // 批次撞风控 4 个账号全部未领取。这几条必须全部为 false。
+        for claim in [
+            json!({"success": false, "code": -1, "msg": "计费接口请求失败: 连接上游超时"}),
+            json!({"success": false, "code": -1, "msg": "登录态已过期或被拒绝，无法调用计费接口"}),
+            json!({"success": false, "code": -1, "msg": ""}),
+            // 键缺失：`claim` 为 null 时上游路径根本没走到判据，这里模拟 msg 缺失
+            json!({"success": false, "code": 40001}),
+        ] {
+            assert!(!checkin_completed_today(&claim), "不该被判成已完成: {claim}");
+        }
+    }
+
+    // ── 闭环：上游放行 → 下游判得出 ─────────────────────────────
+
+    #[test]
+    fn closed_loop_tolerated_400_reaches_completed() {
+        // 模拟 `call_billing` 在 `tolerate_duplicate_claim: true` 时对 400 的放行：
+        // 返回 `Ok(BillingCall { code, msg, data: Null, .. })`，msg 是上游文案。
+        // `code` 取 null —— 上游 400 响应体里没有顶层 `code` 时就是这个形态。
+        let tolerated = BillingCall {
+            code: None,
+            msg: Some(REAL_DUPLICATE.to_string()),
+            request_id: None,
+            data: Value::Null,
+            raw: Some(json!({ "msg": REAL_DUPLICATE })),
+        };
+
+        // 1) 上游确实会放行这一条（判据命中）
+        assert!(is_duplicate_claim(400, REAL_DUPLICATE));
+
+        // 2) 放行后的归一化产出：失败形状，但 msg 保留上游文案
+        let claim = normalize_daily_claim(tolerated);
+        assert_eq!(claim.get("success").and_then(Value::as_bool), Some(false));
+        assert_eq!(claim.get("msg").and_then(Value::as_str), Some(REAL_DUPLICATE));
+
+        // 3) 下游据此判出「今天已完成」→ `mark_checkin` 会被调用、面板标识点亮。
+        //    这一跳就是 #137 里断掉的那一环：原代码在 1) 之前就 Err 了，claim 为
+        //    null，于是这里恒为 false，`checkinAt` 永远写不进去。
+        assert!(
+            checkin_completed_today(&claim),
+            "放行了却判不出已完成 —— 上游与下游的文案判据已经脱钩"
+        );
+    }
+
+    #[test]
+    fn closed_loop_non_duplicate_400_stays_failed() {
+        // 反向：同为 400，文案与「重复领取」无关时上游**不**放行（仍 Err），
+        // 因此不会有 claim 走到下游。这里直接断言判据不命中，钉住「不能过度放宽」。
+        for detail in ["参数错误", "请求内容不是有效 JSON", "活动已结束"] {
+            assert!(!is_duplicate_claim(400, detail), "detail={detail:?} 不该被放行");
+        }
+    }
+
+    // ── HTTP 接线：真正驱动 `call_billing` 的修复分支 ────────────
+    //
+    // ⚠️ 上面那些测试**都不足以保护真正的修复点**。`closed_loop_*` 是手工构造
+    // `BillingCall` 再调 `normalize_daily_claim`，绕过了 `call_billing` —— 把
+    // `mod.rs` 里 `if options.tolerate_duplicate_claim && is_duplicate_claim(...)`
+    // 整段删掉或改成 `if false`，它们**依然全绿**（`is_duplicate_claim` 自己的
+    // 测试也照样过，因为那函数还在）。下面三条起真的 HTTP 服务，让 400 从 socket
+    // 上走一遍，把「修复分支本身」钉住 —— 这是 #137 的回归保护里唯一不可绕过的
+    // 一层。
+
+    /// 起一个只回固定响应的 mock 上游（照抄 `upstream::provider_loop::tests`
+    /// 的手写 axum 约定，项目既有风格，不引入 wiremock）。
+    /// 返回 (base_url, 命中计数, 任务句柄)；句柄由调用方持有到用例结束。
+    async fn mock_billing(
+        status: u16,
+        body: &'static str,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        let app = axum::Router::new().route(
+            "/v2/billing/meter/daily-checkin",
+            axum::routing::post(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, hits, task)
+    }
+
+    /// 指向 mock 的国内版 session —— `call_billing` 从这里取 endpoint 与请求头。
+    /// `edition: "cn"` 是关键：为 `intl` 会走国际版活跃任务链，根本不打这个端点。
+    fn cn_session(base: &str) -> Value {
+        json!({
+            "endpoint": base,
+            "edition": "cn",
+            "auth": { "accessToken": "test-token" },
+            "account": { "uid": "u1" },
+        })
+    }
+
+    /// 建一个可用的 `BillingService`（空账号库即可 —— session 由调用方直接给）。
+    fn billing_service(label: &str) -> (BillingService, crate::server::db::test_temp::TempDb) {
+        use crate::server::core::account_store::AccountStore;
+        let (db, guard) = crate::server::db::test_temp::TempDb::open(label);
+        let store = AccountStore::with_db(Some(db));
+        (
+            BillingService::new(crate::server::core::auth::AuthService::for_store(store)),
+            guard,
+        )
+    }
+
+    #[tokio::test]
+    async fn tolerated_400_from_real_http_reaches_completed() {
+        let (billing, _guard) = billing_service("billing-checkin-400");
+        let (base, hits, _task) = mock_billing(400, r#"{"msg":"今天已签到，请明天再来"}"#).await;
+
+        let claim = billing
+            .claim_daily_checkin(Some(&cn_session(&base)))
+            .await
+            .expect("400 +「今天已签到」应被容错放行，而不是 Err");
+
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "只该打一发上游（重复领取不做重试）"
+        );
+        assert_eq!(claim.get("success").and_then(Value::as_bool), Some(false));
+        assert_eq!(claim.get("msg").and_then(Value::as_str), Some(REAL_DUPLICATE));
+        // 端到端闭环：这一跳就是 #137 断掉的地方（原代码在上一行就 Err 了，
+        // claim 为 null，于是这里恒为 false，checkinAt 永远写不进去）。
+        assert!(checkin_completed_today(&claim), "#137：放行后仍判不出已完成");
+    }
+
+    #[tokio::test]
+    async fn non_duplicate_400_from_real_http_still_errors() {
+        let (billing, _guard) = billing_service("billing-checkin-400-other");
+        let (base, _hits, _task) = mock_billing(400, r#"{"msg":"参数错误"}"#).await;
+
+        let error = billing
+            .claim_daily_checkin(Some(&cn_session(&base)))
+            .await
+            .expect_err("文案与重复领取无关的 400 必须照旧报错");
+        assert!(error.message.contains("400"), "message={}", error.message);
+    }
+
+    #[tokio::test]
+    async fn server_error_from_real_http_still_errors() {
+        let (billing, _guard) = billing_service("billing-checkin-500");
+        // 500 是**真故障**：即便文案恰好含「已签到」也不能放行，否则一次没签上的
+        // 日子会被记成已签（`checkin.rs` 注释里实测过的批次撞风控场景）。
+        let (base, _hits, _task) = mock_billing(500, r#"{"msg":"今天已签到，请明天再来"}"#).await;
+
+        billing
+            .claim_daily_checkin(Some(&cn_session(&base)))
+            .await
+            .expect_err("500 不该被容错放行");
+    }
+}
