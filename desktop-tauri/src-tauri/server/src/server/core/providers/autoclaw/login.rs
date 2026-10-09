@@ -420,9 +420,37 @@ pub async fn login_with_code(
 }
 
 /// 手机号脱敏（源实现 `maskPhone`：保留前 3 后 4）。
+///
+/// 按 `char` 切而非按字节：本函数的入参经 `normalize_phone` 归一化后**当前**是
+/// 11 位 ASCII 数字，但同款实现已在 Loomy 一侧被请求体里的汉字打穿过（见
+/// `loomy::credentials::mask_phone`）。这里与它保持同一口径，免得后续新增调用点
+/// 绕过归一化时再踩一次 —— release 是 `panic = "abort"`，这类切片错一次就是整
+/// 个网关退出。截断口径不变：前 3 个字符 + 后 4 个字符。
 fn mask_phone(phone: &str) -> String {
-    if phone.len() < 7 {
+    let chars: Vec<char> = phone.chars().collect();
+    if chars.len() < 7 {
         return phone.to_string();
     }
-    format!("{}****{}", &phone[..3], &phone[phone.len() - 4..])
+    let head: String = chars[..3].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}****{tail}")
+}
+
+#[cfg(test)]
+mod mask_phone_tests {
+    use super::mask_phone;
+
+    /// 正常手机号口径不变。
+    #[test]
+    fn keeps_three_and_four_for_ascii() {
+        assert_eq!(mask_phone("13800138000"), "138****8000");
+    }
+
+    /// 非 ASCII 输入不得 panic（当前入口经 `normalize_phone` 归一化而不可达，
+    /// 这条钉住的是函数自身的安全性 —— 与 Loomy 一侧同口径，防后续新增调用点）。
+    #[test]
+    fn survives_multibyte_input() {
+        // 14 字符：head = 前 3 个 `1`，tail = 第 11 个 `1` + 三个汉字
+        assert_eq!(mask_phone("11111111111你你你"), "111****1你你你");
+    }
 }

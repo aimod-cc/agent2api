@@ -104,9 +104,56 @@ pub fn from_record(record: Option<&Value>) -> Result<LoomyCredentials, GatewayEr
 }
 
 /// 手机号脱敏（保留前 3 后 4；与 `autoclaw::login` 的同名函数同口径）
+///
+/// ── 为什么按 `char` 而不按字节切 ────────────────────────────────
+/// `POST /api/accounts` 的 `phone` 是**请求体原样**进来的（`account_store` 侧只
+/// `trim` + 按字符数截断，不校验格式），所以它完全可能不是 11 位 ASCII 数字。
+/// 按字节回切 `&phone[phone.len() - 4..]` 就会落在多字节字符中间 —— release 是
+/// `panic = "abort"`，一个带汉字的 `phone` 就能让网关整体退出。按字符取则与
+/// 内容无关地安全（本仓库同款安全写法：`store_util.rs` 的 `token_tail`）。
+/// 截断口径不变：仍保留前 3 个字符与后 4 个字符。
 pub fn mask_phone(phone: &str) -> String {
-    if phone.len() < 7 {
+    let chars: Vec<char> = phone.chars().collect();
+    if chars.len() < 7 {
         return phone.to_string();
     }
-    format!("{}****{}", &phone[..3], &phone[phone.len() - 4..])
+    let head: String = chars[..3].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}****{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mask_phone;
+
+    /// 回归：非 ASCII 的 `phone` 不得 panic。
+    ///
+    /// `phone` 来自 `POST /api/accounts` 的请求体（`account_store` 只 `trim` + 按
+    /// 字符数截断，不校验格式），所以「11 位数字 + 汉字」是合法输入。旧实现按字节
+    /// 回切 `&phone[phone.len() - 4..]`，第 16 字节落在 `你` 的续字节（0xa0）上
+    /// → `panic: not a char boundary` → `panic = "abort"` 整进程退出。
+    #[test]
+    fn mask_phone_survives_multibyte_input() {
+        // 20 字节 / 14 字符：11 个 ASCII 数字 + 3 个汉字。
+        // 旧实现切在第 16 字节（第二个 `你` 的续字节 0xa0）→ panic。
+        // 修复后按字符取：head = 前 3 个 `1`，tail = 第 11 个 `1` + 三个汉字。
+        assert_eq!(mask_phone("11111111111你你你"), "111****1你你你");
+        // 23 字节 / 15 字符：11 个 ASCII 数字 + 4 个汉字。
+        // 旧实现切在第 19 字节（第四个 `你` 的续字节）→ panic。
+        assert_eq!(mask_phone("11111111111你你你你"), "111****你你你你");
+    }
+
+    /// 正常手机号口径不变：保留前 3 后 4。
+    #[test]
+    fn mask_phone_keeps_three_and_four_for_ascii() {
+        assert_eq!(mask_phone("13800138000"), "138****8000");
+    }
+
+    /// 少于 7 个**字符**（不是字节）时原样返回，且不得因字节数够而误切。
+    #[test]
+    fn mask_phone_returns_short_input_unchanged() {
+        assert_eq!(mask_phone("123456"), "123456");
+        // 6 个字符但 18 字节：按字节判会误以为「够长」而去切
+        assert_eq!(mask_phone("你你你你你你"), "你你你你你你");
+    }
 }

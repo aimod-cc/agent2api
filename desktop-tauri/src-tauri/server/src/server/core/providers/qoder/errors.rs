@@ -221,8 +221,21 @@ fn raw_has_code(raw: &str, code: &str) -> bool {
 }
 
 /// 从文本里抠出定价页链接（源实现用正则 `/https?:\/\/[^"\\]*\/pricing[^"\\]*/i`）
+///
+/// ── 折叠为什么必须是 `to_ascii_lowercase` ────────────────────────
+/// 这里拿**折叠后的下标**回切**原文**（`&raw[start..]`），前提是两者逐字节对齐。
+/// `to_lowercase` 是 Unicode 折叠、**不保字节长度**：`ẞ`(U+1E9E) 三字节折成 `ß`
+/// 两字节、`İ`(U+0130) 两字节折成 `i`+U+0307 三字节。下标一回切就可能落在字符
+/// 中间或直接越界 —— release 是 `panic=abort`，进程当场死。上游错误正文完全
+/// 不可控（`http_error` 把整段错误体原样喂进来），这条路径等于把「上游文案里
+/// 出现一个小写化会变长的字符」变成「网关整体宕机」。
+/// `to_ascii_lowercase` 只动 ASCII 字节、长度恒定，下标对 `raw` 恒有效；而要匹配
+/// 的 `http` / `/pricing` 都是 ASCII，非 ASCII 字符的每个字节都 >= 0x80、折叠后
+/// 不可能等于 ASCII 字节，所以只折叠 ASCII 与源实现正则的 `/i` 等价。
+/// （同款坑的既有正确写法：`autoclaw/prompt.rs` 的 `find_ignore_ascii_case`、
+/// `zcode/reasoning.rs` 的 `to_ascii_lowercase`。）
 fn pricing_url_of(raw: &str) -> Option<String> {
-    let lowered = raw.to_lowercase();
+    let lowered = raw.to_ascii_lowercase();
     let mut search_from = 0usize;
     while let Some(offset) = lowered[search_from..].find("http") {
         let start = search_from + offset;
@@ -231,7 +244,7 @@ fn pricing_url_of(raw: &str) -> Option<String> {
             .find(|ch: char| ch == '"' || ch == '\\' || ch.is_whitespace())
             .unwrap_or(rest.len());
         let candidate = &rest[..end];
-        if candidate.to_lowercase().contains("/pricing") {
+        if candidate.to_ascii_lowercase().contains("/pricing") {
             return Some(candidate.to_string());
         }
         search_from = start + 4;
@@ -333,5 +346,46 @@ fn queued_message(queue: &QueueInfo) -> String {
             "上游模型排队中（模型暂不可服务，上游建议 {seconds} 秒后重试）：这不是登录态或额度问题"
         ),
         None => "上游模型排队中（模型暂不可服务）：这不是登录态或额度问题".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pricing_url_of;
+
+    /// 回归：折叠改变字节长度时，`pricing_url_of` 不得 panic。
+    ///
+    /// 旧实现取 `raw.to_lowercase()` 的 `find("http")` 下标去切**原文**，而 Unicode
+    /// 折叠不保字节长度 —— 上游错误正文里只要在 `http` 之前出现一个「小写化后变短」
+    /// 的字符，`&raw[start..]` 就落在多字节字符中间（`panic: not a char boundary`）；
+    /// 出现「变长」的字符则下标越过原文末尾（`panic: index out of bounds`）。
+    /// release 是 `panic = "abort"`，两种都是**进程当场退出**，而这条路径由
+    /// `classify_upstream_error` 对上游错误体无条件触发。
+    #[test]
+    fn pricing_url_survives_case_folding_that_changes_byte_length() {
+        // 变短：`ẞ`(U+1E9E, 3 字节) 折成 `ß`(2 字节) → 旧实现下标前移 1，落进字符中间
+        assert_eq!(
+            pricing_url_of("ẞhttp://x/pricing").as_deref(),
+            Some("http://x/pricing"),
+        );
+
+        // 变长：`İ`(U+0130, 2 字节) 折成 `i`+U+0307(3 字节) → 旧实现下标越过原文末尾
+        let grows = format!("{}http://x/pricing", "İ".repeat(17));
+        assert_eq!(pricing_url_of(&grows).as_deref(), Some("http://x/pricing"));
+    }
+
+    /// 只折叠 ASCII 必须与源实现正则的 `/i` 等价：大小写混写的链接照样命中。
+    #[test]
+    fn pricing_url_matches_ascii_case_insensitively() {
+        assert_eq!(
+            pricing_url_of("Upgrade at HTTPS://QODER.COM/Pricing now").as_deref(),
+            Some("HTTPS://QODER.COM/Pricing"),
+        );
+    }
+
+    /// 非定价页的链接不能被当成定价页（判定是 `/pricing`，不是「有链接」）。
+    #[test]
+    fn pricing_url_ignores_links_that_are_not_the_pricing_page() {
+        assert_eq!(pricing_url_of("see https://qoder.com/docs for help"), None);
     }
 }
