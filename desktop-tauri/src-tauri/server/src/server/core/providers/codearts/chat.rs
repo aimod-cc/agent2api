@@ -152,6 +152,13 @@ pub fn build_upstream_request(
             );
         }
     }
+    // 强制某工具的 `tool_choice` 在本家发不出去，折成字符串 `required`
+    if let Some(named) = fold_forced_tool_choice(&mut payload) {
+        crate::server::logging::verbose(
+            "[CodeArts]",
+            &format!("出站前把 tool_choice 指名折成 required（客户端点名的是 {named}）：本家不收对象形态，折完模型自己挑一个工具"),
+        );
+    }
     // 输出上限钳制（实测依据见 `clamp_output_tokens`）：放在序列化前的最后一步，
     // 此后没有任何一步会再动 body。
     clamp_output_tokens(&mut payload);
@@ -2068,5 +2075,108 @@ mod thinking_reserve {
             payload.get("max_tokens").is_none(),
             "不该同时存在两个额度键"
         );
+    }
+}
+
+/// 把 OpenAI 的对象形态 `tool_choice`（指名某函数）折成字符串 `"required"`。
+///
+/// ── 依据（2026-10-10 在 dev 上量的，同一模型同一套短工具名，只变 `tool_choice`）──
+/// · 对象形态 `{"type":"function","function":{"name":X}}` ⇒ **必拒**：
+///   `InferHub.001001005.400 The request param is invalid`（发出约 0.2 秒回来，被拒不计费）；
+/// · 与 `tools` 有没有无关（空 `tools` 带对象形态同样拒），与名字长短也无关；
+/// · 换成 `"required"` ⇒ 200 且真产生 tool_call；`"none"` / `"auto"` / 不带 ⇒ 都 200；
+/// · 旧版 `functions` + `function_call` 那套**别拿来做翻译目标**：实测 HTTP 200 但什么都没发生
+///   （`finish=stop`、`tool_calls` 空、`function_call` 也没有，`prompt_tokens` 与不带工具同级
+///   ⇒ `functions` 根本没进模型）。那是"成功的空转"，比一次明确失败难查得多。
+///
+/// 语义损失要说清：`required` 保住了「这轮必须调工具」，但**不再指定调哪个** ——
+/// 只有一个工具时等价于强制，多个工具时由模型自己挑。点名的那个名字进 verbose 日志，
+/// 免得日后"为什么没调我要的那个"变成一次无据排查。
+///
+/// 只动 `type == "function"` 这一种。别的不认识的对象形态（`allowed_tools` 之类）原样发：
+/// 上游怎么回我们没测过，替它猜等于把一种未知换成另一种未知。
+///
+/// ── 为什么没照抄这个改法来源的另外两条 ──────────────────────
+/// 同一个修法在外部项目（`HITZY2002/codearts2api` PR #6）里还带两条：把 param-invalid 归成
+/// 400、并且**停止轮转**。那两条的前提这里不成立：
+/// · 他们把 400 映射成 502，而它对 ≥500 一律冷却账号池 10 分钟 ⇒ 一次客户端形状错误打停整池。
+///   我们的冷却判据挂在**错误类**上（只有 `QuotaLimited` 冷却，见 `provider_loop.rs` 的
+///   `UpstreamErrorClass::QuotaLimited` 分支），400/502 都是 `Fatal`，不碰冷却；
+/// · 他们的池子里只有 CodeArts 一家，轮转必然撞同一堵墙；我们是跨家的，实测对象形态被
+///   CodeArts 拒掉后换到别家就正常答出来了 —— 跟着"停止轮转"等于把一条出路砍掉。
+pub fn fold_forced_tool_choice(payload: &mut Value) -> Option<String> {
+    let Value::Object(object) = payload else {
+        return None;
+    };
+    let named = object
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .filter(|choice| choice.get("type").and_then(Value::as_str) == Some("function"))
+        .and_then(|choice| choice.get("function"))
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)?;
+    object.insert("tool_choice".to_string(), Value::String("required".to_string()));
+    Some(named)
+}
+
+#[cfg(test)]
+mod forced_tool_choice {
+    use super::{build_upstream_request, fold_forced_tool_choice, HeaderProfile};
+    use serde_json::{json, Value};
+
+    fn forced(name: &str) -> Value {
+        json!({"tool_choice": {"type": "function", "function": {"name": name}}})
+    }
+
+    #[test]
+    fn the_object_form_is_folded_into_required_and_the_name_is_reported() {
+        let mut payload = forced("alpha");
+        assert_eq!(Some("alpha".to_string()), fold_forced_tool_choice(&mut payload));
+        assert_eq!("required", payload["tool_choice"], "折完必须是字符串 required");
+        // 点名的名字整个从出站体里消失：这道墙与 64 字符那道叠在同一条路径上
+        assert_eq!(0, serde_json::to_string(&payload).unwrap().matches("alpha").count());
+    }
+
+    #[test]
+    fn string_forms_and_unknown_object_forms_are_left_alone() {
+        // 反空跑：实现若写成「逢 tool_choice 就改」也照样绿过前一条，这里把三种字符串钉住
+        for kept in ["auto", "none", "required"] {
+            let mut payload = json!({"tool_choice": kept});
+            assert_eq!(None, fold_forced_tool_choice(&mut payload), "{kept}");
+            assert_eq!(Value::String(kept.to_string()), payload["tool_choice"]);
+        }
+        // 没测过上游怎么回的形状不动它
+        let mut unknown = json!({"tool_choice": {"type": "allowed_tools"}});
+        assert_eq!(None, fold_forced_tool_choice(&mut unknown));
+        assert_eq!("allowed_tools", unknown["tool_choice"]["type"]);
+        // 指名但名字是空的对象也不动（那是客户端写坏了，不是本家拒的形状）
+        let mut blank = forced("   ");
+        assert_eq!(None, fold_forced_tool_choice(&mut blank));
+    }
+
+    #[test]
+    fn the_signed_bytes_carry_no_object_form() {
+        // 端到端钉在出口字节上（`credential=None` 是排障逃生口，返回的就是出门那串）：
+        // 判据落在真发出去的东西上，不落在中间函数上
+        let payload = json!({
+            "messages": [{"role": "user", "content": "短答"}],
+            "tools": [{"type": "function", "function": {"name": "alpha", "parameters": {"type": "object"}}}],
+            "tool_choice": {"type": "function", "function": {"name": "alpha"}},
+        });
+        let (_, _, body) = build_upstream_request(
+            "https://snap-access.cn-north-4.myhuaweicloud.com",
+            "GLM-5.2",
+            payload,
+            false,
+            false,
+            &HeaderProfile::default(),
+            None,
+        )
+        .expect("应当能构造请求");
+        let sent: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!("required", sent["tool_choice"], "出门的字节里不该再有对象形态：{sent}");
+        assert_eq!(1, sent["tools"].as_array().unwrap().len(), "tools 本身不该被牵连");
     }
 }
