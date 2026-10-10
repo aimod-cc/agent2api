@@ -99,7 +99,7 @@ pub const DEFAULT_TIME: &str = "00:01";
 /// 这是「有签到或每日活跃任务」的清单，不是「有积分概念」的清单：CatPaw 有积分
 /// 查询但没有签到，因此不在此列 —— 它的账号在批量签到里被算作 `skipped`。
 /// 加一家之前先确认它的签到链路真的存在（一个点了必然报错的复选框比没有更糟）。
-pub const CHECKIN_PROVIDERS: [&str; 10] = [
+pub const CHECKIN_PROVIDERS: [&str; 11] = [
     "workbuddy",
     "workbuddy-intl",
     "raccoon",

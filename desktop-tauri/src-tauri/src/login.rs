@@ -654,9 +654,6 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         // `providers::antigravity::oauth`）。那条 loopback 导航一旦被白名单拦下，
         // 症状就是上面警告过的那种静默故障：用户明明授权成功，网关却永远等不到码
         // —— 回调本身就是一次普通 HTTP 导航，没有可供回调识别兜底的协议特征。
-        "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
-        | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
-        | "kuku" | "antigravity" => None,
         //
         // OfficeAce 同样不设限：授权页在 `auth.huaweicloud.com`，它会按用户选的
         // 登录方式继续跳华为云账号 / 扫码等不可穷举的主机（与 CodeArts 同一情形）。

@@ -155,7 +155,22 @@ fn credential_of(
 }
 
 /// 任务状态（只读）：列订阅里的奖励活动。
-pub async fn get_tasks(store: &AccountStore, account_id: &str) -> Result<Value, GatewayError> {
+///
+/// ── `refresh` 在本家为什么**不改变取数**────────────────────
+/// 别家（Loomy / CodeArts / 小浣熊）的新人礼是**一次性**的，结清后写进
+/// `onboarding_memory` 永久记忆，`refresh=false` 就直接吃记忆、零上游请求。
+/// 本家不是那个形状：一次 claim 发的是**当天**的全部奖励，第二天上游会开新
+/// 一批活动 —— 用「永久结清」那份记忆会把明天新开的活动也判成已领完。
+/// 所以本家用**按天**的台账（[`ledger_of`]），它今天没结清就照样实查；
+/// 而这里的读请求只是一次 `GET /v1/subscription`（无副作用、不领东西），
+/// 真正会白打的那一发（claim）已经由台账在 [`claim_all`] 里挡住了。
+/// `settled` 字段照别家的口径给出「今天整体领过 = 这条福利已结清」，
+/// 界面据此可以在领完那天跳过自动查询。
+pub async fn get_tasks(
+    store: &AccountStore,
+    account_id: &str,
+    _refresh: bool,
+) -> Result<Value, GatewayError> {
     let credential = credential_of(store, account_id)?;
     let subscription = subscription::fetch_subscription(&credential).await?;
     let bonuses = subscription::bonuses_of(&subscription);
@@ -166,6 +181,8 @@ pub async fn get_tasks(store: &AccountStore, account_id: &str) -> Result<Value, 
         "earned": earned,
         "total": total,
         "unclaimed": unclaimed,
+        // 今天整体领过 ⇒ 这条福利当天结清（台账按天复位，明天重新计）
+        "settled": unclaimed == 0,
         "provider": "officeace",
         "note": "OfficeAce 的奖励由一次领取动作统一发放（每日签到 + 新人礼）；点「全部领取」即领当天所有可领项",
     }))

@@ -212,6 +212,8 @@ pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers:
 /// `sandbox`/`daily`/`prod` 是环境不是地区，规格 §6）。
 pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::Antigravity,
+);
+
 /// OfficeAce（华为云果办 / OfficeClaw）provider id（**从注册表推导**，同
 /// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `officeace_accounts.rs`。
 pub(crate) const OFFICEACE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(

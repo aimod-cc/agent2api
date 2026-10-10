@@ -758,6 +758,7 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
                 Err(error) => return management_error(error.status_code, error.message),
             };
             store.add_antigravity_account(&credentials, import_name, "manual")
+        }
         // OfficeAce（华为云果办 / OfficeClaw）：粘贴模型网关的 Basic 凭据
         // （`baseUrl` + `modelAppKey`/`modelAppSecret`，可选控制面临时凭据）。
         // **不调上游**（与 CodeArts 同口径）——凭据是导入/登录换来的，添加时

@@ -28,9 +28,7 @@ pub struct OfficeAceAdapter;
 /// 静态单例
 pub static OFFICEACE_ADAPTER: OfficeAceAdapter = OfficeAceAdapter;
 
-/// 上游「请求太大」的判据 —— `classify_error` 与 `resends_same_body_in_place`
-/// **共用**这一个函数：两处各写一遍迟早分叉，分叉的症状是「文案写着超限、
-/// 却还是把整份超大 body 原地重发好几遍」。
+/// 上游「请求太大」的判据（`classify_error` 用它把超限折成可读的 413）。
 ///
 /// 取值集合抄自 officeace2api 的 `classifyUpstream`（同一份实测）：`81113` 是
 /// 条数超限那条线给的码，其余四条是同一件事在 APIG / MaaS 两层的不同措辞。
@@ -158,17 +156,6 @@ impl ProviderAdapter for OfficeAceAdapter {
             message: format!("上游返回 {status}: {text}"),
             upstream_code: None,
         }
-    }
-
-    /// 体积超限不在同一账号上原地重发（与 zcode 的 `model not allowed` 同构的否决）。
-    ///
-    /// 上面那条分类把它折成了 `Fatal`，而编排层对 `Fatal` 的默认承诺是
-    /// 「先在这个账号上多试几次再换人」（见 `provider_loop::fallback_retry_advice`）——
-    /// 这条对体积判定是纯浪费：它拒的是这份 body 的条数，重发一次就要把整份
-    /// 超大请求体**再上传一遍**（参考实现实测那一次是 5.5 MB ×3 遍）。
-    /// 判据与分类侧共用 `request_is_too_large`，两处不会分叉。
-    fn resends_same_body_in_place(&self, _status: u16, error_body: &Value) -> bool {
-        !request_is_too_large(&error_body.to_string().to_ascii_lowercase())
     }
 
     /// 取转发凭证：**只做存在性校验**（与 CatPaw 同一口径 —— 它也没有刷新机制）。
@@ -316,10 +303,11 @@ mod tests {
         }
     }
 
-    /// 分类侧与免重发侧读的是**同一份判据**：只在一处认出来，就会留下
-    /// 「文案写着超限、却还是把整份超大 body 白重发几遍」的分裂结论。
+    /// 体积超限要落成客户端看得懂的 413（不是「暂时忙」的 429），并且文案既保住
+    /// 上游原话、也说清对策是**减条数**。判据只有一处（`request_is_too_large`），
+    /// 分类与用例读的都是它。
     #[test]
-    fn the_size_rejection_becomes_a_readably_413_and_is_not_resent() {
+    fn the_size_rejection_becomes_a_readably_413() {
         let adapter = adapter_for(ProviderKind::OfficeAce);
         let body = too_large();
         let (status, message) = match adapter.classify_error(429, &body) {
@@ -332,18 +320,22 @@ mod tests {
             "文案要保住上游原话：{message}"
         );
         assert!(message.contains("条数"), "对策要说清是减少条数：{message}");
-        assert!(
-            !adapter.resends_same_body_in_place(429, &body),
-            "确定性失败，重发只会把整份超大 body 再传一遍"
-        );
+        assert!(request_is_too_large(&body.to_string().to_ascii_lowercase()));
     }
 
-    /// 反向：正常的 429 限额**仍然**保留原地重发的可能性（本家它不重发是因为
-    /// 分类落 QuotaLimited，与这条否决无关）。
+    /// 反向：判据**只**认体积那几条标记 —— 别家的 429/400 形状（限额、模型名）
+    /// 一律不算超限，免得把「暂时忙」也折成客户端可见的 413。
     #[test]
-    fn the_veto_is_limited_to_the_size_markers() {
-        let adapter = adapter_for(ProviderKind::OfficeAce);
-        assert!(adapter.resends_same_body_in_place(429, &json!({"error_code": "ModelArts.81112"})));
-        assert!(adapter.resends_same_body_in_place(400, &json!({"error_msg": "Invalid model"})));
+    fn the_size_judgment_only_recognizes_size_markers() {
+        for body in [
+            json!({"error_code": "ModelArts.81112"}),
+            json!({"error_msg": "Invalid model"}),
+            json!({"error": "rate limit exceeded"}),
+        ] {
+            assert!(
+                !request_is_too_large(&body.to_string().to_ascii_lowercase()),
+                "这条不该算超限：{body}"
+            );
+        }
     }
 }

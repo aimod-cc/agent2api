@@ -580,6 +580,8 @@ impl AccountStore {
                         object.insert(key.to_string(), Value::String(value.to_string()));
                     }
                 }
+            }
+        }
         // ── OfficeAce 的凭据字段（`officeace::adapter` 用）──────────────
         // 它的转发凭证不是 `auth.accessToken`，而是**记录顶层的**网关 Basic 那一对
         // （`baseUrl` / `modelAppKey` / `modelAppSecret`）；控制面临时凭据

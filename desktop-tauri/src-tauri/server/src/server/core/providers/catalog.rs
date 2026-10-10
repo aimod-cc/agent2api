@@ -167,6 +167,7 @@ pub(crate) fn refresh_meta(kind: ProviderKind) -> (bool, i64) {
         ProviderKind::Antigravity => (
             super::antigravity::models::remote_refreshed(),
             super::antigravity::models::last_refreshed_at(),
+        ),
         // OfficeAce 的清单来自 `GET {网关}/v1/models`（OpenAI 格式，网关 Basic
         // 凭据）。上游目录照收（可用性由转发时的 81004/81009 分类回答），
         // 「有内容」就是「远程拉到过」。

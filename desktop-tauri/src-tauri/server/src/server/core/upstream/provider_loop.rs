@@ -1313,30 +1313,65 @@ async fn attempt_queue(
                     // 与其它失败同一落点：把这一轮记为失败、按队列顺延下一家。
                     // 判据是「还有没有下一个账号/家」，不是「这一家还能不能救」——
                     // 同一份 body 再发一次结论不变（审核按内容匹配），所以不原地重发。
-                    if defer_to_next_account(
+                    // 顺延那段与上面转发失败的写法逐字同形（本文件里这条链路
+                    // 已经有四处，不再抽第五份）。
+                    if let Some(account_id) = target.account_id.clone() {
+                        if !tried_ids.contains(&account_id) {
+                            tried_ids.push(account_id);
+                        }
+                    }
+                    // 队列没人 / 换号次数用尽时给客户端的那句话：拒答本身不是
+                    // 网关坏了，要说清「换一家或改内容」这条路还在。
+                    let client_text = format!(
+                        "上游拒答（finish_reason={finish}）：该答复疑似被上游内容策略拦截，\
+                         且没有其他可用的账号或提供商可接管。请调整内容后重试，或在设置中更换该模型的服务商"
+                    );
+                    match rotate::pick_next_account(
                         service,
                         provider_ids,
                         &cooldown_keys,
-                        &mut tried_ids,
-                        &target,
-                        &session,
-                        provider_id,
-                        &model,
-                        "上游拒答",
-                        i32::from(head.status),
-                        &mut switches_left,
-                        switch_total,
+                        &tried_ids,
                         ctx.pinned_account,
                     ) {
-                        continue 'accounts;
+                        Some(next) => {
+                            if !take_switch(&mut switches_left, switch_total) {
+                                return Err(GatewayError::with_status(502, client_text));
+                            }
+                            let next_home = {
+                                let next_provider = rotate::provider_of(&next);
+                                if next_provider == provider_id {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "，切换提供商 → {}",
+                                        kind_from_id(next_provider)
+                                            .map(|kind| meta(kind).label)
+                                            .unwrap_or(next_provider)
+                                    )
+                                }
+                            };
+                            logging::console_line(
+                                "[Upstream]",
+                                &format!(
+                                    "⚠️ 账号 {} 对模型 {model} 上游拒答（HTTP {}），\
+                                     按队列顺延 → {}（优先级 {}{next_home}）",
+                                    account_label(
+                                        target.account.as_ref(),
+                                        &target.account_id.clone().unwrap_or_default(),
+                                        &session
+                                    ),
+                                    head.status,
+                                    account_display(&next),
+                                    next.get("priority")
+                                        .and_then(Value::as_i64)
+                                        .map(|value| value.to_string())
+                                        .unwrap_or_else(|| "-".to_string()),
+                                ),
+                            );
+                            continue 'accounts;
+                        }
+                        None => return Err(GatewayError::with_status(502, client_text)),
                     }
-                    return Err(GatewayError::with_status(
-                        502,
-                        format!(
-                            "上游拒答（finish_reason={finish}）：该答复疑似被上游内容策略拦截，\
-                             且没有其他可用的账号或提供商可接管。请调整内容后重试，或在设置中更换该模型的服务商"
-                        ),
-                    ));
                 }
             }
             Gate::Held(head)
