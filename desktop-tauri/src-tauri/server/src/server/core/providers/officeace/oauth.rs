@@ -638,7 +638,7 @@ pub struct TokenIdentity {
 /// 全程 fail-open：不是三段 JWT / 解不出 base64 / 内层不是 JSON / 字段不是字符串，
 /// 都只当没取到，回空串继续退下一级 —— 名字这条链**没有任何失败面**，
 /// 拿它报错会把一次已经成功的登录记成失败。
-fn jwt_identity(token: &str) -> TokenIdentity {
+pub(crate) fn jwt_identity(token: &str) -> TokenIdentity {
     let Some(claims) = jwt_claims(token) else {
         return TokenIdentity::default();
     };

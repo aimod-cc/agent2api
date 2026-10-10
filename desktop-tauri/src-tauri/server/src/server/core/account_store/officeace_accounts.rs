@@ -62,6 +62,57 @@ fn looks_like_upstream_identifier(name: &str) -> bool {
     name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// 「这条记录的现名可以被上游显示名覆盖吗」—— 续期自愈（[`AccountStore::heal_officeace_display_name`]）
+/// 与启动自愈（[`heal_names_from_stored_tokens`]）**共用这一条判据**，不在两处各写一遍：
+/// 不是用户打的 ⇒ 可以覆盖；是用户打的、但长得像上游标识 ⇒ 也可以（那是旧版把
+/// `account_id`/`principal_id` 当名字落库留下的存量记录，一串十六进制不会是人名）。
+fn name_accepts_upstream_display(current: &str, custom: bool) -> bool {
+    !custom || looks_like_upstream_identifier(current)
+}
+
+/// 启动自愈：**不打网络**，从记录里已经躺着的 `refreshToken` 解出上游显示名补上账号名。
+///
+/// ── 为什么这条值得单独有 ────────────────────────────────
+/// 名字在 `refresh_token` 的 `user_profile.account_name` 里（实测），而旧版本只解
+/// `id_token` ⇒ 存量记录的名字停在十六进制上。光靠续期链自愈要等到令牌临期
+/// （登录起约 5 小时）才补得回来，而钥匙其实**一直在库里**：那枚一次性 refresh token
+/// 就是登录时落盘的，它的 claims 里有名字。
+///
+/// 零副作用：只改名，不碰凭据、不重放任何一次性令牌（重放会得到
+/// `STS5.1806 the refresh token has been used`，那是把生产的续期能力烧掉的事故）。
+/// 解不出名字（不是 JWT / 内层畸形 / 没有 `user_profile`）就当没这回事，现名原样留着。
+pub(crate) fn heal_names_from_stored_tokens(accounts: &mut [StoredAccount]) -> usize {
+    let mut healed = 0usize;
+    for record in accounts.iter_mut() {
+        if record.provider() != OFFICEACE_PROVIDER_ID {
+            continue;
+        }
+        let current = record.name();
+        let custom = record
+            .get("nameCustom")
+            .is_some_and(|value| matches!(value, Value::Bool(true)));
+        if !name_accepts_upstream_display(&current, custom) {
+            continue;
+        }
+        // 先算完再改：`get` 借的是 record，`fields_mut` 要可变借用
+        let display_name = record
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .map(crate::server::core::providers::officeace::oauth::jwt_identity)
+            .map(|identity| truncate_chars(identity.user_name.trim(), MAX_NAME_LENGTH))
+            .unwrap_or_default();
+        if display_name.is_empty() || display_name == current {
+            continue;
+        }
+        let fields = record.fields_mut();
+        fields.insert("name".to_string(), Value::String(display_name));
+        fields.insert("nameCustom".to_string(), Value::Bool(false));
+        record.set_updated_at(logging::now_ms());
+        healed += 1;
+    }
+    healed
+}
+
 /// FNV-1a 64 位（`&str` → 16 位 hex，取前 12 位）。
 fn short_hash(input: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -221,7 +272,7 @@ impl AccountStore {
             .get("nameCustom")
             .is_some_and(|value| matches!(value, Value::Bool(true)));
         let next = truncate_chars(display_name, MAX_NAME_LENGTH);
-        if next == current || (custom && !looks_like_upstream_identifier(&current)) {
+        if next == current || !name_accepts_upstream_display(&current, custom) {
             return Ok(false);
         }
         let fields = record.fields_mut();
@@ -410,7 +461,9 @@ impl AccountStore {
         {
             record.insert("dpopKeyPair".to_string(), value);
         }
-        // 来源：新记录记 import（OAuth 那条路会自己覆写），既有记录沿用
+        // 来源标签：新记录一律记 `import`，既有记录沿用 —— **登录路径并不覆写它**
+        // （全仓 `source` 只出现在这里与 public 的读出，没有任何判定读它）。
+        // 所以网页登录进来的账号也标 `import`，它只是个标签、不影响续期与名字自愈。
         record.insert(
             "source".to_string(),
             Value::String(
@@ -746,8 +799,78 @@ mod tests {
             "空操作回空串，不冒充任何 token"
         );
         assert!(
-            adapter.ensure_access_token(&temp.store, "officeace-absent").await.is_err(),
+            adapter
+                .ensure_access_token(&temp.store, "officeace-absent")
+                .await
+                .is_err(),
             "账号不存在仍然要报错"
+        );
+    }
+
+    fn officeace_record(id: &str, name: &str, custom: bool, refresh_token: &str) -> StoredAccount {
+        let mut fields = Map::new();
+        fields.insert("id".to_string(), Value::String(id.to_string()));
+        fields.insert(
+            "provider".to_string(),
+            Value::String(OFFICEACE_PROVIDER_ID.to_string()),
+        );
+        fields.insert("name".to_string(), Value::String(name.to_string()));
+        if custom {
+            fields.insert("nameCustom".to_string(), Value::Bool(true));
+        }
+        fields.insert(
+            "refreshToken".to_string(),
+            Value::String(refresh_token.to_string()),
+        );
+        StoredAccount::from_map(fields)
+    }
+
+    /// 启动自愈：存量记录的 name 是那串十六进制，而显示名一直躺在**同一行**的
+    /// refreshToken 里 —— 零网络补回来。四种不许动的：用户自己起的名字、
+    /// 已经是对的名字、令牌解不出名字、别家的记录。
+    #[test]
+    fn the_boot_heal_reads_the_name_out_of_the_stored_refresh_token() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let profile = URL_SAFE_NO_PAD.encode(
+            br#"{"account_id":"acc_0123456789abcdef","account_name":"hid_synthetic-1","principal_id":"0123456789abcdef0123456789abcdef"}"#,
+        );
+        let claims =
+            format!(r#"{{"client_id":"pdp5_for_agentarts","type":"refreshToken","user_profile":"{profile}"}}"#);
+        let bearer = format!("h.{}.s", URL_SAFE_NO_PAD.encode(claims.as_bytes()));
+        let hex_name = "0123456789abcdef0123456789abcdef".to_string();
+
+        let mut records = vec![
+            officeace_record("a-1", &hex_name, false, &bearer),
+            officeace_record("a-2", &hex_name, true, &bearer),
+            officeace_record("a-3", "我自己的号", true, &bearer),
+            officeace_record("a-4", "hid_synthetic-1", false, &bearer),
+            officeace_record("a-5", &hex_name, false, "not.a.jwt"),
+            {
+                let mut other = officeace_record("a-6", &hex_name, false, &bearer);
+                other.set("provider", Value::String("workbuddy".to_string()));
+                other
+            },
+        ];
+
+        assert_eq!(2, heal_names_from_stored_tokens(&mut records));
+        assert_eq!("hid_synthetic-1", records[0].name(), "派生名该被补上");
+        assert_eq!("hid_synthetic-1", records[1].name(), "导入的十六进制也补");
+        assert_eq!("我自己的号", records[2].name(), "用户打的-name 永远不动");
+        assert_eq!("hid_synthetic-1", records[3].name());
+        assert_eq!(hex_name, records[4].name(), "解不出名字就留着现名");
+        assert_eq!(hex_name, records[5].name(), "别家的记录一眼不看");
+        assert!(
+            records[0]
+                .get("nameCustom")
+                .is_some_and(|value| value == &Value::Bool(false)),
+            "补来的名字来自上游，还得能被下一轮接着改"
+        );
+        assert_eq!(
+            0,
+            heal_names_from_stored_tokens(&mut records),
+            "再跑一次不该有改动（幂等）"
         );
     }
 }

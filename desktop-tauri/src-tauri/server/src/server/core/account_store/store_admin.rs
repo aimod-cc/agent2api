@@ -481,12 +481,25 @@ impl AccountStore {
         // 只改 `provider`、不改 id（Qoder 的 id 本来就带地区段）。
         let qoder_moved = Self::migrate_qoder_intl_accounts(&mut state);
 
+        // ⑦ OfficeAce 账号名自愈（见 `officeace_accounts::heal_names_from_stored_tokens`）：
+        // 存量记录的 name 曾是十六进制的 account_id/principal_id，而显示名一直躺在**同一行**
+        // 的 refreshToken 里 —— 这里零网络地把它解出来补上，不等续期、不碰那枚一次性令牌。
+        let officeace_named =
+            super::officeace_accounts::heal_names_from_stored_tokens(&mut state.accounts);
+        if officeace_named > 0 {
+            logging::log(
+                "[Accounts]",
+                &format!("🏷️  已按登录态为 {officeace_named} 个 OfficeAce 账号补回上游显示名"),
+            );
+        }
+
         if provider_added == 0
             && assignments.is_empty()
             && !scope_migrated
             && cline_renamed == 0
             && workbuddy_moved == 0
             && qoder_moved == 0
+            && officeace_named == 0
         {
             return json!({
                 "providerAdded": 0,
