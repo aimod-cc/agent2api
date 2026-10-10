@@ -58,6 +58,34 @@ pub async fn post_json(
     Ok(Reply { status, body: text })
 }
 
+/// `GET` 一个 URL（目录对照那一发用的就是它）。
+///
+/// 与 `post_json` 同一套口径：网络层错误归一成 502，HTTP 状态**不**在这里判成
+/// 错误（调用方要按状态码决定怎么说这句话），响应体同样只读 `MAX_BODY_BYTES`。
+/// 单独写而不是复用 POST：GET 带 JSON 体在 upstream 那边是被拒的形态，
+/// 而 remote 目录（`/api/remote/v1/models?functions=…`）本来就是查询串驱动的。
+pub async fn get_json(
+    url: &str,
+    headers: &[(&str, String)],
+    timeout: Duration,
+    proxy: Option<&ResolvedProxy>,
+) -> Result<Reply, GatewayError> {
+    let mut request = egress::client_for(proxy)
+        .get(url)
+        .header("Accept", "application/json")
+        .timeout(timeout);
+    for (name, value) in headers {
+        request = request.header(*name, value.clone());
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| GatewayError::with_status(502, format!("Trae 请求发不出去：{}", egress::describe_error_detail(&error))))?;
+    let status = response.status().as_u16();
+    let text = read_limited(response).await;
+    Ok(Reply { status, body: text })
+}
+
 /// 读响应体，最多 `MAX_BODY_BYTES`。
 async fn read_limited(response: reqwest::Response) -> String {
     let limit = MAX_BODY_BYTES;

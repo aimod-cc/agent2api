@@ -6,8 +6,9 @@
 //! 而通用无状态路径的形状是「响应字节原样透传」，中间**没有**按家翻译帧的钩子
 //! （全仓唯一的协议翻译器在 `custom/forward.rs`，它要的两把凭证不会交给适配器）。
 //! 所以发送、翻帧、错误定档、用量上报都在 `forward.rs` 里做，与 Accio / Qoder
-//! 同一处置。本文件因此只剩三件对外的"协议无关"的事：造请求（给对拍与
-//! `custom` 那类调用点留着）、分错误、取令牌与刷目录。
+//! 同一处置。本文件因此只剩两件对外的"协议无关"的事：分错误、取令牌与刷目录；
+//! `build_chat_request` 只剩一个当场响的契约错误（见那条方法的说明）——
+//! 出站请求体在 `forward::build_plan` 一处构造，别再造第二份。
 //!
 //! ── 续期为什么在这里是真的（不是 zcode 那种如实报错）─────────
 //! 本家有可用的 refreshToken 续期链（`refresh.rs`），而且它**必须**被接上：
@@ -32,11 +33,9 @@ use super::super::content_block;
 use super::super::ProviderKind;
 use super::credentials::Credential;
 use super::errors::{classify, ErrorKind};
-use super::headers::{solo_headers, HeaderIdentity};
 use super::models;
-use super::payload;
 use super::refresh::{refresh_candidates, refresh_shared, MAX_ISSUE_AGE_MS, REFRESH_LEAD_MS};
-use super::{AGENT_BASE_URL, CHAT_PATH, PROVIDER_ID};
+use super::PROVIDER_ID;
 
 /// Trae 适配器（无状态；身份全在账号记录里）。
 pub struct TraeAdapter;
@@ -73,36 +72,26 @@ impl ProviderAdapter for TraeAdapter {
         Box::pin(async move { super::forward::forward(store, account_id, body, proxy, stream, telemetry).await })
     }
 
-    /// 无状态路径的入口。本家**不会**被走到这里（`is_stateful()` 已为 true），
-    /// 留着有两个理由：形状对拍的调用点用它，以及万一有人把 `is_stateful`
-    /// 改回 false，这里报错比"半条链路能跑、帧却没人翻译"好查得多。
+    /// 无状态路径的入口 —— 本家**不该**被走到这里。
+    ///
+    /// ── 为什么返回错误而不是照发一份计划 ────────────────────────
+    /// 分流点只认 `is_stateful` 这一个位（`upstream::provider_loop.rs` 里
+    /// `if adapter.is_stateful()` 那一处，全仓只有 `build_chat_request` 一个调用点，
+    /// 且它在这道分流之后）。原先这里返回一份合法的 `ChatRequestPlan`，是最坏的
+    /// 失败形态：哪天那个位被改回 false，编排层会按「响应字节原样透传」去消费本家
+    /// 的上游 SSE —— 而本家不是 OpenAI 方言（没有 `[DONE]`、`token_usage` 欠到
+    /// 下一帧、`event: error` 之后还继续发帧），症状是空回复和零用量，而不是报错。
+    /// 与 `ProviderAdapter::forward_conversation` 的默认实现同一个取向：
+    /// 内部契约错误要当场响。
     fn build_chat_request(
         &self,
-        account: &Value,
-        body: &Value,
+        _account: &Value,
+        _body: &Value,
         _client_headers: &HeaderMap,
     ) -> Result<ChatRequestPlan, GatewayError> {
-        let credential = credential_of(account)?;
-        if credential.access_token.trim().is_empty() {
-            return Err(GatewayError::with_status(
-                401,
-                "Trae 账号缺少 accessToken，无法转发（请重新登录）",
-            ));
-        }
-        let identity = HeaderIdentity {
-            access_token: credential.access_token.trim(),
-            uid: credential.uid.trim(),
-            machine_id: credential.machine_id.trim(),
-            device_id: credential.device_id.trim(),
-        };
-        // 上游恒 `stream: true`（`payload::prepare_body` 里写死），Accept 因此
-        // 也恒 `text/event-stream`；`resolved_model` 传空 = 用 body 自带的模型名
-        // （本家 M3 前不广告模型，也就没有"映射后的上游名"要覆盖）。
-        let headers = solo_headers(&identity, true);
-        Ok(ChatRequestPlan::chat(
-            format!("{AGENT_BASE_URL}{CHAT_PATH}"),
-            headers.into_iter().collect(),
-            payload::prepare_body(body, credential.variant(), ""),
+        Err(GatewayError::with_status(
+            503,
+            "Trae 是有状态（会话式）提供商，不该走无状态转发路径：这是内部契约错误，请检查 is_stateful 的分流",
         ))
     }
 
@@ -367,11 +356,6 @@ pub(crate) fn read_record(store: &AccountStore, account_id: &str) -> Result<Valu
     }
 }
 
-/// 从账号记录还原凭据（转发侧只需要它已有的字段）。
-fn credential_of(account: &Value) -> Result<Credential, GatewayError> {
-    Credential::from_payload(account).map_err(GatewayError::new)
-}
-
 /// 本家 provider id（供调用点写日志时取用，别处不要再写字面量 `"trae"`）。
 pub const fn provider_id() -> &'static str {
     PROVIDER_ID
@@ -449,6 +433,32 @@ mod tests {
         let (db, _guard) = crate::server::db::test_temp::TempDb::open("trae-maint-empty");
         let store = AccountStore::with_db(Some(db));
         assert!(!TRAE_ADAPTER.credentials_expiring(&store, "trae-solo-does-not-exist"));
+    }
+
+    /// 分流不变量：本家是**有状态**的，无状态入口必须当场报错，而不是发一份
+    /// 「形状对、但没人翻帧」的计划。
+    ///
+    /// 这条断言的失效方式是静默的：`provider_loop` 只按 `is_stateful` 那一个位分流
+    /// （`core/upstream/provider_loop.rs:739`，`build_chat_request` 全仓只有它一个
+    /// 调用点、且在那道分流之后）。若哪天那个位被改掉，原先的 `Ok(plan)` 会让上游
+    /// SSE 被按「原样透传」消费 —— 客户端拿到空回复而不是错误。
+    #[test]
+    fn the_stateless_entry_point_is_a_loud_contract_error() {
+        // `ChatRequestPlan` 没有 Debug，所以这里用 match 而不是 expect_err。
+        let error = match TRAE_ADAPTER.build_chat_request(
+            &json!({"accessToken": "x"}),
+            &json!({"model": "kimi-k3", "messages": []}),
+            &HeaderMap::new(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("有状态家构造出了无状态计划：is_stateful 那道分流就白设了"),
+        };
+        assert_eq!(503, error.status_code, "内部契约错误要能被编排层认出：{}", error.message);
+        assert!(
+            error.message.contains("is_stateful"),
+            "文案要指到那个位，否则排查者会去查出站协议：{}",
+            error.message
+        );
     }
 
     #[test]
