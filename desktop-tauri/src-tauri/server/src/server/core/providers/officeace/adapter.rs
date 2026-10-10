@@ -171,22 +171,31 @@ impl ProviderAdapter for OfficeAceAdapter {
         !request_is_too_large(&error_body.to_string().to_ascii_lowercase())
     }
 
-    /// 本家**没有可刷的 token**：转发凭证是不用过期的网关 Basic 对，
-    /// 控制面临时凭据只服务额度/签到（走了也换不来新的转发凭据）。
-    /// 编排层只在 `TokenExpired` 分类上调用它，而本家从不那样分类 ——
-    /// 这里如实报「没有可刷新项」。
+    /// 取转发凭证：**只做存在性校验**（与 CatPaw 同一口径 —— 它也没有刷新机制）。
+    ///
+    /// 本家的转发凭证是不用过期的网关 Basic 对（`modelAppKey`/`modelAppSecret`），
+    /// 没有「一个可刷新的 token」这个东西，所以这条必然是空操作 ⇒ 回 `Ok` + 空串。
+    /// 调用方只看成/败：`provider_loop` 那两处「出站前问一次」的调用点都丢弃返回值，
+    /// 唯一会读值的那条匿名默认会话路要求 `allows_anonymous_default_session`，本家不开。
+    ///
+    /// ⚠️ 原来这里恒回一个「没有可刷新的 token」的 401，实测**每发请求都记一条**
+    /// 「凭证准备失败（沿用现有 token）」噪声 —— 因为我当时以为这条链只在 401 之后走
+    /// （编排层其实是每次出站前都问一次，见 `provider_loop` §4.2 的两处调用点）。
+    /// 设计上的空操作就该报成功；真缺凭据仍然报错（`credentials::from_record` 那一层）。
     fn ensure_access_token<'a>(
         &'a self,
-        _store: &'a AccountStore,
-        _account_id: &'a str,
+        store: &'a AccountStore,
+        account_id: &'a str,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            Err(GatewayError::with_status(
-                401,
-                "OfficeAce 的转发凭据不过期、也没有可刷新的 token；凭证失效时请重新导入或重新登录",
-            ))
+            let record = store
+                .officeace_account_record(account_id)
+                .ok_or_else(|| GatewayError::with_status(404, "OfficeAce 账号不存在或不可用"))?;
+            // 校验「这对网关凭据齐不齐」—— 齐了就没有任何需要准备的东西
+            credentials::from_record(Some(&record))?;
+            Ok(String::new())
         })
     }
 

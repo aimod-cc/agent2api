@@ -716,4 +716,38 @@ mod tests {
             assert!(!listed.contains(secret), "账号列表里出现了凭据值 {secret}");
         }
     }
+
+    /// 「出站前问一次凭证」那条链：本家没有可刷新的 token，这是**设计上的空操作**，
+    /// 必须报成功。原先它恒回一个 401「没有可刷新的 token」，实测每发请求都往日志记一条
+    /// 「凭证准备失败（沿用现有 token）」—— 因为我把调用时机读错了（不是只在 401 之后走）。
+    #[tokio::test]
+    async fn ensuring_the_forward_credential_is_a_silent_no_op() {
+        use crate::server::core::providers::ProviderKind;
+        use crate::server::core::providers::adapter::adapter_for;
+        use serde_json::json;
+        let temp = temp_store("ensure");
+        let payload = json!({
+            "baseUrl": "https://gw.example.com/v2",
+            "modelAppKey": "K-ENSURE",
+            "modelAppSecret": "S-ENSURE",
+        });
+        let account = temp
+            .store
+            .add_officeace_account(&payload, Some("n"), true)
+            .expect("导入应当成功");
+        let id = account["id"].as_str().unwrap_or("").to_string();
+        let adapter = adapter_for(ProviderKind::OfficeAce);
+        assert_eq!(
+            String::new(),
+            adapter
+                .ensure_access_token(&temp.store, &id)
+                .await
+                .expect("齐备的网关凭据不该报错"),
+            "空操作回空串，不冒充任何 token"
+        );
+        assert!(
+            adapter.ensure_access_token(&temp.store, "officeace-absent").await.is_err(),
+            "账号不存在仍然要报错"
+        );
+    }
 }
