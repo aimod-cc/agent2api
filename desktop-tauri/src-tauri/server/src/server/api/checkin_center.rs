@@ -203,6 +203,9 @@ pub async fn get_center(State(state): State<ServerState>) -> Response {
     let mut onboarding_rows = onboarding_rows_of("loomy");
     onboarding_rows.extend(onboarding_rows_of("raccoon"));
     onboarding_rows.extend(onboarding_rows_of("codearts"));
+    // OfficeAce 的「新手任务」与每日签到是同一个上游动作（见 officeace::onboarding），
+    // 所以它也在这张分组表里 —— 前端按 server 给的 extras.onboarding 驱动，不硬编码家。
+    onboarding_rows.extend(onboarding_rows_of("officeace"));
     // CodeArts 的福利行带**本地领取台账**（`account.welfare`）—— 与下面 ZCode 行
     // 带 `claimPlans` 同一个先例：台账是后端落盘的本地事实（day / accepted /
     // confirmed），带出来零上游请求，不违反「快照零上游」；界面的「已领取」

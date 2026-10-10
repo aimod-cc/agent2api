@@ -414,7 +414,7 @@ impl LoginFlow {
 }
 
 /// 把 RFC3339（`2026-10-10T05:15:00Z`）解析成毫秒时间戳。
-fn parse_rfc3339_ms(input: &str) -> Option<i64> {
+pub(super) fn parse_rfc3339_ms(input: &str) -> Option<i64> {
     let text = input.trim().trim_end_matches('Z');
     let (date, time) = text.split_once('T')?;
     let mut date_parts = date.split('-');

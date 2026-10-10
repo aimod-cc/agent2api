@@ -50,7 +50,7 @@ use axum::response::Response;
 use crate::server::core::account_store::AccountStore;
 use crate::server::core::providers::{
     codearts::onboarding as codearts_onboarding, loomy::onboarding as loomy_onboarding,
-    raccoon::onboarding as raccoon_onboarding,
+    officeace::onboarding as officeace_onboarding, raccoon::onboarding as raccoon_onboarding,
 };
 use crate::server::errors::management_error;
 use crate::server::http::ok_json;
@@ -63,6 +63,11 @@ const RACCOON_PROVIDER_ID: &str = "raccoon";
 /// 常量与本家共用一处，免得界面认的 id 和存储写的 id 分叉。
 const CODEARTS_PROVIDER_ID: &str =
     crate::server::core::account_store::codearts_accounts::CODEARTS_PROVIDER_ID;
+/// OfficeAce 的分派键：它的新手任务与每日签到是**同一个上游动作**
+/// （`POST /v1/subscription/bonus/claim` 一次发当天所有奖励），见
+/// `officeace::onboarding` 的模块头。
+const OFFICEACE_PROVIDER_ID: &str =
+    crate::server::core::account_store::OFFICEACE_PROVIDER_ID;
 
 /// 从账号存储里查一条账号的 provider id（查不到账号给空串 —— 分派会落到
 /// Loomy 分支，由 `loomy_account_record` 报 404，与既有兜底行为一致）。
@@ -112,6 +117,9 @@ pub async fn status(state: &ServerState, account_id: &str, refresh: bool) -> Res
         CODEARTS_PROVIDER_ID => {
             codearts_onboarding::get_tasks(state.store(), account_id, refresh).await
         }
+        OFFICEACE_PROVIDER_ID => {
+            officeace_onboarding::get_tasks(state.store(), account_id, refresh).await
+        }
         _ => loomy_onboarding::get_tasks(state.store(), account_id, refresh).await,
     };
     match result {
@@ -126,6 +134,7 @@ pub async fn claim(state: &ServerState, account_id: &str) -> Response {
     let result = match provider_of_account(state, account_id).as_str() {
         RACCOON_PROVIDER_ID => raccoon_onboarding::claim_all(state.store(), account_id).await,
         CODEARTS_PROVIDER_ID => codearts_onboarding::claim_all(state.store(), account_id).await,
+        OFFICEACE_PROVIDER_ID => officeace_onboarding::claim_all(state.store(), account_id).await,
         _ => loomy_onboarding::claim_all(state.store(), account_id).await,
     };
     match result {

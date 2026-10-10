@@ -110,6 +110,7 @@ pub const CHECKIN_PROVIDERS: [&str; 10] = [
     "trae",
     "loomy",
     "kuku",
+    "officeace",
 ];
 
 /// 缺省的签到提供商集合（全选）

@@ -98,6 +98,40 @@ impl AccountStore {
         candidates.into_iter().next().map(|item| item.to_value())
     }
 
+    /// 写回「奖励领取台账」（存在账号记录的 `bonusClaims` 字段里，整份覆盖）。
+    ///
+    /// 与 CodeArts 的 `put_codearts_welfare_ledger` 同一形态：只写自己这一个命名
+    /// 空间，且记录**在锁内现读** —— 既洗不掉凭据等别的字段，也不存在「快照过期」
+    /// 那类问题（上一版 CodeArts 曾复用凭据写回的比对，代价见那里的注释）。
+    pub fn put_officeace_bonus_ledger(
+        &self,
+        account_id: &str,
+        ledger: &Value,
+    ) -> Result<(), AccountStoreError> {
+        let guard = self.guard();
+        let Some(mut record) = self
+            .record_by_id(&guard, account_id)
+            .filter(|record| record.provider() == OFFICEACE_PROVIDER_ID)
+        else {
+            return Err(AccountStoreError::new(
+                "OfficeAce 账号已不存在，领取台账无处落盘",
+                404,
+            ));
+        };
+        record
+            .fields_mut()
+            .insert("bonusClaims".to_string(), ledger.clone());
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
+        Ok(())
+    }
+
+    /// 台账的读侧（没有台账返回 `None`）。
+    pub fn officeace_bonus_ledger(&self, account_id: &str) -> Option<Value> {
+        self.officeace_account_record(account_id)
+            .and_then(|record| record.get("bonusClaims").cloned())
+    }
+
     /// 添加/更新一个 OfficeAce 账号（手工导入与自助 OAuth 共用）。
     ///
     /// payload：

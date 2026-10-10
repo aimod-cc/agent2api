@@ -21,9 +21,13 @@
 //! 那种并发会话闸门）。
 
 pub mod adapter;
+pub mod balance;
 pub mod chat;
+pub mod checkin;
 pub mod credentials;
 pub mod models;
 pub mod oauth;
+pub mod onboarding;
 pub mod probe;
 pub mod signer;
+pub mod subscription;

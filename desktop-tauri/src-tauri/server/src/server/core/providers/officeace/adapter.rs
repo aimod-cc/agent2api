@@ -163,6 +163,24 @@ impl ProviderAdapter for OfficeAceAdapter {
         true
     }
 
+    /// 有余额查询能力：读订阅快照（`GET /v1/subscription`，V11 签名）并归一成
+    /// `query_usage` 契约的形状（见 `balance` 模块头）。前端「积分」按钮与批量查询
+    /// 都按它是否 true 决定要不要算这一家。
+    fn supports_usage(&self) -> bool {
+        true
+    }
+
+    /// 查余额 / 积分（`balance::query_usage`）。
+    fn query_usage<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Value, GatewayError>> + Send + 'a>,
+    > {
+        Box::pin(super::balance::query_usage(store, account_id))
+    }
+
     /// **暂不支持续期**（false）：控制面临时凭据 2 小时到期后，续期要靠
     /// refresh_token + DPoP 重打令牌端点 —— 那条链还没实现（与签到/额度一起
     /// 后置）。在它落地之前声明 true 是有害的：定时维护会每轮去撞一条必失败

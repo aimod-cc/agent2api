@@ -332,6 +332,16 @@ pub async fn checkin_for(
                     .map_err(|error| error.message);
             claim_result(id, name, &display, true, claim)
         }
+        "officeace" => {
+            // OfficeAce：`POST /v1/subscription/bonus/claim`（V11 签名）一次把当天
+            // 所有可领的奖励（每日签到 + 一次性新人礼）发下来；一天一个活动只能领
+            // 一次、重复领不报错，幂等由上游保证（见 `officeace::checkin` 模块头）。
+            let claim =
+                crate::server::core::providers::officeace::checkin::claim_daily_checkin(store, &id)
+                    .await
+                    .map_err(|error| error.message);
+            claim_result(id, name, &display, true, claim)
+        }
         // 兜底只服务默认那家（WorkBuddy 国内版）——**不是**「剩下所有家」。
         // 这里曾经是无所不包的 `_`：一个 provider 只要没在上面列出，就会拿自己的
         // 令牌去打腾讯的签到接口，稳定报错且看不出原因（Qoder 接入前正是这个处境）。
