@@ -623,23 +623,17 @@ async fn attempt_queue(
                     // 队列顺延，不套用无状态的重试/刷新动作。冷却键从
                     // `cooldown_keys` 解析（与判定侧同源）；会话式分支发生在
                     // 发送体构建之前，拿不到 `SendBody::wire_model`。
-                    if let (UpstreamErrorClass::QuotaLimited { status, upstream_code, .. },
-                            Some(account_id)) =
-                        (adapter.classify_conversation_error(&error), &stateful_account_id)
+                    //
+                    // 整份 `class` 交给 `mark_conversation_limited` 而不是在这里
+                    // 拆散取值 —— 拆散后「漏带一个字段」编译期与运行期都不报错
+                    // （本分支此前就把 `reset_at` 写成死 `None`，见那个函数的说明）。
+                    let class = adapter.classify_conversation_error(&error);
+                    if let (UpstreamErrorClass::QuotaLimited { .. }, Some(account_id)) =
+                        (&class, &stateful_account_id)
                     {
                         let wire = cooldown_keys.for_provider(provider_id);
                         let group = adapter.quota_cooldown_models(account_id, &wire);
-                        for name in &group {
-                            rotate::mark_account_limited(
-                                service,
-                                account_id,
-                                name,
-                                i32::from(status),
-                                upstream_code,
-                                None,
-                                &error.message,
-                            );
-                        }
+                        mark_conversation_limited(service, account_id, &group, &class, &error.message);
                         let label = if group.len() > 1 {
                             format!("{} 等 {} 个模型（福利池按账号记账）",
                                     group.first().cloned().unwrap_or_else(|| wire.clone()),
@@ -1392,6 +1386,54 @@ async fn attempt_queue(
         return Ok(ForwardOutcome::Completion { body: aggregated.body });
     }
     Err(GatewayError::with_status(500, "上游转发重试次数超限"))
+}
+
+/// 会话式路径的限额记账：把适配器分类出的**恢复时刻原样**带到存储层。
+///
+/// ── 为什么单独成函数 ──────────────────────────────────────────
+/// 只为「恢复时刻不许在半路被丢掉」这一条可断言（见 tests 的
+/// `stateful_quota_bookkeeping_keeps_the_adapter_reset_at`）。改造前这段是内联
+/// 的 `for` 循环，`mark_account_limited` 的 `reset_at` 实参写死 `None`：适配器
+/// 那半边算对了（CodeArts 认得出福利日池耗尽 ⇒ 下一个北京零点，见
+/// `providers::codearts::daily_pool_reset_at`；会话式的家里谁给得出恢复时刻都
+/// 是同一形状），却被编排层丢在函数参数上，落回存储层的「缺失即 10 分钟」兜底
+/// 冷却（`account_store::store_admin::mark_rate_limited`）。
+///
+/// 这类缺陷不报错，症状是**同一个已耗尽的账号按兜底常量的节拍被重新撞**：日池
+/// 要等第二天才有额度，而冷却每 10 分钟到期一次 ⇒ 实测官方 2.9.9 上两小时白撞
+/// 8 次（每次 0.2–0.3 秒、被拒不计费、整条请求仍 200 —— 只看响应看不出来，
+/// 判据在 requests.attempt_details 的尝试链）。
+/// 无状态分支从一开始就是透传 `*reset_at` 的（见本文件「动作 1」），两条路径
+/// 到这里才是同一语义。
+///
+/// ── 入参形状：吃整份分类结果，不吃拆散的字段 ──────────────────
+/// `reset_at` 是四个字段里唯一「丢了也没人报错」的那个（状态码丢了客户端会看到
+/// 错的响应、文案丢了日志会空，都有可见后果）。把 `class` 整个传进来、在函数
+/// 内部 destructure，调用方就没有「漏带一个字段」这个可犯的错误形状。
+///
+/// 非 `QuotaLimited` 直接返回 —— 记账闸门由调用方的 `if let` 判定，这里是
+/// 二次防御：别的路径误用本函数时不该落冷却。
+fn mark_conversation_limited(
+    service: &UpstreamService,
+    account_id: &str,
+    group: &[String],
+    class: &UpstreamErrorClass,
+    message: &str,
+) {
+    let UpstreamErrorClass::QuotaLimited { status, upstream_code, reset_at, .. } = class else {
+        return;
+    };
+    for name in group {
+        rotate::mark_account_limited(
+            service,
+            account_id,
+            name,
+            i32::from(*status),
+            *upstream_code,
+            *reset_at,
+            message,
+        );
+    }
 }
 
 /// **自定义提供商**的一次转发（第二阶段；与 [`attempt_stateful`] 同形状）。
