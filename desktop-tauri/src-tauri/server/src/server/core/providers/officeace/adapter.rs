@@ -28,6 +28,26 @@ pub struct OfficeAceAdapter;
 /// 静态单例
 pub static OFFICEACE_ADAPTER: OfficeAceAdapter = OfficeAceAdapter;
 
+/// 上游「请求太大」的判据 —— `classify_error` 与 `resends_same_body_in_place`
+/// **共用**这一个函数：两处各写一遍迟早分叉，分叉的症状是「文案写着超限、
+/// 却还是把整份超大 body 原地重发好几遍」。
+///
+/// 取值集合抄自 officeace2api 的 `classifyUpstream`（同一份实测）：`81113` 是
+/// 条数超限那条线给的码，其余四条是同一件事在 APIG / MaaS 两层的不同措辞。
+/// 参数**要已小写**。
+fn request_is_too_large(lower: &str) -> bool {
+    [
+        "81113",
+        "exceeds the maximum size",
+        "requestentitytoolarge",
+        "payload too large",
+        "request body is too large",
+        "request body is too long",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 impl ProviderAdapter for OfficeAceAdapter {
     fn kind(&self) -> ProviderKind {
         ProviderKind::OfficeAce
@@ -85,7 +105,7 @@ impl ProviderAdapter for OfficeAceAdapter {
     /// 上游错误分类。依据 officeace2api 实测的错误码表（`upstream.mjs` 的
     /// `classifyUpstream`）：
     ///
-    ///   - `81113` / `exceeds the maximum size` → `Fatal`（请求体超限，换账号无用）
+    ///   - `81113` / `exceeds the maximum size` → `Fatal`（**状态码折成 413**）
     ///   - `81111` / `81112` / `81114` / `0308` / `TPM` / HTTP 429 → `QuotaLimited`
     ///     （限流，冷却「该凭据 + 该模型」；上游不给恢复时间，走兜底时长）
     ///   - `81004`（没权限）/ `81009`（名字不认）→ `Fatal`（**只该冷却这一对**，
@@ -96,6 +116,25 @@ impl ProviderAdapter for OfficeAceAdapter {
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass {
         let text = error_body.to_string();
         let lower = text.to_ascii_lowercase();
+        // ── 体积超限**必须先于** `status == 429` 那一条判掉 ──────────────
+        // 上游给这条的 HTTP 码就是 429（参考实现踩过同一个坑，见
+        // `officeace2api/docs/技术笔记.md` 的 requestTooLarge 一节）。落进限额档的后果
+        // 有两层，都不是「多试一次」能兜住的：
+        //   ① 账号被记一次限额冷却并换号 —— 可它拒的是这份 body 的条数，跟这个号无关，
+        //      换号后同一份 body 照样被拒，等于把下一个号也拖进同一笔白账；
+        //   ② 客户端收到透传的 429，按「暂时忙」继续无限重试一个**必然失败**的请求。
+        // 上游原文自报了家门（`messages max size is: 5000`），所以对策写得具体：
+        // 少的是条数，不是每条的长度 —— 参考实现实测 token 窗口远够不到。
+        if request_is_too_large(&lower) {
+            return UpstreamErrorClass::Fatal {
+                status: 413,
+                message: format!(
+                    "请求超过上游上限：{text}（这条拒的是 messages 的条数，上游实测上限 5000 条，\
+                     与 token 数无关：把历史清短一些 —— 要减少条数，光把每条改短没用）"
+                ),
+                upstream_code: None,
+            };
+        }
         let rate_limited = status == 429
             || ["81111", "81112", "81114", "0308", "tpm", "rate limit", "too many requests"]
                 .iter()
@@ -108,12 +147,23 @@ impl ProviderAdapter for OfficeAceAdapter {
                 status,
             };
         }
-        // 其余（体积超限、模型无权限、凭据失效）一律致命：不罚账号池
+        // 其余（模型无权限、凭据失效）一律致命：不罚账号池
         UpstreamErrorClass::Fatal {
             status,
             message: format!("上游返回 {status}: {text}"),
             upstream_code: None,
         }
+    }
+
+    /// 体积超限不在同一账号上原地重发（与 zcode 的 `model not allowed` 同构的否决）。
+    ///
+    /// 上面那条分类把它折成了 `Fatal`，而编排层对 `Fatal` 的默认承诺是
+    /// 「先在这个账号上多试几次再换人」（见 `provider_loop::fallback_retry_advice`）——
+    /// 这条对体积判定是纯浪费：它拒的是这份 body 的条数，重发一次就要把整份
+    /// 超大请求体**再上传一遍**（参考实现实测那一次是 5.5 MB ×3 遍）。
+    /// 判据与分类侧共用 `request_is_too_large`，两处不会分叉。
+    fn resends_same_body_in_place(&self, _status: u16, error_body: &Value) -> bool {
+        !request_is_too_large(&error_body.to_string().to_ascii_lowercase())
     }
 
     /// 本家**没有可刷的 token**：转发凭证是不用过期的网关 Basic 对，
@@ -217,5 +267,69 @@ impl ProviderAdapter for OfficeAceAdapter {
         account_id: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
         Box::pin(async move { super::refresh_control_plane(store, account_id).await })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::core::providers::adapter::adapter_for;
+    use serde_json::json;
+
+    /// 上游给「请求太大」时的**真实形态**（officeace2api 实测，`upstream.mjs` 的
+    /// `requestTooLarge` 说明）：HTTP 状态是 **429**，业务码才是 81113，
+    /// 原文自报了家门 —— 上限说的是 messages 条数。
+    fn too_large() -> Value {
+        json!({
+            "error_code": "ModelArts.81113",
+            "error_msg": "Invalid request body, exceeds the maximum size , messages max size is: 5000."
+        })
+    }
+
+    /// 真限流（81111）与裸 429：修体积那条不许把它们一起误伤（参考实现在
+    /// `test-admin.mjs` 里为这同一件事钉了 8 条反向断言）。
+    #[test]
+    fn real_rate_limits_still_cool_the_account() {
+        let adapter = adapter_for(ProviderKind::OfficeAce);
+        for body in [
+            json!({"error_code": "ModelArts.81111", "error_msg": "Too many requests"}),
+            json!({"error": {"message": "throttled"}}),
+        ] {
+            match adapter.classify_error(429, &body) {
+                UpstreamErrorClass::QuotaLimited { status, .. } => assert_eq!(status, 429),
+                other => panic!("这条应当按限额处理（冷却 + 换号），实际 {other:?}"),
+            }
+        }
+    }
+
+    /// 分类侧与免重发侧读的是**同一份判据**：只在一处认出来，就会留下
+    /// 「文案写着超限、却还是把整份超大 body 白重发几遍」的分裂结论。
+    #[test]
+    fn the_size_rejection_becomes_a_readably_413_and_is_not_resent() {
+        let adapter = adapter_for(ProviderKind::OfficeAce);
+        let body = too_large();
+        let (status, message) = match adapter.classify_error(429, &body) {
+            UpstreamErrorClass::Fatal { status, message, .. } => (status, message),
+            other => panic!("体积超限不该罚账号池，实际 {other:?}"),
+        };
+        assert_eq!(status, 413, "客户端要看到「请求太大」而不是「暂时忙」：{message}");
+        assert!(
+            message.contains("exceeds the maximum size"),
+            "文案要保住上游原话：{message}"
+        );
+        assert!(message.contains("条数"), "对策要说清是减少条数：{message}");
+        assert!(
+            !adapter.resends_same_body_in_place(429, &body),
+            "确定性失败，重发只会把整份超大 body 再传一遍"
+        );
+    }
+
+    /// 反向：正常的 429 限额**仍然**保留原地重发的可能性（本家它不重发是因为
+    /// 分类落 QuotaLimited，与这条否决无关）。
+    #[test]
+    fn the_veto_is_limited_to_the_size_markers() {
+        let adapter = adapter_for(ProviderKind::OfficeAce);
+        assert!(adapter.resends_same_body_in_place(429, &json!({"error_code": "ModelArts.81112"})));
+        assert!(adapter.resends_same_body_in_place(400, &json!({"error_msg": "Invalid model"})));
     }
 }
