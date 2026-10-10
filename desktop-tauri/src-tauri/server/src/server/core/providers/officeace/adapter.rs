@@ -163,6 +163,20 @@ impl ProviderAdapter for OfficeAceAdapter {
         true
     }
 
+    /// 本家把**内容审核拒绝**包成 `HTTP 200 + finish_reason=content_filter` 的
+    /// 假答复（正文是一句固定拒绝话术，见 `upstream::refusal` 模块头）。
+    ///
+    /// 实测（2026-10-10，dev）：ZCode 的 agentic 请求（巨型 system/工具/历史）
+    /// 打到本家的 `deepseek-v4.1-flash` 时，上游条条回这句套话 + 该 finish_reason，
+    /// 而同形状请求走 catpaw / codearts 都正常作答 ⇒ 是本家上游的输入审核拦截。
+    /// 声明它之后编排层会把它当**可轮换失败**：队列里还有别的账号/家就换，
+    /// 只剩这一家时给客户端一句可读错误（不再把套话当答案）。
+    ///
+    /// ⚠️ 只声明这一个取值：`length`（推理吃光预算）是**正常**收尾，不该换家。
+    fn stream_refusal_finishes(&self) -> &'static [&'static str] {
+        &["content_filter"]
+    }
+
     /// 有余额查询能力：读订阅快照（`GET /v1/subscription`，V11 签名）并归一成
     /// `query_usage` 契约的形状（见 `balance` 模块头）。前端「积分」按钮与批量查询
     /// 都按它是否 true 决定要不要算这一家。

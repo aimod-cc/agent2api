@@ -94,7 +94,7 @@ use super::request::{read_upstream_error, send_chat_request, TransportRequest};
 use super::usage::LogPhase;
 use super::{
     account_display, account_label, cancellation, connections::ConnectionGuard, describe_proxy,
-    reset_hint, rotate, ForwardOutcome, InFlightGuard, RouteTarget, UpstreamService,
+    refusal, reset_hint, rotate, ForwardOutcome, InFlightGuard, RouteTarget, UpstreamService,
     MAX_ROUTE_ATTEMPTS,
 };
 
@@ -1273,6 +1273,77 @@ async fn attempt_queue(
             capture.attach_response(response.status().as_u16(), response.headers());
         }
 
+        // ── 流内拒绝门控（只有声明了的家才走，见 `upstream::refusal`）──────
+        // 有些上游把内容审核拒绝包成一次**正常答复**：HTTP 200、SSE 干净收尾，
+        // 正文却是一句固定拒绝话术（实现在终帧带 `finish_reason`）。只看 HTTP
+        // 状态这就是**假成功** —— 编排层不换家，客户端把套话当答案（真实现象：
+        // ZCode 的 agentic 请求打到 OfficeAce 条条如此）。
+        //
+        // 位置在响应头记账之后、任何字节下发之前：预读一小段（有界，见
+        // `refusal` 模块头），够判定就判，不够就原样放行。**没声明 `finish_reason`
+        // 的家一个字节都不碰**（`stream_refusal_finishes` 默认空 ⇒ 短路）。
+        //
+        // 判成拒答时：不罚账号（这是内容问题，不是账号问题），但**该换家**——
+        // 队列里还有别的账号/家就顺延，只剩这一家时给客户端一句**可读错误**，
+        // 而不是把那句上游套话当成答案发出去。
+        //
+        // 三种形态收进 `Gate`：`Live` 是未消费的 `Response`（未声明的家 / 非 200
+        // 走这条，一个字节不改）；`Held` 是预读产物（已消费 `Response`，用预读的
+        // 字节 + 剩余流重建）。用枚举而不是 `Option`，是为了让 `response` 在**恰好
+        // 一支**里被移动 —— 否则借用检查器无法证明「None 那支没被移走」。
+        let refusal_finishes = adapter.stream_refusal_finishes();
+        let gate = if !refusal_finishes.is_empty()
+            && response_protocol == crate::server::core::providers::adapter::UpstreamResponse::Chat
+            && response.status().is_success()
+        {
+            let head = refusal::hold_head(response).await;
+            if let Some(finish) = head.finish_reason.as_deref() {
+                if refusal::is_refusal(refusal_finishes, finish) {
+                    let message = format!(
+                        "上游拒答（finish_reason={finish}，疑似内容策略拦截）：本次答复不采纳"
+                    );
+                    ctx.telemetry.finish_last_attempt(Some(i64::from(head.status)), Some(&message));
+                    logging::console_line(
+                        "[Upstream]",
+                        &format!(
+                            "⚠️ {provider_id} 对模型 {model_label} 返回拒答帧（finish_reason={finish}），\
+                             本家不采纳该答复"
+                        ),
+                    );
+                    // 与其它失败同一落点：把这一轮记为失败、按队列顺延下一家。
+                    // 判据是「还有没有下一个账号/家」，不是「这一家还能不能救」——
+                    // 同一份 body 再发一次结论不变（审核按内容匹配），所以不原地重发。
+                    if defer_to_next_account(
+                        service,
+                        provider_ids,
+                        &cooldown_keys,
+                        &mut tried_ids,
+                        &target,
+                        &session,
+                        provider_id,
+                        &model,
+                        "上游拒答",
+                        i32::from(head.status),
+                        &mut switches_left,
+                        switch_total,
+                        ctx.pinned_account,
+                    ) {
+                        continue 'accounts;
+                    }
+                    return Err(GatewayError::with_status(
+                        502,
+                        format!(
+                            "上游拒答（finish_reason={finish}）：该答复疑似被上游内容策略拦截，\
+                             且没有其他可用的账号或提供商可接管。请调整内容后重试，或在设置中更换该模型的服务商"
+                        ),
+                    ));
+                }
+            }
+            Gate::Held(head)
+        } else {
+            Gate::Live(response)
+        };
+
         // ── 上游响应协议（适配器在构造请求时一并给出）──────────────────
         // 绝大多数上游说 chat SSE（`ForwardStream` / 聚合器的默认输入）；
         // 三条例外各有一台翻译状态机（见 `upstream::translate` 的模块头）：
@@ -1286,10 +1357,20 @@ async fn attempt_queue(
         // 翻译在**两处出口之前**做，于是流式与非流式共用同一条下行语义：
         // reasoning 合并、usage 提取、model 回写、取消处理全都不需要第二套。
         // 说 chat 的家（含自定义家）跳过这一整段，直接走下面的原生路径。
+        //
+        // 门控只在 Chat 协议上生效（上面那个 `response_protocol` 判定），所以
+        // 走到翻译分支时 `gate` 必是 `Live`、`response` 仍是未消费的活体。
         if response_protocol
             != crate::server::core::providers::adapter::UpstreamResponse::Chat
         {
             use crate::server::core::providers::adapter::UpstreamResponse;
+            let Gate::Live(response) = gate else {
+                // 不可达：门控只在 Chat 协议上开启（上面的条件里已限定）。
+                return Err(GatewayError::with_status(
+                    500,
+                    "内部错误：非 Chat 通道不应进入拒绝门控",
+                ));
+            };
             // 状态码要在 consume response 之前取（与 chat 路径同一时机）
             let status = response.status().as_u16();
             let translated: futures::stream::BoxStream<
@@ -1350,48 +1431,90 @@ async fn attempt_queue(
             });
         }
 
-        if ctx.stream {
-            let status = response.status().as_u16();
-            return Ok(ForwardOutcome::Stream {
-                status,
-                // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者；
-                // 连接计数同样移交（`handoff` 转移所有权，本栈帧的凭证随即失效，
-                // 避免同一账号被两份凭证各算一次）
-                stream: Box::new(super::ForwardStream::new(
+        // Chat 协议：按门控形态分流（见上面 `Gate` 的说明）。两个分支都直接
+        // `return`，所以这里是一个「穷尽后不可达」的 match。
+        match gate {
+            Gate::Live(response) => {
+                if ctx.stream {
+                    return Ok(ForwardOutcome::Stream {
+                        status: response.status().as_u16(),
+                        // 槽位交给流：流跑完 / 客户端断开 / 流被 drop 时才放行等待者；
+                        // 连接计数同样移交（`handoff` 转移所有权，本栈帧的凭证随即失效，
+                        // 避免同一账号被两份凭证各算一次）
+                        stream: Box::new(super::ForwardStream::new(
+                            response,
+                            slot.take(),
+                            connections.handoff(),
+                            ctx.telemetry.clone(),
+                            model_rewrite_of(adapter, &model),
+                        )),
+                    });
+                }
+                let aggregated = super::aggregate::aggregate_sse_completion(
                     response,
-                    slot.take(),
-                    connections.handoff(),
                     ctx.telemetry.clone(),
                     model_rewrite_of(adapter, &model),
-                )),
-            });
+                )
+                .await?;
+                log_aggregated(&aggregated);
+                return Ok(ForwardOutcome::Completion { body: aggregated.body });
+            }
+            Gate::Held(head) => {
+                let status = head.status;
+                let capture = ctx.telemetry.capture();
+                let source = head.into_stream(capture);
+                if ctx.stream {
+                    return Ok(ForwardOutcome::Stream {
+                        status,
+                        stream: Box::new(super::ForwardStream::from_translated(
+                            source,
+                            slot.take(),
+                            connections.handoff(),
+                            ctx.telemetry.clone(),
+                            model_rewrite_of(adapter, &model),
+                        )),
+                    });
+                }
+                let aggregated = super::aggregate::aggregate_frame_stream(
+                    source,
+                    ctx.telemetry.clone(),
+                    model_rewrite_of(adapter, &model),
+                )
+                .await?;
+                log_aggregated(&aggregated);
+                return Ok(ForwardOutcome::Completion { body: aggregated.body });
+            }
         }
-        let aggregated = super::aggregate::aggregate_sse_completion(
-            response,
-            ctx.telemetry.clone(),
-            model_rewrite_of(adapter, &model),
-        )
-        .await?;
-        let choice = aggregated.body.get("choices").and_then(|value| value.get(0));
-        let content_chars = choice
-            .and_then(|choice| choice.pointer("/message/content"))
-            .and_then(Value::as_str)
-            .map(|text| text.chars().count())
-            .unwrap_or(0);
-        let finish = choice
-            .and_then(|choice| choice.get("finish_reason"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        logging::verbose(
-            "[Upstream]",
-            &format!(
-                "聚合完成: chunks={} content={content_chars} 字符 finish={finish}",
-                aggregated.chunk_count
-            ),
-        );
-        return Ok(ForwardOutcome::Completion { body: aggregated.body });
     }
     Err(GatewayError::with_status(500, "上游转发重试次数超限"))
+}
+
+/// 门控后的 Chat 响应形态：`Live` = 未消费的 `Response`（原样直通）；
+/// `Held` = 预读产物（用预读字节 + 剩余流重建，见 `upstream::refusal`）。
+enum Gate {
+    Live(reqwest::Response),
+    Held(refusal::HeldHead),
+}
+
+/// 聚合完成的日志（门控两分支共用，措辞只有一处）。
+fn log_aggregated(aggregated: &super::aggregate::AggregatedCompletion) {
+    let choice = aggregated.body.get("choices").and_then(|value| value.get(0));
+    let content_chars = choice
+        .and_then(|choice| choice.pointer("/message/content"))
+        .and_then(Value::as_str)
+        .map(|text| text.chars().count())
+        .unwrap_or(0);
+    let finish = choice
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    logging::verbose(
+        "[Upstream]",
+        &format!(
+            "聚合完成: chunks={} content={content_chars} 字符 finish={finish}",
+            aggregated.chunk_count
+        ),
+    );
 }
 
 /// **自定义提供商**的一次转发（第二阶段；与 [`attempt_stateful`] 同形状）。
