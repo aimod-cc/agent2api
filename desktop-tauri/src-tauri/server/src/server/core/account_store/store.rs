@@ -580,6 +580,36 @@ impl AccountStore {
                         object.insert(key.to_string(), Value::String(value.to_string()));
                     }
                 }
+        // ── OfficeAce 的凭据字段（`officeace::adapter` 用）──────────────
+        // 它的转发凭证不是 `auth.accessToken`，而是**记录顶层的**网关 Basic 那一对
+        // （`baseUrl` / `modelAppKey` / `modelAppSecret`）；控制面临时凭据
+        // （`accessKeyId` 等）留给额度/签到。会话是转发链交给适配器的唯一形态
+        // （`build_chat_request` 的 `account` 参数），所以这些字段必须随会话出来 ——
+        // 否则 `officeace::credentials::from_record` 读到全空、转发必报缺凭据。
+        // 与 ZCode 那支同一形态（本家才注入，别家逐字不变）；空值不写。
+        if record.provider() == crate::server::core::account_store::OFFICEACE_PROVIDER_ID {
+            if let Some(object) = session.as_object_mut() {
+                for key in [
+                    "baseUrl",
+                    "modelAppKey",
+                    "modelAppSecret",
+                    "accessKeyId",
+                    "secretAccessKey",
+                    "securityToken",
+                    "projectId",
+                ] {
+                    let value = record.get(key).and_then(Value::as_str).unwrap_or("");
+                    if !value.trim().is_empty() {
+                        object.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                }
+                if let Some(expires_at) = record
+                    .get("expiresAt")
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value > 0)
+                {
+                    object.insert("expiresAt".to_string(), Value::from(expires_at));
+                }
             }
         }
         session

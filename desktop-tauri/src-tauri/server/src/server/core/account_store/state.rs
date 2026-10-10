@@ -454,9 +454,14 @@ impl StoredAccount {
     /// 不是缺陷而是**这条账号的正常形态**。判据必须**显式**落在记录上 ——
     /// 只看「apiKey 为空」会把用户忘了填 key 的记录一起放行，表现成一条
     /// 看不懂的上游 401（见 [`Self::no_auth`]）。
+    ///
+    /// 第六条判据 `has_officeace_key()` 只对 OfficeAce 有效（`modelAppKey` /
+    /// `modelAppSecret` 是它独有的凭证键）：那家不用 Bearer token，转发凭证是
+    /// 一对网关 Basic key，漏了这一条它整家都会被静默过滤掉（见
+    /// [`Self::has_officeace_key`]）。
     pub fn has_credentials(&self) -> bool {
         self.has_token() || self.is_desktop() || self.has_api_key() || self.has_jwt()
-            || self.no_auth()
+            || self.no_auth() || self.has_officeace_key()
     }
 
     /// 记录是否**显式声明「该上游无需鉴权」**（自定义账号的 `noAuth: true`）。
@@ -483,6 +488,28 @@ impl StoredAccount {
             .get("apiKey")
             .and_then(Value::as_str)
             .is_some_and(|key| !key.trim().is_empty())
+    }
+
+    /// 记录里是否有 OfficeAce 的**网关凭据**（`modelAppKey` + `modelAppSecret`）。
+    ///
+    /// ── 为什么要有这一支 ────────────────────────────────────────
+    /// OfficeAce 的转发凭证是**一对**（`Bearer`/`accessToken` 那套它不用）：
+    /// 网关 Basic 的 `modelAppKey` : `modelAppSecret`。没有这一支时
+    /// `has_credentials()` 对它恒假 ⇒ 账号在 `accounts_for_provider` /
+    /// `current_entry_for_provider` / `get_session_by_id` 三处全被过滤掉，
+    /// 表现为「账号导入成功、目录也拉到了，但 `/v1/models` 里这条家一个模型都
+    /// 没有、点名转发报没有可用账号」——把一整家静默吞掉。
+    ///
+    /// 两个 key 都要非空才算：只填一个的凭据转发必然 401，把它算作「有凭证」
+    /// 只会让失败推迟到上游（与 `has_api_key` 的取舍同一条）。
+    pub fn has_officeace_key(&self) -> bool {
+        let non_empty = |key: &str| {
+            self.fields
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        };
+        non_empty("modelAppKey") && non_empty("modelAppSecret")
     }
 
     /// 小浣熊账号的用户 ID（`userId`；workbuddy 侧对应 `uid`）
@@ -674,5 +701,34 @@ mod tests {
         let mut record = Map::new();
         mark_name_custom(&mut record, false, Some(&existing));
         assert_eq!(record.get("nameCustom"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn officeace_gateway_pair_counts_as_credentials() {
+        // 一对齐备的网关 Basic 凭据 ⇒ 有凭证（否则整家会被静默过滤掉）
+        let mut fields = Map::new();
+        fields.insert("modelAppKey".to_string(), Value::String("K".to_string()));
+        fields.insert("modelAppSecret".to_string(), Value::String("S".to_string()));
+        let record = StoredAccount::from_map(fields);
+        assert!(record.has_officeace_key());
+        assert!(record.has_credentials());
+
+        // 只填一个：不算有凭证（转发必然 401，别把失败推到上游）
+        let mut only_key = Map::new();
+        only_key.insert("modelAppKey".to_string(), Value::String("K".to_string()));
+        assert!(!StoredAccount::from_map(only_key).has_officeace_key());
+
+        // 空串 / 全空白同样不算
+        let mut blank = Map::new();
+        blank.insert("modelAppKey".to_string(), Value::String("K".to_string()));
+        blank.insert("modelAppSecret".to_string(), Value::String("  ".to_string()));
+        assert!(!StoredAccount::from_map(blank).has_officeace_key());
+
+        // 别家的记录不受影响：只有 accessToken 的记录仍是「有凭证」
+        let mut plain = Map::new();
+        plain.insert("accessToken".to_string(), Value::String("T".to_string()));
+        let plain = StoredAccount::from_map(plain);
+        assert!(plain.has_credentials());
+        assert!(!plain.has_officeace_key(), "别家不该被判成有 OfficeAce 凭据");
     }
 }
