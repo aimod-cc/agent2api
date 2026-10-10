@@ -143,6 +143,13 @@ pub struct RuntimeConfig {
     /// 生效，不重启进程），解析一次存下来最省事。默认 `false`，见 `KEY_CORS_ENABLED`。
     /// 只作用于网关面，面板路由不受它影响。
     cors_enabled: bool,
+    /// 「丢弃保活换行分片」开关（`/api/keepalive-strip`，默认关）。
+    ///
+    /// 与 `sanitize_fingerprints` 同一理由：装配下发策略时每轮都要问一次，
+    /// 解析一次存下来最省事。**它不替代能力位**：真正丢不漏是
+    /// 「适配器声明 × 本开关」两者相与（见
+    /// [`crate::server::core::upstream::sse::FramePolicy::assembled`]）。
+    strip_newline_keepalive: bool,
     /// 面板机器人校验开关（设置页「通用 → 机器人校验」，ALTCHA proof-of-work）。
     ///
     /// 与 `debug_mode` 同一理由：登录 / 注册端点逐请求判一次（改完开关下一个
@@ -212,6 +219,11 @@ impl RuntimeConfig {
     /// 网关面（`/v1/*`）跨域访问是否开启（CORS 中间件逐请求判一次，见字段说明）
     pub fn cors_enabled(&self) -> bool {
         self.cors_enabled
+    }
+
+    /// 「丢弃保活换行分片」开关（与能力位相与后才生效，见字段说明）
+    pub fn strip_newline_keepalive(&self) -> bool {
+        self.strip_newline_keepalive
     }
 
     /// 面板机器人校验开关（登录 / 注册端点逐请求判一次）。
@@ -437,6 +449,15 @@ fn build(raw: Map<String, Value>) -> RuntimeConfig {
             .get(KEY_CORS_ENABLED)
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        // 只有字面 `true` 算开启：**默认关**。与 debug_mode 同一取向（两者的
+        // 代价都是「多做了一件界面没说清的事」），而与 sanitize_fingerprints
+        // 相反（那个默认关会让新用户一上来就撞 400）。这里默认关的理由见
+        // KEY_STRIP_NEWLINE_KEEPALIVE 的文档：它会吃掉「单独成片的真换行」。
+        // 配置项缺失时环境变量兜底（Docker 部署第一次启动就能开）。
+        strip_newline_keepalive: raw
+            .get(KEY_STRIP_NEWLINE_KEEPALIVE)
+            .and_then(Value::as_bool)
+            .unwrap_or_else(env_strip_newline_keepalive),
         // 只有字面 `false` 算关闭：**默认开**。登录 / 注册的暴破与抢注防护
         // 宁可多一道不可少一道（见 KEY_CAPTCHA_ENABLED 的说明）。配置项缺失
         // 时环境变量兜底：登录页人机验证组件环境变量，默认为1开启，0为关闭
@@ -858,6 +879,23 @@ pub fn gateway_prompt_text(
         }
     }
     None
+}
+
+/// 只取「丢弃保活换行分片」开关的轻量读取（**不克隆整份 raw**）。
+///
+/// 与 `retention_settings()` 同一取舍：它在**每次装配下发策略**时读
+/// （`upstream::provider_loop::frame_policy_of`，流式与非流式各一处），而
+/// `current()` 每调一次就克隆整个 `raw` Map —— 热路径上没必要。
+/// 未初始化（启动极早期 / 单元测试里没装配过配置）时退回环境变量，与 `current()`
+/// 在同样情形下 `build(空)` 的口径一致；两边都是**默认关**：没有明确开启
+/// 就不改写别人的字节。
+pub fn strip_newline_keepalive() -> bool {
+    if let Ok(guard) = CONFIG.read() {
+        if let Some(config) = guard.as_ref() {
+            return config.strip_newline_keepalive;
+        }
+    }
+    env_strip_newline_keepalive()
 }
 
 /// 只取定时任务设置的轻量读取（**不克隆整份 raw**）。
@@ -1323,6 +1361,23 @@ pub fn set_cors_enabled(enabled: bool) -> bool {
             .raw
             .insert(KEY_CORS_ENABLED.to_string(), Value::Bool(enabled));
         config.cors_enabled = enabled;
+    })
+}
+
+// ─── 保活换行丢弃（stripNewlineKeepalive）───────────────────
+
+/// 写入「丢弃保活换行分片」开关。
+///
+/// 与 `set_sanitize_fingerprints` 同一模式：内存快照立即生效（下一个请求的
+/// 策略装配就用新值），raw 底稿一起改保证写盘不吃掉其它键。开与关都记一条
+/// 事件日志（见调用点）—— 开的那一刻起，下发帧不再是上游原样的字节，
+/// 这件事必须在日志里查得到。
+pub fn set_strip_newline_keepalive(enabled: bool) -> bool {
+    update(|config| {
+        config
+            .raw
+            .insert(KEY_STRIP_NEWLINE_KEEPALIVE.to_string(), Value::Bool(enabled));
+        config.strip_newline_keepalive = enabled;
     })
 }
 

@@ -463,6 +463,16 @@ pub fn panel_router(state: ServerState) -> Router {
             "/api/cors",
             get(api::cors::get_cors).put(api::cors::put_cors),
         )
+        // ── 保活换行丢弃开关 ──
+        // 与 /api/sanitize、/api/debug 同形的单开关端点（GET 读 / PUT 写），挂
+        // protected：它决定「声明了该能力位的提供商」的下发帧要不要丢掉只含换行
+        // 的 content 分片 —— 改的是客户端看到的字节，敏感度与那两者同级。
+        // 默认关（见 config::KEY_STRIP_NEWLINE_KEEPALIVE 的取舍说明）；在线可切是
+        // 为了让「在真流量上验一次、不对立刻撤回」不需要重新构建镜像。
+        .route(
+            "/api/keepalive-strip",
+            get(api::keepalive::get_keepalive_strip).put(api::keepalive::put_keepalive_strip),
+        )
         // ── 机器人校验开关 ──
         // 与 /api/sanitize 同形的单开关端点（GET 读 / PUT 写），挂 protected：
         // 它决定登录 / 注册是否要求 ALTCHA proof-of-work，敏感度同级。
