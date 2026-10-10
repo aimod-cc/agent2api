@@ -43,7 +43,6 @@ const HEADER_XSDK_DATE: &str = "X-Sdk-Date";
 const HEADER_SECURITY_TOKEN: &str = "X-Security-Token";
 const HEADER_PROJECT_ID: &str = "X-Project-ID";
 const HEADER_AUTHORIZATION: &str = "Authorization";
-const HEADER_CONTENT_TYPE: &str = "Content-Type";
 
 /// `sha256("")`，无体请求固定签这个。
 const EMPTY_BODY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -460,6 +459,9 @@ mod tests {
         let text = include_str!("signer_vectors.json");
         serde_json::from_str(text).expect("夹具是合法 JSON")
     }
+
+    /// `Content-Type` 头名（只在测试里用来把夹具声明的 content_type 加进头集合）。
+    const HEADER_CONTENT_TYPE: &str = "Content-Type";
 
     fn credential_of(fixture: &Value) -> Credential {
         let shape = &fixture["credential"];

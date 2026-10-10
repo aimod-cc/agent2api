@@ -134,22 +134,17 @@ impl ProviderAdapter for OfficeAceAdapter {
         true
     }
 
-    /// 支持续期：控制面临时凭据 2 小时到期，靠 refresh_token + DPoP 续
-    /// （见 `credentials` 与后续的 `oauth` 模块）。**未登录/只导入 Basic 时
-    /// 没有可续的东西** —— 那不属于故障，网关凭据不过期。
+    /// **暂不支持续期**（false）：控制面临时凭据 2 小时到期后，续期要靠
+    /// refresh_token + DPoP 重打令牌端点 —— 那条链还没实现（与签到/额度一起
+    /// 后置）。在它落地之前声明 true 是有害的：定时维护会每轮去撞一条必失败
+    /// 的路（`ensure_access_token` 如实报错），日志里多出一片假故障。
+    /// 转发不受影响：网关 Basic 凭据**不过期**。
     fn supports_refresh(&self) -> bool {
-        true
+        false
     }
 
-    /// 控制面凭据临期的账号要进定时维护（与 `supports_refresh` 配对，
-    /// 漏写这一位会让这家每轮静默跳过）。
-    fn credentials_expiring(&self, store: &AccountStore, account_id: &str) -> bool {
-        let Some(record) = store.officeace_account_record(account_id) else {
-            return false;
-        };
-        match credentials::from_record(Some(&record)) {
-            Ok(credential) => credential.has_control_plane() && credential.control_plane_expiring(),
-            Err(_) => false,
-        }
+    /// 与 `supports_refresh` 配对（临期判定只在支持续期时才有意义）。
+    fn credentials_expiring(&self, _store: &AccountStore, _account_id: &str) -> bool {
+        false
     }
 }

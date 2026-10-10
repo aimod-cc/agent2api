@@ -24,4 +24,5 @@ pub mod adapter;
 pub mod chat;
 pub mod credentials;
 pub mod models;
+pub mod oauth;
 pub mod signer;
