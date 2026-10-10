@@ -26,6 +26,7 @@ pub mod session;
 pub mod signer;
 pub mod size_gate;
 pub mod stream_fault;
+pub mod tool_names;
 
 use std::pin::Pin;
 
@@ -233,7 +234,7 @@ impl ProviderAdapter for CodeArtsAdapter {
                 chat_session_id: Some(session_id),
                 ..Default::default()
             };
-            let (url, headers, payload) = {
+            let (url, headers, payload, restorer) = {
                 // 客户端额度太小、而这个模型一定先思考时，抬到 +预留（实测形状与
                 // 三条边界见 `chat::reserve_for_thinking`）：不抬的话上游会把额度全
                 // 花在 reasoning 上，客户端收到一次"成功的空回答"。
@@ -253,6 +254,9 @@ impl ProviderAdapter for CodeArtsAdapter {
                         ),
                     );
                 }
+                // 函数名超上限的那道改写也必须发生在签名之前：改名动了 `tools`，
+                // 而签名覆盖的就是出门那串字节（判据与还原的口径见 `tool_names`）
+                let restorer = tool_names::shorten(&mut outbound);
                 match chat::build_upstream_request(
                     models::DEFAULT_BASE_URL,
                     &upstream_model,
@@ -262,7 +266,7 @@ impl ProviderAdapter for CodeArtsAdapter {
                     &profile,
                     Some(&credential),
                 ) {
-                    Ok(built) => built,
+                    Ok((url, headers, payload)) => (url, headers, payload, restorer),
                     Err(error) => {
                         session.stop().await;
                         drop(permit);
@@ -365,7 +369,11 @@ impl ProviderAdapter for CodeArtsAdapter {
                     chat::size_rejection_any(0, &String::from_utf8_lossy(&all), wire_bytes),
                     wire_bytes,
                 );
-                let completion = chat::aggregate_sse(&all, &upstream_model)?;
+                let mut completion = chat::aggregate_sse(&all, &upstream_model)?;
+                if let Some(restorer) = restorer.as_ref() {
+                    // 客户端要认的是它自己那份名字，折叠好的回答里得换回去
+                    restorer.apply_completion(&mut completion);
+                }
                 // 用量旁路记账：聚合体里那份 usage 是上游给的，报一次进请求日志
                 // （流式那份由 `UsageSniffer` 负责，两条路都缺了就又是恒 0）
                 if let Some(usage) = completion.get("usage") {
@@ -379,12 +387,20 @@ impl ProviderAdapter for CodeArtsAdapter {
             // usage 嗅探要活到这个任务里，而本函数是借用签名 —— 克隆一份 Arc
             // （不是所有权转移：编排层那一份还要在收尾时读同一槽位）
             let sniff_telemetry = telemetry.clone();
+            // 改过函数名才需要还原响应里的名字；没改过（绝大多数请求）时这个 fixer
+            // 全程 idle，一个字节都不碰，走的还是下面那条原样透传
+            let mut fixer = tool_names::StreamFixer::new(restorer);
             crate::spawn_task(async move {
                 use futures::StreamExt;
                 let mut sniffer = chat::UsageSniffer::default();
                 if !prefetched.is_empty() {
                     sniffer.feed(&prefetched, &sniff_telemetry);
-                    if sender.send(Ok(bytes::Bytes::from(prefetched))).await.is_err() {
+                    let head = if fixer.idle() {
+                        bytes::Bytes::from(prefetched)
+                    } else {
+                        bytes::Bytes::from(fixer.push(&prefetched).into_owned())
+                    };
+                    if sender.send(Ok(head)).await.is_err() {
                         session.stop().await;
                         return;
                     }
@@ -395,9 +411,22 @@ impl ProviderAdapter for CodeArtsAdapter {
                     if let Ok(bytes) = item.as_ref() {
                         sniffer.feed(bytes, &sniff_telemetry);
                     }
-                    if sender.send(item).await.is_err() {
+                    let to_send = if fixer.idle() {
+                        item
+                    } else {
+                        match item {
+                            Ok(bytes) => Ok(bytes::Bytes::from(fixer.push(&bytes).into_owned())),
+                            Err(error) => Err(error),
+                        }
+                    };
+                    if sender.send(to_send).await.is_err() {
                         break;
                     }
+                }
+                // 流结束时把成帧缓冲里剩下的一段交出去（半条事件还原不了也照原样放行）
+                let tail = fixer.finish();
+                if !tail.is_empty() {
+                    let _ = sender.send(Ok(bytes::Bytes::from(tail))).await;
                 }
                 sniffer.finish(&sniff_telemetry);
                 // 客户端断开也会走到这里：idle 必须发，否则上游槽位悬着
