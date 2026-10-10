@@ -657,6 +657,16 @@ fn allowed_hosts(provider: &str) -> Option<&'static [&'static str]> {
         "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
         | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
         | "kuku" | "antigravity" => None,
+        //
+        // OfficeAce 同样不设限：授权页在 `auth.huaweicloud.com`，它会按用户选的
+        // 登录方式继续跳华为云账号 / 扫码等不可穷举的主机（与 CodeArts 同一情形）。
+        // **不用回本机** —— 授权码由网关**轮询云端**取回（`/v1/claw/auth/code`，
+        // 见 `providers::officeace::oauth` 的模块头），所以这里没有 CodeArts 那种
+        // loopback 回调要放行；但「不设限」仍是必须显式写出的选择（落进默认分支
+        // 会拿到 WorkBuddy 的白名单 → 窗口白屏）。
+        "catpaw" | "qoder" | "qoder-intl" | "cline-free" | "cline-pass" | "autoclaw"
+        | "autoclaw-intl" | "accio" | "accio-cn" | "zcode" | "zcode-intl" | "codearts" | "trae"
+        | "kuku" | "antigravity" | "officeace" => None,
         // WorkBuddy 的两个地区共用这一张表（表里 `workbuddy.ai` 那一行就是国际站
         // 的登录域）。**显式列出**而不是靠下面的默认分支：上面那条警告要求
         // 「新 provider 落到默认分支」必须是有意的选择，写出来才看得出是选过的
@@ -859,6 +869,11 @@ fn normalize_provider(provider: &str) -> Result<&'static str, String> {
         // （`POST /api/session/login/kuku/complete`，见 `run_embedded` 的
         // 等待循环与 `submit_kuku_login`）。
         "kuku" => Ok("kuku"),
+        // OfficeAce（华为云果办 / OfficeClaw）：授权地址由**后端适配器**现拼
+        // （先向云端要 state，见 `providers::officeace::oauth`），壳侧只负责开窗口
+        // 与轮询 —— 与 ZCode / CodeArts 同一条路。它的授权码由网关**轮询云端**
+        // 取回（云端回调页不往本机跳），所以窗口最后停在云端页上也不影响登录判定。
+        "officeace" => Ok("officeace"),
         other => Err(format!("不支持网页登录的提供商：{other}")),
     }
 }
@@ -1169,15 +1184,18 @@ pub async fn start(
         // Antigravity（Google 的 AI IDE）只有一家，没有地区之分
         // （本仓 `providers::antigravity` 的模块头：端点全球统一）
         "antigravity" => "Antigravity",
+        // OfficeAce 只有一家（自助 OAuth 一条链，没有地区/版本概念），品牌名里
+        // 不需要地区
+        "officeace" => "OfficeAce 果办",
         _ => "WorkBuddy",
     };
-    // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae 的单一家
-    // 都已经在品牌名里，不再拼 edition 后缀（否则会出现「登录 Cline Free 国内版
-    // 账号」「登录 ZCode 国内版 国内版账号」这种说不通的标题）
+    // 窗口标题：Cline 两家的池、ZCode 两家的地区、CodeArts / Trae / OfficeAce
+    // 的单一家都已经在品牌名里，不再拼 edition 后缀（否则会出现「登录 Cline Free
+    // 国内版账号」这种说不通的标题）
     let title = if matches!(
         provider,
         "cline-free" | "cline-pass" | "zcode" | "zcode-intl" | "codearts" | "trae" | "qoder"
-        | "qoder-intl" | "antigravity"
+        | "qoder-intl" | "antigravity" | "officeace"
     ) {
         format!("登录 {provider_label} 账号")
     } else {

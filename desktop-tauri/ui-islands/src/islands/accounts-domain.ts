@@ -167,6 +167,18 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   // `expiry: ''` —— BDUSS 没有过期时间字段（无刷新接口，过期只能重登，
   //   这一列对它是空，界面不渲染「有效期」）。
   kuku: { usage: true, edition: false, identifier: 'uid', expiry: '' },
+  // OfficeAce（华为云果办 / OfficeClaw）。各位各有出处：
+  // `usage: false` —— 额度/积分接口要用**控制面签名**（V11-HMAC-SHA256 打
+  //   `/v1/subscription`），那条链与签到一起后置，还没实现 ⇒ 不显示余额按钮
+  //   （登记 true 会让面板去问一个还没接的端点，一片红）。
+  // `edition: false` —— 单一入口（自助 OAuth 浏览器登录 / 粘贴网关 Basic 凭据），
+  //   没有国际版。
+  // `expiry: 'expiresAt'` —— 控制面临时凭据约 2 小时到期；只导入网关 Basic
+  //   凭据时没有这个字段，界面不渲染「有效期」（那一半本来也不过期）。
+  // `identifier: 'id'` —— 账号标识渲染的是**账号 id**（`officeace-<hash>`，
+  //   由网关基址 + app key 派生），不是任何凭据本身：面板上显示 `modelAppKey`
+  //   会把网关 key 露在界面上（`identifierOf` 读的是字段**值**，不只是标签）。
+  officeace: { usage: false, edition: false, identifier: 'id', expiry: 'expiresAt' },
 }
 
 /**
