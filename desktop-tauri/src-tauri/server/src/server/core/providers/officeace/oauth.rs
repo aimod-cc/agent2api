@@ -87,6 +87,10 @@ pub struct GatewayCredential {
     /// 上游账号 id（`client-permission-validate` 的 `account_id`）。
     /// 显示名取不到时拿它当兜底名字，好把多个账号区分开。
     pub account_id: String,
+    /// IAM **用户级** id（`id_token` 的 `user_profile.principal_id`，取不到退
+    /// `validate` 的 `principal_id`）。多账号兜底时它比 `account_id` 更细：
+    /// 同一个华为云账号下的不同 IAM 用户共用 `account_id`，而 principal 各不同。
+    pub principal_id: String,
     /// 一次性 refresh token（换新的临时 AK/SK 用；上游每轮轮换）。
     /// 落盘后 `hasRefreshToken` 为真 ⇒ 面板出现「刷新 Token」按钮，且续期链可用。
     pub refresh_token: String,
@@ -244,19 +248,27 @@ impl LoginFlow {
 
     /// ⑤⑥⑦：拿授权码换临时凭据，再用它换网关 Basic 那对。
     pub async fn finish(&self, code: &str) -> Result<GatewayCredential, String> {
-        let (temporary, expires_at, user_name, refresh_token) = self.exchange_code(code).await?;
+        let (temporary, expires_at, identity, refresh_token) = self.exchange_code(code).await?;
         let gateway = self.fetch_gateway_credential(&temporary).await?;
+        // principal id 两个来源：`id_token` 的 `user_profile` 优先（它就在身份本身里），
+        // 没有就退 `client-permission-validate` 回的那个
+        let principal_id = if identity.principal_id.is_empty() {
+            gateway.4
+        } else {
+            identity.principal_id
+        };
         Ok(GatewayCredential {
             base_url: gateway.0,
             model_app_key: gateway.1,
             model_app_secret: gateway.2,
             account_id: gateway.3,
+            principal_id,
             access_key_id: temporary.access_key_id,
             secret_access_key: temporary.secret_access_key,
             security_token: temporary.security_token,
             project_id: temporary.project_id,
             expires_at,
-            user_name,
+            user_name: identity.user_name,
             refresh_token,
             // 私钥随登录一并落盘（续期要用它签 DPoP proof；丢了就只能重新登录）
             dpop_key_pair: self.dpop_key_pair.clone(),
@@ -376,8 +388,11 @@ impl LoginFlow {
     /// ⑤ 授权码 → 临时 AK/SK（表单 + `DPoP:` 头，与 CodeArts 同一套；
     /// `send_raw` 只收 JSON 体，所以这里直接用 egress 客户端发表单）。
     ///
-    /// 返回 `(临时凭据, 到期时刻毫秒)`。
-    async fn exchange_code(&self, code: &str) -> Result<(SigningCredential, i64, String, String), String> {
+    /// 返回 `(临时凭据, 到期时刻毫秒, id_token 里的身份信息, refresh token)`。
+    async fn exchange_code(
+        &self,
+        code: &str,
+    ) -> Result<(SigningCredential, i64, TokenIdentity, String), String> {
         let key = DpopKey::from_key_pair(&self.dpop_key_pair)
             .map_err(|error| format!("DPoP 私钥不可用：{error}"))?;
         let proof = key
@@ -434,9 +449,9 @@ impl LoginFlow {
             .and_then(parse_rfc3339_ms)
             .filter(|value| *value > 0)
             .unwrap_or_else(|| logging::now_ms() + 2 * 3600 * 1000);
-        // 用户的显示名从 `id_token`（JWT）的 claims 取（参考实现同源：
-        // `preferred_username || name`）；取不到给空串，落账号时退到种子名。
-        let user_name = id_token_user_name(
+        // 身份信息从 `id_token` 的 claims 取（顶层优先，取不到再解 `user_profile`，
+        // 见 `id_token_identity`）；取不到给空串，落账号时退下一级兜底。
+        let identity = id_token_identity(
             payload
                 .get("id_token")
                 .and_then(Value::as_str)
@@ -465,16 +480,19 @@ impl LoginFlow {
                     .to_string(),
             },
             expires_at,
-            user_name,
+            identity,
             refresh_token,
         ))
     }
 
     /// ⑥ 用临时凭据问云端要网关 Basic 那对（SDK-HMAC-SHA256 签名）。
+    ///
+    /// 返回 `(网关基址, app key, app secret, account_id, principal_id)` ——
+    /// 后两项只用来给账号名兜底。
     async fn fetch_gateway_credential(
         &self,
         temporary: &SigningCredential,
-    ) -> Result<(String, String, String, String), String> {
+    ) -> Result<(String, String, String, String, String), String> {
         let url = format!("{CLOUD_BASE}/v1/claw/client-permission-validate");
         let headers = signer::sign(&signer::SignRequest {
             algorithm: Algorithm::Sdk,
@@ -559,37 +577,121 @@ impl LoginFlow {
             .unwrap_or("")
             .trim()
             .to_string();
-        Ok((base_url, app_key, app_secret, account_id))
+        // 用户级 id（参考实现同源读 `principal_id`）：名字兜底时比 account_id 更细，
+        // 同一华为云账号下的不同 IAM 用户共用 account_id，principal 各不同
+        let principal_id = payload
+            .get("principal_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Ok((base_url, app_key, app_secret, account_id, principal_id))
     }
 }
 
-/// 从 `id_token`（JWT）的 payload 里取用户显示名（`preferred_username` → `name`）。
-///
-/// 参考实现同源（`claims.preferred_username || claims.name`）。取不到（没给
-/// `id_token` / 不是三段 JWT / 解码失败）给空串 —— 调用方退到种子名，不报错。
+/// `id_token` 里取到的身份信息。两项都**可能为空** —— 给不给取决于这个租户的
+/// IAM 形态，取不到不是错误（调用方自己退下一级兜底）。
+#[derive(Clone, Default)]
+pub struct TokenIdentity {
+    pub user_name: String,
+    pub principal_id: String,
+}
+
+/// 显示名（`id_token_identity` 的第一项），续期链只要这一个。
 fn id_token_user_name(id_token: &str) -> String {
+    id_token_identity(id_token).user_name
+}
+
+/// 从 `id_token`（JWT）的 payload 里取显示名与用户级 principal id。
+///
+/// ── 为什么要比参考实现多解一层 ──────────────────────────────
+/// 参考实现只读顶层 `preferred_username || name`（`refresh.mjs` 的 `idTokenClaims`）。
+/// **实测这个租户的 id_token 顶层没有这两个键** —— claims 只有
+/// `client_id / cnf / exp / federation / iat / iss / jti / type / user_profile`，
+/// 身份装在一个 base64 JSON 串里：
+///
+/// ```text
+/// user_profile → { account_id, account_name, principal_id, principal_urn, ... }
+/// ```
+///
+/// 照参考实现只读顶层的结果就是面板上看到的那串十六进制：显示名永远取不到，
+/// 一路退到 `account_id`。所以这里的取法是**顶层优先、内层兜底**：
+/// 顶层有就守既有口径（别家租户形态换了也不用改），没有才解 `user_profile`。
+///
+/// 全程 fail-open：不是三段 JWT / 解不出 base64 / 内层不是 JSON / 字段不是字符串，
+/// 都只当没取到，回空串继续退下一级 —— 名字这条链**没有任何失败面**，
+/// 拿它报错会把一次已经成功的登录记成失败。
+fn id_token_identity(id_token: &str) -> TokenIdentity {
+    let Some(claims) = jwt_claims(id_token) else {
+        return TokenIdentity::default();
+    };
+    let profile = claims
+        .get("user_profile")
+        .and_then(Value::as_str)
+        .and_then(decode_user_profile);
+    let principal_id = profile_text(&profile, "principal_id")
+        .or_else(|| text_of(&claims, "principal_id"))
+        .unwrap_or_default();
+    // 顶层字段优先：上游哪天把名字放回顶层，这里不需要改代码
+    for field in ["preferred_username", "name"] {
+        if let Some(text) = text_of(&claims, field) {
+            return TokenIdentity { user_name: text, principal_id };
+        }
+    }
+    TokenIdentity {
+        user_name: profile_text(&profile, "account_name").unwrap_or_default(),
+        principal_id,
+    }
+}
+
+/// 解 JWT 的 payload 段。**不验签** —— 这里只取显示名，不用于任何鉴权判断。
+fn jwt_claims(id_token: &str) -> Option<Value> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     let mut parts = id_token.split('.');
-    parts.next(); // header（不验签：这里只取显示名，不用于任何鉴权判断）
-    let Some(payload) = parts.next() else {
-        return String::new();
-    };
-    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=').as_bytes()) else {
-        return String::new();
-    };
-    let Ok(claims) = serde_json::from_slice::<Value>(&bytes) else {
-        return String::new();
-    };
-    for field in ["preferred_username", "name"] {
-        if let Some(text) = claims.get(field).and_then(Value::as_str) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
+    parts.next()?; // header
+    let payload = parts.next()?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('=').as_bytes())
+        .ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok()
+}
+
+/// 解 `user_profile`：一段**无填充** base64 的 JSON。两种字母表都试
+/// （URL_SAFE 与 STANDARD），谁先解出合法 JSON 算谁 —— 上游在这里没给口径，
+/// 而这条链的代价是「取不到名字」，不是「取错名字」。
+fn decode_user_profile(text: &str) -> Option<Value> {
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    let body = text.trim().trim_end_matches('=');
+    if body.is_empty() {
+        return None;
+    }
+    for candidate in [
+        URL_SAFE_NO_PAD.decode(body),
+        STANDARD_NO_PAD.decode(body),
+    ] {
+        let Ok(bytes) = candidate else { continue };
+        if let Ok(parsed) = serde_json::from_slice::<Value>(&bytes) {
+            return Some(parsed);
         }
     }
-    String::new()
+    None
+}
+
+/// 从已解开的 `user_profile` 里取一个非空字符串字段。
+fn profile_text(profile: &Option<Value>, field: &str) -> Option<String> {
+    profile.as_ref().and_then(|value| text_of(value, field))
+}
+
+/// 取一个非空的字符串字段（trim 后为空算没有）。
+fn text_of(container: &Value, field: &str) -> Option<String> {
+    container
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 /// 把 RFC3339（`2026-10-10T05:15:00Z`）解析成毫秒时间戳。
@@ -686,5 +788,55 @@ mod tests {
         assert_eq!("", id_token_user_name(""));
         assert_eq!("", id_token_user_name("not.a.jwt"));
         assert_eq!("", id_token_user_name(&token_of(r#"{"sub":"u1"}"#)));
+    }
+
+    /// 实测形态：这个租户的 id_token **顶层没有** `preferred_username`/`name`，
+    /// 身份装在一个 base64 JSON 串（`user_profile`）里。参考实现只读顶层那两个键，
+    /// 所以它接的这条路对我们这个号同样取不到名字 —— 这里多解那一层。
+    /// （夹具形态照真实 claims 的键集：client_id/cnf/exp/federation/iat/iss/jti/type/
+    /// user_profile，值全是合成串，不是真账号数据）
+    #[test]
+    fn identity_reaches_into_the_nested_user_profile() {
+        let profile = base64url(
+            br#"{"account_id":"acc_0123456789abcdef","account_name":"hid_synthetic-1","principal_id":"prin_89abcdef01234567","principal_urn":"iam::acc_0123456789abcdef:user:hid_synthetic-1"}"#,
+        );
+        let claims = format!(
+            r#"{{"client_id":"pdp5_for_agentarts","type":"app","iat":1,"exp":2,"user_profile":"{profile}"}}"#
+        );
+        let identity = id_token_identity(&format!("header.{}.sig", base64url(claims.as_bytes())));
+        assert_eq!("hid_synthetic-1", identity.user_name, "名字在 user_profile.account_name");
+        assert_eq!("prin_89abcdef01234567", identity.principal_id);
+    }
+
+    /// 顶层字段仍然优先（上游哪天把名字放回顶层，不用改代码就回到既有口径）。
+    #[test]
+    fn top_level_claims_still_win_over_the_profile() {
+        let profile = base64url(br#"{"account_name":"from_profile","principal_id":"prin_2"}"#);
+        let claims = format!(r#"{{"preferred_username":"顶层优先","user_profile":"{profile}"}}"#);
+        let identity = id_token_identity(&format!("h.{}.s", base64url(claims.as_bytes())));
+        assert_eq!("顶层优先", identity.user_name);
+        assert_eq!("prin_2", identity.principal_id, "principal 仍从内层取");
+    }
+
+    /// 内层解不开（不是 base64 / 不是 JSON / 字段不是字符串）⇒ 两项都空、不报错：
+    /// 名字这条链没有任何失败面，畸形载荷只当没取到。
+    #[test]
+    fn an_unreadable_profile_yields_no_identity() {
+        let blobs = vec![
+            "!!!not base64!!!".to_string(),
+            base64url(b"plain text, not json"),
+            base64url(br#"{"account_name":123}"#),
+            base64url(br#"{"other":"x"}"#),
+        ];
+        for blob in blobs {
+            let claims = format!(r#"{{"user_profile":"{blob}"}}"#);
+            let identity = id_token_identity(&format!("h.{}.s", base64url(claims.as_bytes())));
+            assert!(
+                identity.user_name.is_empty() && identity.principal_id.is_empty(),
+                "畸形 user_profile 不该产出名字：{blob}"
+            );
+        }
+        let empty = id_token_identity(&format!("h.{}.s", base64url(br#"{"sub":"u1"}"#)));
+        assert!(empty.user_name.is_empty() && empty.principal_id.is_empty());
     }
 }
