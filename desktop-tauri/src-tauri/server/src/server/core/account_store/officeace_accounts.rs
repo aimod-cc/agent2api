@@ -56,6 +56,12 @@ fn pick(payload: &Value, keys: &[&str]) -> String {
     String::new()
 }
 
+/// 像上游标识、不像人起的名字：整串 32 位十六进制（华为云 `account_id` 的实测形态）。
+/// 名字自愈用它判断「这占位名不是用户打的」（见 [`AccountStore::heal_officeace_display_name`]）。
+fn looks_like_upstream_identifier(name: &str) -> bool {
+    name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 /// FNV-1a 64 位（`&str` → 16 位 hex，取前 12 位）。
 fn short_hash(input: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -184,6 +190,48 @@ impl AccountStore {
         Ok(())
     }
 
+    /// 用上游给的显示名**自愈**账号名（续期链每轮调一次，见 `officeace::refresh_control_plane`）。
+    /// 回 `true` = 真的改了名。前提是新名非空；改写条件二选一：
+    ///   - 现名不是用户在面板打的（`nameCustom` 不为真）—— 那它就是登录时派生出来的占位名，
+    ///     上游后来给了真显示名当然该换；
+    ///   - 或现名长得像上游标识（32 位十六进制）—— 这是给**存量**记录留的出路：登录路径曾把
+    ///     `account_id` 当名字落库并顺手标了 custom（现在不标了，见 `name_custom`）。
+    ///     一串十六进制不会是用户自己起的名字，覆盖它不算越过用户意图。
+    ///
+    /// 命中时把 `nameCustom` 落回 false：这条名字来自上游，下一轮显示名再变还要能接着改。
+    pub fn heal_officeace_display_name(
+        &self,
+        account_id: &str,
+        display_name: &str,
+    ) -> Result<bool, AccountStoreError> {
+        let display_name = display_name.trim();
+        if display_name.is_empty() {
+            return Ok(false);
+        }
+        let guard = self.guard();
+        let Some(mut record) = self
+            .record_by_id(&guard, account_id)
+            .filter(|record| record.provider() == OFFICEACE_PROVIDER_ID)
+        else {
+            // 账号不在了不算错误（可能刚被删）—— 续期链上只是没东西可自愈
+            return Ok(false);
+        };
+        let current = record.name();
+        let custom = record
+            .get("nameCustom")
+            .is_some_and(|value| matches!(value, Value::Bool(true)));
+        let next = truncate_chars(display_name, MAX_NAME_LENGTH);
+        if next == current || (custom && !looks_like_upstream_identifier(&current)) {
+            return Ok(false);
+        }
+        let fields = record.fields_mut();
+        fields.insert("name".to_string(), Value::String(next));
+        fields.insert("nameCustom".to_string(), Value::Bool(false));
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
+        Ok(true)
+    }
+
     /// 添加/更新一个 OfficeAce 账号（手工导入与自助 OAuth 共用）。
     ///
     /// payload：
@@ -192,10 +240,16 @@ impl AccountStore {
     ///   - `accessKeyId` / `secretAccessKey` / `securityToken` / `projectId`：控制面临时
     ///     凭据（可选，自助 OAuth 会给；没给就沿用既有记录的值，不把 OAuth 换来的抹掉）；
     ///   - `expiresAt`：控制面凭据到期时刻（毫秒，可选）。
+    ///
+    /// `name` 的两种来路要分清（`name_custom`）：`true` = 用户在面板自己打的（粘贴导入
+    /// 那一路），落库标 `nameCustom`，此后重登与续期都不许覆盖；`false` = 登录路径的
+    /// **派生名**（上游显示名 → `account_id` → 派生 hash），它只是让多账号暂时分得开，
+    /// 上游哪天给了真显示名应由续期链换回来（见 [`Self::heal_officeace_display_name`]）。
     pub fn add_officeace_account(
         &self,
         payload: &Value,
         name: Option<&str>,
+        name_custom: bool,
     ) -> Result<Value, AccountStoreError> {
         let Some(object) = payload.as_object() else {
             return Err(AccountStoreError::new("上传内容必须是 JSON 对象", 400));
@@ -244,14 +298,25 @@ impl AccountStore {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(|value| truncate_chars(value, MAX_NAME_LENGTH));
-        let record_name = explicit_name
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .map(StoredAccount::name)
-                    .filter(|value| !value.is_empty())
-            })
-            .unwrap_or_else(|| "OfficeAce 果办".to_string());
+        // 派生名（登录那一路，`name_custom=false`）不许冲掉用户自己改过的名字 ——
+        // 参考实现的 label 优先级就是「用户标签 → 上游显示名 → id」，用户标签永久赢。
+        let existing_name = || {
+            existing
+                .as_ref()
+                .map(StoredAccount::name)
+                .filter(|value| !value.is_empty())
+        };
+        let carried_custom = existing
+            .as_ref()
+            .and_then(|record| record.get("nameCustom"))
+            .is_some_and(|value| matches!(value, Value::Bool(true)));
+        let record_name = if carried_custom && !name_custom {
+            existing_name().unwrap_or_else(|| "OfficeAce 果办".to_string())
+        } else {
+            explicit_name
+                .or_else(existing_name)
+                .unwrap_or_else(|| "OfficeAce 果办".to_string())
+        };
         let priority = match existing.as_ref() {
             Some(record) => record.priority(),
             None => {
@@ -270,7 +335,7 @@ impl AccountStore {
         record.insert("name".to_string(), Value::String(record_name.clone()));
         mark_name_custom(
             &mut record,
-            name.is_some_and(|value| !value.trim().is_empty()),
+            name_custom && name.is_some_and(|value| !value.trim().is_empty()),
             existing.as_ref(),
         );
         record.insert("baseUrl".to_string(), Value::String(base_url));
@@ -410,5 +475,138 @@ mod tests {
         assert_eq!(12, hash.len());
         // 已知的 FNV-1a 64 向量："hello" → 0xa430d84680aabd0b
         assert_eq!("a430d84680aa", hash);
+    }
+
+    #[test]
+    fn the_identifier_look_only_matches_a_bare_hex_account_id() {
+        assert!(looks_like_upstream_identifier("0123456789abcdef0123456789abcdef"));
+        assert!(!looks_like_upstream_identifier("我的果办号"));
+        assert!(!looks_like_upstream_identifier("OfficeAce 果办"));
+        // 短一位/长一位都不算：只有上游那串 32 位形态才当它是标识
+        assert!(!looks_like_upstream_identifier("0123456789abcdef0123456789abcde"));
+        assert!(!looks_like_upstream_identifier("0123456789abcdef0123456789abcdef0"));
+    }
+
+    /// 临时库 + 目录守卫：删除挂在 Drop 上（"打开前先删"只保证不复用、不保证不留垃圾，
+    /// 目录名带 pid 与序号时上一轮的永远删不到）。
+    struct TempStore {
+        store: AccountStore,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn temp_store(tag: &str) -> TempStore {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "officeace-name-{tag}-{}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = crate::server::db::Db::open(&dir.join("agent2api.db")).expect("临时库该建得起来");
+        TempStore { store: AccountStore::with_db(Some(db)), dir }
+    }
+
+    /// 落一个 OfficeAce 账号（`name_custom` 区分面板打的与登录派生的），回它的 id。
+    fn add_account(store: &AccountStore, key: &str, name: &str, custom: bool) -> String {
+        use serde_json::json;
+        let payload = json!({
+            "baseUrl": "https://gw.example.com/v2",
+            "modelAppKey": key,
+            "modelAppSecret": "SK",
+        });
+        let account = store
+            .add_officeace_account(&payload, Some(name), custom)
+            .expect("导入应当成功");
+        account["id"].as_str().unwrap_or("").to_string()
+    }
+
+    const HEX_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn a_panel_name_is_custom_but_a_login_name_is_not() {
+        let temp = temp_store("flag");
+        let panel = add_account(&temp.store, "K_PANEL", "我的果办号", true);
+        let login = add_account(&temp.store, "K_LOGIN", HEX_ID, false);
+        let record = temp.store.officeace_account_record(&panel).expect("面板那一条");
+        assert_eq!(
+            Some(&Value::Bool(true)),
+            record.get("nameCustom"),
+            "用户在面板打的名字要标 custom"
+        );
+        let record = temp.store.officeace_account_record(&login).expect("登录那一条");
+        assert_ne!(
+            Some(&Value::Bool(true)),
+            record.get("nameCustom"),
+            "登录带来的派生名不该标 custom —— 标了就永远锁死在十六进制上"
+        );
+    }
+
+    #[test]
+    fn a_relogin_does_not_overwrite_a_renamed_account() {
+        use serde_json::json;
+        let temp = temp_store("relogin");
+        let id = add_account(&temp.store, "K_SAME", "我的果办号", true);
+        // 重登同一套凭据、带着派生名回来：不许冲掉用户改过的名字
+        let payload = json!({
+            "baseUrl": "https://gw.example.com/v2",
+            "modelAppKey": "K_SAME",
+            "modelAppSecret": "SK",
+        });
+        temp.store
+            .add_officeace_account(&payload, Some(HEX_ID), false)
+            .expect("重登该就地更新同一条");
+        let record = temp.store.officeace_account_record(&id).expect("账号还在");
+        assert_eq!("我的果办号", record["name"].as_str().unwrap());
+    }
+
+    #[test]
+    fn the_upstream_display_name_heals_a_derived_name_and_keeps_it_healable() {
+        let temp = temp_store("heal");
+        let id = add_account(&temp.store, "K_HEAL", HEX_ID, false);
+        assert!(
+            temp.store
+                .heal_officeace_display_name(&id, "zhang-san")
+                .expect("改名不该失败"),
+            "派生名该被上游显示名换掉"
+        );
+        let record = temp.store.officeace_account_record(&id).expect("账号还在");
+        assert_eq!("zhang-san", record["name"].as_str().unwrap());
+        assert_ne!(
+            Some(&Value::Bool(true)),
+            record.get("nameCustom"),
+            "自愈回来的名字仍属上游，下一轮显示名再变还要能接着改"
+        );
+    }
+
+    #[test]
+    fn a_users_own_name_is_never_healed_but_a_stuck_hex_one_is() {
+        let temp = temp_store("custom");
+        // 存量记录的形态：登录曾把 account_id 落成名字、还标了 custom
+        let stuck = add_account(&temp.store, "K_STUCK", HEX_ID, true);
+        assert!(
+            temp.store
+                .heal_officeace_display_name(&stuck, "zhang-san")
+                .expect("改名不该失败"),
+            "一串十六进制不会是用户起的名字，允许自愈"
+        );
+        // 用户自己打的名字：永远不动
+        let mine = add_account(&temp.store, "K_MINE", "我的果办号", true);
+        assert!(
+            !temp
+                .store
+                .heal_officeace_display_name(&mine, "zhang-san")
+                .expect("改名不该失败"),
+            "用户改过的名不能被上游冲掉"
+        );
+        let record = temp.store.officeace_account_record(&mine).expect("账号还在");
+        assert_eq!("我的果办号", record["name"].as_str().unwrap());
+        // 上游没给显示名：一个字都不动，也不算错误
+        assert!(!temp.store.heal_officeace_display_name(&mine, "").expect("空名不该失败"));
     }
 }

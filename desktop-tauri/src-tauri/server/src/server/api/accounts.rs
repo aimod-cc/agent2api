@@ -763,7 +763,8 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         // **不调上游**（与 CodeArts 同口径）——凭据是导入/登录换来的，添加时
         // 没有可交换的授权码；目录与连通性由刷新链路验。
         Some(crate::server::core::providers::ProviderKind::OfficeAce) => {
-            store.add_officeace_account(&payload, import_name)
+            // 面板传来的名字是用户自己打的 ⇒ 标 custom（此后续期/重登不改它）
+            store.add_officeace_account(&payload, import_name, true)
         }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的

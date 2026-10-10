@@ -138,13 +138,16 @@ impl LoginService {
             // 账号名：优先上游显示名（`id_token` 的 `preferred_username`/`name`）→
             // 上游账号 id → 派生 id 的前 8 位。**不再退到种子名「OfficeAce 果办」** ——
             // 多个账号会同名而分不出来（实测就是这么被报的）。
+            // 这一整串都是**派生**的，不是用户打的 ⇒ `name_custom=false`：
+            // 上游当时不给显示名（实测就不给），名字得留给续期链自愈
+            // （`refresh_control_plane` 每轮从新 `id_token` 再取一次）。
             let account_name = first_non_empty(&[
                 credential.user_name.as_str(),
                 credential.account_id.as_str(),
                 &account_id_for_name(&credential.base_url, &credential.model_app_key),
             ]);
             let account_name = account_name.as_deref();
-            match self.store.add_officeace_account(&payload, account_name) {
+            match self.store.add_officeace_account(&payload, account_name, false) {
                 Ok(account) => {
                     task.session = Some(json!({
                         "accountUid": account.get("id"),

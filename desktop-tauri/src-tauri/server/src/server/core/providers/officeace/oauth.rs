@@ -270,11 +270,12 @@ impl LoginFlow {
     /// 新的必须落盘（旧的重放会得到 `STS5.1806 the refresh token has been used`）。
     ///
     /// `dpop_key_pair` 必须是**当初登录那把**（proof 的 `jwk` 头要与授权时一致）。
-    /// 返回 `(新临时凭据, 到期毫秒, 轮换后的 refresh_token)`。
+    /// 返回 `(新临时凭据, 到期毫秒, id_token 里的显示名, 轮换后的 refresh_token)` ——
+    /// 显示名与 `exchange_code` 同一位置、同一口径（参考实现每次续期都重取它）。
     pub async fn refresh(
         dpop_key_pair: &DpopKeyPair,
         refresh_token: &str,
-    ) -> Result<(SigningCredential, i64, String), String> {
+    ) -> Result<(SigningCredential, i64, String, String), String> {
         if refresh_token.trim().is_empty() {
             return Err("OfficeAce 账号没有 refresh token，只能重新登录授权".to_string());
         }
@@ -331,6 +332,13 @@ impl LoginFlow {
         if access_key_id.is_empty() || secret_access_key.is_empty() {
             return Err("续期响应没有新的 AK/SK".to_string());
         }
+        // 显示名也从这一轮的 `id_token` 重取（参考实现同源：`refresh.mjs` 每次续期都
+        // 解一遍 claims，`accounts.mjs` 的 label 优先级是「用户标签 → 上游显示名 → id」）。
+        // 名字要在续期时自愈 —— 登录那一次上游没给显示名（实测就是没有），
+        // 只有一发一发地再问，账号名才不会永远停在那串十六进制上。
+        let user_name = id_token_user_name(
+            payload.get("id_token").and_then(Value::as_str).unwrap_or(""),
+        );
         let expires_at = credentials
             .get("expiration")
             .and_then(Value::as_str)
@@ -360,6 +368,7 @@ impl LoginFlow {
                     .to_string(),
             },
             expires_at,
+            user_name,
             next_refresh,
         ))
     }

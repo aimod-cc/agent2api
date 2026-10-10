@@ -74,7 +74,7 @@ pub async fn refresh_control_plane(
                 "OfficeAce 账号缺少 DPoP 私钥上下文，无法续期：请重新登录一次",
             )
         })?;
-    let (credential, expires_at, next_refresh) =
+    let (credential, expires_at, user_name, next_refresh) =
         oauth::LoginFlow::refresh(&dpop, &refresh_token)
             .await
             .map_err(|reason| GatewayError::with_status(502, format!("OfficeAce 续期失败：{reason}")))?;
@@ -89,6 +89,19 @@ pub async fn refresh_control_plane(
             &next_refresh,
         )
         .map_err(|error| GatewayError::with_status(500, error.message))?;
+    // 名字自愈：参考实现每次续期都从新 `id_token` 重取 userName（`accounts.mjs` 的
+    // label 优先级是「用户标签 → 上游显示名 → id」）。这里非对称地补那一课 ——
+    // 登录那一刻上游常常不给显示名（实测就没给），账号名会停在 `account_id` 那串
+    // 十六进制上；每续一次就问一次，上游哪天给了名字就换回来，用户自己改过的名不动。
+    if store
+        .heal_officeace_display_name(account_id, &user_name)
+        .map_err(|error| GatewayError::with_status(500, error.message))?
+    {
+        crate::server::logging::log(
+            "[Accounts]",
+            &format!("OfficeAce 账号名已按上游显示名更新: {account_id}"),
+        );
+    }
     crate::server::logging::log(
         "[Accounts]",
         &format!("✅ OfficeAce 账号控制面凭据已续期: {account_id}"),
