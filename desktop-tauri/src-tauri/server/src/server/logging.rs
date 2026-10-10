@@ -256,3 +256,49 @@ pub fn log_event(
 pub fn store_ref() -> Option<&'static LogStore> {
     store()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::infer_level;
+
+    /// 一条**完全成功**的账号导入汇总（`failed == 0`），取自生产库里的真实文案。
+    /// 它照样含「失败」二字 —— 因为「失败 {failed} 条」是无条件拼接的。
+    const IMPORT_SUMMARY_ALL_OK: &str =
+        "📥 账号导入完成: 共 2 条，新增 2 个，更新 0 个，跳过 0 条，失败 0 条\
+         （自定义提供商定义：新增 0 家、更新 0 家）";
+
+    /// 这条测试断言的是「文案推断**会**出错」这个事实本身，用来把这个坑钉住。
+    ///
+    /// 要修的不是 `infer_level` —— 它按关键词判级别是对的，错的是拿它去判
+    /// **汇总文案**。汇总类文案的级别必须由调用方按结果给（`log_with_level`），
+    /// 见该函数的文档。`core/account_transfer.rs` 的导入汇总曾用 `log()`，
+    /// 于是每成功导入一次账号就写一条 error，而面板导航徽标只统计 error
+    /// （`ui/app.js` 的 `updateLogsBadge`：只有错误值得主动打断）——
+    /// 等于正常操作也亮红标。
+    #[test]
+    fn infer_level_misreads_successful_import_summary_as_error() {
+        assert_eq!(infer_level("[Accounts]", IMPORT_SUMMARY_ALL_OK), "error");
+    }
+
+    /// 真失败必须仍是 error —— 改成 `log_with_level` 后由调用方按 `failed` 给级别，
+    /// 这两条钉住「按结果给」的两端。
+    #[test]
+    fn infer_level_keeps_real_failures_as_error() {
+        assert_eq!(infer_level("[Accounts]", "❌ 账号导入失败"), "error");
+        assert_eq!(
+            infer_level("[Checkin]", "定时签到完成: 0/2 个账号成功领取，失败 1 个"),
+            "error"
+        );
+    }
+
+    /// 正常成功文案不得被判成 error，否则等于常挂红标。
+    #[test]
+    fn infer_level_treats_plain_success_as_info() {
+        assert_eq!(infer_level("[Checkin]", "⏰ 定时签到开始（到点触发）"), "info");
+        assert_eq!(
+            infer_level("[Checkin]", "定时签到完成: 2/2 个账号成功领取"),
+            "info"
+        );
+    }
+}
+
