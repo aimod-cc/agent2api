@@ -168,9 +168,10 @@ const PROVIDER_FEATURES: Record<string, ProviderFeatures> = {
   //   这一列对它是空，界面不渲染「有效期」）。
   kuku: { usage: true, edition: false, identifier: 'uid', expiry: '' },
   // OfficeAce（华为云果办 / OfficeClaw）。各位各有出处：
-  // `usage: false` —— 额度/积分接口要用**控制面签名**（V11-HMAC-SHA256 打
-  //   `/v1/subscription`），那条链与签到一起后置，还没实现 ⇒ 不显示余额按钮
-  //   （登记 true 会让面板去问一个还没接的端点，一片红）。
+  // `usage: true` —— 额度/积分要**控制面签名**（V11-HMAC-SHA256 打 `/v1/subscription`），
+  //   那条链已经实现（`officeace/balance.rs` + 适配器 `query_usage`），所以余额按钮与
+  //   积分列都开。⚠️ 只导入网关 Basic 那一对、没有控制面凭据的账号查不到余额，
+  //   服务端回 400 `usage_not_configured`，界面按「未配置查询」如实显示（不是报错）。
   // `edition: false` —— 单一入口（自助 OAuth 浏览器登录 / 粘贴网关 Basic 凭据），
   //   没有国际版。
   // `expiry: 'expiresAt'` —— 控制面临时凭据约 2 小时到期；只导入网关 Basic

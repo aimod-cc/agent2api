@@ -294,6 +294,13 @@ impl AccountStore {
             // 公开形态去掉 token 本体、只留 refresh token 尾号与
             // 「有没有 refreshToken / accessToken」（见 `antigravity_accounts.rs`）
             self.to_antigravity_public_account(record)
+        } else if record.provider() == super::OFFICEACE_PROVIDER_ID {
+            // OfficeAce（华为云果办）：只透出标识与到期时刻，网关 Basic 那一对
+            // 与控制面临时凭据都不出这个函数（见 `to_officeace_public_account`）。
+            // 漏这一支时它会掉进下面的 workbuddy 兜底形状：界面多出一批 uid/edition
+            // 之类与它无关的空字段，而「刷新 Token」按钮靠的 hasRefreshToken
+            // 只是**恰好**在兜底形状里也算得出来 —— 那不是设计，是巧合。
+            self.to_officeace_public_account(record)
         } else if record
             .provider()
             .starts_with(crate::server::core::custom_providers::ID_PREFIX)

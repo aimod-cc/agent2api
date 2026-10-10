@@ -102,14 +102,19 @@ impl ProviderAdapter for OfficeAceAdapter {
         Ok(ChatRequestPlan::chat(plan.url, plan.headers, plan.body))
     }
 
-    /// 上游错误分类。依据 officeace2api 实测的错误码表（`upstream.mjs` 的
-    /// `classifyUpstream`）：
+    /// 上游错误分类。**判据**取自 officeace2api 实测的码表（`upstream.mjs` 的
+    /// `classifyUpstream`），**动作**按本仓四档语义走（见 `adapter::UpstreamErrorClass`）：
     ///
-    ///   - `81113` / `exceeds the maximum size` → `Fatal`（**状态码折成 413**）
-    ///   - `81111` / `81112` / `81114` / `0308` / `TPM` / HTTP 429 → `QuotaLimited`
-    ///     （限流，冷却「该凭据 + 该模型」；上游不给恢复时间，走兜底时长）
-    ///   - `81004`（没权限）/ `81009`（名字不认）→ `Fatal`（**只该冷却这一对**，
-    ///     不牵连整条凭据；4xx 本身不触发冷却，与 codearts 同一判据链）
+    ///   - `81113` / `exceeds the maximum size` → `Fatal`，**状态码折成 413**：上游给这条
+    ///     带的是 HTTP 429，不先判掉就会被下面的限额档吞掉（见 `request_is_too_large`）
+    ///   - `81111` / `81112` / `81114` / `0308` / `TPM` / `rate limit` / `too many requests`
+    ///     / HTTP 429 → `QuotaLimited`（冷却「该凭据 + 该模型」；上游不给恢复时间，走兜底时长。
+    ///     后两条措辞与参考实现同源，不是这里自加的）
+    ///   - `81004`（这个模型没权限）/ `81009`（名字不认）→ `Fatal`。⚠️ 本仓的 `Fatal`
+    ///     **什么都不冷却**（冷却与换家只由 `QuotaLimited` 触发，`Fatal` 是原地重发后透传），
+    ///     参考实现那句「只冷却凭据×模型这一对」在这里不是靠分类做到的 —— 承担它的是
+    ///     `probe.rs` 的可用性收窄：这两个码被探到就把该模型默认隐藏，客户端点不到它。
+    ///     结论一致、机制不同，别把这句话读成「这里会去冷却某个模型」
     ///   - `APIG.1009` / `APIG.1001` / `APIG.1002` / 401 / 403 → `Fatal`
     ///     （凭据失效，用户需重新登录/导入；不自动冷却账号池）
     ///   - 其余 → `Fatal`

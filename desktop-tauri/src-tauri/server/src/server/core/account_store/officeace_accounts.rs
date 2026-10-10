@@ -450,7 +450,61 @@ impl AccountStore {
             "[Accounts]",
             &format!("✅ OfficeAce 账号已保存: {record_name}（优先级 {priority}）"),
         );
-        Ok(saved.to_value())
+        // 回**公开形态**而不是整条记录：记录里躺着 modelAppSecret / secretAccessKey /
+        // securityToken / refreshToken / DPoP 私钥，而账号列表那一侧走的是
+        // `store_view::public_account` 的 officeace 分支（同一个函数）——
+        // 添加响应原先直接把原始记录回出去，是全家族唯一的明文出口。
+        Ok(self.to_officeace_public_account(&saved))
+    }
+
+    /// 账号的公开形态（前端账号列表 / 添加响应 / 会话摘要用；**不含任何凭据**）。
+    ///
+    /// 字段口径照 kuku 那份（`to_kuku_public_account`）：标识 + 归属 + 队列状态 +
+    /// 时间戳 + 代理描述，再加本家界面真正会读的三样 —— `baseUrl`（网关地址，
+    /// 面板改凭据时要用）、`expiresAt`（控制面临时凭据到期时刻，域配置里
+    /// `expiry:'expiresAt'` 读它）、`hasRefreshToken`（面板「刷新 Token」按钮的开关，
+    /// 判据与 workbuddy 那份一致：记录上的 `refreshToken` 非空）。
+    pub fn to_officeace_public_account(&self, record: &StoredAccount) -> Value {
+        let proxy = crate::server::core::proxies::describe_account_proxy(Some(&record.proxy()));
+        let mut public = Map::new();
+        public.insert("id".to_string(), Value::String(record.id().to_string()));
+        public.insert("provider".to_string(), Value::String(record.provider()));
+        public.insert("name".to_string(), Value::String(record.name()));
+        public.insert("source".to_string(), Value::String(record.source()));
+        public.insert("priority".to_string(), Value::from(record.priority()));
+        public.insert("enabled".to_string(), Value::Bool(record.enabled()));
+        public.insert("addedAt".to_string(), Value::from(record.added_at()));
+        public.insert("updatedAt".to_string(), Value::from(record.updated_at()));
+        public.insert("proxy".to_string(), proxy);
+        public.insert(
+            "baseUrl".to_string(),
+            record.get("baseUrl").cloned().unwrap_or(Value::Null),
+        );
+        public.insert(
+            "expiresAt".to_string(),
+            record.get("expiresAt").cloned().unwrap_or(Value::Null),
+        );
+        public.insert(
+            "hasRefreshToken".to_string(),
+            Value::Bool(
+                record
+                    .get("refreshToken")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty()),
+            ),
+        );
+        // 这一位决定界面「备注名赢过上游显示名」的口径；账号列表那一侧由
+        // `public_account` 末尾统一注入，添加响应不经过那里，所以在这里补齐 ——
+        // 两条出口给前端的形状必须一致，否则加完账号要刷新列表才显示对。
+        public.insert(
+            "nameCustom".to_string(),
+            Value::Bool(
+                record
+                    .get("nameCustom")
+                    .is_some_and(|value| matches!(value, Value::Bool(true))),
+            ),
+        );
+        Value::Object(public)
     }
 }
 
@@ -608,5 +662,58 @@ mod tests {
         assert_eq!("我的果办号", record["name"].as_str().unwrap());
         // 上游没给显示名：一个字都不动，也不算错误
         assert!(!temp.store.heal_officeace_display_name(&mine, "").expect("空名不该失败"));
+    }
+
+    /// 添加响应走**公开形态**。审计抓到本家是全家族唯一的明文出口：原先直接回
+    /// 整条记录，里面躺着 modelAppSecret / secretAccessKey / securityToken /
+    /// refreshToken / DPoP 私钥。这条用例既钉「凭据字段一个都不许出现」，
+    /// 也钉界面真读的字段还在（`hasRefreshToken` 之前只是**恰好**从 workbuddy
+    /// 兜底形状里漏出来才有的，不是设计）。
+    #[test]
+    fn neither_the_add_response_nor_the_list_carries_credentials() {
+        use serde_json::json;
+        let temp = temp_store("public");
+        let payload = json!({
+            "baseUrl": "https://gw.example.com/v2",
+            "modelAppKey": "AK-GATEWAY",
+            "modelAppSecret": "SK-GATEWAY",
+            "accessKeyId": "AK-CONTROL",
+            "secretAccessKey": "SK-CONTROL",
+            "securityToken": "STS-TOKEN",
+            "refreshToken": "REFRESH-ONCE",
+            "expiresAt": 1_800_000_000_000_i64,
+        });
+        let account = temp
+            .store
+            .add_officeace_account(&payload, Some("我的果办号"), true)
+            .expect("导入应当成功");
+        for key in [
+            "modelAppKey",
+            "modelAppSecret",
+            "accessKeyId",
+            "secretAccessKey",
+            "securityToken",
+            "refreshToken",
+            "dpopKeyPair",
+        ] {
+            assert!(account.get(key).is_none(), "{key} 是凭据字段，不许出现在添加响应里");
+        }
+        assert_eq!("我的果办号", account["name"].as_str().unwrap());
+        assert_eq!("https://gw.example.com/v2", account["baseUrl"].as_str().unwrap());
+        assert_eq!(
+            Some(&Value::Bool(true)),
+            account.get("hasRefreshToken"),
+            "面板「刷新 Token」按钮读这一位"
+        );
+        assert_eq!(
+            Some(&Value::Bool(true)),
+            account.get("nameCustom"),
+            "面板打的名字仍按「用户说了算」透出"
+        );
+        // 列表同口径：officeace 分支接上之后，凭据值不该出现在任何一处出口
+        let listed = temp.store.list_accounts().to_string();
+        for secret in ["SK-GATEWAY", "AK-GATEWAY", "AK-CONTROL", "SK-CONTROL", "STS-TOKEN", "REFRESH-ONCE"] {
+            assert!(!listed.contains(secret), "账号列表里出现了凭据值 {secret}");
+        }
     }
 }

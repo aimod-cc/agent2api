@@ -41,6 +41,15 @@
 //! 用户一个「重新探一次」的入口（`force = true`），又天然限频（探测自己有 6 小时
 //! TTL + 在途标记，不会因为目录被反复拉而反复打上游）。
 //!
+//! ── 两道「不许拿它当隐藏依据」的闸 ────────────────────────────
+//! 隐藏是**门禁**（藏掉的模型 `/v1/models` 看不到、点名也 400），所以判据宁漏藏不错藏。
+//! 光看文案分不开：`insufficient permission` 既是模型级 81004 的原文，也是华为 IAM
+//! 权限错误的通用措辞 —— 于是补两条结构性判据：
+//!   ① 凭据级失败（HTTP 401，或响应体带 `apig.` 那一族网关码）一律不算模型拒绝；
+//!   ② **整轮全拒**判成凭据/网关问题，一个都不藏 —— 所有模型同时失去权限的概率
+//!      远低于这对凭据失效，而错藏的代价是用户手里能用的模型一次全消失。
+//! 这两条之前，「凭据类 4xx 不藏」只是**巧合成立**（已知凭据码 APIG.1009 恰好不含标记）。
+//!
 //! ── 一处自觉的局限（多账号）────────────────────────────────
 //! 目录缓存是**进程级单槽**（见 `models` 模块头），探测结论也只有一份。多个
 //! OfficeAce 账号权限不同时，这里按**最近一次刷新用的那个账号**探，结论是那份
@@ -296,10 +305,22 @@ async fn run_probe(base_url: &str, app_key: &str, app_secret: &str, ids: &[Strin
     .buffer_unordered(CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
-    results
-        .into_iter()
-        .filter_map(|(id, rejected)| rejected.then_some(id))
-        .collect()
+    let hidden: Vec<String> = results
+        .iter()
+        .filter(|(_, rejected)| *rejected)
+        .map(|(id, _)| id.clone())
+        .collect();
+    if round_blames_credentials(results.len(), hidden.len()) {
+        logging::verbose(
+            "[OfficeAce]",
+            &format!(
+                "模型可用性探测：{} 个模型全被上游拒绝，判成凭据/网关问题，本轮一个都不隐藏",
+                results.len()
+            ),
+        );
+        return Vec::new();
+    }
+    hidden
 }
 
 /// 探一个模型：`true` = 上游明确说这个模型不行（该隐藏）。
@@ -328,10 +349,41 @@ async fn probe_one(endpoint: &str, auth: &str, model: &str) -> bool {
     {
         // 200 就算能用 —— 正文可能是空的（推理预算吃满），那是它应有的样子
         Ok(response) if response.ok => false,
-        Ok(response) => is_model_rejection(&response.payload),
+        // 凭据级失败先挡住（见模块头那两道闸），剩下的才看模型级拒绝标记
+        Ok(response) => {
+            !is_credential_failure(response.status, &response.payload)
+                && is_model_rejection(&response.payload)
+        }
         // 传输 / 超时：拿不到结论 ⇒ 不藏（宁可不藏，不可错藏）
         Err(_) => false,
     }
+}
+
+/// 这一发失败是不是**凭据级**的（拒的是这对网关凭据，不是这个模型）。
+///
+/// 文案单独不够用：`insufficient permission` 既是模型级 81004 的原文，也是华为 IAM
+/// 权限错误的通用措辞，光读正文会把「凭据不行」误判成「这个模型不行」——而隐藏是门禁，
+/// 错藏直接把用户能用的模型关在门外。两条判据都来自实测码表：
+///   - HTTP 401 = 网关鉴权失败（`APIG.1009` 那一族走的就是它）；
+///   - 响应体带 `apig.` 前缀的码 = 网关侧（鉴权 / 签名 / 配额）错误，与具体模型无关。
+fn is_credential_failure(status: u16, payload: &Option<Value>) -> bool {
+    if status == 401 {
+        return true;
+    }
+    payload
+        .as_ref()
+        .map(|value| value.to_string().to_ascii_lowercase())
+        .unwrap_or_default()
+        .contains("apig.")
+}
+
+/// 整轮全拒 ⇒ 判成凭据 / 网关问题，本轮一个都不隐藏（见模块头）。
+///
+/// 依据是形状而不是文案：所有模型**同时**被拒，最省事的解释是这对凭据失效或网关在拒
+/// 所有请求；而逐模型的权限差异只会拒掉一部分（dev 实测一轮是 28 个里拒 17 个）。
+/// 空集合回 false —— 一个模型都没探就不该有任何结论。
+fn round_blames_credentials(total: usize, rejected: usize) -> bool {
+    total > 0 && rejected == total
 }
 
 /// 响应体里有没有「模型级拒绝」的标记（见模块头的隐藏规则）。
@@ -376,5 +428,57 @@ mod tests {
         assert!(is_hidden(&hidden, "glm-5.2"));
         assert!(!is_hidden(&hidden, "glm-5.3"));
         assert!(!is_hidden(&[], "glm-5.2"));
+    }
+
+    /// 凭据级判据只看状态与网关码族，**不看文案**：`Insufficient permission` 这句
+    /// 既是模型级 81004 的原文、也是 IAM 权限错误的通用措辞，靠文案分不开两类。
+    #[test]
+    fn credential_failures_are_told_apart_by_status_and_gateway_codes() {
+        assert!(is_credential_failure(401, &None), "401 就是网关鉴权失败");
+        assert!(
+            is_credential_failure(401, &Some(json!({"error_msg": "Invalid model"}))),
+            "401 下就算文案撞上模型标记，也不算模型拒绝"
+        );
+        assert!(is_credential_failure(403, &Some(json!({"error_code": "APIG.1009"}))));
+        // 模型级的 81004/81009（参考实现实测带 ModelArts 码）不该被误挡成凭据问题
+        assert!(!is_credential_failure(
+            403,
+            &Some(json!({"error_code": "ModelArts.81004", "error_msg": "Insufficient permission"}))
+        ));
+        assert!(!is_credential_failure(
+            400,
+            &Some(json!({"error_code": "ModelArts.81009", "error_msg": "Invalid model"}))
+        ));
+    }
+
+    /// 注入式验证：装闸之前这条会**错藏**（凭据级 403 撞上 IAM 那句通用措辞），
+    /// 装完不藏。判定组合与 `probe_one` 逐字一致，免得闸写好了却没接进判定路径。
+    #[test]
+    fn the_two_guards_gate_the_verdict_exactly_as_probe_one_does() {
+        let hides = |status: u16, body: &Option<Value>| {
+            !is_credential_failure(status, body) && is_model_rejection(body)
+        };
+        assert!(
+            hides(403, &Some(json!({"error_code": "ModelArts.81004", "error_msg": "Insufficient permission"}))),
+            "真的模型级无权限该继续隐藏"
+        );
+        assert!(
+            !hides(403, &Some(json!({"error_code": "APIG.1002", "error_msg": "Insufficient permission"}))),
+            "网关凭据错误撞上同一句文案时不许牵连模型"
+        );
+        assert!(!hides(
+            429,
+            &Some(json!({"error_code": "ModelArts.81111", "error_msg": "Too many requests"}))
+        ));
+    }
+
+    #[test]
+    fn a_whole_round_of_rejections_blames_the_credential() {
+        assert!(round_blames_credentials(28, 28), "整轮全拒的形状");
+        assert!(
+            !round_blames_credentials(28, 17),
+            "dev 实测的一轮就是这个形状：28 个里拒 17 个"
+        );
+        assert!(!round_blames_credentials(0, 0), "一个模型都没探 ⇒ 不该有任何结论");
     }
 }
