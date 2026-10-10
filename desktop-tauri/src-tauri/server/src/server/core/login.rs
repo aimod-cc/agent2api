@@ -32,6 +32,7 @@ mod autoclaw;
 mod catpaw;
 pub mod codearts;
 mod qoder;
+mod officeace;
 mod trae;
 mod zcode;
 

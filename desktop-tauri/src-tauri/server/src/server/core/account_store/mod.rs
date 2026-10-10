@@ -104,6 +104,7 @@ pub mod custom_accounts;
 pub mod kuku_accounts;
 pub mod loomy_accounts;
 pub mod monkeycode_accounts;
+pub mod officeace_accounts;
 pub mod priority;
 pub mod qoder_accounts;
 pub mod raccoon_accounts;
@@ -211,6 +212,12 @@ pub(crate) const COMMANDCODE_PROVIDER_ID: &str = crate::server::core::providers:
 /// `sandbox`/`daily`/`prod` 是环境不是地区，规格 §6）。
 pub(crate) const ANTIGRAVITY_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
     crate::server::core::providers::ProviderKind::Antigravity,
+);
+
+/// OfficeAce（华为云果办 / OfficeClaw）provider id（**从注册表推导**，同
+/// [`LOOMY_PROVIDER_ID`] 的口径）。账号形态见 `officeace_accounts.rs`。
+pub(crate) const OFFICEACE_PROVIDER_ID: &str = crate::server::core::providers::kind_id(
+    crate::server::core::providers::ProviderKind::OfficeAce,
 );
 
 /// Cline **免费池** provider id（账号存储内部多处要用；**从注册表推导**，同

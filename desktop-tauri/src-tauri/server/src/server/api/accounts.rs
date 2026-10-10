@@ -759,6 +759,14 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
             };
             store.add_antigravity_account(&credentials, import_name, "manual")
         }
+        // OfficeAce（华为云果办 / OfficeClaw）：粘贴模型网关的 Basic 凭据
+        // （`baseUrl` + `modelAppKey`/`modelAppSecret`，可选控制面临时凭据）。
+        // **不调上游**（与 CodeArts 同口径）——凭据是导入/登录换来的，添加时
+        // 没有可交换的授权码；目录与连通性由刷新链路验。
+        Some(crate::server::core::providers::ProviderKind::OfficeAce) => {
+            // 面板传来的名字是用户自己打的 ⇒ 标 custom（此后续期/重登不改它）
+            store.add_officeace_account(&payload, import_name, true)
+        }
         // WorkBuddy 系的两家（国内版 / 国际版）：同一套凭证形态与落账号路径，
         // 差别只有归属 —— provider id 自己就是归属（拆家后不再从 payload 里的
         // `edition` 反推：那是账号的属性，而落哪一家是身份问题）。
@@ -994,6 +1002,12 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     // ZCode：同一条理由（它的续期是自家 OAuth 那套，不是 workbuddy 的链）
     if state.store().zcode_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Zcode).await;
+    }
+    // OfficeAce：控制面临时凭据（约 2 小时）用 refresh token + DPoP 私钥续期，
+    // 必须走它自己的适配器。**这条不能省**：漏了就落到 workbuddy 兜底链路，
+    // 用户点「刷新 Token」收到的是腾讯那侧的错（与 CodeArts/Trae 同一条理由）。
+    if state.store().officeace_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::OfficeAce).await;
     }
     // Accio（两个地区）：走适配器的强制刷新（`POST /api/auth/refresh_token`，
     // 结果按「比较再写」回写）。两个地区各查一次 —— 账号集合按 provider 隔离，

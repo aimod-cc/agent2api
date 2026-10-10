@@ -91,6 +91,10 @@ export const PROVIDER_ICONS: Record<string, string> = {
   // 用官方 press 页的「Icon - Full Color」（antigravity.google/press）
   commandcode: 'assets/providers/commandcode.png',
   antigravity: 'assets/providers/antigravity.png',
+  // OfficeAce（华为云果办）：取自官网产品页的产品图标
+  // （`res-static.hc-cdn.cn/.../OfficeAce/新图标.png`，176×176 RGBA，
+  // 归一成 256×256 入库 —— 与系统里显示的应用图标为同一形象）
+  officeace: 'assets/providers/officeace.png',
 }
 
 /**

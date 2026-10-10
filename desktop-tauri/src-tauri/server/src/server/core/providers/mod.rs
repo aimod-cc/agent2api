@@ -136,6 +136,7 @@ pub mod loomy;
 /// 含工具自动批准与提问自动应答）全部已接通；`is_stateful` 为 true，
 /// 见 `monkeycode/mod.rs` 的模块头。
 pub mod monkeycode;
+pub mod officeace;
 pub mod onboarding_memory;
 pub mod qoder;
 pub mod raccoon;
@@ -446,6 +447,13 @@ pub enum ProviderKind {
     /// 翻译器（`protocol::antigravity_outbound` / `antigravity_stream`），
     /// **`is_stateful` 保持 false**（不走 `forward_conversation`）。
     Antigravity,
+    /// OfficeAce（华为云果办 / OfficeClaw / jiuwenclaw）。
+    ///
+    /// 上游是 OpenAI 兼容的华为 AgentArts 模型网关（`Basic` 鉴权，见
+    /// `officeace/mod.rs` 的模块头）—— **无状态**：`build_chat_request` 一条路，
+    /// 不需要 CodeArts 那种会话闸门。凭据两层：网关 Basic（不过期，转发用）
+    /// 与控制面临时 AK/SK（2 小时，额度/签到用）。
+    OfficeAce,
 }
 
 /// 一个提供商的静态元数据。
@@ -532,6 +540,11 @@ pub const PROVIDERS: &[ProviderMeta] = &[
     // 伴生（规格 §6：没有 region 参数，sandbox/daily/prod 是环境不是地区）。
     // 排在末尾（2026-10 接入，后到居后，与 Kuku / Command Code 同一处置）。
     ProviderMeta { id: "antigravity", label: "Antigravity" },
+    // OfficeAce（华为云果办 / OfficeClaw）：排末尾（新家按约定追加在末尾）。
+    // 它的可用名单与 codearts / catpaw / trae / zcode 大面积同名（glm-5.2 /
+    // glm-5.3 / deepseek-v4-flash-0731 / kimi-k2.6 …），注册表顺序决定目录
+    // 合并时同名模型先归谁家 —— 放在末尾即「同名时优先已有各家」。
+    ProviderMeta { id: "officeace", label: "OfficeAce 果办" },
 ];
 
 /// provider id 在注册表里的下标（未知 id → None）。
@@ -614,6 +627,7 @@ pub fn kind_from_id(id: &str) -> Option<ProviderKind> {
         "monkeycode-intl" => Some(ProviderKind::MonkeyCodeIntl),
         "commandcode" => Some(ProviderKind::CommandCode),
         "antigravity" => Some(ProviderKind::Antigravity),
+        "officeace" => Some(ProviderKind::OfficeAce),
         // 走到这里 = 上面的注册表判定已放行、这个 match 却没有对应分支：
         // 只可能是有人给 `PROVIDERS` 加了条目忘了加这里。开发期喊出来；
         // release 返回 None（见上：宁可为「未知」，不可误认成别家）。
@@ -654,6 +668,7 @@ pub const fn kind_id(kind: ProviderKind) -> &'static str {
         ProviderKind::MonkeyCodeIntl => "monkeycode-intl",
         ProviderKind::CommandCode => "commandcode",
         ProviderKind::Antigravity => "antigravity",
+        ProviderKind::OfficeAce => "officeace",
     }
 }
 
