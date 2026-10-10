@@ -80,14 +80,15 @@ pub struct GatewayCredential {
     pub security_token: String,
     pub project_id: String,
     pub expires_at: i64,
-    /// 上游给的账号显示名（`id_token` 的 `preferred_username`/`name`；取不到为空串）。
-    /// 拿它落账号名 —— 否则面板只能显示代码里的种子名「OfficeAce 果办」，
-    /// 看起来就是「只有提供商名」（与别家显示昵称/邮箱不一致）。
+    /// 上游给的账号显示名（`id_token` 或 `refresh_token` 里的
+    /// `preferred_username`/`name`，都没有再解 `user_profile.account_name`；取不到为空串）。
+    /// 拿它落账号名 —— 否则面板只能显示十六进制的 id（与别家显示昵称/邮箱不一致）。
+    /// 实测这个上游的名字在 **`refresh_token`** 那一枚里（见 `response_identity`）。
     pub user_name: String,
     /// 上游账号 id（`client-permission-validate` 的 `account_id`）。
     /// 显示名取不到时拿它当兜底名字，好把多个账号区分开。
     pub account_id: String,
-    /// IAM **用户级** id（`id_token` 的 `user_profile.principal_id`，取不到退
+    /// IAM **用户级** id（令牌 `user_profile` 的 `principal_id`，取不到退
     /// `validate` 的 `principal_id`）。多账号兜底时它比 `account_id` 更细：
     /// 同一个华为云账号下的不同 IAM 用户共用 `account_id`，而 principal 各不同。
     pub principal_id: String,
@@ -250,7 +251,7 @@ impl LoginFlow {
     pub async fn finish(&self, code: &str) -> Result<GatewayCredential, String> {
         let (temporary, expires_at, identity, refresh_token) = self.exchange_code(code).await?;
         let gateway = self.fetch_gateway_credential(&temporary).await?;
-        // principal id 两个来源：`id_token` 的 `user_profile` 优先（它就在身份本身里），
+        // principal id 两个来源：令牌 `user_profile` 优先（它就在身份本身里），
         // 没有就退 `client-permission-validate` 回的那个
         let principal_id = if identity.principal_id.is_empty() {
             gateway.4
@@ -344,13 +345,12 @@ impl LoginFlow {
         if access_key_id.is_empty() || secret_access_key.is_empty() {
             return Err("续期响应没有新的 AK/SK".to_string());
         }
-        // 显示名也从这一轮的 `id_token` 重取（参考实现同源：`refresh.mjs` 每次续期都
-        // 解一遍 claims，`accounts.mjs` 的 label 优先级是「用户标签 → 上游显示名 → id」）。
-        // 名字要在续期时自愈 —— 登录那一次上游没给显示名（实测就是没有），
-        // 只有一发一发地再问，账号名才不会永远停在那串十六进制上。
-        let user_name = id_token_user_name(
-            payload.get("id_token").and_then(Value::as_str).unwrap_or(""),
-        );
+        // 显示名也从这一轮的重发里取（参考实现同源：`refresh.mjs` 每次续期都解一遍
+        // claims，`accounts.mjs` 的 label 优先级是「用户标签 → 上游显示名 → id」）。
+        // 名字要在续期时自愈 —— 登录那一次如果上游没给显示名，账号名就永远停在
+        // 那串十六进制上；每轮再问一次才追得回来（`response_identity` 的两枚 token
+        // 都看，实测名字就在这一发的 `refresh_token` 里）。
+        let user_name = response_identity(&payload).user_name;
         let expires_at = credentials
             .get("expiration")
             .and_then(Value::as_str)
@@ -449,14 +449,10 @@ impl LoginFlow {
             .and_then(parse_rfc3339_ms)
             .filter(|value| *value > 0)
             .unwrap_or_else(|| logging::now_ms() + 2 * 3600 * 1000);
-        // 身份信息从 `id_token` 的 claims 取（顶层优先，取不到再解 `user_profile`，
-        // 见 `id_token_identity`）；取不到给空串，落账号时退下一级兜底。
-        let identity = id_token_identity(
-            payload
-                .get("id_token")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-        );
+        // 身份信息：这一发里 `id_token` 与 `refresh_token` 都要看（实测名字就在
+        // `refresh_token` 的 `user_profile` 里，见 `response_identity`）；取不到给空串，
+        // 落账号时退下一级兜底。
+        let identity = response_identity(&payload);
         // 一次性 refresh token：落盘后 `hasRefreshToken` 为真（面板出现「刷新 Token」），
         // 也是续期链的唯一钥匙 —— 丢了就只能重新登录。
         let refresh_token = payload
@@ -589,24 +585,45 @@ impl LoginFlow {
     }
 }
 
-/// `id_token` 里取到的身份信息。两项都**可能为空** —— 给不给取决于这个租户的
-/// IAM 形态，取不到不是错误（调用方自己退下一级兜底）。
+/// 从令牌端点的**响应体**里取身份信息：一发里有两枚 JWT，名字可能装在任意一枚里。
+///
+/// ── 为什么要看 `refresh_token` ──────────────────────────────
+/// 实测（2026-10-11，解本机 dev 库里两枚存量 refresh token 的 claims，零网络）：
+/// 这个上游把身份放在 **`refresh_token`** 的 `user_profile` 里 ——
+/// `account_name`（IAM 用户名，面板要显示的那个）、`principal_id`、`account_id` 都在。
+/// 只读 `id_token` 的话，这两枚 token 的响应里能不能解出名字**从未被观测过**，
+/// 结果就是账号名永远退到十六进制兜底（用户报了三轮的那现象）。
+///
+/// 顺序：`id_token` 优先（它是这次会话的身份快照，上游哪天补上就立刻切回），
+/// 它没有名字再退 `refresh_token`。principal_id 同口径，但**不因名字空而被丢弃** ——
+/// 只要有一枚给了 principal 就留着，调用方还来得及退 `validate` 那一格。
+fn response_identity(payload: &Value) -> TokenIdentity {
+    let mut principal_only = TokenIdentity::default();
+    for field in ["id_token", "refresh_token"] {
+        let identity = jwt_identity(payload.get(field).and_then(Value::as_str).unwrap_or(""));
+        if !identity.user_name.is_empty() {
+            return identity;
+        }
+        if principal_only.principal_id.is_empty() && !identity.principal_id.is_empty() {
+            principal_only = identity;
+        }
+    }
+    principal_only
+}
+
+/// `id_token` / `refresh_token` 的 claims 解出来的身份信息。两项都**可能为空** ——
+/// 给不给取决于这个租户的 IAM 形态，取不到不是错误（调用方自己退下一级兜底）。
 #[derive(Clone, Default)]
 pub struct TokenIdentity {
     pub user_name: String,
     pub principal_id: String,
 }
 
-/// 显示名（`id_token_identity` 的第一项），续期链只要这一个。
-fn id_token_user_name(id_token: &str) -> String {
-    id_token_identity(id_token).user_name
-}
-
-/// 从 `id_token`（JWT）的 payload 里取显示名与用户级 principal id。
+/// 从一枚 JWT（`id_token` 或 `refresh_token`）的 payload 里取显示名与用户级 principal id。
 ///
 /// ── 为什么要比参考实现多解一层 ──────────────────────────────
 /// 参考实现只读顶层 `preferred_username || name`（`refresh.mjs` 的 `idTokenClaims`）。
-/// **实测这个租户的 id_token 顶层没有这两个键** —— claims 只有
+/// **实测这个租户的令牌顶层没有这两个键** —— claims 只有
 /// `client_id / cnf / exp / federation / iat / iss / jti / type / user_profile`，
 /// 身份装在一个 base64 JSON 串里：
 ///
@@ -621,8 +638,8 @@ fn id_token_user_name(id_token: &str) -> String {
 /// 全程 fail-open：不是三段 JWT / 解不出 base64 / 内层不是 JSON / 字段不是字符串，
 /// 都只当没取到，回空串继续退下一级 —— 名字这条链**没有任何失败面**，
 /// 拿它报错会把一次已经成功的登录记成失败。
-fn id_token_identity(id_token: &str) -> TokenIdentity {
-    let Some(claims) = jwt_claims(id_token) else {
+fn jwt_identity(token: &str) -> TokenIdentity {
+    let Some(claims) = jwt_claims(token) else {
         return TokenIdentity::default();
     };
     let profile = claims
@@ -731,6 +748,8 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     /// 授权地址的关键性质：**回调指向云端**（不是本机 loopback）—— 这是与
@@ -771,30 +790,32 @@ mod tests {
     }
 
     #[test]
-    fn id_token_user_name_reads_the_claims() {
+    fn jwt_identity_reads_the_top_level_claims() {
         let token_of = |claims: &str| format!("header.{}.sig", base64url(claims.as_bytes()));
+        let name_of = |jwt: &str| jwt_identity(jwt).user_name;
 
         assert_eq!(
             "user@example.com",
-            id_token_user_name(&token_of(r#"{"preferred_username":"user@example.com","sub":"u1"}"#))
+            name_of(&token_of(r#"{"preferred_username":"user@example.com","sub":"u1"}"#))
         );
         // `preferred_username` 缺 → 退到 `name`
-        assert_eq!("张三", id_token_user_name(&token_of(r#"{"name":"张三"}"#)));
+        assert_eq!("张三", name_of(&token_of(r#"{"name":"张三"}"#)));
         // 带 `=` 填充也能解（JWT 通常不带，但别为它挂）
         let padded = format!("{}==", base64url(r#"{"name":"abc"}"#.as_bytes()));
-        assert_eq!("abc", id_token_user_name(&format!("h.{padded}.s")));
+        assert_eq!("abc", name_of(&format!("h.{padded}.s")));
 
-        // 取不到就给空串（调用方退种子名），不 panic
-        assert_eq!("", id_token_user_name(""));
-        assert_eq!("", id_token_user_name("not.a.jwt"));
-        assert_eq!("", id_token_user_name(&token_of(r#"{"sub":"u1"}"#)));
+        // 取不到就给空串（调用方退下一级兜底），不 panic
+        assert_eq!("", name_of(""));
+        assert_eq!("", name_of("not.a.jwt"));
+        assert_eq!("", name_of(&token_of(r#"{"sub":"u1"}"#)));
     }
 
-    /// 实测形态：这个租户的 id_token **顶层没有** `preferred_username`/`name`，
-    /// 身份装在一个 base64 JSON 串（`user_profile`）里。参考实现只读顶层那两个键，
-    /// 所以它接的这条路对我们这个号同样取不到名字 —— 这里多解那一层。
-    /// （夹具形态照真实 claims 的键集：client_id/cnf/exp/federation/iat/iss/jti/type/
-    /// user_profile，值全是合成串，不是真账号数据）
+    /// 实测形态（2026-10-11，直接解本机 dev 库里两枚**存量 refresh token** 的 claims，
+    /// 零网络、零消耗）：身份不在顶层，而是装在一个 base64 JSON 串（`user_profile`）里，
+    /// 键集 `client_id / cnf / exp / federation / iat / iss / jti / type / user_profile`。
+    /// 参考实现只读顶层的 `preferred_username`/`name`（`refresh.mjs` 的 `idTokenClaims`），
+    /// 所以它这条路也取不到名字 —— 这里多解那一层。
+    /// （夹具值全是合成串，不是真账号数据）
     #[test]
     fn identity_reaches_into_the_nested_user_profile() {
         let profile = base64url(
@@ -803,7 +824,7 @@ mod tests {
         let claims = format!(
             r#"{{"client_id":"pdp5_for_agentarts","type":"app","iat":1,"exp":2,"user_profile":"{profile}"}}"#
         );
-        let identity = id_token_identity(&format!("header.{}.sig", base64url(claims.as_bytes())));
+        let identity = jwt_identity(&format!("header.{}.sig", base64url(claims.as_bytes())));
         assert_eq!("hid_synthetic-1", identity.user_name, "名字在 user_profile.account_name");
         assert_eq!("prin_89abcdef01234567", identity.principal_id);
     }
@@ -813,7 +834,7 @@ mod tests {
     fn top_level_claims_still_win_over_the_profile() {
         let profile = base64url(br#"{"account_name":"from_profile","principal_id":"prin_2"}"#);
         let claims = format!(r#"{{"preferred_username":"顶层优先","user_profile":"{profile}"}}"#);
-        let identity = id_token_identity(&format!("h.{}.s", base64url(claims.as_bytes())));
+        let identity = jwt_identity(&format!("h.{}.s", base64url(claims.as_bytes())));
         assert_eq!("顶层优先", identity.user_name);
         assert_eq!("prin_2", identity.principal_id, "principal 仍从内层取");
     }
@@ -830,13 +851,58 @@ mod tests {
         ];
         for blob in blobs {
             let claims = format!(r#"{{"user_profile":"{blob}"}}"#);
-            let identity = id_token_identity(&format!("h.{}.s", base64url(claims.as_bytes())));
+            let identity = jwt_identity(&format!("h.{}.s", base64url(claims.as_bytes())));
             assert!(
                 identity.user_name.is_empty() && identity.principal_id.is_empty(),
                 "畸形 user_profile 不该产出名字：{blob}"
             );
         }
-        let empty = id_token_identity(&format!("h.{}.s", base64url(br#"{"sub":"u1"}"#)));
+        let empty = jwt_identity(&format!("h.{}.s", base64url(br#"{"sub":"u1"}"#)));
         assert!(empty.user_name.is_empty() && empty.principal_id.is_empty());
+    }
+
+    /// **账号名一直是十六进制的真根因**：上游把这个租户的身份放在
+    /// `refresh_token` 的 claims 里（实测两枚存量 refresh token 都带
+    /// `user_profile.account_name`），而取名字的代码只看 `id_token` ——
+    /// 那一发里压根没有可用的 `id_token`，于是永远退到下一格兜底。
+    #[test]
+    fn response_identity_falls_back_to_the_refresh_token() {
+        let profile = base64url(
+            br#"{"account_id":"acc_0123456789abcdef","account_name":"hid_synthetic-1","principal_id":"0123456789abcdef0123456789abcdef"}"#,
+        );
+        let bearer = format!(
+            "h.{}.s",
+            base64url(
+                format!(
+                    r#"{{"client_id":"pdp5_for_agentarts","type":"refreshToken","iat":1,"exp":2,"user_profile":"{profile}"}}"#
+                )
+                .as_bytes()
+            )
+        );
+
+        // 只有 refresh_token（登录与续期响应的实测形态）
+        let identity = response_identity(&json!({"credentials": {}, "refresh_token": bearer}));
+        assert_eq!("hid_synthetic-1", identity.user_name, "名字在 refresh_token 里");
+        assert_eq!("0123456789abcdef0123456789abcdef", identity.principal_id);
+
+        // 同一发里 id_token 也带名字 ⇒ 以 id_token 为准（它是这次会话的身份快照）
+        let snapshot = format!(
+            "h.{}.s",
+            base64url(r#"{"preferred_username":"top-level-wins"}"#.as_bytes())
+        );
+        let identity = response_identity(&json!({
+            "id_token": snapshot,
+            "refresh_token": bearer,
+        }));
+        assert_eq!("top-level-wins", identity.user_name);
+
+        // id_token 有但没名字、refresh_token 有名字 ⇒ 仍然取到名字（旧代码正是卡在这）
+        let bare = format!("h.{}.s", base64url(br#"{"sub":"u1"}"#));
+        let identity = response_identity(&json!({"id_token": bare, "refresh_token": bearer}));
+        assert_eq!("hid_synthetic-1", identity.user_name);
+
+        // 两发都没有 ⇒ 空串，调用方继续退下一级兜底
+        let identity = response_identity(&json!({"credentials": {}}));
+        assert!(identity.user_name.is_empty() && identity.principal_id.is_empty());
     }
 }

@@ -89,10 +89,10 @@ pub async fn refresh_control_plane(
             &next_refresh,
         )
         .map_err(|error| GatewayError::with_status(500, error.message))?;
-    // 名字自愈：参考实现每次续期都从新 `id_token` 重取 userName（`accounts.mjs` 的
+    // 名字自愈：参考实现每次续期都从重发令牌里再取一次 userName（`accounts.mjs` 的
     // label 优先级是「用户标签 → 上游显示名 → id」）。这里非对称地补那一课 ——
-    // 登录那一刻上游常常不给显示名（实测就没给），账号名会停在 `account_id` 那串
-    // 十六进制上；每续一次就问一次，上游哪天给了名字就换回来，用户自己改过的名不动。
+    // 登录那一刻可能一枚令牌都没给名字（那时账号名停在十六进制的 principal_id 或
+    // account_id 上），每续一次就问一次，上游给了名字就换回来，用户自己改过的名不动。
     if store
         .heal_officeace_display_name(account_id, &user_name)
         .map_err(|error| GatewayError::with_status(500, error.message))?

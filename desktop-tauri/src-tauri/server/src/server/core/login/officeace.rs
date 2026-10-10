@@ -135,16 +135,17 @@ impl LoginService {
                 "refreshToken": credential.refresh_token,
                 "dpopKeyPair": serde_json::to_value(&credential.dpop_key_pair).unwrap_or(Value::Null),
             });
-            // 账号名：优先上游显示名（`id_token` 顶层 `preferred_username`/`name`，
-            // 取不到再解 `user_profile.account_name` —— 实测这个租户的身份就在内层）→
+            // 账号名：优先上游显示名（`preferred_username`/`name`，都没有再解令牌里
+            // 嵌套的 `user_profile.account_name` —— 实测这个名字装在 **`refresh_token`**
+            // 那一枚的 claims 里，只解 `id_token` 就永远取不到）→
             // 用户级 principal id → 账号级 account_id → 派生 id 的前 8 位。
             // **不再退到种子名「OfficeAce 果办」** ——
             // 多个账号会同名而分不出来（实测就是这么被报的）。
             // principal 排在 account 之前：同一华为云账号下的不同 IAM 用户共用
             // account_id，那串十六进制分不开他们。
-            // 这一整串都是**派生**的，不是用户打的 ⇒ `name_custom=false`：
-            // 上游当时不给显示名（实测就不给），名字得留给续期链自愈
-            // （`refresh_control_plane` 每轮从新 `id_token` 再取一次）。
+            // 后三格都是**派生**的，不是用户打的 ⇒ `name_custom=false`：
+            // 名字留给续期链自愈（`refresh_control_plane` 每轮从新令牌再取一次），
+            // 面板上手工改过的名字则不会被覆盖。
             let account_name = first_non_empty(&[
                 credential.user_name.as_str(),
                 credential.principal_id.as_str(),
