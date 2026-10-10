@@ -64,6 +64,9 @@ pub mod health;
 // `core::import_ccswitch`）
 pub mod import_sources;
 pub mod keys_api;
+/// 保活换行丢弃开关（`/api/keepalive-strip`）：与 `/api/sanitize`、`/api/debug`
+/// 同形的单开关端点，独立成文件而不是塞进 config_api —— 理由见该模块头。
+pub mod keepalive;
 pub mod logs_api;
 pub mod model_manage;
 // 模型测试（模型管理页操作列的「测试」）：挂管理面、走真实转发链路，

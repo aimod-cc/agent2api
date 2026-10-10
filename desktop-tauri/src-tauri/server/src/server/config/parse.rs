@@ -65,6 +65,22 @@ pub(super) fn env_captcha_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// 环境变量 `AGENT2API_STRIP_NEWLINE_KEEPALIVE` 的读法（**默认关**）。
+///
+/// 与 `env_captcha_enabled` 的"非 0 即开"刻意不同：这个开关改的是**下发给客户端
+/// 的字节**（丢掉只含换行的 content 分片），开错的代价是吞掉一个真换行，
+/// 所以只认 `1` / `true` / `on`（忽略大小写与首尾空白），其余一律算关 ——
+/// 包括空值。`AGENT2API_STRIP_NEWLINE_KEEPALIVE=` 这种"写了个空值"的 compose
+/// 写法在 Docker 里太常见了（未设置的变量插值就是这样），按非 0 即开会把它读成开。
+pub(super) fn env_strip_newline_keepalive() -> bool {
+    matches!(
+        std::env::var("AGENT2API_STRIP_NEWLINE_KEEPALIVE")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("1") | Ok("true") | Ok("on")
+    )
+}
+
 /// 从原始 JSON 里取非空字符串字段
 pub(super) fn string_field(map: &Map<String, Value>, key: &str) -> Option<String> {
     map.get(key)

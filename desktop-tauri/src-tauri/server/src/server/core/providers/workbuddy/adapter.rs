@@ -462,6 +462,29 @@ impl ProviderAdapter for WorkBuddyAdapter {
         true
     }
 
+    /// 丢弃「整片只有换行」的 content 分片：**要丢**。
+    ///
+    /// 实测（生产库 `request_raw` 存的下发字节，两天 58 发本家 200 请求）：
+    /// copilot.tencent.com 会在相邻正文分片之间插一帧 `delta.content` 只含换行的
+    /// 分片 —— 同一个流里还在发 `: heartbeat` 注释行，那才是它的本意保活手段。
+    /// 20 发带这类分片（34.5%），脏请求里它们占正文分片中位 13.4%（区间
+    /// 1.2%–30.8%），干净请求恒 0（二值分布）。**与耗时无关**：脏的中位 12.1 秒、
+    /// 干净的 14.3 秒（完整口径与五种实测形态见 `upstream::sse` 模块头）。
+    /// 客户端按 markdown 渲染时一个换行就是一个 `<br>`，
+    /// 「Let me run the unit tests」被排成一行一个词。
+    ///
+    /// ── 与本家「透传逐字节不变」那条硬要求的关系 ────────────────
+    /// 那条要求说的是**网关不得擅自改写上游帧**；这里丢的正是上游擅自塞进
+    /// 正文的节拍，而且是**显式开关**（判据见 `upstream::sse::is_newline_keepalive`，
+    /// 关掉即回到逐字节一致）。本家这一位只是"允许"，真正生效还要
+    /// `stripNewlineKeepalive` 开着（`/api/keepalive-strip` 或环境变量
+    /// `AGENT2API_STRIP_NEWLINE_KEEPALIVE`，**默认关**）。
+    /// 取舍：模型若真有一个「单独成片」的换行，会被
+    /// 一起吃掉 —— 少一个换行的外观损失，换掉整屏断句。
+    fn sse_strip_newline_chunks(&self) -> bool {
+        true
+    }
+
     /// workbuddy 支持主动刷新（`/auth/token/refresh` + `X-Refresh-Token` 头，
     /// 实现见 `AuthService::refresh_account`）。
     fn supports_refresh(&self) -> bool {

@@ -991,14 +991,14 @@ mod tests {
     #[tokio::test]
     async fn empty_stream_becomes_502_when_aggregated() {
         use crate::server::core::upstream::{
-            aggregate::aggregate_frame_stream, usage::RequestTelemetry,
+            aggregate::aggregate_frame_stream, sse::FramePolicy, usage::RequestTelemetry,
         };
         use std::sync::Arc;
 
         let mut stream = ChatFromAnthropicStream::new("glm-5.3");
         let frames = futures::stream::iter(stream.finish().into_iter().map(Ok));
         let result =
-            aggregate_frame_stream(Box::pin(frames), Arc::new(RequestTelemetry::new()), None).await;
+            aggregate_frame_stream(Box::pin(frames), Arc::new(RequestTelemetry::new()), FramePolicy::default()).await;
         match result {
             Err(error) => {
                 assert_eq!(error.status_code, 502);

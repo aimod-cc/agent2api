@@ -82,7 +82,10 @@ use crate::server::core::proxies::ResolvedProxy;
 use crate::server::core::providers::custom::emulation;
 use crate::server::core::upstream::connections::ConnectionGuard;
 use crate::server::core::upstream::request::{read_upstream_error, send_chat_request, TransportRequest};
-use crate::server::core::upstream::sse::ModelRewrite;
+// `FramePolicy::with_rewrite(...)`：自定义家只带 model 回写，保活换行的丢弃
+// 保持关闭 —— 那一项的依据是 WorkBuddy / AutoClaw 两条上游的实测，不能替
+// 用户自配的上游猜。
+use crate::server::core::upstream::sse::{FramePolicy, ModelRewrite};
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardStream, InFlightGuard};
 use crate::server::errors::GatewayError;
@@ -296,7 +299,7 @@ pub(crate) async fn forward(
                 slot.take(),
                 connections.handoff(),
                 telemetry.clone(),
-                rewrite,
+                FramePolicy::with_rewrite(rewrite),
             )),
         })
     } else {
@@ -305,7 +308,7 @@ pub(crate) async fn forward(
         let aggregated = crate::server::core::upstream::aggregate::aggregate_sse_completion(
             response,
             telemetry.clone(),
-            rewrite,
+            FramePolicy::with_rewrite(rewrite),
         )
         .await?;
         Ok(ForwardOutcome::Completion {
@@ -612,14 +615,14 @@ async fn forward_translated(
                 slot.take(),
                 connections.handoff(),
                 telemetry.clone(),
-                rewrite,
+                FramePolicy::with_rewrite(rewrite),
             )),
         })
     } else {
         let aggregated = crate::server::core::upstream::aggregate::aggregate_frame_stream(
             translated,
             telemetry.clone(),
-            rewrite,
+            FramePolicy::with_rewrite(rewrite),
         )
         .await?;
         Ok(ForwardOutcome::Completion { body: aggregated.body })

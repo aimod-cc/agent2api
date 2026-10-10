@@ -29,7 +29,7 @@ use serde_json::{json, Map, Value};
 use crate::server::errors::GatewayError;
 
 use super::cancellation;
-use super::sse::ModelRewrite;
+use super::sse::{is_newline_keepalive, FramePolicy, ModelRewrite};
 use super::usage::RequestTelemetry;
 
 /// 流式读取的上限保护：单条 SSE 行长度（解析失败的行会原样丢掉，
@@ -53,14 +53,17 @@ pub struct AggregatedCompletion {
 /// **不影响返回的 body**（usage 的透传口径由 aggregate 自己的
 /// `self.usage` 负责，与这里无关，两条路径互不干扰）。
 ///
-/// `model_rewrite` 与流式分支同源（适配器的 `sse_model_rewrite()`）：
-/// **非流式响应体里的 `model` 同样要回写**成客户端请求的名字 ——
-/// 客户端拿到的 model 名不该因为「要不要流式」而变样（源实现
-/// `forwardChatCompletions` 的非流式分支也是 `payload.model = requestedModel`）。
+/// `policy` 与流式分支同源（适配器的 `sse_model_rewrite()` 与
+/// `sse_strip_newline_chunks()`）：**非流式响应体里的 `model` 同样要回写**成
+/// 客户端请求的名字 —— 客户端拿到的 model 名不该因为「要不要流式」而变样
+/// （源实现 `forwardChatCompletions` 的非流式分支也是
+/// `payload.model = requestedModel`）。保活换行分片同理：上游插的那些
+/// 「整片只有换行」的分片在流式里会被丢掉，非流式若照抄就把同一个噪声以
+/// 词间换行的形式交给了客户端（见 `sse.rs` 模块头的实测）。
 pub async fn aggregate_sse_completion(
     response: reqwest::Response,
     telemetry: Arc<RequestTelemetry>,
-    model_rewrite: Option<ModelRewrite>,
+    policy: FramePolicy,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 与 `ForwardStream::new` 同款：reqwest 错误在这里就地描述成文案折进
     // io::Error（`describe_error_detail` 只认 reqwest::Error）
@@ -74,7 +77,7 @@ pub async fn aggregate_sse_completion(
         }
         item
     });
-    aggregate_frame_stream(Box::pin(stream), telemetry, model_rewrite).await
+    aggregate_frame_stream(Box::pin(stream), telemetry, policy).await
 }
 
 /// 聚合一条**标准 chat SSE** 字节流（不限定来源）。
@@ -82,13 +85,13 @@ pub async fn aggregate_sse_completion(
 /// 自定义家的翻译协议（responses / anthropic 上游）在进入本函数前先过
 /// `providers::custom` 的 `ProtocolTranslateStream` —— 本函数与
 /// [`aggregate_sse_completion`] 共用同一套聚合规则，只是输入从
-/// reqwest::Response 换成已翻译的帧流。telemetry / model_rewrite 的语义
+/// reqwest::Response 换成已翻译的帧流。telemetry / policy 的语义
 /// 与那个函数完全一致（见它的说明）。
 /// 原始报文由输入流在翻译前采集，本函数不重复采集内部 chat 帧。
 pub async fn aggregate_frame_stream(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
-    model_rewrite: Option<ModelRewrite>,
+    policy: FramePolicy,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 非流式响应总超时（设置页「请求超时」第四项）：**一次性计时、不重置**
     // —— 与流式的空闲超时是两种语义（那是「两次数据之间」，这里读完整份
@@ -98,7 +101,7 @@ pub async fn aggregate_frame_stream(
     let budget = std::time::Duration::from_millis(
         crate::server::config::timeout_settings().body_ms(),
     );
-    match tokio::time::timeout(budget, aggregate_frame_stream_inner(stream, telemetry, model_rewrite))
+    match tokio::time::timeout(budget, aggregate_frame_stream_inner(stream, telemetry, policy))
         .await
     {
         Ok(result) => result,
@@ -113,7 +116,7 @@ pub async fn aggregate_frame_stream(
 async fn aggregate_frame_stream_inner(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
-    model_rewrite: Option<ModelRewrite>,
+    policy: FramePolicy,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // ── 手动终止的旁路流（与 `ForwardStream::from_translated` 同一手法）──
     // 聚合是 `while let Some(item) = stream.next().await` 的拉取循环：没有
@@ -129,7 +132,11 @@ async fn aggregate_frame_stream_inner(
     // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
     let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
     let mut buffer = String::new();
-    let mut acc = CompletionAccumulator { rewrite: model_rewrite, ..Default::default() };
+    let mut acc = CompletionAccumulator {
+        rewrite: policy.rewrite,
+        strip_newline_chunks: policy.strip_newline_chunks,
+        ..Default::default()
+    };
     // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
     // 没有下发流可言），所以第一个**上游** chunk 在这里记 —— 它就是
     // 「上游开始吐内容」的时刻。非流式请求的用时要等聚合完才有意义，
@@ -195,6 +202,9 @@ struct CompletionAccumulator {
     tool_calls: BTreeMap<i64, Value>,
     /// model 名回写参数（None = 不改写，沿用上游给的 model）
     rewrite: Option<ModelRewrite>,
+    /// 丢弃「整片只有换行」的 content 分片（WorkBuddy / AutoClaw 的保活节拍，
+    /// 判据与理由见 `sse::is_newline_keepalive`）。false = 与接入前逐字一致。
+    strip_newline_chunks: bool,
 }
 
 impl CompletionAccumulator {
@@ -271,7 +281,14 @@ impl CompletionAccumulator {
             }
         }
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
-            self.content.push_str(content);
+            // 保活换行分片：只跳过**正文拼接**，不提前 return —— 同一帧的
+            // id / model / created / role / usage 照常记账（流式分支也是这个
+            // 次序：先旁路提取与记元数据，再决定丢这一帧）。两条路径口径一致，
+            // 「同一个请求要不要流式」才不会出现两种正文。
+            let keepalive = self.strip_newline_chunks && is_newline_keepalive(chunk);
+            if !keepalive {
+                self.content.push_str(content);
+            }
         }
         // 思考增量挂在哪个字段上，上游并不统一：`reasoning_content`（多数
         // OpenAI 兼容网关）与 `reasoning`（Cline 免费池实测，配 `reasoning_details`）
@@ -518,5 +535,37 @@ mod tests {
         let message = &body["choices"][0]["message"];
         assert_eq!(message["content"], "你好");
         assert!(message.get("reasoning_content").is_none());
+    }
+
+    /// 把「A / \n / ' B'」三帧折成一份非流式正文（`strip` = 丢不丢保活换行）
+    fn fold(strip: bool) -> String {
+        let mut acc = CompletionAccumulator {
+            strip_newline_chunks: strip,
+            ..Default::default()
+        };
+        let telemetry = RequestTelemetry::new();
+        for delta in [json!({"content": "A"}), json!({"content": "\n"}), json!({"content": " B"})] {
+            let chunk = json!({
+                "id": "c1",
+                "model": "m",
+                "created": 1,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                "usage": Value::Null,
+            });
+            acc.consume_chunk(&chunk, &telemetry)
+                .expect("测试里的帧不该被判成上游错误");
+        }
+        let body = acc.into_completion().body;
+        body.pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn non_stream_folding_drops_the_keepalive_newlines_too() {
+        // 两条路径口径必须一致：同一个请求要不要流式，正文不该长得不一样
+        assert_eq!(fold(false), "A\n B", "关掉时照旧逐字拼接");
+        assert_eq!(fold(true), "A B", "开启时非流式客户端也拿不到那一记换行");
     }
 }

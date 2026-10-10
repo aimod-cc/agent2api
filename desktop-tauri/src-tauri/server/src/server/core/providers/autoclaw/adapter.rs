@@ -443,6 +443,18 @@ impl ProviderAdapter for AutoClawAdapter {
         true
     }
 
+    /// 丢弃「整片只有换行」的 content 分片：**要丢**（与 WorkBuddy 同一现象，
+    /// 判据与实测见 [`crate::server::core::providers::workbuddy`] 那侧的说明与
+    /// `upstream::sse::is_newline_keepalive`）。
+    ///
+    /// 本家的形态差别：上游代理把每一帧都拼成 `{role:"assistant", content:…}`
+    /// （没有 `finish_reason` 键），纯换行的节拍帧也带 `role` —— 所以判定里
+    /// **role 存在不算「有别的有效载荷」**，否则本家一条都丢不掉。
+    /// `role` 因此不会丢：脏流的每一帧都带它，留下的帧照样把角色告诉客户端。
+    fn sse_strip_newline_chunks(&self) -> bool {
+        true
+    }
+
     /// AutoClaw 支持主动刷新（`POST {userapi}/refresh`，签名校验失败时降级
     /// `agent-refresh`；实现在 `refresh.rs`）。
     fn supports_refresh(&self) -> bool {

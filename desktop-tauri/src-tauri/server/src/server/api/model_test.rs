@@ -66,6 +66,7 @@ use crate::server::core::key_scope::KeyScope;
 use crate::server::core::providers::catalog;
 use crate::server::core::upstream::aggregate::aggregate_frame_stream;
 use crate::server::core::upstream::cancellation;
+use crate::server::core::upstream::sse::FramePolicy;
 use crate::server::core::upstream::usage::RequestTelemetry;
 use crate::server::core::upstream::{ForwardOutcome, ForwardRequest};
 use crate::server::errors;
@@ -362,7 +363,7 @@ async fn run_forward(
             use futures::StreamExt;
             match tokio::time::timeout(
                 TEST_TIMEOUT,
-                aggregate_frame_stream(source.boxed(), telemetry.clone(), None),
+                aggregate_frame_stream(source.boxed(), telemetry.clone(), FramePolicy::default()),
             )
             .await
             {

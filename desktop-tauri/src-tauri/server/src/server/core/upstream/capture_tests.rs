@@ -1,4 +1,5 @@
 use super::*;
+use super::sse::FramePolicy;
 use crate::server::core::debug_traffic::TrafficCapture;
 use futures::StreamExt;
 
@@ -52,11 +53,11 @@ async fn translated_responses_capture_only_original_anthropic_bytes() {
                 None,
                 ConnectionGuard::new(Connections::new()),
                 telemetry,
-                None,
+                FramePolicy::default(),
             );
             assert!(drain(stream).await.contains("hello"));
         } else {
-            let result = aggregate::aggregate_frame_stream(translated, telemetry, None)
+            let result = aggregate::aggregate_frame_stream(translated, telemetry, FramePolicy::default())
                 .await
                 .unwrap();
             assert_eq!(result.body["choices"][0]["message"]["content"], "hello");
@@ -75,11 +76,11 @@ async fn direct_chat_responses_still_capture_original_bytes_once() {
                 None,
                 ConnectionGuard::new(Connections::new()),
                 telemetry,
-                None,
+                FramePolicy::default(),
             );
             assert!(drain(stream).await.contains("hello"));
         } else {
-            let result = aggregate::aggregate_sse_completion(response(CHAT), telemetry, None)
+            let result = aggregate::aggregate_sse_completion(response(CHAT), telemetry, FramePolicy::default())
                 .await
                 .unwrap();
             assert_eq!(result.body["choices"][0]["message"]["content"], "hello");

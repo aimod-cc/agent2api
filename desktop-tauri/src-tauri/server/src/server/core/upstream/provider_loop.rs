@@ -1296,14 +1296,14 @@ async fn attempt_queue(
                         slot.take(),
                         connections.handoff(),
                         ctx.telemetry.clone(),
-                        model_rewrite_of(adapter, &model),
+                        frame_policy_of(adapter, &model),
                     )),
                 });
             }
             let aggregated = super::aggregate::aggregate_frame_stream(
                 translated,
                 ctx.telemetry.clone(),
-                model_rewrite_of(adapter, &model),
+                frame_policy_of(adapter, &model),
             )
             .await?;
             return Ok(ForwardOutcome::Completion {
@@ -1323,14 +1323,14 @@ async fn attempt_queue(
                     slot.take(),
                     connections.handoff(),
                     ctx.telemetry.clone(),
-                    model_rewrite_of(adapter, &model),
+                    frame_policy_of(adapter, &model),
                 )),
             });
         }
         let aggregated = super::aggregate::aggregate_sse_completion(
             response,
             ctx.telemetry.clone(),
-            model_rewrite_of(adapter, &model),
+            frame_policy_of(adapter, &model),
         )
         .await?;
         let choice = aggregated.body.get("choices").and_then(|value| value.get(0));
@@ -1765,15 +1765,27 @@ fn limit_model_label(requested: &str, wire: &str) -> String {
     format!("{requested} → {wire}")
 }
 
-/// SSE/聚合响应的 model 名回写参数：要不要改写由适配器回答
-/// （小浣熊上游会回自己的内部名，见 `providers::raccoon` 与 `sse.rs` 的模块头）。
-/// 未声明回写的 provider 得 None，下发帧逐字节不变（workbuddy 的硬要求）。
-fn model_rewrite_of(adapter: &dyn ProviderAdapter, model: &str) -> Option<super::sse::ModelRewrite> {
-    if adapter.sse_model_rewrite() {
-        Some(super::sse::ModelRewrite { requested: model.to_string() })
-    } else {
-        None
-    }
+/// 下发帧的改写策略：能力位由适配器回答，全局开关由配置回答，通用层不出现
+/// provider 分支。
+///
+///   - model 名回写：小浣熊 / AutoClaw / Cline 的上游会回自己的内部名，
+///     见 `providers::raccoon` 与 `sse.rs` 的模块头；
+///   - 丢弃保活换行分片：WorkBuddy / AutoClaw 上游会在正文分片之间
+///     插一帧只含换行的 content（实测口径见 `sse::is_newline_keepalive`），
+///     **且**要把 `stripNewlineKeepalive` 开关打开（默认关，见
+///     `config::KEY_STRIP_NEWLINE_KEEPALIVE`）—— 装配规则与两位的先后关系
+///     写在 [`super::sse::FramePolicy::assembled`]。
+///
+/// 其余 provider（以及没开开关的本两家）得到全关的 `FramePolicy`，下发帧
+/// 逐字节不变（workbuddy 那条「透传逐字节不变」的硬要求只在开关打开时让路一次）。
+fn frame_policy_of(adapter: &dyn ProviderAdapter, model: &str) -> super::sse::FramePolicy {
+    super::sse::FramePolicy::assembled(
+        adapter
+            .sse_model_rewrite()
+            .then(|| super::sse::ModelRewrite { requested: model.to_string() }),
+        adapter.sse_strip_newline_chunks(),
+        crate::server::config::strip_newline_keepalive(),
+    )
 }
 
 /// 手动终止在 `send_with_retry` 里的返回形态（见 [`cancelled_error`] 的说明：
