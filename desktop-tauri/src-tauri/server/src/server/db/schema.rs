@@ -154,6 +154,12 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 它不是配置项（配置写入绝不能动它，否则用户配好的代理会被改一次 API Key
     // 清空）。条目不落独立表、只整份读写，理由见那个模块头。
     "proxyPool",
+    // OfficeAce 模型可用性探测的结论（core::providers::officeace::probe）：
+    // 整份 `{unavailable:[…], probedAt, account}` 一个键。探测「目录里列着、这个
+    // 号实际打不通」的模型（上游回 81004/81009），结论由 `advertise_models` 用来
+    // 默认隐藏它们。属于「其它零散状态」——不是配置项，配置写入绝不能动它
+    // （否则每次改配置都让隐藏集合清零、客户端又照着一个一个试）。
+    "officeaceModelProbe",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。

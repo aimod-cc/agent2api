@@ -357,6 +357,11 @@ impl ServerState {
         // 位置必须在这里：它得早于下面那次 `restore_cached_catalogs` 预热 ——
         // 各家的目录句柄首次初始化时才读缓存，句柄先被碰到就再也读不回来了。
         core::providers::catalog_cache::install(db.clone());
+        // OfficeAce 模型可用性探测的结论也落同一个库（kv 的 `officeaceModelProbe`
+        // 键）：目录刷新后探一轮、把「这个号打不通」的模型从对外清单里收窄掉。
+        // 与 catalog_cache 同一形态（kv 固定键 + 整份读写），位置只需早于
+        // 第一次 `advertise_models`（那是纯读，未 install 时给空结论 = 不藏）。
+        core::providers::officeace::probe::install(db.clone());
         // ── 旧文件一次性迁移：**本切片起不再自动跑** ────────────────
         // 它现在由用户在升级弹窗里点「升级」触发（`POST /api/upgrade/run`）。
         // 为什么改成手动：需求是「弹窗告诉用户换了 SQLite，点升级才开始导」——

@@ -25,4 +25,5 @@ pub mod chat;
 pub mod credentials;
 pub mod models;
 pub mod oauth;
+pub mod probe;
 pub mod signer;

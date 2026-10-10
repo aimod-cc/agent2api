@@ -38,6 +38,35 @@ impl ProviderAdapter for OfficeAceAdapter {
         models::list()
     }
 
+    /// 对外广告前把「这个号实际打不通」的模型收窄掉（默认隐藏）。
+    ///
+    /// ── 为什么本家要覆写它（其余家都是恒等）──────────────────────
+    /// 上游目录（`GET {网关}/v1/models`）会列出 28~34 个名，但**实测一个号只有
+    /// 11 个真的能打通**，其余回 `81004`（没权限）/ `81009`（名字不认）。本仓的
+    /// 适配器把这两类归成 `Fatal` —— **不换家、不冷却**，一个点名到无权限模型的
+    /// 请求会直接把这个上游错误透传给客户端。收窄是**门禁**（见 trait 文档）：
+    /// 收窄掉的名字客户端看不到、也点不动（400 `model_not_found`），于是「照着一个
+    /// 一个试、试一个错一个」在入口就被挡住。
+    ///
+    /// ── 谁提供这份隐藏集合 ──────────────────────────────────────
+    /// `probe` 模块：目录刷新后主动探一轮（`max_tokens: 1`，只问「认不认这个名字」），
+    /// 结论落盘、6 小时 TTL。**没探过时隐藏集合为空 = 不藏任何东西** —— 这是刻意的：
+    /// 宁可漏藏几个让客户端多试一次，也不在还没有结论时把用户真能用的模型挡在门外
+    /// （trait 文档那条「写错会把用户真能用的模型挡在门外」）。
+    fn advertise_models(&self, _store: &AccountStore, manifest: Vec<Value>) -> Vec<Value> {
+        let hidden = super::probe::hidden_ids();
+        if hidden.is_empty() {
+            return manifest;
+        }
+        manifest
+            .into_iter()
+            .filter(|item| {
+                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                !super::probe::is_hidden(&hidden, id)
+            })
+            .collect()
+    }
+
     /// 构造 `POST {网关}/v2/chat/completions`。
     ///
     /// 上游恒流式（见 `chat` 的模块头）；非流式客户端请求由编排层聚合。

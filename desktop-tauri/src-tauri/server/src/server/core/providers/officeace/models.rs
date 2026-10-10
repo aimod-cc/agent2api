@@ -193,6 +193,11 @@ pub async fn refresh(credential: &OfficeAceCredential, force: bool) -> ModelRefr
         });
     });
     catalog_cache::save(SCOPE, &models, now);
+    // 目录刷新成功后按需起一轮可用性探测（有 6 小时 TTL + 在途标记，不会因为
+    // 目录被反复拉而反复打上游；`force` 由手动「刷新模型清单」透传，给用户一个
+    // 「重新探一次」的入口）。探测结论由 `adapter::advertise_models` 用来收窄
+    // 对外清单 —— 见 `probe` 模块头。
+    super::probe::maybe_spawn(credential, &models, force);
     ModelRefreshOutcome::refreshed(count)
 }
 
