@@ -177,38 +177,46 @@ impl Bonus {
     }
 }
 
+/// 上游的数值字段是**字符串**（实测样例：`"sku_value": "500"`、`"points": "4000"`）——
+/// `Value::as_f64()` 对字符串恒回 `None`，直接用它会把余额/奖励全算成 0。
+/// 所有数值都走这里：数字直接用、字符串解析、其余给 0（与 JS 的 `Number(v)` 同口径）。
+fn num(value: Option<&Value>) -> f64 {
+    match value {
+        Some(Value::Number(number)) => number.as_f64().unwrap_or(0.0),
+        Some(Value::String(text)) => text.trim().parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// 一个 `bonus_skus` 条目 → [`Bonus`]（解析口径见 [`bonuses_of`]）。
+fn bonus_of(item: &Value) -> Option<Bonus> {
+    let text = |field: &str| {
+        item.get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    // 键的兜底：实测**奖励条目可能没有 `activity_id`**（样例只有 `activity_name`）——
+    // 只认 `activity_id` 会把这些条目整条丢掉（表现为「没有任务」）。
+    let key = text("activity_id")
+        .or_else(|| text("cbc_resource_id"))
+        .or_else(|| text("activity_name"))?;
+    Some(Bonus {
+        name: text("activity_name").unwrap_or_else(|| key.clone()),
+        total: num(item.get("points")),
+        used: num(item.get("current_value")),
+        expires_at: parse_ms(item.get("expired_time")),
+        activity_id: key,
+    })
+}
+
 /// 从 `bonus_skus` 数组解出奖励活动（形状见参考实现的 `summarizeSubscription`）。
 pub fn bonuses_of(subscription: &Value) -> Vec<Bonus> {
     subscription
         .get("bonus_skus")
         .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let activity_id = item
-                        .get("activity_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    if activity_id.is_empty() {
-                        return None;
-                    }
-                    Some(Bonus {
-                        name: item
-                            .get("activity_name")
-                            .and_then(Value::as_str)
-                            .filter(|name| !name.is_empty())
-                            .unwrap_or(&activity_id)
-                            .to_string(),
-                        total: item.get("points").and_then(Value::as_f64).unwrap_or(0.0),
-                        used: item.get("current_value").and_then(Value::as_f64).unwrap_or(0.0),
-                        expires_at: parse_ms(item.get("expired_time")),
-                        activity_id,
-                    })
-                })
-                .collect()
-        })
+        .map(|items| items.iter().filter_map(bonus_of).collect())
         .unwrap_or_default()
 }
 
@@ -247,12 +255,12 @@ pub fn summarize(subscription: &Value) -> Value {
             }
             match quota.get("sku_attr_code").and_then(Value::as_str) {
                 Some("officeace_points") => {
-                    plan_total += quota.get("sku_value").and_then(Value::as_f64).unwrap_or(0.0);
-                    plan_used += quota.get("current_value").and_then(Value::as_f64).unwrap_or(0.0);
+                    plan_total += num(quota.get("sku_value"));
+                    plan_used += num(quota.get("current_value"));
                 }
                 Some("online_search_count") => {
-                    search_total += quota.get("sku_value").and_then(Value::as_f64).unwrap_or(0.0);
-                    search_used += quota.get("current_value").and_then(Value::as_f64).unwrap_or(0.0);
+                    search_total += num(quota.get("sku_value"));
+                    search_used += num(quota.get("current_value"));
                 }
                 _ => {}
             }
@@ -360,18 +368,20 @@ mod tests {
 
     #[test]
     fn summarize_adds_plan_and_bonus_remaining() {
+        // 关键：上游的数值是**字符串**（实测样例 `"sku_value": "500"`）—— as_f64 会算成 0
         let sub = json!({
             "subscribe_status": "SUBSCRIBED",
             "skus": [{
                 "sku_name": "标准版",
                 "expired_time": "2099-01-01T00:00:00Z",
                 "quotas": [
-                    { "sku_attr_code": "officeace_points", "sku_value": 500, "current_value": 120 },
-                    { "sku_attr_code": "online_search_count", "sku_value": 200, "current_value": 0 }
+                    { "sku_attr_code": "officeace_points", "sku_value": "500", "current_value": "120" },
+                    { "sku_attr_code": "online_search_count", "sku_value": "200", "current_value": "0" }
                 ]
             }],
             "bonus_skus": [
-                { "activity_id": "newbie", "activity_name": "新人注册礼", "points": 100, "current_value": 0 }
+                // 奖励条目**可能没有 activity_id**（只有 activity_name）—— 不能被丢掉
+                { "activity_name": "新用户专属福利", "points": "100", "current_value": "0" }
             ]
         });
         let out = summarize(&sub);
@@ -400,11 +410,17 @@ mod tests {
     }
 
     #[test]
-    fn bonuses_of_ignores_entries_without_activity_id() {
-        let sub = json!({ "bonus_skus": [ {"points": 1}, {"activity_id": "a", "points": 5, "current_value": 2} ] });
+    fn bonuses_keep_entries_without_activity_id_but_drop_unidentifiable_ones() {
+        let sub = json!({ "bonus_skus": [
+            { "points": "1" },                                                  // 无任何标识 → 丢
+            { "activity_id": "a", "points": "5", "current_value": "2" },        // 有 id
+            { "activity_name": "新用户专属福利", "points": "4000", "current_value": "0" }, // 只有名字 → 保留（键退到名字）
+        ] });
         let bonuses = bonuses_of(&sub);
-        assert_eq!(1, bonuses.len());
+        assert_eq!(2, bonuses.len(), "无标识的丢掉，只有名字的保留");
         assert_eq!("a", bonuses[0].activity_id);
         assert_eq!(3.0, bonuses[0].remaining());
+        assert_eq!("新用户专属福利", bonuses[1].activity_id);
+        assert_eq!(4000.0, bonuses[1].total, "字符串数字要解析出来");
     }
 }

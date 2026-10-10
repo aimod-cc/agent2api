@@ -115,7 +115,15 @@ impl LoginService {
                 "projectId": credential.project_id,
                 "expiresAt": credential.expires_at,
             });
-            match self.store.add_officeace_account(&payload, None) {
+            // 账号名用上游给的显示名（`id_token` 的 `preferred_username`/`name`）；
+            // 拿不到才退到种子名「OfficeAce 果办」—— 否则面板的账号名看起来
+            // 「只有提供商名」，与别家显示昵称/邮箱不一致。
+            let account_name = if credential.user_name.trim().is_empty() {
+                None
+            } else {
+                Some(credential.user_name.as_str())
+            };
+            match self.store.add_officeace_account(&payload, account_name) {
                 Ok(account) => {
                     task.session = Some(json!({
                         "accountUid": account.get("id"),

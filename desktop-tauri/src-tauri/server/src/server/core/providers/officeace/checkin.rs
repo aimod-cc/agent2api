@@ -28,6 +28,9 @@ pub async fn claim_daily_checkin(
     // 领之前记一份余额好算增量；读失败不阻断签到（只是少一个读数，不能因此判签到失败）
     let before = subscription::fetch_subscription(&credential).await.ok();
     let after = subscription::claim_bonus(&credential).await?;
+    // 签到与新手任务是同一个上游动作：签到成功即新手任务也已完成 —— 顺手把
+    // 当天所有奖励记进新手任务台账，免得面板一直显示「未完成」（见 `onboarding`）。
+    super::onboarding::mark_claimed(store, account_id, &subscription::bonuses_of(&after));
     let gained = before
         .as_ref()
         .map(|before| subscription::gained_between(before, &after));

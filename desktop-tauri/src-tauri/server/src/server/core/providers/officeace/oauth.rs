@@ -80,6 +80,10 @@ pub struct GatewayCredential {
     pub security_token: String,
     pub project_id: String,
     pub expires_at: i64,
+    /// 上游给的账号显示名（`id_token` 的 `preferred_username`/`name`；取不到为空串）。
+    /// 拿它落账号名 —— 否则面板只能显示代码里的种子名「OfficeAce 果办」，
+    /// 看起来就是「只有提供商名」（与别家显示昵称/邮箱不一致）。
+    pub user_name: String,
 }
 
 fn base64url(bytes: &[u8]) -> String {
@@ -232,7 +236,7 @@ impl LoginFlow {
 
     /// ⑤⑥⑦：拿授权码换临时凭据，再用它换网关 Basic 那对。
     pub async fn finish(&self, code: &str) -> Result<GatewayCredential, String> {
-        let (temporary, expires_at) = self.exchange_code(code).await?;
+        let (temporary, expires_at, user_name) = self.exchange_code(code).await?;
         let gateway = self.fetch_gateway_credential(&temporary).await?;
         Ok(GatewayCredential {
             base_url: gateway.0,
@@ -243,6 +247,7 @@ impl LoginFlow {
             security_token: temporary.security_token,
             project_id: temporary.project_id,
             expires_at,
+            user_name,
         })
     }
 
@@ -250,7 +255,7 @@ impl LoginFlow {
     /// `send_raw` 只收 JSON 体，所以这里直接用 egress 客户端发表单）。
     ///
     /// 返回 `(临时凭据, 到期时刻毫秒)`。
-    async fn exchange_code(&self, code: &str) -> Result<(SigningCredential, i64), String> {
+    async fn exchange_code(&self, code: &str) -> Result<(SigningCredential, i64, String), String> {
         let key = DpopKey::from_key_pair(&self.dpop_key_pair)
             .map_err(|error| format!("DPoP 私钥不可用：{error}"))?;
         let proof = key
@@ -307,6 +312,14 @@ impl LoginFlow {
             .and_then(parse_rfc3339_ms)
             .filter(|value| *value > 0)
             .unwrap_or_else(|| logging::now_ms() + 2 * 3600 * 1000);
+        // 用户的显示名从 `id_token`（JWT）的 claims 取（参考实现同源：
+        // `preferred_username || name`）；取不到给空串，落账号时退到种子名。
+        let user_name = id_token_user_name(
+            payload
+                .get("id_token")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
         Ok((
             SigningCredential {
                 access_key_id,
@@ -323,6 +336,7 @@ impl LoginFlow {
                     .to_string(),
             },
             expires_at,
+            user_name,
         ))
     }
 
@@ -413,6 +427,35 @@ impl LoginFlow {
     }
 }
 
+/// 从 `id_token`（JWT）的 payload 里取用户显示名（`preferred_username` → `name`）。
+///
+/// 参考实现同源（`claims.preferred_username || claims.name`）。取不到（没给
+/// `id_token` / 不是三段 JWT / 解码失败）给空串 —— 调用方退到种子名，不报错。
+fn id_token_user_name(id_token: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let mut parts = id_token.split('.');
+    parts.next(); // header（不验签：这里只取显示名，不用于任何鉴权判断）
+    let Some(payload) = parts.next() else {
+        return String::new();
+    };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=').as_bytes()) else {
+        return String::new();
+    };
+    let Ok(claims) = serde_json::from_slice::<Value>(&bytes) else {
+        return String::new();
+    };
+    for field in ["preferred_username", "name"] {
+        if let Some(text) = claims.get(field).and_then(Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 /// 把 RFC3339（`2026-10-10T05:15:00Z`）解析成毫秒时间戳。
 pub(super) fn parse_rfc3339_ms(input: &str) -> Option<i64> {
     let text = input.trim().trim_end_matches('Z');
@@ -487,5 +530,25 @@ mod tests {
         assert_eq!("a%20b", url_escape("a b"));
         assert_eq!("a%2Fb", url_escape("a/b"));
         assert_eq!("-_.~", url_escape("-_.~"));
+    }
+
+    #[test]
+    fn id_token_user_name_reads_the_claims() {
+        let token_of = |claims: &str| format!("header.{}.sig", base64url(claims.as_bytes()));
+
+        assert_eq!(
+            "user@example.com",
+            id_token_user_name(&token_of(r#"{"preferred_username":"user@example.com","sub":"u1"}"#))
+        );
+        // `preferred_username` 缺 → 退到 `name`
+        assert_eq!("张三", id_token_user_name(&token_of(r#"{"name":"张三"}"#)));
+        // 带 `=` 填充也能解（JWT 通常不带，但别为它挂）
+        let padded = format!("{}==", base64url(r#"{"name":"abc"}"#.as_bytes()));
+        assert_eq!("abc", id_token_user_name(&format!("h.{padded}.s")));
+
+        // 取不到就给空串（调用方退种子名），不 panic
+        assert_eq!("", id_token_user_name(""));
+        assert_eq!("", id_token_user_name("not.a.jwt"));
+        assert_eq!("", id_token_user_name(&token_of(r#"{"sub":"u1"}"#)));
     }
 }

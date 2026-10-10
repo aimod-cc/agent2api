@@ -71,6 +71,24 @@ fn persist_ledger(store: &AccountStore, account_id: &str, ledger: &Ledger) {
     }
 }
 
+/// 把一批活动记进「今天已处理」台账（签到与领取共用）。
+///
+/// ── 为什么签到也要调它（与用户预期对齐）──────────────────────
+/// OfficeAce 的签到与新手任务是**同一个上游动作**（一次 claim 就把当天所有奖励
+/// 都发下来）—— 所以签到成功之后，新手任务其实**已经领过了**。若不在签到里落这笔
+/// 台账，面板的「新手任务」会一直显示未完成（要再点一次「领取」才补上），
+/// 与用户预期「和其他家一样在签到时自动完成新手任务」不符。
+pub fn mark_claimed(store: &AccountStore, account_id: &str, bonuses: &[subscription::Bonus]) {
+    if bonuses.is_empty() {
+        return;
+    }
+    let mut ledger = ledger_of(store, account_id);
+    for bonus in bonuses {
+        ledger.claimed.insert(bonus.activity_id.clone());
+    }
+    persist_ledger(store, account_id, &ledger);
+}
+
 /// 任务行 + 汇总：返回 `(tasks, total, earned, unclaimed)`。
 fn build_tasks(
     bonuses: &[subscription::Bonus],
