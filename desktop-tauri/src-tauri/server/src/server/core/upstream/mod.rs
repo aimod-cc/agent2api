@@ -74,7 +74,7 @@ use crate::server::errors::GatewayError;
 use crate::server::logging;
 
 use self::connections::{ConnectionGuard, Connections};
-use self::sse::{ModelRewrite, ReasoningCoalescer};
+use self::sse::{FramePolicy, ReasoningCoalescer};
 
 #[cfg(test)]
 mod capture_tests;
@@ -507,14 +507,15 @@ pub struct ForwardStream {
 }
 
 impl ForwardStream {
-    /// `model_rewrite` 由适配器的 `sse_model_rewrite()` 决定（见 `sse.rs` 模块头）：
-    /// 为 None 时帧的字节与接入前完全一致（workbuddy 的透传逐字节不变）。
+    /// `policy` 由适配器的 `sse_model_rewrite()` / `sse_strip_newline_chunks()`
+    /// 装配（见 `sse::FramePolicy`）：两项都关时下发帧的字节与接入前完全一致
+    /// （workbuddy 的透传逐字节不变是硬要求）。
     pub(super) fn new(
         response: reqwest::Response,
         slot: Option<InFlightGuard>,
         connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
-        model_rewrite: Option<ModelRewrite>,
+        policy: FramePolicy,
     ) -> Self {
         use futures::StreamExt;
         // reqwest 错误在这里就地描述成文案（`describe_error_detail` 认的是
@@ -533,7 +534,7 @@ impl ForwardStream {
             ),
         );
         let capture = telemetry.capture();
-        let mut stream = Self::from_translated(guarded, slot, connection, telemetry, model_rewrite);
+        let mut stream = Self::from_translated(guarded, slot, connection, telemetry, policy);
         stream.capture = capture;
         stream
     }
@@ -542,14 +543,14 @@ impl ForwardStream {
     ///
     /// 自定义家的 responses / anthropic 上游先过 `providers::custom` 的
     /// `ProtocolTranslateStream`（上游协议事件 → chat 帧），再进本流的
-    /// reasoning 合并 / usage 提取 / model 回写 —— 那三层只认 chat 帧，
-    /// 不需要知道上游原本是什么协议。
+    /// reasoning 合并 / usage 提取 / model 回写 / 保活换行丢弃 —— 这几层只认
+    /// chat 帧，不需要知道上游原本是什么协议。
     pub(super) fn from_translated(
         inner: futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>,
         slot: Option<InFlightGuard>,
         connection: ConnectionGuard,
         telemetry: Arc<usage::RequestTelemetry>,
-        model_rewrite: Option<ModelRewrite>,
+        policy: FramePolicy,
     ) -> Self {
         // ── 手动终止的旁路流（本次新增）────────────────────────────
         // 把令牌的等待挂成一条「只产出一个错误项」的旁路：置位后 poll 立刻
@@ -568,7 +569,7 @@ impl ForwardStream {
         Self {
             inner,
             coalescer: ReasoningCoalescer::with_telemetry(telemetry.clone())
-                .with_model_rewrite(model_rewrite),
+                .with_policy(policy),
             upstream_done: false,
             pending: std::collections::VecDeque::new(),
             _slot: slot,

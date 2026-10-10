@@ -26,7 +26,7 @@
 //! 用 `OnceLock<HashMap<…>>` 反而要处理「注册表还没装好时被调用」的路径，
 //! 而那条路径在 panic=abort 的 release 里只能 panic —— 得不偿失。
 //!
-//! ── 契约之外的十处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
+//! ── 契约之外的十一处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
 //!   1. `retry_advice`：识别「可退避重试的错误」并给出间隔与日志文案。
 //!      §4.3 要求「11128 退避逻辑保持在转发层」——**循环**留在编排层，
 //!      但「哪个码要退避、退多久」是 provider 知识（11128 是 workbuddy 的
@@ -100,6 +100,13 @@
 //!      编排层（`upstream::payload`）只负责在正确的时机问一次、按结果改写 body。
 //!      **默认实现是「不接」**（返回 `NotSupported`）—— 理由见那个方法的文档：
 //!      接一家要有一家的证据，没证据就注入等于把未知参数推给上游。
+//!  11. `sse_strip_newline_chunks`（下发帧丢掉「整片只有换行」的 content 分片）：
+//!      WorkBuddy 与 AutoClaw 的上游在生成慢时会在相邻正文分片之间插一帧纯换行
+//!      的 content（那是它们的保活节拍，实测占受影响请求正文分片的 36–39%，
+//!      见 `upstream::sse` 模块头）。丢不丢是 provider 知识 —— 同样的帧在别家
+//!      可能真是模型写的换行，所以由适配器回答，执行落在 `upstream::sse` 这个
+//!      SSE 逐行解析的唯一出口（与 `sse_model_rewrite` 同一分工、同一位置）。
+//!      **默认 false**：没声明的 provider 下发帧逐字节不变。
 //!
 //! ── 未注册的 provider 怎么办 ────────────────────────────────
 //! 四家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
@@ -716,6 +723,18 @@ pub trait ProviderAdapter: Send + Sync {
     /// 的内部名，因此它的适配器覆盖成 true —— 见 `upstream::sse` 的
     /// `model_rewrite` 参数与 `raccoon::mod` 的说明。
     fn sse_model_rewrite(&self) -> bool {
+        false
+    }
+
+    /// SSE 下发帧要不要丢掉「整片只有换行」的 content 分片（模块头扩展 11）。
+    ///
+    /// 默认 false（帧的字节逐字不变）。目前声明 true 的只有 WorkBuddy 与
+    /// AutoClaw —— 那两家的上游在生成慢时会在正文分片之间插纯换行的帧作为
+    /// 保活节拍，客户端按 markdown 渲染就被排成一行一个词。
+    /// 判据与实测口径见 [`crate::server::core::upstream::sse::is_newline_keepalive`]；
+    /// **执行不在这里**：本方法只回答「要不要」，丢帧动作落在 `upstream::sse`
+    /// 这个 SSE 逐行解析的唯一出口，与 [`Self::sse_model_rewrite`] 同一分工。
+    fn sse_strip_newline_chunks(&self) -> bool {
         false
     }
 
