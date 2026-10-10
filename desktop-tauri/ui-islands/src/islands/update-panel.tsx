@@ -12,14 +12,19 @@ import { t } from '../i18n'
 /**
  * Agent2API · 设置页「软件更新」面板（React 岛）。
  *
- * 替换 ui/update-panel.js。对外接口与原实现**完全一致**：
- *   `window.wbUpdatePanel = { load, check, syncFromCache, openAndDownload }`
- * 调用点一行都不用改：ui/settings-panel.js:177 → load()（切到设置页时）；
- * ui/app.js:845 → syncFromCache()（DOMContentLoaded，首屏用后端缓存回填）；
- * 「检测到更新」弹窗的「去更新」→ openAndDownload(info)（弹窗已归 update-modal.tsx）。
- * 另多导出一个 showUpdateModal(info)：旧 app.js 的定时轮询（pollUpdateStatus）是「隔
- * 一会儿再弹一次」的唯一推手，它原来走 wbApp.updateUpdateBadge → app.js 的
- * maybeShowUpdateModal；静态弹窗 DOM 一删那条路就断了，所以判定逻辑搬进了弹窗文件。
+ * 替换 ui/update-panel.js，原有的四个方法一字不改（调用点也不用改）：
+ *   load()           切到设置页时（settings-state.ts 的 load）；
+ *   check()          「检查更新」按钮；
+ *   syncFromCache()  首屏（app.js 的 DOMContentLoaded）读后端缓存回填；
+ *   openAndDownload(info)  「检测到更新」弹窗的「去更新」。
+ * 另多导出两个「结果已经在手上」的转发口：
+ *   applyStatus(info)     把外部的检查结果铺进面板（不重查、不弹窗）——
+ *                         app.js 的 60 秒轮询与定时任务页的「立即执行」走它；
+ *   showUpdateModal(info) 弹与不弹的判定（跳过此次版本 / 本会话已弹过 / 人已在设置页）
+ *                         连同弹窗本体都在 update-modal.tsx。旧 app.js 的轮询原来走
+ *                         maybeShowUpdateModal，静态弹窗 DOM 一删那条路就断了。
+ * 这两个口一起解决「后端查到了、界面不知道」：只喂导航徽标和弹窗的话，后端定时任务
+ * 查到的新版本与新的检查时刻，都要等用户手点一次「检查更新」才出现在面板上。
  *
  * ── 文件分工（这一族拆成四个，单文件不过长的同时不引入循环依赖）──
  *   update-panel.tsx    常驻面板 + 命令式流程（本文件）：root 建在
@@ -76,7 +81,9 @@ type DownloadPhase = 'idle' | 'downloading' | 'failed' | 'ready'
 type Snapshot = {
   /** 最近一次检查结果（null = 未检查 / 检查失败；更新日志也由它渲染） */
   info: UpdateInfo | null
-  /** 上次检查的时刻（0 = 没有；以后端返回的 checkedAt 为准） */
+  /** 上次检查的时刻（0 = 没有）。一律取后端那份状态里的 `checkedAt`：手动与定时是
+   *  同一段代码、同一个字段（后端只记「最近一次**成功**检查」，不区分谁触发），
+   *  前端不拿本地时钟冒充 —— 那会把几分钟前的结果标成「刚刚查的」 */
   checkedAt: number
   /** owner/repo，来自接口：作者行由它拼出来 */
   repository: string
@@ -131,11 +138,20 @@ function formatDateTime(value: unknown): string {
     + ` ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
 }
 
-/** 「上次检查」只要时刻：同一天内的检查看几点几分几秒就够了 */
+/**
+ * 「上次检查」的时刻：当天 `HH:mm:ss`，非当天补上日期 —— 自动检查被关掉 / 后端很久没查过
+ * 时，只显示小时分钟会把昨天或前天的检查读成今天刚查的，而这一处显示的正是「上次检查是
+ * 什么时候」。
+ */
 function formatClock(value: number): string {
   const date = new Date(value)
   if (!value || Number.isNaN(date.getTime())) return ''
-  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+  const today = new Date()
+  const sameDay = date.getFullYear() === today.getFullYear()
+    && date.getMonth() === today.getMonth()
+    && date.getDate() === today.getDate()
+  const clock = `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+  return sameDay ? clock : `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${clock}`
 }
 
 /**
@@ -264,6 +280,26 @@ function renderCheckResult(): void {
       })
       : t('仓库暂无发布版本。{at}', { at }))
   }
+}
+
+/**
+ * 把**外面拿到的一份检查结果**铺进面板（不请求、不弹窗）。
+ *
+ * 调用点：app.js 的 60 秒轮询（pollUpdateStatus）与定时任务页的「立即执行」——它们读到
+ * 后端缓存后经 `wbApp.updateUpdateBadge` 转到这里；本文件的 syncFromCache 也用它（读数从
+ * 缓存来，同样是「结果已经在手上」）。导航徽标与「检测到更新」弹窗归那条出口自己管，
+ * 本函数只管面板的读数（版本号 / 更新日志 / 检查时刻），也**不要**回调 updateUpdateBadge
+ * ——那是兜圈子。从前没有这一条时，后端定时任务刚查到的东西在面板上完全看不到，得用户
+ * 自己再点一次「检查更新」：功能都有，只是没串起来。
+ */
+function applyStatus(info?: UpdateInfo | null): void {
+  // checked === false：后端还没有任何检查结果，不能拿它清空面板上已有的读数
+  if (!info || info.checked === false) return
+  publish({ info, checkedAt: Number(info.checkedAt) || 0 })
+  if (info.repository) applyRepository(info.repository)
+  // 下载中 / 已就绪 / 下载失败这几种阶段下，徽章与状态行归下载流程（进度、安装提示、失败
+  // 原因），一次后台轮询不该把它们顶掉；版本号与更新日志是派生渲染，照常跟着新结果走
+  if (snapshot.phase === 'idle') renderCheckResult()
 }
 
 /** 仓库全名（owner/repo）来自接口；形态不对就不用，免得拼出个乱七八糟的链接 */
@@ -426,32 +462,29 @@ async function check(): Promise<UpdateInfo | null> {
 /**
  * 铺面板：读**后端缓存**里的最近一次检查结果，不自己打 GitHub。
  *
- * 查询由后端的定时任务负责（默认每 20 分钟一次，结果落库）。前端每次加载都自己再查
- * 一遍是重复劳动，代价还很高：dev 热重载下页面一天要重载几十次，匿名限额（60 次/小时，
- * 按出口 IP 计）很快见底，见底之后连定时任务也一起失败 —— 见底后本该做的只是等下一个
- * 检查窗口。缓存里没有结果时（后端刚起、或用户关掉了这条定时任务）按「未检查」显示。
+ * 查询由后端的定时任务负责（间隔在「更新设置」里配，结果落库）。手动与定时共用同一份
+ * 状态，所以这里读到的就是「最近一次成功检查」的真实时刻与版本，与谁触发无关。前端每次
+ * 加载都自己再查一遍是重复劳动，代价还很高：dev 热重载下页面一天要重载几十次，匿名限额
+ * （60 次/小时，按出口 IP 计）很快见底，见底之后连定时任务也一起失败。读库不打网络，
+ * 所以**每次进设置页都读一遍**（见 load）。缓存里没有结果时按「未检查」显示 —— 但只在
+ * 面板本来也没有读数时：已经铺过一次的就留着，别越读越空。
  */
 async function syncFromCache(): Promise<void> {
-  if (snapshot.info) {
-    renderCheckResult()
-    return
-  }
   let cached: UpdateInfo | null = null
   try {
     cached = (await shared().workbuddyDesktop?.getUpdateStatus()) ?? null
   } catch {
-    /* 后端未就绪：按未检查处理 */
+    /* 后端未就绪：保留面板上已有的读数，不清空 */
   }
   if (cached && cached.checked !== false) {
-    publish({ info: cached, checkedAt: Number(cached.checkedAt) || 0 })
-    if (cached.repository) applyRepository(cached.repository)
-    renderCheckResult()
+    applyStatus(cached)
     // 导航提示与 check() 同一出口：定时任务查到新版本时也能亮起来
     shared().wbApp?.updateUpdateBadge?.(cached)
     // 首屏这条路径正是「定时任务发现新版本 → 弹一次提示」的唯一入口（旧 app.js 同）
     showUpdateModal(cached, openAndDownload)
     return
   }
+  if (snapshot.info) return
   setBadge(t('未检查'))
   setState(t('点击「检查更新」查询 GitHub 上的最新发布版本。'))
 }
@@ -521,9 +554,14 @@ async function downloadOrCancel(): Promise<void> {
 
 /** 面板数据入口（切入设置页时由 settings-panel.js 调用） */
 async function load(): Promise<void> {
-  // 日志与版本号同源：先按当前结果铺一次（含启动时那次自动检查的结果与检查时刻），
-  // 切回来时不会白着一块等接口
+  // 日志与版本号同源：先按当前快照铺一次，切回来时不会白着一块等接口
   renderCheckResult()
+
+  // 再读一次后端缓存那一份（定时任务按间隔写、手动检查也写同一个字段）：**每次进来都读**，
+  // 不因为「本次会话已经有结果」就跳过 —— 后端刚查到的新版本、新的检查时刻要立刻反映到
+  // 面板上（本地读库，不打网络，理由见 syncFromCache）。放在下载任务之前：下面那几条路
+  // 会把徽章与状态行换成下载读数，谁的读数更「当下」就归谁
+  await syncFromCache()
 
   // 先看有没有上次遗留的下载任务（页面切走再回来时进度不丢）
   try {
@@ -542,17 +580,6 @@ async function load(): Promise<void> {
   } catch {
     /* 后端未就绪：按未检查处理 */
   }
-
-  // 启动时已经自动检查过一次的话，把那次结果原样铺回来（含检查时刻）。这里曾经无条件
-  // 重置成「未检查」，那样等于把启动检查的结果白白丢掉
-  if (snapshot.info) {
-    renderCheckResult()
-    return
-  }
-
-  // 本次会话还没有结果：读后端缓存（定时任务按间隔查一次、结果落库的那一份）。
-  // 这里**不再自己打 GitHub** —— 理由见 syncFromCache。
-  await syncFromCache()
 }
 
 /**
@@ -568,8 +595,9 @@ async function load(): Promise<void> {
  */
 async function openAndDownload(checkedInfo?: UpdateInfo | null): Promise<void> {
   if (checkedInfo?.hasUpdate === true) {
-    // 这里的时刻取本地时钟（照旧实现）：弹窗那份结果刚拿到手，标成「刚刚查的」才准
-    publish({ info: checkedInfo, checkedAt: Date.now() })
+    // 时刻用后端给的那一个：弹窗这份结果就是后端缓存里的最近一次检查结果（轮询读来的），
+    // 用本地时钟会把几小时前的检查标成「刚刚查的」—— 面板要显示的是真实的上次检查时间
+    publish({ info: checkedInfo, checkedAt: Number(checkedInfo.checkedAt) || snapshot.checkedAt })
     if (checkedInfo.repository) applyRepository(checkedInfo.repository)
     renderCheckResult()
     shared().wbApp?.updateUpdateBadge?.(checkedInfo)
@@ -837,6 +865,9 @@ declare global {
       syncFromCache(): Promise<void>
       /** 弹窗「去更新」/ 定时检查发现新版本后：铺面板并直接开始下载 */
       openAndDownload(info?: UpdateInfo | null): Promise<void>
+      /** 外部拿到的检查结果（app.js 的 60 秒轮询、定时任务页「立即执行」）：原样铺进
+       *  面板。不请求、不弹窗、不碰导航徽标 —— 那几件事归调用方那条出口 */
+      applyStatus(info?: UpdateInfo | null): void
       /** 本文件新增（旧实现里这段在 app.js 的 maybeShowUpdateModal）：内部已含「跳过
        *  版本 / 本会话已弹过 / 人已在设置页」的全部判定，调用方把 checkUpdate /
        *  getUpdateStatus 的结果直接转发进来即可。app.js 的定时轮询（pollUpdateStatus）
@@ -848,6 +879,6 @@ declare global {
 }
 
 window.wbUpdatePanel = {
-  load, check, syncFromCache, openAndDownload,
+  load, check, syncFromCache, openAndDownload, applyStatus,
   showUpdateModal: (info) => showUpdateModal(info, openAndDownload),
 }

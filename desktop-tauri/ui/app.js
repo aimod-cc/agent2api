@@ -581,10 +581,13 @@ function syncUpdateBadge() {
 function updateUpdateBadge(info) {
   lastUpdateInfo = info || null;
   syncUpdateBadge();
-  // 「检测到更新」弹窗已迁到组件库（见 ui-islands/src/islands/update-panel.tsx）：
-  // 弹与不弹的判定（跳过此次更新的版本号 / 本会话已弹过 / 人已在设置页）与弹窗本体
-  // 都在那边，这里只把结果递过去。app.js 不再持有弹窗 DOM、跳过键与会话守卫 ——
-  // 那套状态若两边各留一份，判定必然漂移（这正是本次迁移要避免的）。
+  // 结果递给软件更新面板（另一个岛，见 ui-islands/src/islands/update-panel.tsx）：
+  //   · applyStatus：把这份读数铺进面板。后端定时任务查到的新版本、新的检查时刻，
+  //     不该等到用户手点一次「检查更新」才出现；
+  //   · showUpdateModal：「检测到更新」弹窗。弹与不弹的判定（跳过此次更新的版本号 /
+  //     本会话已弹过 / 人已在设置页）与弹窗本体都在那边 —— app.js 不再持有弹窗 DOM、
+  //     跳过键与会话守卫，那套状态若两边各留一份，判定必然漂移。
+  window.wbUpdatePanel?.applyStatus?.(info);
   window.wbUpdatePanel?.showUpdateModal?.(info);
 }
 
