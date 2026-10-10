@@ -31,3 +31,67 @@ pub mod onboarding;
 pub mod probe;
 pub mod signer;
 pub mod subscription;
+
+use serde_json::Value;
+
+use crate::server::core::account_store::AccountStore;
+use crate::server::errors::GatewayError;
+
+/// 用落盘的 refresh token + DPoP 私钥续期控制面临时凭据，并把新凭据写回账号。
+///
+/// 返回新的 `access_key_id`（适配器 `refresh_access_token` 契约要一个非空串表成功）。
+///
+/// ── 为什么只写控制面那半边 ──────────────────────────────────
+/// 续期换的是**控制面**的临时 AK/SK/STS（额度/签到用）；转发的网关 Basic 那对
+/// **不过期**，不动。写回走 `update_officeace_control_plane`（只改这四个字段 +
+/// 到期时刻 + 轮换后的 refresh token），不碰 baseUrl / modelAppKey / dpopKeyPair。
+pub async fn refresh_control_plane(
+    store: &AccountStore,
+    account_id: &str,
+) -> Result<String, GatewayError> {
+    let record = store
+        .officeace_account_record(account_id)
+        .ok_or_else(|| GatewayError::with_status(404, "OfficeAce 账号不存在或不可用"))?;
+    let refresh_token = record
+        .get("refreshToken")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if refresh_token.is_empty() {
+        return Err(GatewayError::with_status(
+            400,
+            "OfficeAce 账号没有 refresh token，无法续期：请重新登录一次",
+        ));
+    }
+    let dpop = record
+        .get("dpopKeyPair")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(|| {
+            GatewayError::with_status(
+                400,
+                "OfficeAce 账号缺少 DPoP 私钥上下文，无法续期：请重新登录一次",
+            )
+        })?;
+    let (credential, expires_at, next_refresh) =
+        oauth::LoginFlow::refresh(&dpop, &refresh_token)
+            .await
+            .map_err(|reason| GatewayError::with_status(502, format!("OfficeAce 续期失败：{reason}")))?;
+    store
+        .update_officeace_control_plane(
+            account_id,
+            &credential.access_key_id,
+            &credential.secret_access_key,
+            &credential.security_token,
+            &credential.project_id,
+            expires_at,
+            &next_refresh,
+        )
+        .map_err(|error| GatewayError::with_status(500, error.message))?;
+    crate::server::logging::log(
+        "[Accounts]",
+        &format!("✅ OfficeAce 账号控制面凭据已续期: {account_id}"),
+    );
+    Ok(credential.access_key_id)
+}

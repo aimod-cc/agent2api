@@ -17,7 +17,7 @@
 
 use std::time::Duration;
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::server::core::providers::officeace::oauth::LoginFlow;
 use crate::server::core::providers::ProviderKind;
@@ -25,6 +25,22 @@ use crate::server::core::providers::kind_id;
 use crate::server::logging;
 
 use super::{finish_task_error, LoginService, LoginTaskHandle};
+
+/// 取第一个非空（去空白）的字符串。
+fn first_non_empty(values: &[&str]) -> Option<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 兜底账号名：`OfficeAce <派生 id 前 8 位>`（与账号 id 同源，稳定且能区分多个账号）。
+fn account_id_for_name(base_url: &str, app_key: &str) -> String {
+    let id = crate::server::core::account_store::officeace_accounts::account_id_for(base_url, app_key);
+    let tail: String = id.chars().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("OfficeAce {tail}")
+}
 
 impl LoginService {
     /// 发起 OfficeAce 自助登录（等待浏览器授权）。
@@ -114,15 +130,20 @@ impl LoginService {
                 "securityToken": credential.security_token,
                 "projectId": credential.project_id,
                 "expiresAt": credential.expires_at,
+                // 一次性 refresh token + 这次登录的 DPoP 密钥对：面板「刷新 Token」与
+                // 自动维护续期都靠它们（丢了只能重新登录，见 OfficeAce 的会话说明）。
+                "refreshToken": credential.refresh_token,
+                "dpopKeyPair": serde_json::to_value(&credential.dpop_key_pair).unwrap_or(Value::Null),
             });
-            // 账号名用上游给的显示名（`id_token` 的 `preferred_username`/`name`）；
-            // 拿不到才退到种子名「OfficeAce 果办」—— 否则面板的账号名看起来
-            // 「只有提供商名」，与别家显示昵称/邮箱不一致。
-            let account_name = if credential.user_name.trim().is_empty() {
-                None
-            } else {
-                Some(credential.user_name.as_str())
-            };
+            // 账号名：优先上游显示名（`id_token` 的 `preferred_username`/`name`）→
+            // 上游账号 id → 派生 id 的前 8 位。**不再退到种子名「OfficeAce 果办」** ——
+            // 多个账号会同名而分不出来（实测就是这么被报的）。
+            let account_name = first_non_empty(&[
+                credential.user_name.as_str(),
+                credential.account_id.as_str(),
+                &account_id_for_name(&credential.base_url, &credential.model_app_key),
+            ]);
+            let account_name = account_name.as_deref();
             match self.store.add_officeace_account(&payload, account_name) {
                 Ok(account) => {
                     task.session = Some(json!({

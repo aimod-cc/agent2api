@@ -132,6 +132,58 @@ impl AccountStore {
             .and_then(|record| record.get("bonusClaims").cloned())
     }
 
+    /// 续期写回：只改**控制面**那半边（临时 AK/SK/STS/project_id + 到期时刻 +
+    /// 轮换后的 refresh token），**不碰** baseUrl / modelAppKey / dpopKeyPair。
+    ///
+    /// 与 CodeArts 的凭据写回同一取舍：转发的网关 Basic 不过期，续期只管控制面；
+    /// 一次续期把网关凭据一起重写等于给它一次无谓的写风险。就地更新，不改队列位置。
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_officeace_control_plane(
+        &self,
+        account_id: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        security_token: &str,
+        project_id: &str,
+        expires_at: i64,
+        refresh_token: &str,
+    ) -> Result<(), AccountStoreError> {
+        let guard = self.guard();
+        let Some(mut record) = self
+            .record_by_id(&guard, account_id)
+            .filter(|record| record.provider() == OFFICEACE_PROVIDER_ID)
+        else {
+            return Err(AccountStoreError::new(
+                "OfficeAce 账号已不存在，续期结果无处落盘",
+                404,
+            ));
+        };
+        let fields = record.fields_mut();
+        for (key, value) in [
+            ("accessKeyId", access_key_id),
+            ("secretAccessKey", secret_access_key),
+            ("securityToken", security_token),
+            ("projectId", project_id),
+        ] {
+            if !value.trim().is_empty() {
+                fields.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+        if expires_at > 0 {
+            fields.insert("expiresAt".to_string(), Value::from(expires_at));
+        }
+        // refresh token 一次性轮换：新的必须落盘，否则下一轮续期会用废掉的旧串
+        if !refresh_token.trim().is_empty() {
+            fields.insert(
+                "refreshToken".to_string(),
+                Value::String(refresh_token.to_string()),
+            );
+        }
+        record.set_updated_at(logging::now_ms());
+        self.with_conn(&guard, |conn| sql::update_in_place(conn, &record))?;
+        Ok(())
+    }
+
     /// 添加/更新一个 OfficeAce 账号（手工导入与自助 OAuth 共用）。
     ///
     /// payload：
@@ -261,6 +313,37 @@ impl AccountStore {
             .unwrap_or(0);
         if expires_at > 0 {
             record.insert("expiresAt".to_string(), Value::from(expires_at));
+        }
+        // 续期材料：一次性 refresh token + 当初登录那把 DPoP 私钥。两者一起落盘才
+        // 能续期（私钥丢了签不出与授权一致的 DPoP proof）。给了就存、没给沿用既有
+        // 记录 —— 手工导入不带它们，重复导入不该把 OAuth 换来的抹掉。
+        let refresh_token = {
+            let incoming = pick(payload, &["refreshToken", "refresh_token"]);
+            if !incoming.is_empty() {
+                incoming
+            } else {
+                existing
+                    .as_ref()
+                    .and_then(|record| record.fields().get("refreshToken").cloned())
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default()
+            }
+        };
+        if !refresh_token.is_empty() {
+            record.insert("refreshToken".to_string(), Value::String(refresh_token));
+        }
+        if let Some(value) = object
+            .get("dpopKeyPair")
+            .filter(|value| value.is_object())
+            .cloned()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|record| record.fields().get("dpopKeyPair").cloned())
+                    .filter(|value| value.is_object())
+            })
+        {
+            record.insert("dpopKeyPair".to_string(), value);
         }
         // 来源：新记录记 import（OAuth 那条路会自己覆写），既有记录沿用
         record.insert(

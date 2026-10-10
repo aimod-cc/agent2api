@@ -84,6 +84,14 @@ pub struct GatewayCredential {
     /// 拿它落账号名 —— 否则面板只能显示代码里的种子名「OfficeAce 果办」，
     /// 看起来就是「只有提供商名」（与别家显示昵称/邮箱不一致）。
     pub user_name: String,
+    /// 上游账号 id（`client-permission-validate` 的 `account_id`）。
+    /// 显示名取不到时拿它当兜底名字，好把多个账号区分开。
+    pub account_id: String,
+    /// 一次性 refresh token（换新的临时 AK/SK 用；上游每轮轮换）。
+    /// 落盘后 `hasRefreshToken` 为真 ⇒ 面板出现「刷新 Token」按钮，且续期链可用。
+    pub refresh_token: String,
+    /// 这次登录用的 DPoP 密钥对（续期签 proof 要用**同一把**私钥，丢了只能重登）。
+    pub dpop_key_pair: DpopKeyPair,
 }
 
 fn base64url(bytes: &[u8]) -> String {
@@ -236,26 +244,131 @@ impl LoginFlow {
 
     /// ⑤⑥⑦：拿授权码换临时凭据，再用它换网关 Basic 那对。
     pub async fn finish(&self, code: &str) -> Result<GatewayCredential, String> {
-        let (temporary, expires_at, user_name) = self.exchange_code(code).await?;
+        let (temporary, expires_at, user_name, refresh_token) = self.exchange_code(code).await?;
         let gateway = self.fetch_gateway_credential(&temporary).await?;
         Ok(GatewayCredential {
             base_url: gateway.0,
             model_app_key: gateway.1,
             model_app_secret: gateway.2,
+            account_id: gateway.3,
             access_key_id: temporary.access_key_id,
             secret_access_key: temporary.secret_access_key,
             security_token: temporary.security_token,
             project_id: temporary.project_id,
             expires_at,
             user_name,
+            refresh_token,
+            // 私钥随登录一并落盘（续期要用它签 DPoP proof；丢了就只能重新登录）
+            dpop_key_pair: self.dpop_key_pair.clone(),
         })
+    }
+
+    /// 用一次性 refresh_token 换一套新的临时 AK/SK（面板「刷新 Token」与自动维护走这条）。
+    ///
+    /// ── 与 `exchange_code` 同一套（表单 + `DPoP:` 头），只换 grant 与表单项 ──
+    /// 上游令牌端点两个 grant 共用；`refresh_token` **一次性轮换**，所以返回值里那份
+    /// 新的必须落盘（旧的重放会得到 `STS5.1806 the refresh token has been used`）。
+    ///
+    /// `dpop_key_pair` 必须是**当初登录那把**（proof 的 `jwk` 头要与授权时一致）。
+    /// 返回 `(新临时凭据, 到期毫秒, 轮换后的 refresh_token)`。
+    pub async fn refresh(
+        dpop_key_pair: &DpopKeyPair,
+        refresh_token: &str,
+    ) -> Result<(SigningCredential, i64, String), String> {
+        if refresh_token.trim().is_empty() {
+            return Err("OfficeAce 账号没有 refresh token，只能重新登录授权".to_string());
+        }
+        let key = DpopKey::from_key_pair(dpop_key_pair)
+            .map_err(|error| format!("DPoP 私钥不可用：{error}"))?;
+        let proof = key
+            .proof("POST", TOKEN_URL, logging::now_ms())
+            .map_err(|error| format!("生成 DPoP proof 失败：{error}"))?;
+        let form = [
+            ("client_id", CLIENT_ID),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.trim()),
+        ]
+        .iter()
+        .map(|(name, value)| format!("{}={}", url_escape(name), url_escape(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+        let response = egress::client_for(None)
+            .post(TOKEN_URL)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("Accept", "application/json")
+            .header("DPoP", proof)
+            .timeout(Duration::from_millis(REQUEST_TIMEOUT_MS))
+            .body(form)
+            .send()
+            .await
+            .map_err(|error| {
+                format!("续期请求失败：{}", egress::describe_error_detail(&error))
+            })?;
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        let payload = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+        if !(200..300).contains(&status) {
+            // 错误体里可能回显发过去的东西（表单里躺着 refresh_token）—— 只取 code/message
+            let detail = payload
+                .get("error_description")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("error_msg").and_then(Value::as_str))
+                .or_else(|| payload.get("error").and_then(Value::as_str))
+                .unwrap_or("");
+            return Err(format!("续期被拒（HTTP {status}）：{detail}"));
+        }
+        let credentials = payload.get("credentials").unwrap_or(&Value::Null);
+        let access_key_id = credentials
+            .get("access_key_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let secret_access_key = credentials
+            .get("secret_access_key")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if access_key_id.is_empty() || secret_access_key.is_empty() {
+            return Err("续期响应没有新的 AK/SK".to_string());
+        }
+        let expires_at = credentials
+            .get("expiration")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339_ms)
+            .filter(|value| *value > 0)
+            .unwrap_or_else(|| logging::now_ms() + 2 * 3600 * 1000);
+        // 轮换后的 token：没给就沿用旧的（一次性的，沿用也只是再赌一次）
+        let next_refresh = payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(refresh_token)
+            .to_string();
+        Ok((
+            SigningCredential {
+                access_key_id,
+                secret_access_key,
+                security_token: credentials
+                    .get("security_token")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                project_id: credentials
+                    .get("project_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            expires_at,
+            next_refresh,
+        ))
     }
 
     /// ⑤ 授权码 → 临时 AK/SK（表单 + `DPoP:` 头，与 CodeArts 同一套；
     /// `send_raw` 只收 JSON 体，所以这里直接用 egress 客户端发表单）。
     ///
     /// 返回 `(临时凭据, 到期时刻毫秒)`。
-    async fn exchange_code(&self, code: &str) -> Result<(SigningCredential, i64, String), String> {
+    async fn exchange_code(&self, code: &str) -> Result<(SigningCredential, i64, String, String), String> {
         let key = DpopKey::from_key_pair(&self.dpop_key_pair)
             .map_err(|error| format!("DPoP 私钥不可用：{error}"))?;
         let proof = key
@@ -320,6 +433,13 @@ impl LoginFlow {
                 .and_then(Value::as_str)
                 .unwrap_or(""),
         );
+        // 一次性 refresh token：落盘后 `hasRefreshToken` 为真（面板出现「刷新 Token」），
+        // 也是续期链的唯一钥匙 —— 丢了就只能重新登录。
+        let refresh_token = payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         Ok((
             SigningCredential {
                 access_key_id,
@@ -337,6 +457,7 @@ impl LoginFlow {
             },
             expires_at,
             user_name,
+            refresh_token,
         ))
     }
 
@@ -344,7 +465,7 @@ impl LoginFlow {
     async fn fetch_gateway_credential(
         &self,
         temporary: &SigningCredential,
-    ) -> Result<(String, String, String), String> {
+    ) -> Result<(String, String, String, String), String> {
         let url = format!("{CLOUD_BASE}/v1/claw/client-permission-validate");
         let headers = signer::sign(&signer::SignRequest {
             algorithm: Algorithm::Sdk,
@@ -423,7 +544,13 @@ impl LoginFlow {
         } else {
             format!("https://{host}/v2")
         };
-        Ok((base_url, app_key, app_secret))
+        let account_id = payload
+            .get("account_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Ok((base_url, app_key, app_secret, account_id))
     }
 }
 

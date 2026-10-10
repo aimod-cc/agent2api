@@ -1001,6 +1001,12 @@ pub async fn refresh_account(state: &ServerState, body: &Bytes) -> Response {
     if state.store().zcode_account_record(&id).is_some() {
         return refresh_provider_account(state, &id, ProviderKind::Zcode).await;
     }
+    // OfficeAce：控制面临时凭据（约 2 小时）用 refresh token + DPoP 私钥续期，
+    // 必须走它自己的适配器。**这条不能省**：漏了就落到 workbuddy 兜底链路，
+    // 用户点「刷新 Token」收到的是腾讯那侧的错（与 CodeArts/Trae 同一条理由）。
+    if state.store().officeace_account_record(&id).is_some() {
+        return refresh_provider_account(state, &id, ProviderKind::OfficeAce).await;
+    }
     // Accio（两个地区）：走适配器的强制刷新（`POST /api/auth/refresh_token`，
     // 结果按「比较再写」回写）。两个地区各查一次 —— 账号集合按 provider 隔离，
     // 同一 id 不可能同时属于两家（撞 id 在存储层就报错了）。

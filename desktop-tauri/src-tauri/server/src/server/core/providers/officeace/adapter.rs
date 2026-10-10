@@ -181,17 +181,27 @@ impl ProviderAdapter for OfficeAceAdapter {
         Box::pin(super::balance::query_usage(store, account_id))
     }
 
-    /// **暂不支持续期**（false）：控制面临时凭据 2 小时到期后，续期要靠
-    /// refresh_token + DPoP 重打令牌端点 —— 那条链还没实现（与签到/额度一起
-    /// 后置）。在它落地之前声明 true 是有害的：定时维护会每轮去撞一条必失败
-    /// 的路（`ensure_access_token` 如实报错），日志里多出一片假故障。
-    /// 转发不受影响：网关 Basic 凭据**不过期**。
+    /// **支持续期**：控制面临时凭据约 2 小时到期，用落盘的一次性 refresh token +
+    /// 当初登录那把 DPoP 私钥重打令牌端点（`oauth::LoginFlow::refresh`）换新的
+    /// AK/SK。刷新链的实现见 `refresh_control_plane`。
     fn supports_refresh(&self) -> bool {
-        false
+        true
     }
 
-    /// 与 `supports_refresh` 配对（临期判定只在支持续期时才有意义）。
-    fn credentials_expiring(&self, _store: &AccountStore, _account_id: &str) -> bool {
-        false
+    /// 该账号的控制面凭据是否临期（到期前 30 分钟算临期）。
+    fn credentials_expiring(&self, store: &AccountStore, account_id: &str) -> bool {
+        store
+            .officeace_account_record(account_id)
+            .and_then(|record| credentials::from_record(Some(&record)).ok())
+            .is_some_and(|credential| credential.control_plane_expiring())
+    }
+
+    /// 控制面续期：refresh token + DPoP 私钥 → 新的临时 AK/SK，写回账号记录。
+    fn refresh_access_token<'a>(
+        &'a self,
+        store: &'a AccountStore,
+        account_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, GatewayError>> + Send + 'a>> {
+        Box::pin(async move { super::refresh_control_plane(store, account_id).await })
     }
 }

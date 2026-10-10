@@ -33,20 +33,32 @@ use super::{credentials, subscription};
 /// 任务分组名（签到中心按它分块显示）。
 const TASK_GROUP: &str = "奖励积分";
 
-/// 本地领取台账：`{ "day": "YYYY-MM-DD", "items": ["<activityId>"…] }`。
+/// 本地领取台账：`{ "day": "YYYY-MM-DD", "items": ["<activityId>"…], "all": bool }`。
 struct Ledger {
     day: String,
     claimed: BTreeSet<String>,
+    /// 今天是否**整体领过**一次（签到或「一键领取」成功即置位）。
+    ///
+    /// ── 为什么不能只靠 `claimed` 判 done（实测踩到）────────────
+    /// 领取后活动集合会变：已领满的会从 `bonus_skus` 掉出去、新的活动可能进来 ——
+    /// 于是台账里记的 key 与「当前列出的任务」对不上，面板永远显示「待领取」。
+    /// 而 OfficeAce 一次 claim 就把当天所有可领的都发了，所以「今天领过」就等于
+    /// 「当前这批任务都已处理」。`done = all || claimed.contains(key)` 两者取并。
+    all: bool,
 }
 
 /// 读台账；跨天（或没台账 / 记录坏了）都当空表 —— 只回答「**今天**领过没有」。
 fn ledger_of(store: &AccountStore, account_id: &str) -> Ledger {
     let day = crate::server::core::providers::codearts::welfare::today(logging::now_ms());
-    let claimed = store
+    let stored = store
         .officeace_bonus_ledger(account_id)
-        .filter(|stored| stored.get("day").and_then(Value::as_str) == Some(day.as_str()))
-        .and_then(|stored| stored.get("items").cloned())
-        .and_then(|items| items.as_array().cloned())
+        .filter(|stored| stored.get("day").and_then(Value::as_str) == Some(day.as_str()));
+    let Some(stored) = stored else {
+        return Ledger { day, claimed: BTreeSet::new(), all: false };
+    };
+    let claimed = stored
+        .get("items")
+        .and_then(Value::as_array)
         .map(|rows| {
             rows.iter()
                 .filter_map(Value::as_str)
@@ -54,13 +66,15 @@ fn ledger_of(store: &AccountStore, account_id: &str) -> Ledger {
                 .collect()
         })
         .unwrap_or_default();
-    Ledger { day, claimed }
+    let all = stored.get("all").and_then(Value::as_bool).unwrap_or(false);
+    Ledger { day, claimed, all }
 }
 
 fn persist_ledger(store: &AccountStore, account_id: &str, ledger: &Ledger) {
     let payload = json!({
         "day": ledger.day,
         "items": ledger.claimed.iter().cloned().collect::<Vec<_>>(),
+        "all": ledger.all,
     });
     if let Err(error) = store.put_officeace_bonus_ledger(account_id, &payload) {
         // 落盘失败不改签到结果：上游那边可能已经发下来了，把成功报成失败本末倒置。
@@ -71,7 +85,7 @@ fn persist_ledger(store: &AccountStore, account_id: &str, ledger: &Ledger) {
     }
 }
 
-/// 把一批活动记进「今天已处理」台账（签到与领取共用）。
+/// 把一批活动记进「今天已处理」台账（签到与领取共用），并置「整体领过」位。
 ///
 /// ── 为什么签到也要调它（与用户预期对齐）──────────────────────
 /// OfficeAce 的签到与新手任务是**同一个上游动作**（一次 claim 就把当天所有奖励
@@ -79,10 +93,10 @@ fn persist_ledger(store: &AccountStore, account_id: &str, ledger: &Ledger) {
 /// 台账，面板的「新手任务」会一直显示未完成（要再点一次「领取」才补上），
 /// 与用户预期「和其他家一样在签到时自动完成新手任务」不符。
 pub fn mark_claimed(store: &AccountStore, account_id: &str, bonuses: &[subscription::Bonus]) {
-    if bonuses.is_empty() {
-        return;
-    }
     let mut ledger = ledger_of(store, account_id);
+    // 即便这次一个活动都没列出来（上游当时没给 bonus_skus），也置位：
+    // 这次 claim 本身已经把当天能领的都领了。
+    ledger.all = true;
     for bonus in bonuses {
         ledger.claimed.insert(bonus.activity_id.clone());
     }
@@ -90,16 +104,20 @@ pub fn mark_claimed(store: &AccountStore, account_id: &str, bonuses: &[subscript
 }
 
 /// 任务行 + 汇总：返回 `(tasks, total, earned, unclaimed)`。
+///
+/// `done = 今天整体领过 || 这个 key 在台账里` —— 前者兜住「领取后活动集合变了、
+/// key 对不上」那种情况（见 [`Ledger`] 的说明）。
 fn build_tasks(
     bonuses: &[subscription::Bonus],
-    claimed: &BTreeSet<String>,
+    ledger: &Ledger,
 ) -> (Vec<Value>, f64, f64, usize) {
+    let is_done = |key: &str| ledger.all || ledger.claimed.contains(key);
     let tasks: Vec<Value> = bonuses
         .iter()
         .map(|bonus| {
             let key = bonus.activity_id.clone();
             let title = bonus.name.clone();
-            let done = claimed.contains(&key);
+            let done = is_done(&key);
             json!({
                 "key": key,
                 "title": title,
@@ -115,12 +133,12 @@ fn build_tasks(
     let total: f64 = bonuses.iter().map(|bonus| bonus.total).sum();
     let earned: f64 = bonuses
         .iter()
-        .filter(|bonus| claimed.contains(&bonus.activity_id))
+        .filter(|bonus| is_done(&bonus.activity_id))
         .map(|bonus| bonus.total)
         .sum();
     let unclaimed = bonuses
         .iter()
-        .filter(|bonus| !claimed.contains(&bonus.activity_id))
+        .filter(|bonus| !is_done(&bonus.activity_id))
         .count();
     (tasks, total, earned, unclaimed)
 }
@@ -142,7 +160,7 @@ pub async fn get_tasks(store: &AccountStore, account_id: &str) -> Result<Value, 
     let subscription = subscription::fetch_subscription(&credential).await?;
     let bonuses = subscription::bonuses_of(&subscription);
     let ledger = ledger_of(store, account_id);
-    let (tasks, total, earned, unclaimed) = build_tasks(&bonuses, &ledger.claimed);
+    let (tasks, total, earned, unclaimed) = build_tasks(&bonuses, &ledger);
     Ok(json!({
         "tasks": tasks,
         "earned": earned,
@@ -188,8 +206,11 @@ pub async fn claim_all(store: &AccountStore, account_id: &str) -> Result<Value, 
             "gained": gained,
         }));
     }
+    // 一次 claim 把整个集合都结算了：置「今天整体领过」位（上面的循环已把每个
+    // 活动记进台账）。`all` 兜住「领完之后活动集合变了、key 对不上」那种情况。
+    ledger.all = true;
     persist_ledger(store, account_id, &ledger);
-    let (tasks, total, earned, unclaimed) = build_tasks(&bonuses, &ledger.claimed);
+    let (tasks, total, earned, unclaimed) = build_tasks(&bonuses, &ledger);
     Ok(json!({
         "results": results,
         "claimed": claimed,
