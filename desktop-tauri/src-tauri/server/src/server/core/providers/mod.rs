@@ -136,6 +136,7 @@ pub mod loomy;
 /// 含工具自动批准与提问自动应答）全部已接通；`is_stateful` 为 true，
 /// 见 `monkeycode/mod.rs` 的模块头。
 pub mod monkeycode;
+pub mod officeace;
 pub mod onboarding_memory;
 pub mod qoder;
 pub mod raccoon;
