@@ -20,6 +20,8 @@
 //! 签名规范化的三处差异见 [`signer`] 的模块头；上游 chat 面无状态（不需要 CodeArts
 //! 那种并发会话闸门）。
 
+pub mod adapter;
 pub mod chat;
 pub mod credentials;
+pub mod models;
 pub mod signer;

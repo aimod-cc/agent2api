@@ -1091,6 +1091,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 全部已接通（转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层，
         // 见 `antigravity/mod.rs` 与 `antigravity/adapter.rs`）
         ProviderKind::Antigravity => &super::antigravity::ANTIGRAVITY_ADAPTER,
+        // OfficeAce（华为云果办 / OfficeClaw）：无状态 OpenAI 兼容转发
+        // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
+        // `officeace/mod.rs` 的模块头）
+        ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
     }
 }
 
@@ -1183,6 +1187,9 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 循环不会问它。转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层
         // （Gemini v1internal 信封 + SSE），`build_chat_request` 已接真身。
         ProviderKind::Antigravity,
+        // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
+        // 进本列表才会被后台目录刷新调度
+        ProviderKind::OfficeAce,
     ]
 }
 
